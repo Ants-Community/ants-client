@@ -62,11 +62,11 @@ typedef enum {
 
 typedef struct {
     ants_cbor_ctx_kind_t kind;
-    size_t               remaining; /* items left to add at this level */
+    size_t remaining; /* items left to add at this level */
     /* For maps: the byte range of the most recently added key, so the
      * encoder can validate canonical-key-order on the next key. */
-    size_t               last_key_begin;
-    size_t               last_key_end;
+    size_t last_key_begin;
+    size_t last_key_end;
 } ants_cbor_ctx_t;
 
 /*
@@ -76,11 +76,11 @@ typedef struct {
  */
 typedef struct {
     uint8_t *buf; /* caller-provided write buffer */
-    size_t   cap; /* total capacity in bytes */
-    size_t   pos; /* current write position */
+    size_t cap;   /* total capacity in bytes */
+    size_t pos;   /* current write position */
 
     ants_cbor_ctx_t stack[ANTS_CBOR_MAX_DEPTH];
-    int             depth; /* current stack index; -1 means top level */
+    int depth; /* current stack index; -1 means top level */
 } ants_cbor_enc_t;
 
 /*
@@ -164,8 +164,8 @@ typedef enum {
 
 typedef struct {
     const uint8_t *buf;
-    size_t         len;
-    size_t         pos;
+    size_t len;
+    size_t pos;
 } ants_cbor_dec_t;
 
 /*

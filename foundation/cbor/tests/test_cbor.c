@@ -32,23 +32,29 @@
 
 static int failures = 0;
 
-#define CHECK(cond)                                                                              \
-    do {                                                                                         \
-        if (!(cond)) {                                                                           \
-            failures++;                                                                          \
-            fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);                      \
-        }                                                                                        \
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);                        \
+        }                                                                                          \
     } while (0)
 
-#define CHECK_EQ(actual, expected)                                                               \
-    do {                                                                                         \
-        ants_error_t _a = (actual);                                                              \
-        ants_error_t _e = (expected);                                                            \
-        if (_a != _e) {                                                                          \
-            failures++;                                                                          \
-            fprintf(stderr, "FAIL %s:%d  expected %s (%d), got %s (%d)\n", __FILE__, __LINE__,   \
-                    ants_strerror(_e), (int)_e, ants_strerror(_a), (int)_a);                     \
-        }                                                                                        \
+#define CHECK_EQ(actual, expected)                                                                 \
+    do {                                                                                           \
+        ants_error_t _a = (actual);                                                                \
+        ants_error_t _e = (expected);                                                              \
+        if (_a != _e) {                                                                            \
+            failures++;                                                                            \
+            fprintf(stderr,                                                                        \
+                    "FAIL %s:%d  expected %s (%d), got %s (%d)\n",                                 \
+                    __FILE__,                                                                      \
+                    __LINE__,                                                                      \
+                    ants_strerror(_e),                                                             \
+                    (int)_e,                                                                       \
+                    ants_strerror(_a),                                                             \
+                    (int)_a);                                                                      \
+        }                                                                                          \
     } while (0)
 
 static void test_strerror_covers_every_code(void)
@@ -66,8 +72,8 @@ static void test_strerror_covers_every_code(void)
 
 static void test_enc_init_rejects_invalid_args(void)
 {
-    uint8_t          buf[16];
-    ants_cbor_enc_t  enc;
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
 
     CHECK_EQ(ants_cbor_enc_init(NULL, buf, sizeof buf), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_cbor_enc_init(&enc, NULL, sizeof buf), ANTS_ERROR_INVALID_ARG);
@@ -76,8 +82,8 @@ static void test_enc_init_rejects_invalid_args(void)
 
 static void test_enc_init_succeeds(void)
 {
-    uint8_t          buf[16];
-    ants_cbor_enc_t  enc;
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
 
     CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
     CHECK(enc.buf == buf);
@@ -89,8 +95,8 @@ static void test_enc_init_succeeds(void)
 
 static void test_enc_stubs_return_not_implemented(void)
 {
-    uint8_t          buf[16];
-    ants_cbor_enc_t  enc;
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
 
     CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
 
@@ -116,19 +122,19 @@ static void test_dec_init_rejects_invalid_args(void)
 
 static void test_dec_stubs_return_not_implemented(void)
 {
-    const uint8_t   input[] = {0x00};
+    const uint8_t input[] = {0x00};
     ants_cbor_dec_t dec;
 
     CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
 
-    ants_cbor_type_t  t;
-    uint64_t          u;
-    int64_t           i;
-    const uint8_t    *bp;
-    const char       *sp;
-    size_t            sz;
-    uint64_t          tag;
-    bool              b;
+    ants_cbor_type_t t;
+    uint64_t u;
+    int64_t i;
+    const uint8_t *bp;
+    const char *sp;
+    size_t sz;
+    uint64_t tag;
+    bool b;
 
     CHECK_EQ(ants_cbor_dec_peek_type(&dec, &t), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_dec_uint(&dec, &u), ANTS_ERROR_NOT_IMPLEMENTED);
