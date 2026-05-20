@@ -34,6 +34,35 @@ target_link_libraries(ants_crypto PRIVATE blst)
 
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
+# ECVRF-ELL2 needs direct access to libsodium's ref10 fe/ge/sc
+# primitives; pulling in `private/ed25519_ref10.h` transitively
+# instantiates a header full of static-inline implementations that
+# trigger our pedantic warning set. The warnings are vendor-code
+# noise (unused-static-inline, signed/unsigned narrowing inside
+# 25.5/51-radix field arithmetic) — apply targeted suppressions
+# rather than weakening the project-wide flags. Wrapper logic in
+# crypto.c is still covered by the full warning set everywhere
+# *except* through these specific suppressions.
+if(NOT MSVC)
+    target_compile_options(ants_crypto PRIVATE
+        -Wno-unused-function
+        -Wno-sign-conversion
+    )
+endif()
+
+# libsodium's private/common.h emits `#warning` diagnostics unless the
+# CONFIGURED and DEV_MODE build-tier macros are defined; they are
+# defined inside deps/ed25519's own build, but PRIVATE there so they
+# don't reach foundation/crypto when we include the same header.
+target_compile_definitions(ants_crypto PRIVATE
+    CONFIGURED=1
+    DEV_MODE=1
+    SODIUM_STATIC=1
+)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_compile_definitions(ants_crypto PRIVATE HAVE_TI_MODE=1)
+endif()
+
 # ---- Tests ---------------------------------------------------------------
 
 if(BUILD_TESTING)

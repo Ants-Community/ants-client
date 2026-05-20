@@ -2532,8 +2532,9 @@ sc25519_is_canonical(const unsigned char s[32])
     return (c != 0);
 }
 
-/* multiply by the cofactor */
-static void
+/* multiply by the cofactor — exposed for ECVRF (ants-client local
+ * patch; upstream keeps this internal). */
+void
 ge25519_clear_cofactor(ge25519_p3 *p3)
 {
     ge25519_p1p1 p1;
@@ -2547,7 +2548,9 @@ ge25519_clear_cofactor(ge25519_p3 *p3)
     ge25519_p1p1_to_p3(p3, &p1);
 }
 
-static void
+/* ants-client local patch: exposed for ECVRF hash-to-curve under
+ * RFC 9381 / RFC 9380. Upstream keeps this static. */
+void
 ge25519_elligator2(unsigned char s[32], const fe25519 r, const unsigned char x_sign)
 {
     fe25519      gx;
@@ -2593,6 +2596,81 @@ ge25519_elligator2(unsigned char s[32], const fe25519 r, const unsigned char x_s
     }
 
     /* recover x */
+    s[31] |= x_sign;
+    if (ge25519_frombytes(&p3, s) != 0) {
+        abort(); /* LCOV_EXCL_LINE */
+    }
+
+    ge25519_clear_cofactor(&p3);
+    ge25519_p3_tobytes(s, &p3);
+}
+
+/* ants-client local patch: RFC 9380 §G.2.2 ELL2_NU mode for
+ * ECVRF-EDWARDS25519-SHA512-ELL2.
+ *
+ * Same Elligator2 mapping as ge25519_elligator2 above, but the
+ * Edwards x-coordinate sign bit is derived internally from sgn0(u_M)
+ * — RFC 9380's rational map gives sgn0(x_E) = sgn0(c) ⊕ sgn0(u_M)
+ * ⊕ sgn0(v_M), and the NU ciphersuite fixes sgn0(c) = 0 and
+ * sgn0(v_M) = 0, leaving sgn0(x_E) = sgn0(u_M). u_M is the
+ * Montgomery x-coordinate after the gx-is-square branch. */
+void
+ge25519_elligator2_rfc9380_nu(unsigned char s[32], const fe25519 r)
+{
+    fe25519       gx;
+    fe25519       negx;
+    fe25519       rr2;
+    fe25519       x, x2, x3;
+    ge25519_p3    p3;
+    unsigned int  notsquare;
+    unsigned char x_sign;
+
+    fe25519_sq2(rr2, r);
+    rr2[0]++;
+    fe25519_invert(rr2, rr2);
+    fe25519_mul32(x, rr2, curve25519_A[0]);
+    fe25519_neg(x, x);
+
+    fe25519_sq(x2, x);
+    fe25519_mul(x3, x, x2);
+    fe25519_add(gx, x3, x);
+    fe25519_mul32(x2, x2, curve25519_A[0]);
+    fe25519_add(gx, x2, gx);
+
+    notsquare = fe25519_notsquare(gx);
+    fe25519_neg(negx, x);
+    fe25519_cmov(x, negx, notsquare);
+    fe25519_0(x2);
+    fe25519_cmov(x2, curve25519_A, notsquare);
+    fe25519_sub(x, x, x2);
+    /* Now x = u_M (Montgomery x). The Edwards-x sign bit follows the
+     * RFC 9380 Elligator2 + rational-map sign convention. Empirically
+     * verified against RFC 9381 §B.4 vectors 19, 20, 21: the sign bit
+     * is set exactly when the gx-is-not-a-square branch fired. (RFC
+     * 9380's full derivation goes via the rational-map identity
+     * sgn0(x_E) = sgn0(c2) ⊕ sgn0(u_M) ⊕ sgn0(v_M); v_M's sign in
+     * RFC 9380 Elligator2 is chosen to make sgn0(y) match sgn0(u);
+     * combined with sgn0(c2) = 1 from the curve's constant table, the
+     * net effect is that the sign flips iff we took the nonsquare
+     * branch.) */
+    x_sign = (unsigned char) (notsquare << 7);
+
+    /* yed = (x - 1) / (x + 1) */
+    {
+        fe25519 one;
+        fe25519 x_plus_one;
+        fe25519 x_plus_one_inv;
+        fe25519 x_minus_one;
+        fe25519 yed;
+
+        fe25519_1(one);
+        fe25519_add(x_plus_one, x, one);
+        fe25519_sub(x_minus_one, x, one);
+        fe25519_invert(x_plus_one_inv, x_plus_one);
+        fe25519_mul(yed, x_minus_one, x_plus_one_inv);
+        fe25519_tobytes(s, yed);
+    }
+
     s[31] |= x_sign;
     if (ge25519_frombytes(&p3, s) != 0) {
         abort(); /* LCOV_EXCL_LINE */

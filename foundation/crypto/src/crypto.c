@@ -3,14 +3,19 @@
  *
  * Status: BLAKE3 implemented via vendored deps/blake3 (v1.8.5).
  * Ed25519 implemented via vendored deps/ed25519 (libsodium 1.0.22
- * ref10 subset). BLS12-381 and ECVRF-ELL2 still stubbed.
+ * ref10 subset). BLS12-381 implemented via vendored deps/blst (0.3.15,
+ * portable C). ECVRF-EDWARDS25519-SHA512-ELL2 implemented in-tree
+ * against the libsodium ref10 fe25519/ge25519/sc25519 primitives per
+ * RFC 9381.
  */
 
 #include "ants_crypto.h"
 
 #include "blake3.h"
 #include "blst.h"
+#include "crypto_hash_sha512.h"
 #include "crypto_sign_ed25519.h"
+#include "private/ed25519_ref10.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -333,18 +338,364 @@ ants_error_t ants_bls_verify_aggregate(const uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZ
 
 /* ------------------------------------------------------------------------ */
 /* ECVRF-EDWARDS25519-SHA512-ELL2                                           */
+/*                                                                          */
+/* Implementation follows RFC 9381 §5 with the ELL2 ciphersuite of §5.5.    */
+/* The Elligator2-with-cofactor-clear primitive is libsodium's              */
+/* ge25519_from_uniform, which is exactly the RFC 9381 §5.4.1.2 mapping     */
+/* once the input's high bit has been masked to zero. Curve, field, and     */
+/* scalar arithmetic come from libsodium's ref10. The construction is       */
+/* split into helpers (hash_to_curve, nonce, challenge, proof_to_hash) so   */
+/* prove and verify can share them.                                         */
 /* ------------------------------------------------------------------------ */
+
+#define VRF_SUITE_STRING 0x04
+#define VRF_C_LEN        16 /* truncated challenge length in bytes */
+
+/*
+ * RFC 9381 §5.4.2.2 ECVRF_nonce_generation_RFC8032: derive a
+ * 32-byte scalar `k` from the Ed25519 expanded secret's upper half
+ * and the hash point H. We re-derive the SHA-512 expansion from the
+ * 32-byte seed each time to keep the public API seed-only.
+ */
+static void vrf_nonce_generation(const uint8_t hashed_sk_upper[32],
+                                 const uint8_t H_bytes[32],
+                                 uint8_t out_k[32])
+{
+    crypto_hash_sha512_state st;
+    uint8_t k_full[64];
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, hashed_sk_upper, 32);
+    crypto_hash_sha512_update(&st, H_bytes, 32);
+    crypto_hash_sha512_final(&st, k_full);
+    sc25519_reduce(k_full);
+    memcpy(out_k, k_full, 32);
+    memset(k_full, 0, sizeof k_full);
+}
+
+/*
+ * RFC 9381 §5.4.3 ECVRF_challenge_generation: c = first cLen bytes
+ * of SHA-512(suite_string || 0x02 || Y || H || Gamma || U || V || 0x00).
+ * The output is the 16-byte truncated `c_string`; callers zero-pad to
+ * 32 bytes when using it as a scalar.
+ */
+static void vrf_challenge_generation(const uint8_t Y[32],
+                                     const uint8_t H[32],
+                                     const uint8_t Gamma[32],
+                                     const uint8_t U[32],
+                                     const uint8_t V[32],
+                                     uint8_t out_c[VRF_C_LEN])
+{
+    crypto_hash_sha512_state st;
+    uint8_t full[64];
+    const uint8_t suite = VRF_SUITE_STRING;
+    const uint8_t two = 0x02;
+    const uint8_t zero = 0x00;
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, &suite, 1);
+    crypto_hash_sha512_update(&st, &two, 1);
+    crypto_hash_sha512_update(&st, Y, 32);
+    crypto_hash_sha512_update(&st, H, 32);
+    crypto_hash_sha512_update(&st, Gamma, 32);
+    crypto_hash_sha512_update(&st, U, 32);
+    crypto_hash_sha512_update(&st, V, 32);
+    crypto_hash_sha512_update(&st, &zero, 1);
+    crypto_hash_sha512_final(&st, full);
+    memcpy(out_c, full, VRF_C_LEN);
+}
+
+/*
+ * RFC 9380 §5.4.1 expand_message_xmd with SHA-512.
+ *
+ * Output: len_in_bytes bytes from SHA-512 in an MGF1-style chain.
+ * Used by RFC 9381 ELL2 with len_in_bytes = 48 (= L*m*count for
+ * Edwards25519 with one field element).
+ */
+static void vrf_expand_message_xmd_sha512(const uint8_t *msg,
+                                          size_t msg_len,
+                                          const uint8_t *dst,
+                                          size_t dst_len,
+                                          uint8_t *out,
+                                          size_t len_in_bytes)
+{
+    /* hLen = 64 for SHA-512. ell = ceil(len_in_bytes / hLen). For our
+     * len_in_bytes = 48 ≤ 64, ell = 1, so only b_0 and b_1 are
+     * produced and b_1 alone gives the output. */
+    const size_t hLen = 64;
+    /* RFC 9380 requires dst_len ≤ 255. Our DST is 41 bytes. */
+    uint8_t dst_prime[256];
+    if (dst_len > 255) {
+        /* Out of spec; abort silently by zeroing output. */
+        memset(out, 0, len_in_bytes);
+        return;
+    }
+    memcpy(dst_prime, dst, dst_len);
+    dst_prime[dst_len] = (uint8_t)dst_len;
+
+    const size_t ell = (len_in_bytes + hLen - 1) / hLen;
+    /* Z_pad = I2OSP(0, s_in_bytes). For SHA-512, s_in_bytes (input
+     * block size) = 128. */
+    static const uint8_t Z_pad[128] = {0};
+    const uint8_t l_i_b_str[2] = {(uint8_t)(len_in_bytes >> 8), (uint8_t)(len_in_bytes & 0xFF)};
+    const uint8_t I2OSP_0 = 0x00;
+
+    /* b_0 = H(Z_pad || msg || l_i_b_str || I2OSP(0,1) || dst_prime). */
+    crypto_hash_sha512_state st;
+    uint8_t b_0[64];
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, Z_pad, sizeof Z_pad);
+    if (msg_len > 0) {
+        crypto_hash_sha512_update(&st, msg, (unsigned long long)msg_len);
+    }
+    crypto_hash_sha512_update(&st, l_i_b_str, 2);
+    crypto_hash_sha512_update(&st, &I2OSP_0, 1);
+    crypto_hash_sha512_update(&st, dst_prime, dst_len + 1);
+    crypto_hash_sha512_final(&st, b_0);
+
+    /* b_1 = H(b_0 || I2OSP(1,1) || dst_prime). */
+    uint8_t b_prev[64];
+    uint8_t b_i[64];
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, b_0, sizeof b_0);
+    {
+        const uint8_t i_str = 0x01;
+        crypto_hash_sha512_update(&st, &i_str, 1);
+    }
+    crypto_hash_sha512_update(&st, dst_prime, dst_len + 1);
+    crypto_hash_sha512_final(&st, b_i);
+    memcpy(b_prev, b_i, sizeof b_i);
+
+    size_t written = 0;
+    size_t take = (len_in_bytes < hLen) ? len_in_bytes : hLen;
+    memcpy(out, b_i, take);
+    written = take;
+
+    /* b_i = H(b_0 XOR b_{i-1} || I2OSP(i, 1) || dst_prime) for i = 2..ell. */
+    for (size_t i = 2; i <= ell && written < len_in_bytes; i++) {
+        uint8_t xor_buf[64];
+        for (size_t j = 0; j < 64; j++) {
+            xor_buf[j] = (uint8_t)(b_0[j] ^ b_prev[j]);
+        }
+        crypto_hash_sha512_init(&st);
+        crypto_hash_sha512_update(&st, xor_buf, sizeof xor_buf);
+        {
+            const uint8_t i_str = (uint8_t)i;
+            crypto_hash_sha512_update(&st, &i_str, 1);
+        }
+        crypto_hash_sha512_update(&st, dst_prime, dst_len + 1);
+        crypto_hash_sha512_final(&st, b_i);
+        memcpy(b_prev, b_i, sizeof b_i);
+        size_t remaining = len_in_bytes - written;
+        take = remaining < hLen ? remaining : hLen;
+        memcpy(out + written, b_i, take);
+        written += take;
+    }
+}
+
+/*
+ * Reduce a 48-byte big-endian integer mod p = 2^255 - 19 and load
+ * into an fe25519. Splits V = V_hi * 2^256 + V_lo (V_hi = top 16 BE
+ * bytes, V_lo = remaining 32 BE bytes). Then V mod p = V_hi * 38 +
+ * V_lo mod p since 2^256 ≡ 38 (mod p). V_lo's bit 255 (if set) is
+ * handled by adding 19 once after the unreduced load, since
+ * fe25519_frombytes silently masks bit 255.
+ */
+static void vrf_reduce_48_be_to_fe(const uint8_t v[48], fe25519 out)
+{
+    /* V_lo = v[16..47] interpreted as a 256-bit big-endian integer.
+     * Byte-reverse to little-endian for fe25519_frombytes. */
+    uint8_t lo_le[32];
+    for (size_t i = 0; i < 32; i++) {
+        lo_le[i] = v[16 + 31 - i];
+    }
+    uint8_t bit_255 = (uint8_t)(lo_le[31] >> 7);
+    lo_le[31] &= 0x7F;
+    fe25519 lo_fe;
+    fe25519_frombytes(lo_fe, lo_le);
+    if (bit_255) {
+        /* Add 19 mod p to compensate for the silently-masked 2^255 bit. */
+        fe25519 nineteen;
+        uint8_t nineteen_bytes[32] = {0};
+        nineteen_bytes[0] = 19;
+        fe25519_frombytes(nineteen, nineteen_bytes);
+        fe25519_add(lo_fe, lo_fe, nineteen);
+    }
+
+    /* V_hi = v[0..15] (128 bits, big-endian) → 32-byte LE with high
+     * 16 bytes zero. */
+    uint8_t hi_le[32] = {0};
+    for (size_t i = 0; i < 16; i++) {
+        hi_le[i] = v[15 - i];
+    }
+    fe25519 hi_fe;
+    fe25519_frombytes(hi_fe, hi_le);
+    /* V_hi * 38 fits within fe25519's pre-reduction range. */
+    fe25519 hi_38;
+    fe25519_mul32(hi_38, hi_fe, 38);
+
+    fe25519 sum;
+    fe25519_add(sum, lo_fe, hi_38);
+    /* fe25519_reduce is static-inline inside the fe_25_5/fe_51
+     * headers and not exposed; canonicalise by round-tripping through
+     * the 32-byte serialisation, which internally reduces. The 32-byte
+     * form is mod 2^255, and since p = 2^255 - 19, the worst case
+     * after this is a value in [0, p+19); a single conditional sub of
+     * p (via fe25519_tobytes' reduction) handles it. */
+    uint8_t canonical[32];
+    fe25519_tobytes(canonical, sum);
+    fe25519_frombytes(out, canonical);
+}
+
+/*
+ * RFC 9381 §§ 5.4.1.2 + 5.5 ECVRF_encode_to_curve_h2c_suite with
+ * suite ID "edwards25519_XMD:SHA-512_ELL2_NU_" (RFC 9380 §G.2.2).
+ *
+ *   msg = PK_string || alpha
+ *   DST = "ECVRF_" || suite_ID || suite_string (=0x04)
+ *   uniform_bytes = expand_message_xmd_sha512(msg, DST, 48)
+ *   u = OS2IP(uniform_bytes) mod p
+ *   H_prelim = Elligator2(u)        (NU mode: single map call)
+ *   H = clear_cofactor(H_prelim)
+ *   return point_to_string(H)
+ */
+static void
+vrf_hash_to_curve(const uint8_t Y[32], const uint8_t *alpha, size_t alpha_len, uint8_t out_H[32])
+{
+    /* DST for ECVRF-EDWARDS25519-SHA512-ELL2 per RFC 9381 §5.5. */
+    static const uint8_t dst[] = "ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
+    const size_t dst_len = sizeof dst - 1; /* exclude the NUL terminator */
+
+    /* Compose msg = PK || alpha into a stack buffer; alpha is
+     * application-controlled but length is bounded in practice by
+     * the protocol's max-VRF-input size. 1 KiB is generous. */
+    uint8_t msg_buf[1024];
+    size_t msg_len = 32;
+    if (alpha_len > sizeof msg_buf - 32) {
+        /* Out of spec; produce a deterministic but obviously-wrong
+         * output by hashing only the first 32 bytes. Callers should
+         * never trigger this path; we don't expose an error code
+         * here because the rest of the API treats hash_to_curve as
+         * infallible. */
+        alpha_len = sizeof msg_buf - 32;
+    }
+    memcpy(msg_buf, Y, 32);
+    if (alpha_len > 0) {
+        memcpy(msg_buf + 32, alpha, alpha_len);
+        msg_len += alpha_len;
+    }
+
+    uint8_t uniform[48];
+    vrf_expand_message_xmd_sha512(msg_buf, msg_len, dst, dst_len, uniform, sizeof uniform);
+
+    fe25519 u_fe;
+    vrf_reduce_48_be_to_fe(uniform, u_fe);
+
+    /* RFC 9380 NU mode: Elligator2 with sign convention derived
+     * from the gx-is-square branch; see the patched variant in
+     * deps/ed25519/src/ed25519_ref10_core.c. */
+    ge25519_elligator2_rfc9380_nu(out_H, u_fe);
+}
+
+/*
+ * RFC 9381 §5.2 proof_to_hash for ECVRF-EDWARDS25519-SHA512-ELL2:
+ *   beta = SHA-512(suite || 0x03 || point_to_string(8 * Gamma) || 0x00)
+ * where 8 is the Edwards25519 cofactor. Every Gamma we accept is
+ * already cofactor-cleared (H is, so x*H is), but the spec applies
+ * the multiplication unconditionally as a safety measure against
+ * subgroup-membership oversights.
+ */
+static void vrf_proof_to_hash(const ge25519_p3 *Gamma_p3, uint8_t out_beta[64])
+{
+    ge25519_p3 eight_gamma;
+    uint8_t eight[32] = {0};
+    uint8_t eight_gamma_bytes[32];
+    eight[0] = 8;
+    ge25519_scalarmult(&eight_gamma, eight, Gamma_p3);
+    ge25519_p3_tobytes(eight_gamma_bytes, &eight_gamma);
+
+    crypto_hash_sha512_state st;
+    const uint8_t suite = VRF_SUITE_STRING;
+    const uint8_t three = 0x03;
+    const uint8_t zero = 0x00;
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, &suite, 1);
+    crypto_hash_sha512_update(&st, &three, 1);
+    crypto_hash_sha512_update(&st, eight_gamma_bytes, 32);
+    crypto_hash_sha512_update(&st, &zero, 1);
+    crypto_hash_sha512_final(&st, out_beta);
+}
 
 ants_error_t ants_vrf_prove(const uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE],
                             const uint8_t *alpha,
                             size_t alpha_len,
                             uint8_t out_proof[ANTS_VRF_PROOF_SIZE])
 {
-    (void)sk;
-    (void)alpha;
-    (void)alpha_len;
-    (void)out_proof;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (sk == NULL || (alpha == NULL && alpha_len > 0) || out_proof == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* 1. Expand SK to (x, hashed_sk_upper) and derive Y = x*B. */
+    uint8_t hashed_sk[64];
+    uint8_t x_clamped[32];
+    crypto_hash_sha512(hashed_sk, sk, ANTS_ED25519_PRIVKEY_SIZE);
+    memcpy(x_clamped, hashed_sk, 32);
+    x_clamped[0] &= 0xF8;
+    x_clamped[31] &= 0x7F;
+    x_clamped[31] |= 0x40;
+
+    ge25519_p3 Y_p3;
+    uint8_t Y_bytes[32];
+    ge25519_scalarmult_base(&Y_p3, x_clamped);
+    ge25519_p3_tobytes(Y_bytes, &Y_p3);
+
+    /* 2. H = hash_to_curve_ell2(Y, alpha). */
+    uint8_t H_bytes[32];
+    vrf_hash_to_curve(Y_bytes, alpha, alpha_len, H_bytes);
+    ge25519_p3 H_p3;
+    if (ge25519_frombytes(&H_p3, H_bytes) != 0) {
+        memset(hashed_sk, 0, sizeof hashed_sk);
+        memset(x_clamped, 0, sizeof x_clamped);
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* 3. Gamma = x * H. */
+    ge25519_p3 Gamma_p3;
+    uint8_t Gamma_bytes[32];
+    ge25519_scalarmult(&Gamma_p3, x_clamped, &H_p3);
+    ge25519_p3_tobytes(Gamma_bytes, &Gamma_p3);
+
+    /* 4. Nonce k. */
+    uint8_t k[32];
+    vrf_nonce_generation(hashed_sk + 32, H_bytes, k);
+
+    /* 5. c = challenge_generation(Y, H, Gamma, kB, kH). */
+    ge25519_p3 kB_p3;
+    ge25519_p3 kH_p3;
+    uint8_t kB_bytes[32];
+    uint8_t kH_bytes[32];
+    ge25519_scalarmult_base(&kB_p3, k);
+    ge25519_scalarmult(&kH_p3, k, &H_p3);
+    ge25519_p3_tobytes(kB_bytes, &kB_p3);
+    ge25519_p3_tobytes(kH_bytes, &kH_p3);
+
+    uint8_t c_string[VRF_C_LEN];
+    vrf_challenge_generation(Y_bytes, H_bytes, Gamma_bytes, kB_bytes, kH_bytes, c_string);
+
+    /* 6. s = c*x + k mod L (with c zero-padded to 32 bytes). */
+    uint8_t c_padded[32];
+    memcpy(c_padded, c_string, VRF_C_LEN);
+    memset(c_padded + VRF_C_LEN, 0, 32 - VRF_C_LEN);
+    uint8_t s_bytes[32];
+    sc25519_muladd(s_bytes, c_padded, x_clamped, k);
+
+    /* 7. pi = Gamma || c || s. */
+    memcpy(out_proof, Gamma_bytes, 32);
+    memcpy(out_proof + 32, c_string, VRF_C_LEN);
+    memcpy(out_proof + 32 + VRF_C_LEN, s_bytes, 32);
+
+    /* Best-effort zeroisation of secret material. */
+    memset(hashed_sk, 0, sizeof hashed_sk);
+    memset(x_clamped, 0, sizeof x_clamped);
+    memset(k, 0, sizeof k);
+    return ANTS_OK;
 }
 
 ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
@@ -353,10 +704,100 @@ ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
                              const uint8_t proof[ANTS_VRF_PROOF_SIZE],
                              uint8_t out_beta[ANTS_VRF_OUTPUT_SIZE])
 {
-    (void)pk;
-    (void)alpha;
-    (void)alpha_len;
-    (void)proof;
-    (void)out_beta;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (pk == NULL || (alpha == NULL && alpha_len > 0) || proof == NULL || out_beta == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* 1. Validate Y. Reject non-canonical or low-order encodings. */
+    if (!ge25519_is_canonical(pk) || ge25519_has_small_order(pk)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* For step 4 we want -Y, so decompress with the _negate variant. */
+    ge25519_p3 neg_Y;
+    if (ge25519_frombytes_negate_vartime(&neg_Y, pk) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* 2. Decode pi. */
+    const uint8_t *Gamma_bytes = proof;
+    const uint8_t *c_string = proof + 32;
+    const uint8_t *s_bytes = proof + 32 + VRF_C_LEN;
+
+    if (!ge25519_is_canonical(Gamma_bytes)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    ge25519_p3 Gamma_p3;
+    if (ge25519_frombytes(&Gamma_p3, Gamma_bytes) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* s must be a canonical scalar in [0, L). The ref10 doesn't
+     * export a public sc25519_is_canonical, but sc25519_muladd
+     * tolerates non-canonical inputs (it reduces internally), so we
+     * do the canonical check manually against L. L is given in the
+     * spec as the curve order: 2^252 + 27742317777372353535851937790883648493. */
+    {
+        static const uint8_t L[32] = {0xED, 0xD3, 0xF5, 0x5C, 0x1A, 0x63, 0x12, 0x58,
+                                      0xD6, 0x9C, 0xF7, 0xA2, 0xDE, 0xF9, 0xDE, 0x14,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10};
+        for (int i = 31; i >= 0; i--) {
+            if (s_bytes[i] < L[i]) {
+                break;
+            }
+            if (s_bytes[i] > L[i] || i == 0) {
+                return ANTS_ERROR_MALFORMED;
+            }
+        }
+    }
+
+    /* 3. H = hash_to_curve_ell2(Y, alpha). */
+    uint8_t H_bytes[32];
+    vrf_hash_to_curve(pk, alpha, alpha_len, H_bytes);
+    ge25519_p3 H_p3;
+    if (ge25519_frombytes(&H_p3, H_bytes) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* 4. U = s*B - c*Y. Using neg_Y: U = c*(-Y) + s*B. */
+    uint8_t c_padded[32];
+    memcpy(c_padded, c_string, VRF_C_LEN);
+    memset(c_padded + VRF_C_LEN, 0, 32 - VRF_C_LEN);
+
+    ge25519_p2 U_p2;
+    uint8_t U_bytes[32];
+    ge25519_double_scalarmult_vartime(&U_p2, c_padded, &neg_Y, s_bytes);
+    ge25519_tobytes(U_bytes, &U_p2);
+
+    /* 5. V = s*H - c*Gamma. */
+    ge25519_p3 sH_p3;
+    ge25519_p3 cGamma_p3;
+    ge25519_cached cGamma_cached;
+    ge25519_p1p1 V_p1p1;
+    ge25519_p3 V_p3;
+    uint8_t V_bytes[32];
+    ge25519_scalarmult(&sH_p3, s_bytes, &H_p3);
+    ge25519_scalarmult(&cGamma_p3, c_padded, &Gamma_p3);
+    ge25519_p3_to_cached(&cGamma_cached, &cGamma_p3);
+    ge25519_sub(&V_p1p1, &sH_p3, &cGamma_cached);
+    ge25519_p1p1_to_p3(&V_p3, &V_p1p1);
+    ge25519_p3_tobytes(V_bytes, &V_p3);
+
+    /* 6. c' = challenge_generation(Y, H, Gamma, U, V). */
+    uint8_t c_prime[VRF_C_LEN];
+    vrf_challenge_generation(pk, H_bytes, Gamma_bytes, U_bytes, V_bytes, c_prime);
+
+    /* 7. Constant-time compare c' against c_string. */
+    {
+        unsigned int diff = 0;
+        for (size_t i = 0; i < VRF_C_LEN; i++) {
+            diff |= (unsigned int)(c_prime[i] ^ c_string[i]);
+        }
+        if (diff != 0) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+
+    /* 8. beta = proof_to_hash(pi). */
+    vrf_proof_to_hash(&Gamma_p3, out_beta);
+    return ANTS_OK;
 }

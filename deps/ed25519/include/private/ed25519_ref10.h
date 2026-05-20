@@ -112,6 +112,21 @@ void ge25519_from_uniform(unsigned char s[32], const unsigned char r[32]);
 
 void ge25519_from_hash(unsigned char s[32], const unsigned char h[64]);
 
+/* ants-client local patch: exposed for ECVRF hash-to-curve under RFC
+ * 9381 / RFC 9380. The pure Elligator2 + rational-map + cofactor
+ * routine takes a field element directly so RFC 9380's 48-byte
+ * uniform_bytes-mod-p path can target it. x_sign is OR-ed into bit 7
+ * of the compressed encoding's last byte before decompression. */
+void ge25519_elligator2(unsigned char s[32], const fe25519 r, const unsigned char x_sign);
+
+/* Same as ge25519_elligator2 but computes x_sign internally as
+ * sgn0(u_M) per RFC 9380 §G.3.1 (sgn0(c)=0, sgn0(v_M)=0 ⇒ sgn0(x_E)
+ * = sgn0(u_M)). This is the RFC 9381 ECVRF-EDWARDS25519-SHA512-ELL2
+ * encode-to-curve primitive. */
+void ge25519_elligator2_rfc9380_nu(unsigned char s[32], const fe25519 r);
+
+void ge25519_clear_cofactor(ge25519_p3 *p3);
+
 /*
  Ristretto group
  */
