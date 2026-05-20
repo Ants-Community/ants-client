@@ -192,16 +192,115 @@ static void test_blake3_streaming_matches_one_shot(void)
     CHECK(memcmp(one_shot, streamed, ANTS_BLAKE3_HASH_SIZE) == 0);
 }
 
-static void test_ed25519_stubs(void)
-{
-    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE] = {0};
-    uint8_t pub[ANTS_ED25519_PUBKEY_SIZE] = {0};
-    uint8_t sig[ANTS_ED25519_SIG_SIZE] = {0};
-    uint8_t msg[1] = {0};
+/* RFC 8032 §7.1 TEST 1: empty message */
+static const char *RFC8032_T1_SEED =
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+static const char *RFC8032_T1_PUB =
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+static const char *RFC8032_T1_SIG =
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e0652249015"
+    "55fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b";
 
-    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv, pub), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_ed25519_sign(priv, msg, sizeof msg, sig), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_ed25519_verify(pub, msg, sizeof msg, sig), ANTS_ERROR_NOT_IMPLEMENTED);
+/* RFC 8032 §7.1 TEST 2: single-byte message 0x72 */
+static const char *RFC8032_T2_SEED =
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+static const char *RFC8032_T2_PUB =
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+static const char *RFC8032_T2_MSG = "72";
+static const char *RFC8032_T2_SIG =
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+    "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00";
+
+static void test_ed25519_rejects_invalid_args(void)
+{
+    uint8_t buf[64];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(NULL, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(buf, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_sign(NULL, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_sign(buf, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_sign(buf, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_verify(NULL, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_verify(buf, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ed25519_verify(buf, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_ed25519_rfc8032_test1_empty(void)
+{
+    uint8_t seed[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t expected_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t expected_sig[ANTS_ED25519_SIG_SIZE];
+    CHECK(hex_to_bytes(RFC8032_T1_SEED, seed, sizeof seed) == 32);
+    CHECK(hex_to_bytes(RFC8032_T1_PUB, expected_pub, sizeof expected_pub) == 32);
+    CHECK(hex_to_bytes(RFC8032_T1_SIG, expected_sig, sizeof expected_sig) == 64);
+
+    /* Derive pubkey from seed; must match expected. */
+    uint8_t derived_pub[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(seed, derived_pub), ANTS_OK);
+    CHECK(memcmp(derived_pub, expected_pub, ANTS_ED25519_PUBKEY_SIZE) == 0);
+
+    /* Sign empty message; must produce expected signature. */
+    uint8_t sig[ANTS_ED25519_SIG_SIZE];
+    CHECK_EQ(ants_ed25519_sign(seed, NULL, 0, sig), ANTS_OK);
+    CHECK(memcmp(sig, expected_sig, ANTS_ED25519_SIG_SIZE) == 0);
+
+    /* Verify both expected and freshly-signed signatures against the
+     * expected pubkey. */
+    CHECK_EQ(ants_ed25519_verify(expected_pub, NULL, 0, expected_sig), ANTS_OK);
+    CHECK_EQ(ants_ed25519_verify(expected_pub, NULL, 0, sig), ANTS_OK);
+}
+
+static void test_ed25519_rfc8032_test2_single_byte(void)
+{
+    uint8_t seed[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t expected_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t expected_sig[ANTS_ED25519_SIG_SIZE];
+    uint8_t msg[1];
+    CHECK(hex_to_bytes(RFC8032_T2_SEED, seed, sizeof seed) == 32);
+    CHECK(hex_to_bytes(RFC8032_T2_PUB, expected_pub, sizeof expected_pub) == 32);
+    CHECK(hex_to_bytes(RFC8032_T2_SIG, expected_sig, sizeof expected_sig) == 64);
+    CHECK(hex_to_bytes(RFC8032_T2_MSG, msg, sizeof msg) == 1);
+
+    uint8_t derived_pub[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(seed, derived_pub), ANTS_OK);
+    CHECK(memcmp(derived_pub, expected_pub, ANTS_ED25519_PUBKEY_SIZE) == 0);
+
+    uint8_t sig[ANTS_ED25519_SIG_SIZE];
+    CHECK_EQ(ants_ed25519_sign(seed, msg, sizeof msg, sig), ANTS_OK);
+    CHECK(memcmp(sig, expected_sig, ANTS_ED25519_SIG_SIZE) == 0);
+
+    CHECK_EQ(ants_ed25519_verify(expected_pub, msg, sizeof msg, expected_sig), ANTS_OK);
+}
+
+static void test_ed25519_verify_rejects_tampered(void)
+{
+    uint8_t seed[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t sig[ANTS_ED25519_SIG_SIZE];
+    const uint8_t msg[] = "ANTS test message";
+    CHECK(hex_to_bytes(RFC8032_T1_SEED, seed, sizeof seed) == 32);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(seed, pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(seed, msg, sizeof msg - 1, sig), ANTS_OK);
+
+    /* Untampered: verify OK. */
+    CHECK_EQ(ants_ed25519_verify(pub, msg, sizeof msg - 1, sig), ANTS_OK);
+
+    /* Tamper the signature: verify must fail with MALFORMED. */
+    uint8_t bad_sig[ANTS_ED25519_SIG_SIZE];
+    memcpy(bad_sig, sig, sizeof bad_sig);
+    bad_sig[0] ^= 0x01;
+    CHECK_EQ(ants_ed25519_verify(pub, msg, sizeof msg - 1, bad_sig), ANTS_ERROR_MALFORMED);
+
+    /* Tamper the message: verify must fail. */
+    uint8_t bad_msg[sizeof msg - 1];
+    memcpy(bad_msg, msg, sizeof bad_msg);
+    bad_msg[0] ^= 0x01;
+    CHECK_EQ(ants_ed25519_verify(pub, bad_msg, sizeof bad_msg, sig), ANTS_ERROR_MALFORMED);
+
+    /* Tamper the public key: verify must fail. */
+    uint8_t bad_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memcpy(bad_pub, pub, sizeof bad_pub);
+    bad_pub[0] ^= 0x01;
+    CHECK_EQ(ants_ed25519_verify(bad_pub, msg, sizeof msg - 1, sig), ANTS_ERROR_MALFORMED);
 }
 
 static void test_bls_stubs(void)
@@ -239,7 +338,12 @@ int main(void)
     test_blake3_known_inputs();
     test_blake3_derive_key();
     test_blake3_streaming_matches_one_shot();
-    test_ed25519_stubs();
+
+    test_ed25519_rejects_invalid_args();
+    test_ed25519_rfc8032_test1_empty();
+    test_ed25519_rfc8032_test2_single_byte();
+    test_ed25519_verify_rejects_tampered();
+
     test_bls_stubs();
     test_vrf_stubs();
 

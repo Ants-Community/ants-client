@@ -13,6 +13,64 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/crypto: implement Ed25519 (vendored libsodium 1.0.22 ref10) · 2026-05-20
+
+Second crypto primitive landed. Ed25519 sign / verify / pubkey-derive
+wired against a vendored subset of libsodium's `ref10` implementation.
+
+Vendoring (`deps/ed25519/`):
+
+- Pinned snapshot of [jedisct1/libsodium 1.0.22](https://github.com/jedisct1/libsodium/releases/tag/1.0.22-RELEASE)
+  ref10 subset. Upstream LICENSE (ISC) preserved.
+- Source files: `sign_ed25519.c`, `ref10_keypair.c`, `ref10_sign.c`,
+  `ref10_open.c`, `ed25519_ref10_core.c` (fe25519/ge25519/sc25519 ops),
+  `hash_sha512.c` (SHA-512 portable), `verify.c` (constant-time
+  compare), `utils.c` (libsodium plumbing). Plus a small
+  `sodium_stub.c` that provides abort-stubs for `sodium_misuse()` and
+  `randombytes_buf()` (the deterministic Ed25519 ref10 path does not
+  call randomness).
+- Headers: all relevant libsodium public + private headers flattened
+  under `include/` and `include/private/` with the upstream
+  hierarchy mostly preserved (only `crypto_sign/ed25519/ref10/sign_ed25519_ref10.h`
+  is renamed to flat `include/sign_ed25519_ref10.h` to match the
+  layout).
+- CMake forces the portable C path everywhere: `HAVE_AMD64_ASM` and
+  `HAVE_*MMINTRIN_H` deliberately *not* defined (libsodium uses
+  `#ifdef`, so defining to 0 still triggers true; the only correct
+  way is to not define them at all).
+
+Wrapper (`foundation/crypto/src/crypto.c`):
+
+- `ants_ed25519_pubkey_from_priv` — derives the 32-byte public key
+  from a 32-byte seed via `crypto_sign_ed25519_seed_keypair`. The
+  intermediate 64-byte libsodium secret-key buffer is zeroed before
+  return.
+- `ants_ed25519_sign` — derives the libsodium sk on the fly and
+  signs via `crypto_sign_ed25519_detached`.
+- `ants_ed25519_verify` — calls `crypto_sign_ed25519_verify_detached`;
+  maps libsodium's non-zero return to `ANTS_ERROR_MALFORMED`.
+
+Tests (4 new functions):
+
+- `test_ed25519_rejects_invalid_args` — NULL pointers.
+- `test_ed25519_rfc8032_test1_empty` — RFC 8032 §7.1 TEST 1 (empty
+  message). Derived pubkey matches expected; signature matches
+  expected; verify accepts both fresh and expected signatures.
+- `test_ed25519_rfc8032_test2_single_byte` — RFC 8032 §7.1 TEST 2
+  (single-byte message `0x72`). Same checks.
+- `test_ed25519_verify_rejects_tampered` — tamper-bit-flip on
+  signature / message / pubkey each cause `MALFORMED`.
+
+Local build clean (Debug, AppleClang 21 on arm64), 2/2 ctest passing.
+Format clean (clang-format-22 dry-run --Werror).
+
+The ANTS protocol's identity layer now has a working peer-identity
+signature primitive end-to-end against the RFC 8032 reference
+vectors.
+
+Next: vendor `supranational/blst` and wire `ants_bls_*` (sign/verify
++ aggregate for L2 PoUH committee signatures).
+
 ### foundation/crypto: implement BLAKE3 (vendored 1.8.5) · 2026-05-20
 
 First crypto primitive implemented. BLAKE3 (hash + `derive_key` +
