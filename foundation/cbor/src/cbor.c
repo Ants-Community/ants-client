@@ -4,11 +4,9 @@
  * Implements RFC 8949 §4.2.1 strict deterministic encoding, per
  * RFC-0008 §1.1.
  *
- * Status: major types 0 (uint), 1 (negint), 2 (byte string), 3 (text
- * string), 4 (array), 5 (map with canonical-key-order enforcement),
- * 6 (tag, restricted to RFC-0008 §1.1 reserved set {0, 32, 42}), and
- * the bool/null subset of type 7 implemented. ants_cbor_is_canonical
- * still stubbed pending the top-level walk.
+ * Status: **feature-complete**. All major types 0-6 and the bool/null
+ * subset of type 7 implemented. ants_cbor_is_canonical implemented as
+ * a walk-every-item function that requires exactly len bytes consumed.
  *
  * Canonical-encoding discipline lives in cbor_read_head (shortest-form
  * + indefinite + reserved rejection) and in the enc_track_item /
@@ -1106,11 +1104,125 @@ bool ants_cbor_dec_eof(const ants_cbor_dec_t *dec)
 
 /* ------------------------------------------------------------------------ */
 /* Validator                                                                */
+/*                                                                          */
+/* The top-level validator walks every item in the input, exercising each   */
+/* dec_* function (which already enforces shortest-form, canonical-key      */
+/* order, reserved-info rejection, etc.). After the walk it requires:       */
+/*   - exactly len bytes consumed (no trailing data);                       */
+/*   - depth back to -1 (every container closed).                           */
+/*                                                                          */
+/* Maximum recursion depth is bounded by ANTS_CBOR_MAX_DEPTH because the    */
+/* underlying decoder rejects deeper nesting via dec_track_item.            */
 /* ------------------------------------------------------------------------ */
+
+static ants_error_t walk_one_item(ants_cbor_dec_t *dec)
+{
+    if (ants_cbor_dec_eof(dec)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    ants_cbor_type_t t;
+    ants_error_t err = ants_cbor_dec_peek_type(dec, &t);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    switch (t) {
+    case ANTS_CBOR_TYPE_UINT: {
+        uint64_t v;
+        return ants_cbor_dec_uint(dec, &v);
+    }
+    case ANTS_CBOR_TYPE_NEGINT: {
+        int64_t v;
+        return ants_cbor_dec_int(dec, &v);
+    }
+    case ANTS_CBOR_TYPE_BYTES: {
+        const uint8_t *b;
+        size_t l;
+        return ants_cbor_dec_bytes(dec, &b, &l);
+    }
+    case ANTS_CBOR_TYPE_TEXT: {
+        const char *s;
+        size_t l;
+        return ants_cbor_dec_text(dec, &s, &l);
+    }
+    case ANTS_CBOR_TYPE_ARRAY: {
+        size_t n;
+        err = ants_cbor_dec_array(dec, &n);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        for (size_t i = 0; i < n; i++) {
+            err = walk_one_item(dec);
+            if (err != ANTS_OK) {
+                return err;
+            }
+        }
+        return ANTS_OK;
+    }
+    case ANTS_CBOR_TYPE_MAP: {
+        size_t n;
+        err = ants_cbor_dec_map(dec, &n);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        for (size_t i = 0; i < n; i++) {
+            err = walk_one_item(dec); /* key */
+            if (err != ANTS_OK) {
+                return err;
+            }
+            err = walk_one_item(dec); /* value */
+            if (err != ANTS_OK) {
+                return err;
+            }
+        }
+        return ANTS_OK;
+    }
+    case ANTS_CBOR_TYPE_TAG: {
+        uint64_t tag;
+        err = ants_cbor_dec_tag(dec, &tag);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        return walk_one_item(dec); /* tagged item */
+    }
+    case ANTS_CBOR_TYPE_BOOL: {
+        bool b;
+        return ants_cbor_dec_bool(dec, &b);
+    }
+    case ANTS_CBOR_TYPE_NULL:
+        return ants_cbor_dec_null(dec);
+    default:
+        return ANTS_ERROR_MALFORMED;
+    }
+}
 
 ants_error_t ants_cbor_is_canonical(const uint8_t *buf, size_t len)
 {
-    (void)buf;
-    (void)len;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (buf == NULL && len > 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (len == 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    ants_cbor_dec_t dec;
+    ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = walk_one_item(&dec);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (!ants_cbor_dec_eof(&dec)) {
+        /* Trailing bytes after the top-level item. */
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (dec.depth != -1) {
+        /* Should not happen if walk completed successfully — defence in
+         * depth. */
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
 }
