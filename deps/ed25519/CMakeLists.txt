@@ -19,8 +19,12 @@ add_library(ed25519_sodium STATIC
 
 target_include_directories(ed25519_sodium PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_include_directories(ed25519_sodium PRIVATE
+    # The `private` directory holds the ref10 fe25519/ge25519/sc25519
+    # API. Upstream libsodium keeps these internal because the public
+    # API is keypair/sign/verify only — but our ECVRF-EDWARDS25519-
+    # SHA512-ELL2 implementation needs to drive those primitives
+    # directly. We expose them inside ants-client only (this target is
+    # not installed, it's an internal static lib for foundation/crypto).
     ${CMAKE_CURRENT_SOURCE_DIR}/include/private
 )
 

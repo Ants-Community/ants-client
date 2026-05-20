@@ -490,16 +490,242 @@ static void test_bls_aggregate_wrong_message_fails(void)
              ANTS_ERROR_MALFORMED);
 }
 
-static void test_vrf_stubs(void)
-{
-    uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE] = {0};
-    uint8_t pk[ANTS_ED25519_PUBKEY_SIZE] = {0};
-    uint8_t alpha[1] = {0};
-    uint8_t proof[ANTS_VRF_PROOF_SIZE] = {0};
-    uint8_t beta[ANTS_VRF_OUTPUT_SIZE] = {0};
+/* ------------------------------------------------------------------------ */
+/* ECVRF-EDWARDS25519-SHA512-ELL2 — RFC 9381 §B.4 reference vectors +       */
+/* round-trip + tamper-detection. SK/PK pairs are inherited from RFC 8032   */
+/* §7.1 (TEST 1/2/3); pi and beta are the Examples 19/20/21 outputs of     */
+/* RFC 9381 §B.4 (also reproducing H, x, k, U, V intermediates which we    */
+/* don't expose, but the published pi/beta pin the whole construction).    */
+/* ------------------------------------------------------------------------ */
 
-    CHECK_EQ(ants_vrf_prove(sk, alpha, sizeof alpha, proof), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_vrf_verify(pk, alpha, sizeof alpha, proof, beta), ANTS_ERROR_NOT_IMPLEMENTED);
+/* RFC 9381 §B.4 Example 19 — alpha = "". */
+static const char *VRF_T1_SK = "9d61b19deffd5a60ba844af492ec2cc4"
+                               "4449c5697b326919703bac031cae7f60";
+static const char *VRF_T1_PK = "d75a980182b10ab7d54bfed3c964073a"
+                               "0ee172f3daa62325af021a68f707511a";
+static const char *VRF_T1_PI = "7d9c633ffeee27349264cf5c667579fc"
+                               "583b4bda63ab71d001f89c10003ab46f"
+                               "14adf9a3cd8b8412d9038531e865c341"
+                               "cafa73589b023d14311c331a9ad15ff2"
+                               "fb37831e00f0acaa6d73bc9997b06501";
+static const char *VRF_T1_BETA = "9d574bf9b8302ec0fc1e21c3ec536826"
+                                 "9527b87b462ce36dab2d14ccf80c53cc"
+                                 "cf6758f058c5b1c856b116388152bbe5"
+                                 "09ee3b9ecfe63d93c3b4346c1fbc6c54";
+
+/* RFC 9381 §B.4 Example 20 — alpha = 0x72. */
+static const char *VRF_T2_SK = "4ccd089b28ff96da9db6c346ec114e0f"
+                               "5b8a319f35aba624da8cf6ed4fb8a6fb";
+static const char *VRF_T2_PK = "3d4017c3e843895a92b70aa74d1b7ebc"
+                               "9c982ccf2ec4968cc0cd55f12af4660c";
+static const char *VRF_T2_ALPHA_HEX = "72";
+static const char *VRF_T2_PI = "47b327393ff2dd81336f8a2ef1033911"
+                               "2401253b3c714eeda879f12c509072ef"
+                               "055b48372bb82efbdce8e10c8cb9a2f9"
+                               "d60e93908f93df1623ad78a86a028d6b"
+                               "c064dbfc75a6a57379ef855dc6733801";
+static const char *VRF_T2_BETA = "38561d6b77b71d30eb97a062168ae12b"
+                                 "667ce5c28caccdf76bc88e093e463598"
+                                 "7cd96814ce55b4689b3dd2947f80e59a"
+                                 "ac7b7675f8083865b46c89b2ce9cc735";
+
+/* RFC 9381 §B.4 Example 21 — alpha = 0xaf82. */
+static const char *VRF_T3_SK = "c5aa8df43f9f837bedb7442f31dcb7b1"
+                               "66d38535076f094b85ce3a2e0b4458f7";
+static const char *VRF_T3_PK = "fc51cd8e6218a1a38da47ed00230f058"
+                               "0816ed13ba3303ac5deb911548908025";
+static const char *VRF_T3_ALPHA_HEX = "af82";
+static const char *VRF_T3_PI = "926e895d308f5e328e7aa159c06eddbe"
+                               "56d06846abf5d98c2512235eaa57fdce"
+                               "35b46edfc655bc828d44ad09d1150f31"
+                               "374e7ef73027e14760d42e77341fe054"
+                               "67bb286cc2c9d7fde29120a0b2320d04";
+static const char *VRF_T3_BETA = "121b7f9b9aaaa29099fc04a94ba52784"
+                                 "d44eac976dd1a3cca458733be5cd090a"
+                                 "7b5fbd148444f17f8daf1fb55cb04b1a"
+                                 "e85a626e30a54b4b0f8abf4a43314a58";
+
+static void check_vrf_vector(const char *what,
+                             const char *sk_hex,
+                             const char *pk_hex,
+                             const uint8_t *alpha,
+                             size_t alpha_len,
+                             const char *pi_hex,
+                             const char *beta_hex)
+{
+    uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t pk[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t expected_pi[ANTS_VRF_PROOF_SIZE];
+    uint8_t expected_beta[ANTS_VRF_OUTPUT_SIZE];
+
+    CHECK(hex_to_bytes(sk_hex, sk, sizeof sk) == ANTS_ED25519_PRIVKEY_SIZE);
+    CHECK(hex_to_bytes(pk_hex, pk, sizeof pk) == ANTS_ED25519_PUBKEY_SIZE);
+    CHECK(hex_to_bytes(pi_hex, expected_pi, sizeof expected_pi) == ANTS_VRF_PROOF_SIZE);
+    CHECK(hex_to_bytes(beta_hex, expected_beta, sizeof expected_beta) == ANTS_VRF_OUTPUT_SIZE);
+
+    /* PK consistency: derived from SK must match the vector's PK. */
+    uint8_t derived_pk[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(sk, derived_pk), ANTS_OK);
+    if (memcmp(derived_pk, pk, ANTS_ED25519_PUBKEY_SIZE) != 0) {
+        failures++;
+        fprintf(stderr, "FAIL %s: derived PK mismatch\n", what);
+    }
+
+    /* Prove. */
+    uint8_t pi[ANTS_VRF_PROOF_SIZE];
+    CHECK_EQ(ants_vrf_prove(sk, alpha, alpha_len, pi), ANTS_OK);
+    if (memcmp(pi, expected_pi, ANTS_VRF_PROOF_SIZE) != 0) {
+        failures++;
+        fprintf(stderr, "FAIL %s pi mismatch\n  expected: %s\n  got:      ", what, pi_hex);
+        for (size_t i = 0; i < ANTS_VRF_PROOF_SIZE; i++) {
+            fprintf(stderr, "%02x", pi[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    /* Verify expected_pi against expected_pk; beta must match. */
+    uint8_t beta[ANTS_VRF_OUTPUT_SIZE];
+    CHECK_EQ(ants_vrf_verify(pk, alpha, alpha_len, expected_pi, beta), ANTS_OK);
+    if (memcmp(beta, expected_beta, ANTS_VRF_OUTPUT_SIZE) != 0) {
+        failures++;
+        fprintf(stderr, "FAIL %s beta mismatch\n  expected: %s\n  got:      ", what, beta_hex);
+        for (size_t i = 0; i < ANTS_VRF_OUTPUT_SIZE; i++) {
+            fprintf(stderr, "%02x", beta[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+static void test_vrf_rfc9381_vectors(void)
+{
+    check_vrf_vector("RFC 9381 §B.4 ex19", VRF_T1_SK, VRF_T1_PK, NULL, 0, VRF_T1_PI, VRF_T1_BETA);
+
+    uint8_t alpha2[1];
+    CHECK(hex_to_bytes(VRF_T2_ALPHA_HEX, alpha2, sizeof alpha2) == 1);
+    check_vrf_vector(
+        "RFC 9381 §B.4 ex20", VRF_T2_SK, VRF_T2_PK, alpha2, sizeof alpha2, VRF_T2_PI, VRF_T2_BETA);
+
+    uint8_t alpha3[2];
+    CHECK(hex_to_bytes(VRF_T3_ALPHA_HEX, alpha3, sizeof alpha3) == 2);
+    check_vrf_vector(
+        "RFC 9381 §B.4 ex21", VRF_T3_SK, VRF_T3_PK, alpha3, sizeof alpha3, VRF_T3_PI, VRF_T3_BETA);
+}
+
+static void test_vrf_rejects_invalid_args(void)
+{
+    uint8_t buf[ANTS_VRF_PROOF_SIZE];
+    CHECK_EQ(ants_vrf_prove(NULL, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_prove(buf, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_prove(buf, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_verify(NULL, buf, 1, buf, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_verify(buf, NULL, 1, buf, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_verify(buf, buf, 1, NULL, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_vrf_verify(buf, buf, 1, buf, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_vrf_roundtrip(void)
+{
+    /* Use the RFC 8032 §7.1 TEST 1 seed (well-known fixed key). */
+    uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t pk[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(RFC8032_T1_SEED, sk, sizeof sk) == ANTS_ED25519_PRIVKEY_SIZE);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(sk, pk), ANTS_OK);
+
+    /* Round-trip over three alpha sizes: empty, 1 byte, 17 bytes. */
+    const struct {
+        const char *desc;
+        const uint8_t *alpha;
+        size_t alpha_len;
+    } cases[] = {
+        {"empty", NULL, 0},
+        {"1B", (const uint8_t *)"\x72", 1},
+        {"17B", (const uint8_t *)"ANTS VRF round-tr", 17},
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        uint8_t pi[ANTS_VRF_PROOF_SIZE];
+        uint8_t beta1[ANTS_VRF_OUTPUT_SIZE];
+        uint8_t beta2[ANTS_VRF_OUTPUT_SIZE];
+        CHECK_EQ(ants_vrf_prove(sk, cases[i].alpha, cases[i].alpha_len, pi), ANTS_OK);
+        CHECK_EQ(ants_vrf_verify(pk, cases[i].alpha, cases[i].alpha_len, pi, beta1), ANTS_OK);
+
+        /* Determinism: prove again, same proof bytes; verify again,
+         * same beta bytes. ECVRF is fully deterministic in SK and
+         * alpha (nonce k is hash-derived, not random). */
+        uint8_t pi2[ANTS_VRF_PROOF_SIZE];
+        CHECK_EQ(ants_vrf_prove(sk, cases[i].alpha, cases[i].alpha_len, pi2), ANTS_OK);
+        CHECK(memcmp(pi, pi2, ANTS_VRF_PROOF_SIZE) == 0);
+        CHECK_EQ(ants_vrf_verify(pk, cases[i].alpha, cases[i].alpha_len, pi, beta2), ANTS_OK);
+        CHECK(memcmp(beta1, beta2, ANTS_VRF_OUTPUT_SIZE) == 0);
+        (void)cases[i].desc;
+    }
+}
+
+static void test_vrf_distinct_alpha_distinct_beta(void)
+{
+    /* Same key, different alpha ⇒ distinct beta values. Beta is the
+     * VRF's pseudorandom output; if the same key produced the same
+     * beta for distinct inputs, the construction would be broken. */
+    uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t pk[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(RFC8032_T1_SEED, sk, sizeof sk) == ANTS_ED25519_PRIVKEY_SIZE);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(sk, pk), ANTS_OK);
+
+    uint8_t pi_a[ANTS_VRF_PROOF_SIZE];
+    uint8_t pi_b[ANTS_VRF_PROOF_SIZE];
+    uint8_t beta_a[ANTS_VRF_OUTPUT_SIZE];
+    uint8_t beta_b[ANTS_VRF_OUTPUT_SIZE];
+    CHECK_EQ(ants_vrf_prove(sk, (const uint8_t *)"A", 1, pi_a), ANTS_OK);
+    CHECK_EQ(ants_vrf_prove(sk, (const uint8_t *)"B", 1, pi_b), ANTS_OK);
+    CHECK(memcmp(pi_a, pi_b, ANTS_VRF_PROOF_SIZE) != 0);
+    CHECK_EQ(ants_vrf_verify(pk, (const uint8_t *)"A", 1, pi_a, beta_a), ANTS_OK);
+    CHECK_EQ(ants_vrf_verify(pk, (const uint8_t *)"B", 1, pi_b, beta_b), ANTS_OK);
+    CHECK(memcmp(beta_a, beta_b, ANTS_VRF_OUTPUT_SIZE) != 0);
+}
+
+static void test_vrf_verify_rejects_tampered(void)
+{
+    uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t pk[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t pi[ANTS_VRF_PROOF_SIZE];
+    uint8_t beta[ANTS_VRF_OUTPUT_SIZE];
+    const uint8_t alpha[] = "ANTS VRF test input";
+    const size_t alpha_len = sizeof alpha - 1;
+
+    CHECK(hex_to_bytes(RFC8032_T1_SEED, sk, sizeof sk) == ANTS_ED25519_PRIVKEY_SIZE);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(sk, pk), ANTS_OK);
+    CHECK_EQ(ants_vrf_prove(sk, alpha, alpha_len, pi), ANTS_OK);
+    CHECK_EQ(ants_vrf_verify(pk, alpha, alpha_len, pi, beta), ANTS_OK);
+
+    /* Tamper Gamma (proof byte 0). */
+    uint8_t bad_pi[ANTS_VRF_PROOF_SIZE];
+    memcpy(bad_pi, pi, sizeof bad_pi);
+    bad_pi[0] ^= 0x01;
+    CHECK(ants_vrf_verify(pk, alpha, alpha_len, bad_pi, beta) != ANTS_OK);
+
+    /* Tamper c (proof byte 32). */
+    memcpy(bad_pi, pi, sizeof bad_pi);
+    bad_pi[32] ^= 0x01;
+    CHECK_EQ(ants_vrf_verify(pk, alpha, alpha_len, bad_pi, beta), ANTS_ERROR_MALFORMED);
+
+    /* Tamper s (proof byte 48). */
+    memcpy(bad_pi, pi, sizeof bad_pi);
+    bad_pi[48] ^= 0x01;
+    CHECK_EQ(ants_vrf_verify(pk, alpha, alpha_len, bad_pi, beta), ANTS_ERROR_MALFORMED);
+
+    /* Tamper alpha. */
+    uint8_t bad_alpha[sizeof alpha - 1];
+    memcpy(bad_alpha, alpha, sizeof bad_alpha);
+    bad_alpha[0] ^= 0x01;
+    CHECK_EQ(ants_vrf_verify(pk, bad_alpha, sizeof bad_alpha, pi, beta), ANTS_ERROR_MALFORMED);
+
+    /* Tamper PK. byte 0 flip may produce a non-canonical encoding
+     * (which we reject with MALFORMED). Either way the call must
+     * not succeed. */
+    uint8_t bad_pk[ANTS_ED25519_PUBKEY_SIZE];
+    memcpy(bad_pk, pk, sizeof bad_pk);
+    bad_pk[0] ^= 0x01;
+    CHECK(ants_vrf_verify(bad_pk, alpha, alpha_len, pi, beta) != ANTS_OK);
 }
 
 int main(void)
@@ -521,7 +747,11 @@ int main(void)
     test_bls_sign_verify_roundtrip();
     test_bls_aggregate_wrong_message_fails();
 
-    test_vrf_stubs();
+    test_vrf_rejects_invalid_args();
+    test_vrf_rfc9381_vectors();
+    test_vrf_roundtrip();
+    test_vrf_distinct_alpha_distinct_beta();
+    test_vrf_verify_rejects_tampered();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
