@@ -13,6 +13,38 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/cbor: implement major types 0–3 · 2026-05-20
+
+`ants_cbor` library now implements:
+
+- **Major type 0** — unsigned integer encode/decode with shortest-form
+  enforcement (1/2/3/5/9-byte representations chosen by value range).
+- **Major type 1** — signed integer encode/decode covering the full
+  int64_t range, including the `-1 - n` convention for negatives.
+- **Major type 2** — byte string encode/decode with length-prefixed
+  shortest-form headers; decoder rejects truncated input as malformed.
+- **Major type 3** — UTF-8 text string encode/decode; the codec does
+  not validate UTF-8 well-formedness (caller's responsibility).
+- **`ants_cbor_dec_peek_type`** for type dispatch.
+
+Canonical-encoding discipline is enforced by `cbor_read_head` (a
+static helper inside `cbor.c`):
+
+- Reject non-shortest-form encodings (e.g., `0x18 0x00` is rejected
+  because the value 0 must use the 1-byte form `0x00`).
+- Reject indefinite-length items (additional info 31).
+- Reject reserved additional-info values 28, 29, 30.
+
+Tests cover round-trip for all listed major types, canonical
+rejection vectors (non-shortest, indefinite, reserved), and overflow
+when decoding a uint into `int64_t`. ~17 test functions in
+`test_cbor.c`, single `cbor_basic` ctest target.
+
+Still stubbed: major types 4 (array), 5 (map), 6 (tag), simple
+values (bool, null), and `ants_cbor_is_canonical`. Next PR adds
+arrays and maps with the canonical-key-order discipline (RFC 8949
+§4.2.1 most important rule).
+
 ### CI workflow + clang-format · 2026-05-20
 
 GitHub Actions workflow added (`.github/workflows/ci.yml`) with build
