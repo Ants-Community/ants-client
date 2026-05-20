@@ -62,9 +62,14 @@ typedef enum {
 
 typedef struct {
     ants_cbor_ctx_kind_t kind;
-    size_t remaining; /* items left to add at this level */
-    /* For maps: the byte range of the most recently added key, so the
-     * encoder can validate canonical-key-order on the next key. */
+    size_t remaining; /* array: items left; map: pairs left */
+    /* Byte position in the encoder/decoder buffer where this container's
+     * header started — needed so the tracker can register a completed
+     * container as a single item in its parent container, recursively. */
+    size_t container_begin;
+    /* For maps: byte range of the most recently added key, so the
+     * encoder/decoder can validate canonical-key-order against the next
+     * key under RFC 8949 §4.2.1. */
     size_t last_key_begin;
     size_t last_key_end;
 } ants_cbor_ctx_t;
@@ -162,10 +167,18 @@ typedef enum {
     ANTS_CBOR_TYPE_NULL,
 } ants_cbor_type_t;
 
+/*
+ * Decoder state. Caller allocates (typically on the stack). The buf is
+ * not copied; it must outlive the decoder. The stack + depth track open
+ * container contexts the same way as the encoder, so canonical-key-order
+ * is enforced symmetrically on decode.
+ */
 typedef struct {
     const uint8_t *buf;
     size_t len;
     size_t pos;
+    ants_cbor_ctx_t stack[ANTS_CBOR_MAX_DEPTH];
+    int depth; /* -1 means top level */
 } ants_cbor_dec_t;
 
 /*
