@@ -9,6 +9,7 @@
 #include "ants_crypto.h"
 
 #include "blake3.h"
+#include "blst.h"
 #include "crypto_sign_ed25519.h"
 
 #include <assert.h>
@@ -178,12 +179,37 @@ ants_error_t ants_ed25519_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
 /* BLS12-381                                                                */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Variant: min-pubkey-size. Public keys are points on G1 (48 bytes
+ * compressed); signatures are points on G2 (96 bytes compressed). This
+ * is the variant blst calls `pk_in_g1` and the IETF BLS draft calls
+ * "minimal-pubkey-size".
+ *
+ * Ciphersuite (RFC-0008 §3.3):
+ *   BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_
+ * — Basic mode, no application augmentation. The DST is the
+ * ciphersuite identifier itself, passed verbatim to `hash_to_curve`
+ * (RFC 9380) which produces the message hash on G2.
+ */
+static const uint8_t ANTS_BLS_DST[] = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+#define ANTS_BLS_DST_LEN (sizeof ANTS_BLS_DST - 1)
+
 ants_error_t ants_bls_pubkey_from_priv(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE],
                                        uint8_t out_pub[ANTS_BLS_PUBKEY_SIZE])
 {
-    (void)priv;
-    (void)out_pub;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (priv == NULL || out_pub == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_scalar sk;
+    blst_p1 pk;
+    blst_scalar_from_bendian(&sk, priv);
+    if (!blst_sk_check(&sk)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    blst_sk_to_pk_in_g1(&pk, &sk);
+    blst_p1_compress(out_pub, &pk);
+    memset(&sk, 0, sizeof sk);
+    return ANTS_OK;
 }
 
 ants_error_t ants_bls_sign(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE],
@@ -191,11 +217,21 @@ ants_error_t ants_bls_sign(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE],
                            size_t len,
                            uint8_t out_sig[ANTS_BLS_SIG_SIZE])
 {
-    (void)priv;
-    (void)msg;
-    (void)len;
-    (void)out_sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (priv == NULL || (msg == NULL && len > 0) || out_sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_scalar sk;
+    blst_p2 hash;
+    blst_p2 sig;
+    blst_scalar_from_bendian(&sk, priv);
+    if (!blst_sk_check(&sk)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    blst_hash_to_g2(&hash, msg, len, ANTS_BLS_DST, ANTS_BLS_DST_LEN, NULL, 0);
+    blst_sign_pk_in_g1(&sig, &hash, &sk);
+    blst_p2_compress(out_sig, &sig);
+    memset(&sk, 0, sizeof sk);
+    return ANTS_OK;
 }
 
 ants_error_t ants_bls_verify(const uint8_t pub[ANTS_BLS_PUBKEY_SIZE],
@@ -203,35 +239,96 @@ ants_error_t ants_bls_verify(const uint8_t pub[ANTS_BLS_PUBKEY_SIZE],
                              size_t len,
                              const uint8_t sig[ANTS_BLS_SIG_SIZE])
 {
-    (void)pub;
-    (void)msg;
-    (void)len;
-    (void)sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (pub == NULL || (msg == NULL && len > 0) || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_p1_affine pk_aff;
+    blst_p2_affine sig_aff;
+    if (blst_p1_uncompress(&pk_aff, pub) != BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (blst_p2_uncompress(&sig_aff, sig) != BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* hash_or_encode=true selects RFC 9380 hash_to_curve (the RO
+     * ciphersuite); encode_to_curve would be the NU variant. */
+    if (blst_core_verify_pk_in_g1(
+            &pk_aff, &sig_aff, true, msg, len, ANTS_BLS_DST, ANTS_BLS_DST_LEN, NULL, 0) !=
+        BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
 }
 
+/*
+ * Aggregate `n` BLS signatures into a single 96-byte signature. The
+ * group operation is point addition on G2. Each input is decompressed,
+ * subgroup-checked (blst_aggregate_in_g2 does the in-G2 check), and
+ * added to a running accumulator. n=0 is a caller error.
+ */
 ants_error_t ants_bls_aggregate(const uint8_t (*sigs)[ANTS_BLS_SIG_SIZE],
                                 size_t n,
                                 uint8_t out_sig[ANTS_BLS_SIG_SIZE])
 {
-    (void)sigs;
-    (void)n;
-    (void)out_sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (sigs == NULL || n == 0 || out_sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_p2_affine first;
+    blst_p2 acc;
+    if (blst_p2_uncompress(&first, sigs[0]) != BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    blst_p2_from_affine(&acc, &first);
+    for (size_t i = 1; i < n; i++) {
+        if (blst_aggregate_in_g2(&acc, &acc, sigs[i]) != BLST_SUCCESS) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+    blst_p2_compress(out_sig, &acc);
+    return ANTS_OK;
 }
 
+/*
+ * Verify an aggregate signature: FastAggregateVerify from
+ * draft-irtf-cfrg-bls-signature-05 §3.3.4. All n public keys MUST
+ * correspond to signatures over the SAME `msg` — that is the L2 PoUH
+ * committee case (every member signs the same block hash). Aggregates
+ * the n pubkeys into one G1 point, then runs CoreVerify against the
+ * single aggregated signature. n=0 is a caller error.
+ */
 ants_error_t ants_bls_verify_aggregate(const uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZE],
                                        size_t n,
                                        const uint8_t *msg,
                                        size_t msg_len,
                                        const uint8_t sig[ANTS_BLS_SIG_SIZE])
 {
-    (void)pubs;
-    (void)n;
-    (void)msg;
-    (void)msg_len;
-    (void)sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (pubs == NULL || n == 0 || (msg == NULL && msg_len > 0) || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_p1_affine first;
+    blst_p1 acc_pk;
+    if (blst_p1_uncompress(&first, pubs[0]) != BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    blst_p1_from_affine(&acc_pk, &first);
+    for (size_t i = 1; i < n; i++) {
+        if (blst_aggregate_in_g1(&acc_pk, &acc_pk, pubs[i]) != BLST_SUCCESS) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+    blst_p1_affine acc_pk_aff;
+    blst_p1_to_affine(&acc_pk_aff, &acc_pk);
+
+    blst_p2_affine sig_aff;
+    if (blst_p2_uncompress(&sig_aff, sig) != BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (blst_core_verify_pk_in_g1(
+            &acc_pk_aff, &sig_aff, true, msg, msg_len, ANTS_BLS_DST, ANTS_BLS_DST_LEN, NULL, 0) !=
+        BLST_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */

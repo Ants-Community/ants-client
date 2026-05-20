@@ -28,6 +28,10 @@ target_link_libraries(ants_crypto PRIVATE blake3)
 # Vendored Ed25519 from libsodium ref10 (deps/ed25519, pinned to 1.0.22).
 target_link_libraries(ants_crypto PRIVATE ed25519_sodium)
 
+# Vendored BLS12-381 from supranational/blst (deps/blst, pinned to 0.3.15,
+# portable C path via __BLST_NO_ASM__).
+target_link_libraries(ants_crypto PRIVATE blst)
+
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------
