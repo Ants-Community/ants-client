@@ -2,7 +2,7 @@
 
 CBOR canonical codec. Foundation layer.
 
-**Status:** in progress (BDFL interim primary; claim still open). Major types 0 (uint), 1 (negative int), 2 (byte string), 3 (text string) implemented with canonical-encoding enforcement. Major types 4–7 still stubbed.
+**Status:** in progress (BDFL interim primary; claim still open). Major types 0 (uint), 1 (negative int), 2 (byte string), 3 (text string), 4 (array), 5 (map with canonical-key-order enforcement) implemented. Major type 6 (tag), simple values (bool, null), and the top-level `ants_cbor_is_canonical` validator still stubbed.
 **Effort:** 1 EM.
 **Spec:** [RFC-0008 §1.1](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0008-wire-formats.md) (deterministic CBOR per RFC 8949 §4.2.1).
 **Dependencies:** none internal. Candidate baselines: [`tinycbor`](https://github.com/intel/tinycbor) (Intel) or [`nanocbor`](https://github.com/bergzand/NanoCBOR).

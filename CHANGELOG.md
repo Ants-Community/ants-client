@@ -13,6 +13,63 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/cbor: implement major types 4 (array) + 5 (map) · 2026-05-20
+
+`ants_cbor` library now implements arrays and maps with
+canonical-key-order enforcement on both encode and decode paths.
+
+Mechanism:
+
+- `ants_cbor_ctx_t` extended with `container_begin` so the tracker can
+  register a closed container as a single item in its parent.
+- `ants_cbor_dec_t` extended with `stack[]` + `depth` symmetric to the
+  encoder, so canonical-key-order is enforced on decode too.
+- Two static helpers `enc_track_item` and `dec_track_item` walk the
+  context stack after each item is written/consumed, decrementing
+  remaining counts, switching MAP_KEY ↔ MAP_VALUE state, and
+  recursively closing full containers by registering them as items in
+  their parents. Both helpers are *transactional*: any failure path
+  restores the depth/stack to pre-call state via a snapshot at entry.
+- `compare_keys` implements bytewise lexicographic comparison with
+  length tiebreak per RFC 8949 §4.2.1, used by both encoder and
+  decoder for map key ordering.
+
+Canonical-encoding rules now enforced for maps:
+
+- Keys must be **strictly monotonically increasing** in bytewise
+  lexicographic order of their canonical CBOR encoding. The encoder
+  rejects an out-of-order or duplicate key with
+  `ANTS_ERROR_NON_CANONICAL`. The decoder symmetrically rejects an
+  input that presents keys out of order.
+- The encoder validates each new key against the byte range of the
+  previously-added key (stored in the context stack).
+- The decoder does the same against the input buffer.
+
+Tests added (14 new test functions):
+
+- `test_encode_array_empty / _flat / _nested / _underfill` — array
+  round-trip including nested `[[1,2],[3]]`, plus underfill detection
+  via `ants_cbor_enc_finalise` returning `ANTS_ERROR_MALFORMED`.
+- `test_encode_map_empty / _canonical_order` — round-trip
+  `{1:"one", 2:"two"}` to the expected byte string.
+- `test_encode_map_rejects_unsorted_keys / _duplicate_keys` —
+  encoder rejects key 1 after key 2, and key 1 after key 1.
+- `test_encode_map_in_array` — mixed nesting
+  `[{1:10}, {2:20}]`.
+- `test_decode_array_round_trip / _empty` — symmetric decode.
+- `test_decode_map_round_trip / _rejects_unsorted_keys /
+  _rejects_duplicate_keys` — decoder enforces the same canonical-key
+  order on input.
+
+Still stubbed: major type 6 (tag), bool, null, `ants_cbor_is_canonical`.
+
+Bug found and fixed during this iteration: `enc_track_item` /
+`dec_track_item` were missing an `else { return ANTS_OK; }` after the
+non-closing path, causing the loop to keep decrementing remaining
+until the container was forced shut on the first item write. Caught
+by `test_encode_array_underfill` (which expected MALFORMED on
+finalise but got OK). The fix is two lines.
+
 ### foundation/cbor: implement major types 0–3 · 2026-05-20
 
 `ants_cbor` library now implements:

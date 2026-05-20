@@ -489,7 +489,278 @@ static void test_peek_type(void)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Stubs still in place                                                     */
+/* Encode: array (major type 4)                                             */
+/* ------------------------------------------------------------------------ */
+
+static void test_encode_array_empty(void)
+{
+    uint8_t buf[8];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 0), ANTS_OK);
+    check_bytes("empty array", buf, enc.pos, (const uint8_t *)"\x80", 1);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_array_flat(void)
+{
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 3), ANTS_OK);
+    /* After the third item, container closes automatically. */
+    check_bytes("array[1,2,3]", buf, enc.pos, (const uint8_t *)"\x83\x01\x02\x03", 4);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_array_nested(void)
+{
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    /* [[1, 2], [3]] */
+    CHECK_EQ(ants_cbor_enc_array(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 3), ANTS_OK);
+    check_bytes("nested array", buf, enc.pos, (const uint8_t *)"\x82\x82\x01\x02\x81\x03", 6);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_array_underfill(void)
+{
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    /* Declare 3 items, add only 2, then finalise. */
+    CHECK_EQ(ants_cbor_enc_array(&enc, 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_ERROR_MALFORMED);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Encode: map (major type 5) with canonical-key-order enforcement          */
+/* ------------------------------------------------------------------------ */
+
+static void test_encode_map_empty(void)
+{
+    uint8_t buf[8];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 0), ANTS_OK);
+    check_bytes("empty map", buf, enc.pos, (const uint8_t *)"\xa0", 1);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_map_canonical_order(void)
+{
+    uint8_t buf[32];
+    ants_cbor_enc_t enc;
+    /* {1: "one", 2: "two"} — keys 1 and 2 encode to 0x01 and 0x02; correct order. */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_text(&enc, "one", 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_text(&enc, "two", 3), ANTS_OK);
+    /* Expected: 0xa2 0x01 0x63 'o' 'n' 'e' 0x02 0x63 't' 'w' 'o' */
+    check_bytes("map {1:one, 2:two}",
+                buf,
+                enc.pos,
+                (const uint8_t *)"\xa2\x01\x63\x6f\x6e\x65\x02\x63\x74\x77\x6f",
+                11);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_map_rejects_unsorted_keys(void)
+{
+    uint8_t buf[32];
+    ants_cbor_enc_t enc;
+    /* {2: "two", 1: ...} — keys out of order; encoder must reject the
+     * second key. */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_text(&enc, "two", 3), ANTS_OK);
+    /* Second key 1 < 2: should be rejected. */
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_encode_map_rejects_duplicate_keys(void)
+{
+    uint8_t buf[32];
+    ants_cbor_enc_t enc;
+    /* {1: ..., 1: ...} — duplicate key. Strict canonical requires strict
+     * monotone order, so duplicates are NON_CANONICAL too. */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_text(&enc, "one", 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_encode_map_in_array(void)
+{
+    /* Mixed nesting: [{1: 10}, {2: 20}] */
+    uint8_t buf[32];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 10), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 20), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+    /* 0x82 0xa1 0x01 0x0a 0xa1 0x02 0x14 */
+    check_bytes(
+        "nested map-in-array", buf, enc.pos, (const uint8_t *)"\x82\xa1\x01\x0a\xa1\x02\x14", 7);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Decode: array + map                                                      */
+/* ------------------------------------------------------------------------ */
+
+static void test_decode_array_round_trip(void)
+{
+    /* [1, 2, 3] */
+    const uint8_t input[] = {0x83, 0x01, 0x02, 0x03};
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    size_t n = 0;
+    CHECK_EQ(ants_cbor_dec_array(&dec, &n), ANTS_OK);
+    CHECK(n == 3);
+    uint64_t v = 0;
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &v), ANTS_OK);
+    CHECK(v == 1);
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &v), ANTS_OK);
+    CHECK(v == 2);
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &v), ANTS_OK);
+    CHECK(v == 3);
+    CHECK(ants_cbor_dec_eof(&dec));
+    CHECK(dec.depth == -1); /* container auto-closed */
+}
+
+static void test_decode_array_empty(void)
+{
+    const uint8_t input[] = {0x80};
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    size_t n = 999;
+    CHECK_EQ(ants_cbor_dec_array(&dec, &n), ANTS_OK);
+    CHECK(n == 0);
+    CHECK(ants_cbor_dec_eof(&dec));
+    CHECK(dec.depth == -1);
+}
+
+static void test_decode_map_round_trip(void)
+{
+    /* {1: "one", 2: "two"} canonical encoding. */
+    const uint8_t input[] = {
+        0xa2,
+        0x01,
+        0x63,
+        0x6f,
+        0x6e,
+        0x65,
+        0x02,
+        0x63,
+        0x74,
+        0x77,
+        0x6f,
+    };
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    size_t n = 0;
+    CHECK_EQ(ants_cbor_dec_map(&dec, &n), ANTS_OK);
+    CHECK(n == 2);
+    uint64_t k;
+    const char *v;
+    size_t vlen;
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_OK);
+    CHECK(k == 1);
+    CHECK_EQ(ants_cbor_dec_text(&dec, &v, &vlen), ANTS_OK);
+    CHECK(vlen == 3 && memcmp(v, "one", 3) == 0);
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_OK);
+    CHECK(k == 2);
+    CHECK_EQ(ants_cbor_dec_text(&dec, &v, &vlen), ANTS_OK);
+    CHECK(vlen == 3 && memcmp(v, "two", 3) == 0);
+    CHECK(ants_cbor_dec_eof(&dec));
+    CHECK(dec.depth == -1);
+}
+
+static void test_decode_map_rejects_unsorted_keys(void)
+{
+    /* {2: "two", 1: ...} — well-formed CBOR but keys out of order. */
+    const uint8_t input[] = {
+        0xa2,
+        0x02,
+        0x63,
+        0x74,
+        0x77,
+        0x6f,
+        0x01,
+        0x63,
+        0x6f,
+        0x6e,
+        0x65,
+    };
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    size_t n = 0;
+    CHECK_EQ(ants_cbor_dec_map(&dec, &n), ANTS_OK);
+    CHECK(n == 2);
+    uint64_t k;
+    const char *v;
+    size_t vlen;
+    /* First pair: key 2, value "two". OK. */
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_OK);
+    CHECK(k == 2);
+    CHECK_EQ(ants_cbor_dec_text(&dec, &v, &vlen), ANTS_OK);
+    /* Second key is 1, less than 2: must be rejected as non-canonical. */
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_decode_map_rejects_duplicate_keys(void)
+{
+    /* {1: "one", 1: "two"} — duplicate keys; strict canonical order
+     * requires strict monotone, so equal keys are rejected. */
+    const uint8_t input[] = {
+        0xa2,
+        0x01,
+        0x63,
+        0x6f,
+        0x6e,
+        0x65,
+        0x01,
+        0x63,
+        0x74,
+        0x77,
+        0x6f,
+    };
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    size_t n = 0;
+    CHECK_EQ(ants_cbor_dec_map(&dec, &n), ANTS_OK);
+    CHECK(n == 2);
+    uint64_t k;
+    const char *v;
+    size_t vlen;
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_text(&dec, &v, &vlen), ANTS_OK);
+    /* Duplicate key 1: rejected. */
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &k), ANTS_ERROR_NON_CANONICAL);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Stubs still in place: tag, bool, null, is_canonical                       */
 /* ------------------------------------------------------------------------ */
 
 static void test_remaining_stubs(void)
@@ -498,21 +769,16 @@ static void test_remaining_stubs(void)
     ants_cbor_enc_t enc;
     CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
 
-    CHECK_EQ(ants_cbor_enc_array(&enc, 0), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_enc_map(&enc, 0), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_enc_bool(&enc, true), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_enc_null(&enc), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_enc_tag(&enc, 0), ANTS_ERROR_NOT_IMPLEMENTED);
 
-    const uint8_t input[] = {0x80};
+    const uint8_t input[] = {0xc0};
     ants_cbor_dec_t dec;
     CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
 
-    size_t sz;
     uint64_t tag;
     bool b;
-    CHECK_EQ(ants_cbor_dec_array(&dec, &sz), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_dec_map(&dec, &sz), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_dec_bool(&dec, &b), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_cbor_dec_null(&dec), ANTS_ERROR_NOT_IMPLEMENTED);
@@ -543,6 +809,23 @@ int main(void)
     test_decode_text_round_trip();
 
     test_peek_type();
+
+    test_encode_array_empty();
+    test_encode_array_flat();
+    test_encode_array_nested();
+    test_encode_array_underfill();
+    test_encode_map_empty();
+    test_encode_map_canonical_order();
+    test_encode_map_rejects_unsorted_keys();
+    test_encode_map_rejects_duplicate_keys();
+    test_encode_map_in_array();
+
+    test_decode_array_round_trip();
+    test_decode_array_empty();
+    test_decode_map_round_trip();
+    test_decode_map_rejects_unsorted_keys();
+    test_decode_map_rejects_duplicate_keys();
+
     test_remaining_stubs();
 
     if (failures > 0) {
