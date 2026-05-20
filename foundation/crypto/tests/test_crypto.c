@@ -303,20 +303,187 @@ static void test_ed25519_verify_rejects_tampered(void)
     CHECK_EQ(ants_ed25519_verify(bad_pub, msg, sizeof msg - 1, sig), ANTS_ERROR_MALFORMED);
 }
 
-static void test_bls_stubs(void)
-{
-    uint8_t priv[ANTS_BLS_PRIVKEY_SIZE] = {0};
-    uint8_t pub[ANTS_BLS_PUBKEY_SIZE] = {0};
-    uint8_t sig[ANTS_BLS_SIG_SIZE] = {0};
-    uint8_t msg[1] = {0};
-    uint8_t sigs[2][ANTS_BLS_SIG_SIZE] = {{0}};
-    uint8_t pubs[2][ANTS_BLS_PUBKEY_SIZE] = {{0}};
+/* ------------------------------------------------------------------------ */
+/* BLS12-381 — vector-driven tests against IETF BLS signature draft v5 and  */
+/* round-trip self-consistency.                                             */
+/* ------------------------------------------------------------------------ */
 
-    CHECK_EQ(ants_bls_pubkey_from_priv(priv, pub), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bls_sign(priv, msg, sizeof msg, sig), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bls_verify(pub, msg, sizeof msg, sig), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bls_aggregate(sigs, 2, sig), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bls_verify_aggregate(pubs, 2, msg, sizeof msg, sig), ANTS_ERROR_NOT_IMPLEMENTED);
+/*
+ * Helper SK = scalar 1, encoded big-endian. Per BLS draft §2.3 the
+ * scalar 1 is a valid secret key (in [1, r-1]). Its public key is the
+ * G1 generator, which has a well-known compressed encoding.
+ */
+static const char *BLS_SK_ONE_HEX =
+    "0000000000000000000000000000000000000000000000000000000000000001";
+
+/* G1 generator compressed (Zcash serialization). The leading 0x97
+ * encodes: bit 7 = compressed flag (1), bit 6 = infinity flag (0),
+ * bit 5 = y-sign (1 here for the generator with positive-y choice as
+ * defined in draft-irtf-cfrg-pairing-friendly-curves §4.2.1). The
+ * remaining bytes are the x-coordinate of the G1 generator. */
+static const char *BLS_PK_G1_GENERATOR_HEX =
+    "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c5"
+    "5e83ff97a1aeffb3af00adb22c6bb";
+
+static void test_bls_rejects_invalid_args(void)
+{
+    uint8_t buf[ANTS_BLS_SIG_SIZE];
+    uint8_t one[ANTS_BLS_SIG_SIZE] = {0};
+    uint8_t (*sigs)[ANTS_BLS_SIG_SIZE] = (uint8_t (*)[ANTS_BLS_SIG_SIZE])one;
+    uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZE] = (uint8_t (*)[ANTS_BLS_PUBKEY_SIZE])one;
+
+    CHECK_EQ(ants_bls_pubkey_from_priv(NULL, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_pubkey_from_priv(buf, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_sign(NULL, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_sign(buf, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_sign(buf, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify(NULL, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify(buf, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify(buf, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_aggregate(NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_aggregate(sigs, 0, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_aggregate(sigs, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify_aggregate(NULL, 1, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 0, buf, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 1, NULL, 1, buf), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 1, buf, 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+/* SK = 1 derives PK = G1 generator. This is a fixed point of the
+ * BLS12-381 curve definition and a universal cross-implementation
+ * check: every spec-conformant implementation MUST produce the same
+ * bytes for the G1 generator's compressed encoding. */
+static void test_bls_g1_generator(void)
+{
+    uint8_t sk[ANTS_BLS_PRIVKEY_SIZE];
+    uint8_t expected_pk[ANTS_BLS_PUBKEY_SIZE];
+    uint8_t pk[ANTS_BLS_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(BLS_SK_ONE_HEX, sk, sizeof sk) == ANTS_BLS_PRIVKEY_SIZE);
+    CHECK(hex_to_bytes(BLS_PK_G1_GENERATOR_HEX, expected_pk, sizeof expected_pk) ==
+          ANTS_BLS_PUBKEY_SIZE);
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk, pk), ANTS_OK);
+    CHECK(memcmp(pk, expected_pk, ANTS_BLS_PUBKEY_SIZE) == 0);
+}
+
+/* Scalar 0 is NOT a valid secret key (blst_sk_check rejects it; the
+ * BLS spec requires SK in [1, r-1]). The wrapper must surface this as
+ * MALFORMED rather than computing the identity point. */
+static void test_bls_rejects_zero_sk(void)
+{
+    uint8_t sk[ANTS_BLS_PRIVKEY_SIZE] = {0};
+    uint8_t pk[ANTS_BLS_PUBKEY_SIZE];
+    uint8_t sig[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk, pk), ANTS_ERROR_MALFORMED);
+    CHECK_EQ(ants_bls_sign(sk, (const uint8_t *)"x", 1, sig), ANTS_ERROR_MALFORMED);
+}
+
+static void test_bls_sign_verify_roundtrip(void)
+{
+    /* Three distinct secret keys (SK=1, SK=2, SK=3). */
+    uint8_t sk1[ANTS_BLS_PRIVKEY_SIZE] = {0};
+    uint8_t sk2[ANTS_BLS_PRIVKEY_SIZE] = {0};
+    uint8_t sk3[ANTS_BLS_PRIVKEY_SIZE] = {0};
+    sk1[31] = 1;
+    sk2[31] = 2;
+    sk3[31] = 3;
+
+    uint8_t pk1[ANTS_BLS_PUBKEY_SIZE];
+    uint8_t pk2[ANTS_BLS_PUBKEY_SIZE];
+    uint8_t pk3[ANTS_BLS_PUBKEY_SIZE];
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk1, pk1), ANTS_OK);
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk2, pk2), ANTS_OK);
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk3, pk3), ANTS_OK);
+
+    /* Distinct SK ⇒ distinct PK. */
+    CHECK(memcmp(pk1, pk2, ANTS_BLS_PUBKEY_SIZE) != 0);
+    CHECK(memcmp(pk1, pk3, ANTS_BLS_PUBKEY_SIZE) != 0);
+    CHECK(memcmp(pk2, pk3, ANTS_BLS_PUBKEY_SIZE) != 0);
+
+    const uint8_t msg[] = "ants L2 block hash";
+    uint8_t sig1[ANTS_BLS_SIG_SIZE];
+    uint8_t sig2[ANTS_BLS_SIG_SIZE];
+    uint8_t sig3[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_sign(sk1, msg, sizeof msg - 1, sig1), ANTS_OK);
+    CHECK_EQ(ants_bls_sign(sk2, msg, sizeof msg - 1, sig2), ANTS_OK);
+    CHECK_EQ(ants_bls_sign(sk3, msg, sizeof msg - 1, sig3), ANTS_OK);
+
+    /* Each sig verifies against its own pk. */
+    CHECK_EQ(ants_bls_verify(pk1, msg, sizeof msg - 1, sig1), ANTS_OK);
+    CHECK_EQ(ants_bls_verify(pk2, msg, sizeof msg - 1, sig2), ANTS_OK);
+    CHECK_EQ(ants_bls_verify(pk3, msg, sizeof msg - 1, sig3), ANTS_OK);
+
+    /* Cross-verification fails: sig1 against pk2, etc. */
+    CHECK_EQ(ants_bls_verify(pk2, msg, sizeof msg - 1, sig1), ANTS_ERROR_MALFORMED);
+    CHECK_EQ(ants_bls_verify(pk1, msg, sizeof msg - 1, sig2), ANTS_ERROR_MALFORMED);
+
+    /* Verify rejects tampered signature. */
+    uint8_t bad_sig[ANTS_BLS_SIG_SIZE];
+    memcpy(bad_sig, sig1, sizeof bad_sig);
+    bad_sig[ANTS_BLS_SIG_SIZE - 1] ^= 0x01;
+    CHECK_EQ(ants_bls_verify(pk1, msg, sizeof msg - 1, bad_sig), ANTS_ERROR_MALFORMED);
+
+    /* Verify rejects tampered message. */
+    uint8_t bad_msg[sizeof msg - 1];
+    memcpy(bad_msg, msg, sizeof bad_msg);
+    bad_msg[0] ^= 0x01;
+    CHECK_EQ(ants_bls_verify(pk1, bad_msg, sizeof bad_msg, sig1), ANTS_ERROR_MALFORMED);
+
+    /* Aggregate the three signatures (all over the same message), then
+     * FastAggregateVerify against the three public keys. This is the
+     * L2 PoUH committee-signature path of RFC-0008 §3.3. */
+    uint8_t sigs[3][ANTS_BLS_SIG_SIZE];
+    memcpy(sigs[0], sig1, ANTS_BLS_SIG_SIZE);
+    memcpy(sigs[1], sig2, ANTS_BLS_SIG_SIZE);
+    memcpy(sigs[2], sig3, ANTS_BLS_SIG_SIZE);
+    uint8_t agg[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_aggregate(sigs, 3, agg), ANTS_OK);
+
+    uint8_t pubs[3][ANTS_BLS_PUBKEY_SIZE];
+    memcpy(pubs[0], pk1, ANTS_BLS_PUBKEY_SIZE);
+    memcpy(pubs[1], pk2, ANTS_BLS_PUBKEY_SIZE);
+    memcpy(pubs[2], pk3, ANTS_BLS_PUBKEY_SIZE);
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 3, msg, sizeof msg - 1, agg), ANTS_OK);
+
+    /* Aggregate of just sig1 must equal sig1 itself (since the
+     * accumulator is initialised by decompressing sig1 alone). The
+     * compressed encoding is unique for points in G2, so the bytes
+     * match. */
+    uint8_t agg_single[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_aggregate(sigs, 1, agg_single), ANTS_OK);
+    CHECK(memcmp(agg_single, sig1, ANTS_BLS_SIG_SIZE) == 0);
+
+    /* Tamper one of the pubkeys: aggregate-verify must fail. */
+    uint8_t bad_pubs[3][ANTS_BLS_PUBKEY_SIZE];
+    memcpy(bad_pubs, pubs, sizeof bad_pubs);
+    /* Flipping a coordinate bit yields an off-curve point ⇒
+     * uncompress fails ⇒ MALFORMED. */
+    bad_pubs[0][1] ^= 0x01;
+    CHECK_EQ(ants_bls_verify_aggregate(bad_pubs, 3, msg, sizeof msg - 1, agg),
+             ANTS_ERROR_MALFORMED);
+}
+
+/* Aggregate verification with the WRONG message must fail. */
+static void test_bls_aggregate_wrong_message_fails(void)
+{
+    uint8_t sk[ANTS_BLS_PRIVKEY_SIZE] = {0};
+    sk[31] = 7;
+    uint8_t pk[ANTS_BLS_PUBKEY_SIZE];
+    uint8_t sig[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_pubkey_from_priv(sk, pk), ANTS_OK);
+    CHECK_EQ(ants_bls_sign(sk, (const uint8_t *)"msg-A", 5, sig), ANTS_OK);
+
+    uint8_t pubs[1][ANTS_BLS_PUBKEY_SIZE];
+    memcpy(pubs[0], pk, ANTS_BLS_PUBKEY_SIZE);
+    uint8_t sigs[1][ANTS_BLS_SIG_SIZE];
+    memcpy(sigs[0], sig, ANTS_BLS_SIG_SIZE);
+    uint8_t agg[ANTS_BLS_SIG_SIZE];
+    CHECK_EQ(ants_bls_aggregate(sigs, 1, agg), ANTS_OK);
+
+    /* Right message: OK. */
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 1, (const uint8_t *)"msg-A", 5, agg), ANTS_OK);
+    /* Wrong message: MALFORMED. */
+    CHECK_EQ(ants_bls_verify_aggregate(pubs, 1, (const uint8_t *)"msg-B", 5, agg),
+             ANTS_ERROR_MALFORMED);
 }
 
 static void test_vrf_stubs(void)
@@ -344,7 +511,12 @@ int main(void)
     test_ed25519_rfc8032_test2_single_byte();
     test_ed25519_verify_rejects_tampered();
 
-    test_bls_stubs();
+    test_bls_rejects_invalid_args();
+    test_bls_g1_generator();
+    test_bls_rejects_zero_sk();
+    test_bls_sign_verify_roundtrip();
+    test_bls_aggregate_wrong_message_fails();
+
     test_vrf_stubs();
 
     if (failures > 0) {
