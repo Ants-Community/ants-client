@@ -11,6 +11,26 @@ the spec repo's
 
 ---
 
+## Unreleased
+
+### CI workflow + clang-format · 2026-05-20
+
+GitHub Actions workflow added (`.github/workflows/ci.yml`) with build
+matrix across Linux GCC/Clang and macOS arm64 Clang, in Debug
+(AddressSanitizer + UndefinedBehaviorSanitizer) and Release. A
+separate ThreadSanitizer job runs on Ubuntu Clang. A
+`clang-format`-check job validates formatting against the new
+`.clang-format` config — currently a no-op trivially-passing since no
+C source files exist yet, but in place for the first PRs landing
+component code.
+
+This is infrastructure-only: no component code, no behavioural
+change. Establishes the review surface so subsequent PRs (CBOR
+scaffolding, then CBOR implementation) have a working CI signal from
+the first line of C.
+
+---
+
 ## v0.0.1 — Scaffolding · 2026-05-20
 
 Initial repository creation. No component code yet.

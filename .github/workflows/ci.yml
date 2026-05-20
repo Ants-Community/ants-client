@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Avoid running duplicate workflows when a PR is pushed to from the same repo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }} · ${{ matrix.compiler }} · ${{ matrix.build-type }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            build-type: Debug
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            build-type: Debug
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            build-type: Release
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            build-type: Debug
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            build-type: Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show compiler info
+        run: |
+          ${{ matrix.cc }} --version
+          cmake --version
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build-type }} -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --build-config ${{ matrix.build-type }}
+
+  tsan:
+    name: build (ubuntu · clang · ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure with TSan
+        env:
+          CC: clang
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DANTS_TSAN=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  format-check:
+    name: clang-format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-17
+          sudo ln -sf /usr/bin/clang-format-17 /usr/local/bin/clang-format
+          clang-format --version
+
+      - name: Check format
+        run: |
+          # Find all .c and .h files, excluding deps/ and build/
+          files=$(find . -type f \( -name "*.c" -o -name "*.h" \) \
+                  -not -path "./deps/*" \
+                  -not -path "./build/*" \
+                  -not -path "./.git/*" 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "No C/header files yet — format check trivially passes."
+            exit 0
+          fi
+          echo "Checking format of:"
+          echo "$files"
+          clang-format --dry-run --Werror $files
