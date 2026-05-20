@@ -13,6 +13,57 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/crypto: implement BLAKE3 (vendored 1.8.5) · 2026-05-20
+
+First crypto primitive implemented. BLAKE3 (hash + `derive_key` +
+incremental streaming) wired against a vendored snapshot of the
+upstream C reference implementation.
+
+Vendoring:
+
+- `deps/blake3/` — pinned snapshot of [BLAKE3-team/BLAKE3 v1.8.5](https://github.com/BLAKE3-team/BLAKE3/releases/tag/1.8.5)
+  with all three upstream LICENSE files (`LICENSE_A2`,
+  `LICENSE_A2LLVM`, `LICENSE_CC0`) preserved.
+- Portable C only at this stage; SIMD acceleration sources
+  (`blake3_avx2.c`, `_sse41.c`, `_avx512.c`, `_neon.c` + asm) are
+  deliberately not vendored yet. The CMake build sets `BLAKE3_NO_*`
+  and `BLAKE3_USE_NEON=0` to force the dispatch to the portable
+  path on every architecture.
+- `deps/blake3/CMakeLists.txt` builds a static `blake3` library
+  with relaxed warning flags (the upstream code is high-quality but
+  triggers the project's strict `-Wshadow`/`-Wconversion` set).
+- Root `CMakeLists.txt` adds `deps/blake3` as a subdirectory before
+  `foundation/`.
+
+Wrapper:
+
+- `foundation/crypto/src/crypto.c` wires `ants_blake3_hash`,
+  `ants_blake3_derive_key`, and the incremental
+  `init`/`init_derive`/`update`/`final` family to the upstream
+  `blake3_hasher_*` functions.
+- Portable C99 compile-time `_Static_assert` analogue verifies
+  `sizeof(blake3_hasher) ≤ sizeof(ants_blake3_ctx_t._opaque)`.
+- All memory caller-provided; the wrapper never calls malloc.
+
+Tests:
+
+- `test_blake3_rejects_invalid_args` — NULL pointers, zero
+  capacity.
+- `test_blake3_empty` — BLAKE3 of empty input matches the
+  well-known constant `af1349b9...`.
+- `test_blake3_known_inputs` — three short inputs (`"IETF"`,
+  single `0x00`, 64-byte mod-251 pattern) pinned against vendored
+  BLAKE3 v1.8.5 output.
+- `test_blake3_derive_key` — `derive_key` returns OK and produces
+  non-zero output (full known-answer pinning awaits the
+  ants-test-vectors BLAKE3 regen).
+- `test_blake3_streaming_matches_one_shot` — feeds 100 bytes one
+  at a time through the incremental API; verifies the final hash
+  matches the one-shot call.
+
+Ed25519, BLS12-381, ECVRF-ELL2 stubs unchanged; next PR vendors
+`ed25519-donna` (or a verified C impl) and wires `ants_ed25519_*`.
+
 ### foundation/crypto: scaffolding + public API header · 2026-05-20
 
 First foundation-layer code for Component #1 (Crypto primitives,

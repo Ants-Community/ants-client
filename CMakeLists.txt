@@ -93,6 +93,9 @@ enable_testing()
 # for the components within it. Components are uncommented in the
 # layer's CMakeLists.txt as their code lands.
 
+# Vendored dependencies (added as they arrive per-component).
+add_subdirectory(deps/blake3)
+
 add_subdirectory(foundation)
 add_subdirectory(network)
 add_subdirectory(reputation)
