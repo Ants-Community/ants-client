@@ -7,7 +7,7 @@
 # add_subdirectory(crypto)
 
 # Component #2 — CBOR canonical codec  (1 EM)
-# add_subdirectory(cbor)
+add_subdirectory(cbor)
 
 # Component #3 — TEE attestation harness  (6 EM)
 # add_subdirectory(tee)
