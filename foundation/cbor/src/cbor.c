@@ -5,10 +5,10 @@
  * RFC-0008 §1.1.
  *
  * Status: major types 0 (uint), 1 (negint), 2 (byte string), 3 (text
- * string), 4 (array), 5 (map with canonical-key-order enforcement)
- * implemented. Major type 6 (tag) and the bool/null subset of type 7
- * still stubbed; ants_cbor_is_canonical also stubbed pending all major
- * types.
+ * string), 4 (array), 5 (map with canonical-key-order enforcement),
+ * 6 (tag, restricted to RFC-0008 §1.1 reserved set {0, 32, 42}), and
+ * the bool/null subset of type 7 implemented. ants_cbor_is_canonical
+ * still stubbed pending the top-level walk.
  *
  * Canonical-encoding discipline lives in cbor_read_head (shortest-form
  * + indefinite + reserved rejection) and in the enc_track_item /
@@ -283,6 +283,16 @@ static ants_error_t enc_track_item(ants_cbor_enc_t *enc, size_t item_begin)
                 return ANTS_OK;
             }
             break;
+        case ANTS_CBOR_CTX_TAG:
+            /* TAG always has remaining=1 when opened; tagged item closes it. */
+            if (ctx->remaining == 0) {
+                ENC_TRACK_FAIL(ANTS_ERROR_MALFORMED);
+            }
+            ctx->remaining--;
+            if (ctx->remaining == 0) {
+                closed = true;
+            }
+            break;
         case ANTS_CBOR_CTX_NONE:
         default:
             ENC_TRACK_FAIL(ANTS_ERROR_MALFORMED);
@@ -361,6 +371,15 @@ static ants_error_t dec_track_item(ants_cbor_dec_t *dec, size_t item_begin)
             } else {
                 ctx->kind = ANTS_CBOR_CTX_MAP_KEY;
                 return ANTS_OK;
+            }
+            break;
+        case ANTS_CBOR_CTX_TAG:
+            if (ctx->remaining == 0) {
+                DEC_TRACK_FAIL(ANTS_ERROR_MALFORMED);
+            }
+            ctx->remaining--;
+            if (ctx->remaining == 0) {
+                closed = true;
             }
             break;
         case ANTS_CBOR_CTX_NONE:
@@ -562,24 +581,82 @@ ants_error_t ants_cbor_enc_map(ants_cbor_enc_t *enc, size_t n)
     return ANTS_OK;
 }
 
+/*
+ * Major type 7 simple values:
+ *   false: 0xf4 (info 20)
+ *   true:  0xf5 (info 21)
+ *   null:  0xf6 (info 22)
+ *
+ * RFC 8949 §4.2.1 requires single-byte form (info < 24) for the simple
+ * values 0..23. The encoder always emits the 1-byte form; the decoder
+ * rejects the 2-byte form (info==24) for values <24 as non-canonical
+ * (already handled by cbor_read_head's shortest-form check, which we
+ * deliberately reuse via a thin wrapper for symmetry).
+ */
 ants_error_t ants_cbor_enc_bool(ants_cbor_enc_t *enc, bool v)
 {
-    (void)enc;
-    (void)v;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (enc == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t item_begin = enc->pos;
+    if (enc->pos + 1 > enc->cap) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    enc->buf[enc->pos++] = v ? (uint8_t)0xf5 : (uint8_t)0xf4;
+    ants_error_t err = enc_track_item(enc, item_begin);
+    if (err != ANTS_OK) {
+        enc->pos = item_begin;
+    }
+    return err;
 }
 
 ants_error_t ants_cbor_enc_null(ants_cbor_enc_t *enc)
 {
-    (void)enc;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (enc == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t item_begin = enc->pos;
+    if (enc->pos + 1 > enc->cap) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    enc->buf[enc->pos++] = (uint8_t)0xf6;
+    ants_error_t err = enc_track_item(enc, item_begin);
+    if (err != ANTS_OK) {
+        enc->pos = item_begin;
+    }
+    return err;
 }
 
+/*
+ * Tag encoder. Per RFC-0008 §1.1, only reserved tags 0, 32, 42 are
+ * accepted. A TAG context is pushed expecting exactly one tagged item
+ * to follow; the tracker closes the TAG and registers the combined
+ * (tag header + tagged item) byte range as a single item in the parent.
+ */
 ants_error_t ants_cbor_enc_tag(ants_cbor_enc_t *enc, uint64_t tag)
 {
-    (void)enc;
-    (void)tag;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (enc == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (tag != 0 && tag != 32 && tag != 42) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    if (enc->depth + 1 >= ANTS_CBOR_MAX_DEPTH) {
+        return ANTS_ERROR_OVERFLOW;
+    }
+    size_t item_begin = enc->pos;
+    ants_error_t err = cbor_write_head(enc, 6, tag);
+    if (err != ANTS_OK) {
+        enc->pos = item_begin;
+        return err;
+    }
+    enc->depth++;
+    enc->stack[enc->depth].kind = ANTS_CBOR_CTX_TAG;
+    enc->stack[enc->depth].remaining = 1;
+    enc->stack[enc->depth].container_begin = item_begin;
+    enc->stack[enc->depth].last_key_begin = 0;
+    enc->stack[enc->depth].last_key_end = 0;
+    return ANTS_OK;
 }
 
 size_t ants_cbor_enc_size(const ants_cbor_enc_t *enc)
@@ -932,22 +1009,83 @@ ants_error_t ants_cbor_dec_map(ants_cbor_dec_t *dec, size_t *out_n)
 
 ants_error_t ants_cbor_dec_tag(ants_cbor_dec_t *dec, uint64_t *out_tag)
 {
-    (void)dec;
-    (void)out_tag;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (dec == NULL || out_tag == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t saved = dec->pos;
+    uint8_t major;
+    uint64_t value;
+    ants_error_t err = cbor_read_head(dec, &major, &value);
+    if (err != ANTS_OK) {
+        dec->pos = saved;
+        return err;
+    }
+    if (major != 6) {
+        dec->pos = saved;
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    /* Per RFC-0008 §1.1, only reserved tags 0, 32, 42 are accepted. */
+    if (value != 0 && value != 32 && value != 42) {
+        dec->pos = saved;
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    if (dec->depth + 1 >= ANTS_CBOR_MAX_DEPTH) {
+        dec->pos = saved;
+        return ANTS_ERROR_OVERFLOW;
+    }
+    dec->depth++;
+    dec->stack[dec->depth].kind = ANTS_CBOR_CTX_TAG;
+    dec->stack[dec->depth].remaining = 1;
+    dec->stack[dec->depth].container_begin = saved;
+    dec->stack[dec->depth].last_key_begin = 0;
+    dec->stack[dec->depth].last_key_end = 0;
+    *out_tag = value;
+    return ANTS_OK;
 }
 
 ants_error_t ants_cbor_dec_bool(ants_cbor_dec_t *dec, bool *out)
 {
-    (void)dec;
-    (void)out;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (dec == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t saved = dec->pos;
+    if (dec->pos + 1 > dec->len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint8_t b = dec->buf[dec->pos];
+    if (b != (uint8_t)0xf4 && b != (uint8_t)0xf5) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    dec->pos++;
+    bool v = (b == (uint8_t)0xf5);
+    ants_error_t err = dec_track_item(dec, saved);
+    if (err != ANTS_OK) {
+        dec->pos = saved;
+        return err;
+    }
+    *out = v;
+    return ANTS_OK;
 }
 
 ants_error_t ants_cbor_dec_null(ants_cbor_dec_t *dec)
 {
-    (void)dec;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (dec == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t saved = dec->pos;
+    if (dec->pos + 1 > dec->len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (dec->buf[dec->pos] != (uint8_t)0xf6) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    dec->pos++;
+    ants_error_t err = dec_track_item(dec, saved);
+    if (err != ANTS_OK) {
+        dec->pos = saved;
+        return err;
+    }
+    return ANTS_OK;
 }
 
 size_t ants_cbor_dec_pos(const ants_cbor_dec_t *dec)

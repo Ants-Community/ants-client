@@ -13,6 +13,49 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/cbor: implement major type 6 (tag) + bool + null · 2026-05-20
+
+`ants_cbor` codec now implements every encode/decode primitive except
+the top-level `ants_cbor_is_canonical` validator.
+
+- **Tag** (major type 6): restricted to the RFC-0008 §1.1 reserved set
+  {0, 32, 42}. Any other tag is rejected with
+  `ANTS_ERROR_UNSUPPORTED_TYPE`. Tag opens a `ANTS_CBOR_CTX_TAG`
+  context expecting exactly one tagged item; the tracker closes the
+  TAG and registers the combined (tag header + tagged item) byte
+  range as a single item in the parent. Symmetric on the decoder.
+- **Bool**: encoded as 1-byte simple value 0xf4 (false) / 0xf5 (true).
+  Decoder rejects 0xf6 (null) as `UNSUPPORTED_TYPE`.
+- **Null**: encoded as 1-byte simple value 0xf6. Decoder rejects 0xf4
+  / 0xf5 as `UNSUPPORTED_TYPE`.
+
+The ctx-kind enum gained `ANTS_CBOR_CTX_TAG` and both track-item
+helpers gained a TAG case. The single-decrement → close pattern is
+identical to the array case at remaining=1.
+
+Test additions (12 new functions):
+
+- `test_encode_bool` / `test_decode_bool` /
+  `test_decode_bool_rejects_non_bool`.
+- `test_encode_null` / `test_decode_null` /
+  `test_decode_null_rejects_non_null`.
+- `test_encode_tag_reserved` covers all three reserved tags with the
+  expected hex byte sequences (0xc0 0x05, 0xd8 0x20 0x05,
+  0xd8 0x2a 0x62 0x68 0x69).
+- `test_encode_tag_rejects_non_reserved` rejects tags 1, 31, 100.
+- `test_decode_tag_reserved` round-trips all three.
+- `test_decode_tag_rejects_non_reserved` rejects tag 1 on input.
+- `test_encode_tag_in_array` exercises array-of-tagged-items nesting.
+- `test_encode_map_with_simple_values` exercises `{1: true, 2: null}`
+  to verify the canonical-key-order tracker works across simple-value
+  values.
+
+Local build clean, ctest 1/1 passing, format clean.
+
+Only `ants_cbor_is_canonical` (the top-level validator that walks
+every item and ensures exactly `len` bytes are consumed) remains
+stubbed. Next PR closes CBOR.
+
 ### foundation/cbor: implement major types 4 (array) + 5 (map) · 2026-05-20
 
 `ants_cbor` library now implements arrays and maps with
