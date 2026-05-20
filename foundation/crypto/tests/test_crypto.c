@@ -328,9 +328,13 @@ static const char *BLS_PK_G1_GENERATOR_HEX =
 static void test_bls_rejects_invalid_args(void)
 {
     uint8_t buf[ANTS_BLS_SIG_SIZE];
-    uint8_t one[ANTS_BLS_SIG_SIZE] = {0};
-    uint8_t (*sigs)[ANTS_BLS_SIG_SIZE] = (uint8_t (*)[ANTS_BLS_SIG_SIZE])one;
-    uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZE] = (uint8_t (*)[ANTS_BLS_PUBKEY_SIZE])one;
+    /* Single-element arrays whose addresses match the
+     * pointer-to-array parameter types of aggregate / verify_aggregate.
+     * We don't care what they contain — only the n=0 and NULL-msg
+     * cases reach the body; any non-NULL pointer is accepted by the
+     * argument checks. */
+    uint8_t sigs[1][ANTS_BLS_SIG_SIZE] = {{0}};
+    uint8_t pubs[1][ANTS_BLS_PUBKEY_SIZE] = {{0}};
 
     CHECK_EQ(ants_bls_pubkey_from_priv(NULL, buf), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_bls_pubkey_from_priv(buf, NULL), ANTS_ERROR_INVALID_ARG);
