@@ -22,6 +22,9 @@ target_include_directories(ants_crypto
 # tests can call ants_strerror without redefining the symbol.
 target_link_libraries(ants_crypto PUBLIC ants_cbor)
 
+# Vendored BLAKE3 (deps/blake3, pinned to 1.8.5).
+target_link_libraries(ants_crypto PRIVATE blake3)
+
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------

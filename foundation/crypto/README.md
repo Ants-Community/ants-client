@@ -2,9 +2,11 @@
 
 Crypto primitives library. Foundation layer.
 
-**Status:** scaffolding (BDFL interim primary; claim still open).
-API surface declared in `include/ants_crypto.h`; implementation is
-stubbed and lands per-primitive in subsequent PRs.
+**Status:** in progress (BDFL interim primary; claim still open).
+BLAKE3 (hash + `derive_key` + incremental streaming API) implemented
+via vendored `deps/blake3` (pinned to upstream `1.8.5`). Ed25519,
+BLS12-381, ECVRF-ELL2 still stubbed; per-primitive PRs land them
+next.
 
 **Effort:** 2 EM (per IMPLEMENTATION.md).
 **Spec:** [RFC-0008 §§ 2–4](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0008-wire-formats.md).

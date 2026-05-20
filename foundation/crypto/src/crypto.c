@@ -1,72 +1,112 @@
 /*
  * crypto.c — Crypto primitives library.
  *
- * Status: API surface only. All primitives return
- * ANTS_ERROR_NOT_IMPLEMENTED. Implementation lands per-primitive in
- * subsequent PRs:
- *
- *   PR: vendor BLAKE3 (BLAKE3-team/BLAKE3) + implement ants_blake3_*.
- *   PR: vendor ed25519-donna + implement ants_ed25519_*.
- *   PR: vendor blst + implement ants_bls_*.
- *   PR: port RFC 9381 ECVRF-ELL2 + implement ants_vrf_*.
+ * Status: BLAKE3 (hash + derive_key + streaming) implemented via
+ * vendored deps/blake3 (v1.8.5). Ed25519, BLS12-381, ECVRF-ELL2 still
+ * stubbed; per-primitive PRs land them.
  */
 
 #include "ants_crypto.h"
 
+#include "blake3.h"
+
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+
+/* The opaque ctx exposed in ants_crypto.h must be at least as large
+ * (and at least as well aligned) as the vendored blake3_hasher. The
+ * trick below is a portable C99 compile-time assertion: if the
+ * condition fails, the typedef declares an array of size -1, which is
+ * a compile error. If blake3_hasher ever grows, the _opaque buffer in
+ * ants_blake3_ctx_t must be enlarged accordingly. */
+typedef char ants_blake3_ctx_size_check
+    [(sizeof(blake3_hasher) <= sizeof(((ants_blake3_ctx_t *)0)->_opaque)) ? 1 : -1];
 
 /* ------------------------------------------------------------------------ */
 /* BLAKE3                                                                   */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * One-shot hash. Initialises a temporary hasher on the stack, feeds the
+ * input, finalises into the 32-byte output buffer.
+ */
 ants_error_t ants_blake3_hash(const uint8_t *data, size_t len, uint8_t out[ANTS_BLAKE3_HASH_SIZE])
 {
-    (void)data;
-    (void)len;
-    (void)out;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if ((data == NULL && len > 0) || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    if (len > 0) {
+        blake3_hasher_update(&h, data, len);
+    }
+    blake3_hasher_finalize(&h, out, ANTS_BLAKE3_HASH_SIZE);
+    return ANTS_OK;
 }
 
+/*
+ * Derive-key one-shot. `context` is a NUL-terminated ASCII
+ * domain-separation string from RFC-0008 §4.1's reserved table; the
+ * library does not validate against the table (callers should use the
+ * named constants but the upstream BLAKE3 accepts any context string).
+ */
 ants_error_t ants_blake3_derive_key(const char *context,
                                     const uint8_t *key_material,
                                     size_t key_material_len,
                                     uint8_t out[ANTS_BLAKE3_HASH_SIZE])
 {
-    (void)context;
-    (void)key_material;
-    (void)key_material_len;
-    (void)out;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (context == NULL || (key_material == NULL && key_material_len > 0) || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blake3_hasher h;
+    blake3_hasher_init_derive_key(&h, context);
+    if (key_material_len > 0) {
+        blake3_hasher_update(&h, key_material, key_material_len);
+    }
+    blake3_hasher_finalize(&h, out, ANTS_BLAKE3_HASH_SIZE);
+    return ANTS_OK;
 }
 
 ants_error_t ants_blake3_init(ants_blake3_ctx_t *ctx)
 {
-    (void)ctx;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (ctx == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blake3_hasher_init((blake3_hasher *)(void *)ctx->_opaque);
+    return ANTS_OK;
 }
 
 ants_error_t ants_blake3_init_derive(ants_blake3_ctx_t *ctx, const char *context)
 {
-    (void)ctx;
-    (void)context;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (ctx == NULL || context == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blake3_hasher_init_derive_key((blake3_hasher *)(void *)ctx->_opaque, context);
+    return ANTS_OK;
 }
 
 ants_error_t ants_blake3_update(ants_blake3_ctx_t *ctx, const uint8_t *data, size_t len)
 {
-    (void)ctx;
-    (void)data;
-    (void)len;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (ctx == NULL || (data == NULL && len > 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (len > 0) {
+        blake3_hasher_update((blake3_hasher *)(void *)ctx->_opaque, data, len);
+    }
+    return ANTS_OK;
 }
 
 ants_error_t ants_blake3_final(ants_blake3_ctx_t *ctx, uint8_t out[ANTS_BLAKE3_HASH_SIZE])
 {
-    (void)ctx;
-    (void)out;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (ctx == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blake3_hasher_finalize(
+        (const blake3_hasher *)(const void *)ctx->_opaque, out, ANTS_BLAKE3_HASH_SIZE);
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
