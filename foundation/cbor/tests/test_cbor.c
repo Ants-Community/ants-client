@@ -953,13 +953,108 @@ static void test_encode_map_with_simple_values(void)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Stubs still in place: is_canonical (the top-level validator)              */
+/* ants_cbor_is_canonical — the top-level validator                          */
 /* ------------------------------------------------------------------------ */
 
-static void test_remaining_stubs(void)
+static void test_is_canonical_accepts_valid(void)
 {
-    const uint8_t input[] = {0x00};
-    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* uint 5 */
+    const uint8_t v1[] = {0x05};
+    /* [1, 2, 3] */
+    const uint8_t v2[] = {0x83, 0x01, 0x02, 0x03};
+    /* {1: "one", 2: "two"} */
+    const uint8_t v3[] = {
+        0xa2,
+        0x01,
+        0x63,
+        0x6f,
+        0x6e,
+        0x65,
+        0x02,
+        0x63,
+        0x74,
+        0x77,
+        0x6f,
+    };
+    /* tag 42 + text "hi" */
+    const uint8_t v4[] = {0xd8, 0x2a, 0x62, 0x68, 0x69};
+    /* [tag 0 + uint 1, {1: true}] — nested with simple values */
+    const uint8_t v5[] = {0x82, 0xc0, 0x01, 0xa1, 0x01, 0xf5};
+
+    CHECK_EQ(ants_cbor_is_canonical(v1, sizeof v1), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(v2, sizeof v2), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(v3, sizeof v3), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(v4, sizeof v4), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(v5, sizeof v5), ANTS_OK);
+}
+
+static void test_is_canonical_rejects_empty(void)
+{
+    CHECK_EQ(ants_cbor_is_canonical(NULL, 0), ANTS_ERROR_MALFORMED);
+    /* Non-NULL pointer with zero length is also malformed (no item). */
+    const uint8_t empty[] = {0};
+    CHECK_EQ(ants_cbor_is_canonical(empty, 0), ANTS_ERROR_MALFORMED);
+}
+
+static void test_is_canonical_rejects_trailing(void)
+{
+    /* uint 5 followed by an extra byte. */
+    const uint8_t trailing[] = {0x05, 0xff};
+    CHECK_EQ(ants_cbor_is_canonical(trailing, sizeof trailing), ANTS_ERROR_MALFORMED);
+}
+
+static void test_is_canonical_rejects_non_shortest(void)
+{
+    /* uint 0 in 2-byte form. */
+    const uint8_t input[] = {0x18, 0x00};
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_is_canonical_rejects_indefinite(void)
+{
+    /* Indefinite-length array. */
+    const uint8_t input[] = {0x9f, 0x01, 0xff};
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_is_canonical_rejects_unsorted_map(void)
+{
+    /* {2: "two", 1: "one"} — unsorted keys. */
+    const uint8_t input[] = {
+        0xa2,
+        0x02,
+        0x63,
+        0x74,
+        0x77,
+        0x6f,
+        0x01,
+        0x63,
+        0x6f,
+        0x6e,
+        0x65,
+    };
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_is_canonical_rejects_underfill_array(void)
+{
+    /* array(3) but only 2 items. */
+    const uint8_t input[] = {0x83, 0x01, 0x02};
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_MALFORMED);
+}
+
+static void test_is_canonical_rejects_unreserved_tag(void)
+{
+    /* tag 1 + uint 5 — tag not in reserved set. */
+    const uint8_t input[] = {0xc1, 0x05};
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
+
+static void test_is_canonical_rejects_float(void)
+{
+    /* float16 0xf9 0x3c 0x00 (≈ 1.0). Floats forbidden per RFC-0008 §1.3. */
+    const uint8_t input[] = {0xf9, 0x3c, 0x00};
+    CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_UNSUPPORTED_TYPE);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1016,7 +1111,15 @@ int main(void)
     test_encode_tag_in_array();
     test_encode_map_with_simple_values();
 
-    test_remaining_stubs();
+    test_is_canonical_accepts_valid();
+    test_is_canonical_rejects_empty();
+    test_is_canonical_rejects_trailing();
+    test_is_canonical_rejects_non_shortest();
+    test_is_canonical_rejects_indefinite();
+    test_is_canonical_rejects_unsorted_map();
+    test_is_canonical_rejects_underfill_array();
+    test_is_canonical_rejects_unreserved_tag();
+    test_is_canonical_rejects_float();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

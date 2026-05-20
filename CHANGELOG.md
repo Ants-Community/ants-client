@@ -13,6 +13,45 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/cbor: implement ants_cbor_is_canonical (codec feature-complete) · 2026-05-20
+
+The CBOR codec is now **feature-complete**. `ants_cbor_is_canonical`
+walks every item in the input by calling each decode function (which
+already enforces shortest-form, canonical-key-order, reserved-info
+rejection, no-floats, no-indefinite-length), then requires:
+
+- exactly `len` bytes consumed (no trailing data), AND
+- depth back to -1 (every container properly closed).
+
+A small static `walk_one_item` helper dispatches on
+`ants_cbor_dec_peek_type` to the appropriate decode function and
+recurses into arrays / maps / tagged items. Recursion depth is
+bounded by `ANTS_CBOR_MAX_DEPTH` because the underlying decoder
+rejects deeper nesting.
+
+Test additions (9 new functions):
+
+- `test_is_canonical_accepts_valid` — uint, array, map, tagged, mixed
+  nesting `[tag 0 + uint 1, {1: true}]`
+- `test_is_canonical_rejects_empty` — both `NULL` pointer and length 0
+- `test_is_canonical_rejects_trailing` — bytes after the top-level item
+- `test_is_canonical_rejects_non_shortest` — `0x18 0x00` (uint 0 in
+  2-byte form)
+- `test_is_canonical_rejects_indefinite` — indefinite-length array
+  `0x9f 0x01 0xff`
+- `test_is_canonical_rejects_unsorted_map` — keys out of order
+- `test_is_canonical_rejects_underfill_array` — array(3) with 2 items
+- `test_is_canonical_rejects_unreserved_tag` — tag 1
+- `test_is_canonical_rejects_float` — float16 0xf9 0x3c 0x00
+
+Local: `1/1 tests passed`, **52 internal test functions** now.
+Format clean.
+
+The CBOR codec is the first ants-client component to reach
+feature-complete. Next session moves on to component #1 (crypto
+primitives) — wrappers for BLAKE3, Ed25519, BLS12-381, ECVRF-ELL2,
+with test-vector conformance against pinned implementations.
+
 ### foundation/cbor: implement major type 6 (tag) + bool + null · 2026-05-20
 
 `ants_cbor` codec now implements every encode/decode primitive except
