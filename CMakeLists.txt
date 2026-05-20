@@ -95,6 +95,7 @@ enable_testing()
 
 # Vendored dependencies (added as they arrive per-component).
 add_subdirectory(deps/blake3)
+add_subdirectory(deps/ed25519)
 
 add_subdirectory(foundation)
 add_subdirectory(network)

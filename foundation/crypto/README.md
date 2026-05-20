@@ -3,10 +3,14 @@
 Crypto primitives library. Foundation layer.
 
 **Status:** in progress (BDFL interim primary; claim still open).
-BLAKE3 (hash + `derive_key` + incremental streaming API) implemented
-via vendored `deps/blake3` (pinned to upstream `1.8.5`). Ed25519,
-BLS12-381, ECVRF-ELL2 still stubbed; per-primitive PRs land them
-next.
+BLAKE3 + Ed25519 implemented. BLS12-381 and ECVRF-ELL2 still stubbed.
+
+| Primitive | Status | Vendor |
+|---|---|---|
+| BLAKE3 (hash + derive_key + streaming) | ✅ | `deps/blake3/` pinned to BLAKE3 1.8.5 |
+| Ed25519 (sign/verify + pubkey derive) | ✅ | `deps/ed25519/` pinned to libsodium 1.0.22 ref10 subset, RFC 8032 §7.1 vectors verified |
+| BLS12-381 | stub | `supranational/blst` (planned) |
+| ECVRF-EDWARDS25519-SHA512-ELL2 | stub | RFC 9381 reference port (planned) |
 
 **Effort:** 2 EM (per IMPLEMENTATION.md).
 **Spec:** [RFC-0008 §§ 2–4](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0008-wire-formats.md).

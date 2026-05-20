@@ -25,6 +25,9 @@ target_link_libraries(ants_crypto PUBLIC ants_cbor)
 # Vendored BLAKE3 (deps/blake3, pinned to 1.8.5).
 target_link_libraries(ants_crypto PRIVATE blake3)
 
+# Vendored Ed25519 from libsodium ref10 (deps/ed25519, pinned to 1.0.22).
+target_link_libraries(ants_crypto PRIVATE ed25519_sodium)
+
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------

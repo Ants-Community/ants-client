@@ -1,14 +1,15 @@
 /*
  * crypto.c — Crypto primitives library.
  *
- * Status: BLAKE3 (hash + derive_key + streaming) implemented via
- * vendored deps/blake3 (v1.8.5). Ed25519, BLS12-381, ECVRF-ELL2 still
- * stubbed; per-primitive PRs land them.
+ * Status: BLAKE3 implemented via vendored deps/blake3 (v1.8.5).
+ * Ed25519 implemented via vendored deps/ed25519 (libsodium 1.0.22
+ * ref10 subset). BLS12-381 and ECVRF-ELL2 still stubbed.
  */
 
 #include "ants_crypto.h"
 
 #include "blake3.h"
+#include "crypto_sign_ed25519.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -113,12 +114,29 @@ ants_error_t ants_blake3_final(ants_blake3_ctx_t *ctx, uint8_t out[ANTS_BLAKE3_H
 /* Ed25519                                                                  */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Note on the libsodium Ed25519 ABI: libsodium represents the secret
+ * key as a 64-byte concatenation of the 32-byte seed and the 32-byte
+ * public key, derived once at keypair time. Our public API exposes
+ * only the 32-byte seed (`priv`) — the matching public key is derived
+ * on demand from the seed in each call. This keeps the protocol's key
+ * storage simple at the cost of a small per-call seed_keypair
+ * expansion, which is negligible against the cost of the actual
+ * sign/verify operation.
+ */
 ants_error_t ants_ed25519_pubkey_from_priv(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
                                            uint8_t out_pub[ANTS_ED25519_PUBKEY_SIZE])
 {
-    (void)priv;
-    (void)out_pub;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (priv == NULL || out_pub == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    uint8_t sk[crypto_sign_ed25519_SECRETKEYBYTES];
+    if (crypto_sign_ed25519_seed_keypair(out_pub, sk, priv) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* Zero the derived 64-byte sk; we don't keep it. */
+    memset(sk, 0, sizeof sk);
+    return ANTS_OK;
 }
 
 ants_error_t ants_ed25519_sign(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
@@ -126,11 +144,20 @@ ants_error_t ants_ed25519_sign(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
                                size_t len,
                                uint8_t out_sig[ANTS_ED25519_SIG_SIZE])
 {
-    (void)priv;
-    (void)msg;
-    (void)len;
-    (void)out_sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (priv == NULL || (msg == NULL && len > 0) || out_sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    uint8_t sk[crypto_sign_ed25519_SECRETKEYBYTES];
+    uint8_t pk[crypto_sign_ed25519_PUBLICKEYBYTES];
+    if (crypto_sign_ed25519_seed_keypair(pk, sk, priv) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    int rc = crypto_sign_ed25519_detached(out_sig, NULL, msg, len, sk);
+    memset(sk, 0, sizeof sk);
+    if (rc != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
 }
 
 ants_error_t ants_ed25519_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
@@ -138,11 +165,13 @@ ants_error_t ants_ed25519_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                                  size_t len,
                                  const uint8_t sig[ANTS_ED25519_SIG_SIZE])
 {
-    (void)pub;
-    (void)msg;
-    (void)len;
-    (void)sig;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (pub == NULL || (msg == NULL && len > 0) || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (crypto_sign_ed25519_verify_detached(sig, msg, len, pub) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
