@@ -13,6 +13,43 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/crypto: scaffolding + public API header · 2026-05-20
+
+First foundation-layer code for Component #1 (Crypto primitives,
+RFC-0008 §§ 2–4). Establishes the public API surface of the wrapper
+library as a stubbed library: every primitive returns
+`ANTS_ERROR_NOT_IMPLEMENTED`, but the API contract is now reviewable
+and the static library + ctest harness compile.
+
+Public API declared in `foundation/crypto/include/ants_crypto.h`:
+
+- **BLAKE3**: `ants_blake3_hash`, `ants_blake3_derive_key`, plus the
+  incremental `init` / `update` / `final` family. Reserved
+  domain-separation context strings from RFC-0008 §4.1 will be honoured
+  by the implementation when it lands.
+- **Ed25519**: `ants_ed25519_pubkey_from_priv`, `_sign`, `_verify`. Per
+  RFC 8032.
+- **BLS12-381**: `ants_bls_pubkey_from_priv`, `_sign`, `_verify`,
+  `_aggregate`, `_verify_aggregate`. Per the IETF BLS signature draft
+  with the ciphersuite RFC-0008 §3.3 names.
+- **ECVRF-EDWARDS25519-SHA512-ELL2**: `ants_vrf_prove`, `_verify`. Per
+  RFC 9381 with the Elligator 2 hash-to-curve.
+
+The PR-by-primitive plan in `foundation/crypto/README.md` calls for
+vendoring upstream reference implementations under `deps/<lib>/`
+followed by a thin wrapper layer in `src/crypto.c`. Each vendoring
+will preserve the upstream LICENSE notice and pin a specific
+commit/version.
+
+A placeholder test binary `crypto_basic` validates that every stub
+returns `ANTS_ERROR_NOT_IMPLEMENTED` rather than crashing or returning
+a misleading success.
+
+Local: 2/2 ctest targets passing (`crypto_basic` + `cbor_basic`).
+Format clean.
+
+Next per-primitive PRs land in order: BLAKE3, Ed25519, BLS, ECVRF.
+
 ### foundation/cbor: implement ants_cbor_is_canonical (codec feature-complete) · 2026-05-20
 
 The CBOR codec is now **feature-complete**. `ants_cbor_is_canonical`
