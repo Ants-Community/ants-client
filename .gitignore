@@ -1,0 +1,51 @@
+# Build artifacts
+build/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exp
+*.pdb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Editor / IDE
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+.DS_Store
+
+# Sanitizer / coverage / profile
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+default.profraw
+
+# Vendored deps with their own builds (kept in tree but not their build output)
+deps/*/build/
+deps/*/.git/
+
+# Local secrets / config (never commit)
+.env
+*.local
+*.token
