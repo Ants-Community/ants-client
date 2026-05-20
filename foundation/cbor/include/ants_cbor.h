@@ -58,6 +58,12 @@ typedef enum {
     ANTS_CBOR_CTX_ARRAY,
     ANTS_CBOR_CTX_MAP_KEY,
     ANTS_CBOR_CTX_MAP_VALUE,
+    /* Tag context: opened by enc_tag / dec_tag, expects exactly one
+     * tagged item to follow. When that item is added/consumed, the
+     * tracker closes the tag context and registers the combined
+     * (tag header + tagged item) byte range as a single item in the
+     * parent container. */
+    ANTS_CBOR_CTX_TAG,
 } ants_cbor_ctx_kind_t;
 
 typedef struct {

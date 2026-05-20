@@ -760,29 +760,205 @@ static void test_decode_map_rejects_duplicate_keys(void)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Stubs still in place: tag, bool, null, is_canonical                       */
+/* Encode / Decode: bool (major type 7, simple values 20/21)                 */
 /* ------------------------------------------------------------------------ */
 
-static void test_remaining_stubs(void)
+static void test_encode_bool(void)
+{
+    uint8_t buf[4];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bool(&enc, false), ANTS_OK);
+    check_bytes("encode false", buf, enc.pos, (const uint8_t *)"\xf4", 1);
+
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bool(&enc, true), ANTS_OK);
+    check_bytes("encode true", buf, enc.pos, (const uint8_t *)"\xf5", 1);
+}
+
+static void test_decode_bool(void)
+{
+    const uint8_t inp_false[] = {0xf4};
+    const uint8_t inp_true[] = {0xf5};
+    ants_cbor_dec_t dec;
+    bool v;
+
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp_false, sizeof inp_false), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_bool(&dec, &v), ANTS_OK);
+    CHECK(v == false);
+
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp_true, sizeof inp_true), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_bool(&dec, &v), ANTS_OK);
+    CHECK(v == true);
+}
+
+static void test_decode_bool_rejects_non_bool(void)
+{
+    const uint8_t null_byte[] = {0xf6};
+    ants_cbor_dec_t dec;
+    bool v;
+    CHECK_EQ(ants_cbor_dec_init(&dec, null_byte, sizeof null_byte), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_bool(&dec, &v), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Encode / Decode: null (major type 7, simple value 22)                     */
+/* ------------------------------------------------------------------------ */
+
+static void test_encode_null(void)
+{
+    uint8_t buf[4];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_null(&enc), ANTS_OK);
+    check_bytes("encode null", buf, enc.pos, (const uint8_t *)"\xf6", 1);
+}
+
+static void test_decode_null(void)
+{
+    const uint8_t input[] = {0xf6};
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_null(&dec), ANTS_OK);
+}
+
+static void test_decode_null_rejects_non_null(void)
+{
+    const uint8_t bool_byte[] = {0xf4};
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, bool_byte, sizeof bool_byte), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_null(&dec), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Encode / Decode: tag (major type 6, RFC-0008 §1.1 reserved set 0/32/42)   */
+/* ------------------------------------------------------------------------ */
+
+static void test_encode_tag_reserved(void)
+{
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+
+    /* tag 0 + uint 5: 0xc0 0x05 (2 bytes) */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 0), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 5), ANTS_OK);
+    check_bytes("tag 0 + uint 5", buf, enc.pos, (const uint8_t *)"\xc0\x05", 2);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+
+    /* tag 32 + uint 5: 0xd8 0x20 0x05 (3 bytes; tag 32 needs 2-byte form) */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 32), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 5), ANTS_OK);
+    check_bytes("tag 32 + uint 5", buf, enc.pos, (const uint8_t *)"\xd8\x20\x05", 3);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+
+    /* tag 42 + text "hi": 0xd8 0x2a 0x62 0x68 0x69 (5 bytes) */
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 42), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_text(&enc, "hi", 2), ANTS_OK);
+    check_bytes("tag 42 + text hi", buf, enc.pos, (const uint8_t *)"\xd8\x2a\x62\x68\x69", 5);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+static void test_encode_tag_rejects_non_reserved(void)
 {
     uint8_t buf[16];
     ants_cbor_enc_t enc;
     CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    /* tag 1 not in reserved set */
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 1), ANTS_ERROR_UNSUPPORTED_TYPE);
+    /* tag 100 not in reserved set */
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 100), ANTS_ERROR_UNSUPPORTED_TYPE);
+    /* tag 31 (close to but not 32) not in reserved set */
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 31), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
 
-    CHECK_EQ(ants_cbor_enc_bool(&enc, true), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_enc_null(&enc), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_enc_tag(&enc, 0), ANTS_ERROR_NOT_IMPLEMENTED);
+static void test_decode_tag_reserved(void)
+{
+    const uint8_t inp0[] = {0xc0, 0x05};
+    const uint8_t inp32[] = {0xd8, 0x20, 0x05};
+    const uint8_t inp42[] = {0xd8, 0x2a, 0x62, 0x68, 0x69};
 
-    const uint8_t input[] = {0xc0};
     ants_cbor_dec_t dec;
-    CHECK_EQ(ants_cbor_dec_init(&dec, input, sizeof input), ANTS_OK);
-
     uint64_t tag;
-    bool b;
-    CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_dec_bool(&dec, &b), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_cbor_dec_null(&dec), ANTS_ERROR_NOT_IMPLEMENTED);
+    uint64_t u;
+    const char *txt;
+    size_t txtlen;
 
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp0, sizeof inp0), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_OK);
+    CHECK(tag == 0);
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &u), ANTS_OK);
+    CHECK(u == 5);
+    CHECK(dec.depth == -1); /* tag closed after item */
+
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp32, sizeof inp32), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_OK);
+    CHECK(tag == 32);
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &u), ANTS_OK);
+    CHECK(u == 5);
+
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp42, sizeof inp42), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_OK);
+    CHECK(tag == 42);
+    CHECK_EQ(ants_cbor_dec_text(&dec, &txt, &txtlen), ANTS_OK);
+    CHECK(txtlen == 2 && memcmp(txt, "hi", 2) == 0);
+}
+
+static void test_decode_tag_rejects_non_reserved(void)
+{
+    /* tag 1 + uint 5: 0xc1 0x05 */
+    const uint8_t inp[] = {0xc1, 0x05};
+    ants_cbor_dec_t dec;
+    uint64_t tag;
+    CHECK_EQ(ants_cbor_dec_init(&dec, inp, sizeof inp), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_tag(&dec, &tag), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
+
+static void test_encode_tag_in_array(void)
+{
+    /* [tag 0 + uint 1, tag 32 + uint 2] */
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 0), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_tag(&enc, 32), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    /* Expected: 0x82 0xc0 0x01 0xd8 0x20 0x02 */
+    check_bytes("array of tagged", buf, enc.pos, (const uint8_t *)"\x82\xc0\x01\xd8\x20\x02", 6);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Mixed: map with simple values                                             */
+/* ------------------------------------------------------------------------ */
+
+static void test_encode_map_with_simple_values(void)
+{
+    /* {1: true, 2: null} */
+    uint8_t buf[16];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bool(&enc, true), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_null(&enc), ANTS_OK);
+    /* Expected: 0xa2 0x01 0xf5 0x02 0xf6 */
+    check_bytes("map with simple values", buf, enc.pos, (const uint8_t *)"\xa2\x01\xf5\x02\xf6", 5);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Stubs still in place: is_canonical (the top-level validator)              */
+/* ------------------------------------------------------------------------ */
+
+static void test_remaining_stubs(void)
+{
+    const uint8_t input[] = {0x00};
     CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_NOT_IMPLEMENTED);
 }
 
@@ -825,6 +1001,20 @@ int main(void)
     test_decode_map_round_trip();
     test_decode_map_rejects_unsorted_keys();
     test_decode_map_rejects_duplicate_keys();
+
+    test_encode_bool();
+    test_decode_bool();
+    test_decode_bool_rejects_non_bool();
+    test_encode_null();
+    test_decode_null();
+    test_decode_null_rejects_non_null();
+
+    test_encode_tag_reserved();
+    test_encode_tag_rejects_non_reserved();
+    test_decode_tag_reserved();
+    test_decode_tag_rejects_non_reserved();
+    test_encode_tag_in_array();
+    test_encode_map_with_simple_values();
 
     test_remaining_stubs();
 
