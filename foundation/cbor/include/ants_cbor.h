@@ -100,6 +100,14 @@ typedef struct {
  * On success the encoder is at depth -1 (top level), pos 0, and ready
  * to accept the first item.
  *
+ * `cap` is the buffer capacity in bytes. There is no enforced minimum,
+ * but cap == 0 is rejected as obviously useless; cap == 1 is the
+ * theoretical floor (single-byte CBOR items like `0..0x17`, false,
+ * true, null). Buffers smaller than the encoded item return
+ * ANTS_ERROR_BUFFER_TOO_SMALL from the corresponding encode call —
+ * pos is left unchanged in that case so the caller can resize and
+ * retry the same operation.
+ *
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG if enc or buf is NULL, or cap is 0.
@@ -239,6 +247,21 @@ size_t ants_cbor_dec_pos(const ants_cbor_dec_t *dec);
 
 /* True if the decoder is at end-of-buffer (all bytes consumed). */
 bool ants_cbor_dec_eof(const ants_cbor_dec_t *dec);
+
+/*
+ * Symmetric counterpart of ants_cbor_enc_finalise: check that the
+ * decoder consumed every byte and closed every container it opened.
+ * Returns:
+ *   ANTS_OK              - exactly one top-level item was decoded
+ *                          AND no bytes remain AND depth == -1.
+ *   ANTS_ERROR_MALFORMED - bytes remain unread, or a container is
+ *                          still open (mid-array / mid-map / mid-tag).
+ *
+ * Equivalent to `ants_cbor_dec_eof(dec) && depth_closed`, but returns
+ * an error code so callers can branch identically to the encoder side
+ * — useful for "parse the whole thing or reject" validators.
+ */
+ants_error_t ants_cbor_dec_finalise(const ants_cbor_dec_t *dec);
 
 /* ------------------------------------------------------------------------ */
 /* Canonical-encoding validator                                             */

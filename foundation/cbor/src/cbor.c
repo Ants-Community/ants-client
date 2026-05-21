@@ -1105,6 +1105,22 @@ bool ants_cbor_dec_eof(const ants_cbor_dec_t *dec)
     return dec->pos >= dec->len;
 }
 
+ants_error_t ants_cbor_dec_finalise(const ants_cbor_dec_t *dec)
+{
+    if (dec == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Mirror enc_finalise: every container we opened must have closed
+     * (depth == -1) AND we must have consumed every byte. */
+    if (dec->depth != -1) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (dec->pos != dec->len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Validator                                                                */
 /*                                                                          */

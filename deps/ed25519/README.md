@@ -41,9 +41,37 @@ sign / verify / pubkey-derive with deterministic RFC 8032 semantics:
 | `include/private/fe_25_5/*.h`, `fe_51/*.h` | `crypto_core/ed25519/ref10/fe_{25_5,51}/*.h` (field-element constants) |
 
 All upstream files are bit-identical to libsodium 1.0.22 except for
-one mechanical rename in `src/sign_ed25519.c`: the include `"ref10/sign_ed25519_ref10.h"`
-has been adjusted to `"sign_ed25519_ref10.h"` to match the flattened
-header layout under `include/`.
+one mechanical rename in `src/sign_ed25519.c` (the include
+`"ref10/sign_ed25519_ref10.h"` was flattened to
+`"sign_ed25519_ref10.h"`) and a small number of **annotated local
+patches** required by ECVRF-EDWARDS25519-SHA512-ELL2 — see the
+section below.
+
+## Local patches (ECVRF support)
+
+The ECVRF implementation in `foundation/crypto/src/crypto.c` needs
+direct access to a few libsodium internals that upstream keeps
+`static`. All edits are annotated in-source with the marker
+`ants-client local patch` so an upstream re-fetch can find them
+mechanically. They are:
+
+1. **`src/ed25519_ref10_core.c`** — promote `ge25519_clear_cofactor`
+   and `ge25519_elligator2` from `static` to extern. Same body as
+   upstream.
+2. **`src/ed25519_ref10_core.c`** — add a new function
+   `ge25519_elligator2_rfc9380_nu` that performs the RFC 9380 §G.2.2
+   ELL2_NU map: Elligator2 → signed sqrt of g(u_M) per §G.2.1 line
+   37-38 → rational map x_E = c1 · u_M / y_M (with c1 = sqrt(-486664),
+   sgn0(c1) = 0 pinned as 32 LE bytes) → cofactor clear. Validated
+   against RFC 9381 §B.4 vectors 19/20/21 plus four independent
+   cross-validation vectors (`alpha` ∈ `hello`/`world`/`ANTS`/32 zero
+   bytes) regenerated from a Python RFC 9380 reference.
+3. **`include/private/ed25519_ref10.h`** — declarations for (1) and
+   (2).
+4. **`CMakeLists.txt`** — `include/private` promoted to PUBLIC scope
+   so the foundation/crypto target can include the ref10 API. The
+   visibility expansion is internal to ants-client; these primitives
+   are NOT exposed to downstream consumers of the ed25519 library.
 
 ## What is intentionally not vendored
 
@@ -65,11 +93,21 @@ header layout under `include/`.
 
 ## How to update
 
-Re-fetch the file set from a newer libsodium tag, re-apply the single
-`sign_ed25519.c` include-path edit, run the test suite (`ctest --test-dir
-build` in the repo root; the RFC 8032 §7.1 vectors in
-`foundation/crypto/tests/test_crypto.c` must pass), update the table
-above, and commit. Pin to a tagged release; never to `master`.
+Re-fetch the file set from a newer libsodium tag and re-apply the
+**five** local edits (search for `ants-client local patch` in the
+sources to locate them):
+
+1. The mechanical include-path edit in `src/sign_ed25519.c`
+   (`"ref10/sign_ed25519_ref10.h"` → `"sign_ed25519_ref10.h"`).
+2-5. The four ECVRF patches enumerated in **Local patches (ECVRF
+   support)** above: non-static promotion of two ref10 functions, the
+   new `ge25519_elligator2_rfc9380_nu` body, the matching public
+   declarations, and the `include/private` CMake scope change.
+
+Then run the test suite (`ctest --test-dir build` in the repo root;
+the RFC 8032 §7.1 vectors plus the RFC 9381 §B.4 ECVRF vectors in
+`foundation/crypto/tests/test_crypto.c` must pass byte-for-byte), and
+update the table above. Pin to a tagged release; never to `master`.
 
 ## Why snapshot, not git submodule
 

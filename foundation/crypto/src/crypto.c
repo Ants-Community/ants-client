@@ -16,8 +16,8 @@
 #include "crypto_hash_sha512.h"
 #include "crypto_sign_ed25519.h"
 #include "private/ed25519_ref10.h"
+#include "utils.h" /* sodium_memzero */
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -140,8 +140,9 @@ ants_error_t ants_ed25519_pubkey_from_priv(const uint8_t priv[ANTS_ED25519_PRIVK
     if (crypto_sign_ed25519_seed_keypair(out_pub, sk, priv) != 0) {
         return ANTS_ERROR_MALFORMED;
     }
-    /* Zero the derived 64-byte sk; we don't keep it. */
-    memset(sk, 0, sizeof sk);
+    /* Zero the derived 64-byte sk; we don't keep it. sodium_memzero
+     * carries a compiler barrier so this isn't dead-store-eliminated. */
+    sodium_memzero(sk, sizeof sk);
     return ANTS_OK;
 }
 
@@ -159,7 +160,7 @@ ants_error_t ants_ed25519_sign(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
         return ANTS_ERROR_MALFORMED;
     }
     int rc = crypto_sign_ed25519_detached(out_sig, NULL, msg, len, sk);
-    memset(sk, 0, sizeof sk);
+    sodium_memzero(sk, sizeof sk);
     if (rc != 0) {
         return ANTS_ERROR_MALFORMED;
     }
@@ -219,7 +220,7 @@ ants_error_t ants_bls_pubkey_from_priv(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE]
     }
     blst_sk_to_pk_in_g1(&pk, &sk);
     blst_p1_compress(out_pub, &pk);
-    memset(&sk, 0, sizeof sk);
+    sodium_memzero(&sk, sizeof sk);
     return ANTS_OK;
 }
 
@@ -241,7 +242,7 @@ ants_error_t ants_bls_sign(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE],
     blst_hash_to_g2(&hash, msg, len, ANTS_BLS_DST, ANTS_BLS_DST_LEN, NULL, 0);
     blst_sign_pk_in_g1(&sig, &hash, &sk);
     blst_p2_compress(out_sig, &sig);
-    memset(&sk, 0, sizeof sk);
+    sodium_memzero(&sk, sizeof sk);
     return ANTS_OK;
 }
 
@@ -378,7 +379,7 @@ static void vrf_nonce_generation(const uint8_t hashed_sk_upper[32],
     crypto_hash_sha512_final(&st, k_full);
     sc25519_reduce(k_full);
     memcpy(out_k, k_full, 32);
-    memset(k_full, 0, sizeof k_full);
+    sodium_memzero(k_full, sizeof k_full);
 }
 
 /*
@@ -657,8 +658,8 @@ ants_error_t ants_vrf_prove(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
     vrf_hash_to_curve(Y_bytes, alpha, alpha_len, H_bytes);
     ge25519_p3 H_p3;
     if (ge25519_frombytes(&H_p3, H_bytes) != 0) {
-        memset(hashed_sk, 0, sizeof hashed_sk);
-        memset(x_clamped, 0, sizeof x_clamped);
+        sodium_memzero(hashed_sk, sizeof hashed_sk);
+        sodium_memzero(x_clamped, sizeof x_clamped);
         return ANTS_ERROR_MALFORMED;
     }
 
@@ -697,10 +698,22 @@ ants_error_t ants_vrf_prove(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
     memcpy(out_proof + 32, c_string, VRF_C_LEN);
     memcpy(out_proof + 32 + VRF_C_LEN, s_bytes, 32);
 
-    /* Best-effort zeroisation of secret material. */
-    memset(hashed_sk, 0, sizeof hashed_sk);
-    memset(x_clamped, 0, sizeof x_clamped);
-    memset(k, 0, sizeof k);
+    /* Zeroise every stack value that carries information about the
+     * secret scalar x or the nonce k. Beyond x_clamped and k, the
+     * Ed25519 expanded secret (hashed_sk) and the nonce-derived
+     * point bytes (kB, kH) and the algebraically-secret-related
+     * (c, s) need to be wiped too: kB = k*B leaks k; kH = k*H leaks
+     * k relative to H; s = c*x + k mod L relates k and x. The proof
+     * bytes (out_proof) are public and stay untouched. */
+    sodium_memzero(hashed_sk, sizeof hashed_sk);
+    sodium_memzero(x_clamped, sizeof x_clamped);
+    sodium_memzero(k, sizeof k);
+    sodium_memzero(&kB_p3, sizeof kB_p3);
+    sodium_memzero(&kH_p3, sizeof kH_p3);
+    sodium_memzero(kB_bytes, sizeof kB_bytes);
+    sodium_memzero(kH_bytes, sizeof kH_bytes);
+    sodium_memzero(c_padded, sizeof c_padded);
+    sodium_memzero(s_bytes, sizeof s_bytes);
     return ANTS_OK;
 }
 
@@ -730,31 +743,24 @@ ants_error_t ants_vrf_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
     const uint8_t *c_string = proof + 32;
     const uint8_t *s_bytes = proof + 32 + VRF_C_LEN;
 
-    if (!ge25519_is_canonical(Gamma_bytes)) {
+    /* Γ canonicity, on-curve, and subgroup-membership checks. RFC
+     * 9381 §5.4.5 recommends a full-group check on Γ: without it, a
+     * malicious prover could add a small-order point to a real Γ and
+     * still get verify() to accept, breaking VRF determinism. The
+     * proof_to_hash's 8·Γ cofactor multiplication is a fallback but
+     * not a substitute for rejecting low-order points up front. */
+    if (!ge25519_is_canonical(Gamma_bytes) || ge25519_has_small_order(Gamma_bytes)) {
         return ANTS_ERROR_MALFORMED;
     }
     ge25519_p3 Gamma_p3;
     if (ge25519_frombytes(&Gamma_p3, Gamma_bytes) != 0) {
         return ANTS_ERROR_MALFORMED;
     }
-    /* s must be a canonical scalar in [0, L). The ref10 doesn't
-     * export a public sc25519_is_canonical, but sc25519_muladd
-     * tolerates non-canonical inputs (it reduces internally), so we
-     * do the canonical check manually against L. L is given in the
-     * spec as the curve order: 2^252 + 27742317777372353535851937790883648493. */
-    {
-        static const uint8_t L[32] = {0xED, 0xD3, 0xF5, 0x5C, 0x1A, 0x63, 0x12, 0x58,
-                                      0xD6, 0x9C, 0xF7, 0xA2, 0xDE, 0xF9, 0xDE, 0x14,
-                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10};
-        for (int i = 31; i >= 0; i--) {
-            if (s_bytes[i] < L[i]) {
-                break;
-            }
-            if (s_bytes[i] > L[i] || i == 0) {
-                return ANTS_ERROR_MALFORMED;
-            }
-        }
+    /* s must be a canonical scalar in [0, L). The ref10 exposes
+     * sc25519_is_canonical (a constant-time check); use that
+     * rather than a hand-written byte compare. */
+    if (sc25519_is_canonical(s_bytes) == 0) {
+        return ANTS_ERROR_MALFORMED;
     }
 
     /* 3. H = hash_to_curve_ell2(Y, alpha). */
