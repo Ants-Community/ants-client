@@ -171,22 +171,238 @@ static void test_action_stubs_return_not_implemented(void)
     CHECK_EQ(ants_dht_lookup_cancel(NULL), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_introspection_safe_defaults(void)
+static void test_introspection_empty_table(void)
 {
-    /* Observers return safe defaults rather than NOT_IMPLEMENTED so
-     * callers that don't check error codes still see "empty table"
-     * (matching ants_transport_peer_list's convention). */
+    /* Empty table — phase 2 implements both size() and enumerate()
+     * against the actual k-bucket data structure. With no insertions,
+     * size returns 0 and enumerate succeeds with *out_count = 0. */
     ants_dht_t d = {{0}};
     CHECK(ants_dht_routing_table_size(&d) == 0);
 
     ants_dht_peer_t peers[4];
     size_t count = 99;
-    CHECK_EQ(ants_dht_routing_table_enumerate(&d, peers, 4, &count), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_dht_routing_table_enumerate(&d, peers, 4, &count), ANTS_OK);
     CHECK(count == 0);
 
     /* NULL-arg guards. */
     CHECK_EQ(ants_dht_routing_table_enumerate(NULL, peers, 4, &count), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_dht_routing_table_enumerate(&d, peers, 4, NULL), ANTS_ERROR_INVALID_ARG);
+    /* cap > 0 with NULL out_peers is rejected (we'd otherwise write
+     * to a NULL pointer in the enumerate copy loop). */
+    CHECK_EQ(ants_dht_routing_table_enumerate(&d, NULL, 4, &count), ANTS_ERROR_INVALID_ARG);
+
+    /* size() returns 0 on NULL too (observer-safe). */
+    CHECK(ants_dht_routing_table_size(NULL) == 0);
+}
+
+/* ------------------------------------------------------------------------ */
+/* K-bucket internal-API tests                                              */
+/*                                                                          */
+/* Phase 2 exposes a small private test hook surface (ants_dht__test_*) so  */
+/* we can exercise XOR-distance bucket placement and insertion/eviction    */
+/* without first wiring bootstrap/dial. Declared extern here, defined in   */
+/* dht.c. Production callers never touch these.                             */
+/* ------------------------------------------------------------------------ */
+
+extern ants_error_t
+ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_t now_us);
+extern ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
+extern uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
+
+/* Helper: zero-init a dht with a deterministic local pubkey. */
+static ants_error_t test_init_with_local(ants_dht_t *d,
+                                         const uint8_t local_pub[ANTS_ED25519_PUBKEY_SIZE])
+{
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    static ants_transport_t dummy_transport = {{0}};
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_noop_event;
+    memcpy(cfg.local_peer_id.bytes, local_pub, ANTS_ED25519_PUBKEY_SIZE);
+    return ants_dht_init(d, &cfg);
+}
+
+/* Helper: build a peer at a known XOR distance from local. For test
+ * determinism: take local, flip a single bit at `flip_bit` (0 = LSB,
+ * 255 = MSB), use the result as the peer's pubkey. The peer is then
+ * guaranteed to land in bucket `flip_bit`. */
+static void test_make_peer(const uint8_t local[ANTS_ED25519_PUBKEY_SIZE],
+                           uint32_t flip_bit,
+                           ants_dht_peer_t *out_peer)
+{
+    memset(out_peer, 0, sizeof *out_peer);
+    memcpy(out_peer->peer_id.bytes, local, ANTS_ED25519_PUBKEY_SIZE);
+    /* flip_bit indexes bits from LSB (0) within the entire 256-bit ID.
+     * Big-endian layout: byte index for bit i is (31 - i/8); bit
+     * position within that byte is i % 8. */
+    uint32_t byte_idx = (uint32_t)ANTS_PEER_ID_SIZE - 1 - flip_bit / 8;
+    uint32_t bit_in_byte = flip_bit % 8;
+    out_peer->peer_id.bytes[byte_idx] ^= (uint8_t)(1u << bit_in_byte);
+    /* Stash a recognisable multiaddr so we can match peers after
+     * enumerate. The flip_bit value is the discriminator. */
+    snprintf(out_peer->multiaddr,
+             sizeof out_peer->multiaddr,
+             "/ip4/127.0.0.1/udp/%u/quic-v1",
+             (unsigned)(flip_bit + 1));
+}
+
+static void test_bucket_index_math(void)
+{
+    /* Local id = all zeros. Peers at single-bit-flip positions land
+     * in their flip_bit's bucket. */
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* LSB flip → bucket 0. */
+    ants_dht_peer_t p;
+    test_make_peer(local, 0, &p);
+    CHECK(ants_dht__test_bucket_index(&d, &p.peer_id) == 0);
+
+    /* MSB flip → bucket 255. */
+    test_make_peer(local, 255, &p);
+    CHECK(ants_dht__test_bucket_index(&d, &p.peer_id) == 255);
+
+    /* Middle: bit 127 → bucket 127. */
+    test_make_peer(local, 127, &p);
+    CHECK(ants_dht__test_bucket_index(&d, &p.peer_id) == 127);
+
+    /* Self-insertion sentinel: XOR is zero → UINT32_MAX. */
+    ants_peer_id_t self;
+    memcpy(self.bytes, local, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK(ants_dht__test_bucket_index(&d, &self) == UINT32_MAX);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_kbucket_insert_and_enumerate(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* Insert 10 peers at distinct bit-flip positions → 10 different
+     * buckets, 10 total entries. */
+    for (uint32_t i = 0; i < 10; i++) {
+        ants_dht_peer_t p;
+        test_make_peer(local, i * 16, &p); /* bits 0, 16, 32, ..., 144 */
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 1000 + i), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(&d) == 10);
+
+    /* Inserting the same peer again is idempotent (refresh, not duplicate). */
+    ants_dht_peer_t dup;
+    test_make_peer(local, 0, &dup);
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &dup, 2000), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&d) == 10);
+
+    /* Enumerate them all. */
+    ants_dht_peer_t out[20];
+    size_t count = 0;
+    CHECK_EQ(ants_dht_routing_table_enumerate(&d, out, 20, &count), ANTS_OK);
+    CHECK(count == 10);
+
+    /* Too-small buffer: BUFFER_TOO_SMALL with *out_count = total available. */
+    count = 0;
+    CHECK_EQ(ants_dht_routing_table_enumerate(&d, out, 5, &count), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(count == 10);
+
+    /* Self-insertion rejected. */
+    ants_dht_peer_t self;
+    memset(&self, 0, sizeof self);
+    memcpy(self.peer_id.bytes, local, ANTS_PEER_ID_SIZE);
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &self, 0), ANTS_ERROR_INVALID_ARG);
+    CHECK(ants_dht_routing_table_size(&d) == 10);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_kbucket_full_rejects(void)
+{
+    /* Insert K+1 peers that all land in the same bucket. The K+1-th
+     * insertion is rejected with BUFFER_TOO_SMALL (phase 2 has no
+     * LRU eviction — that's phase 6). */
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* Construct K+1 peers all in bucket 0 (low-bit-flip + high-bit-XOR
+     * variations that keep the top set bit at position 0). For bucket
+     * 0 we need XOR with MSB at position 0, i.e. XOR == 1. So only one
+     * peer can land in bucket 0 — we need a different strategy.
+     *
+     * Instead use bucket 255: peers whose pubkey differs from local
+     * only in the MSB plus low-order bits. We flip bit 255 plus K
+     * different combinations of lower bits — all land in bucket 255
+     * because the MSB-XOR dominates. */
+    for (size_t i = 0; i < ANTS_DHT_K; i++) {
+        ants_dht_peer_t p;
+        memset(&p, 0, sizeof p);
+        /* High-bit-flip (bit 255) plus a unique low-bit pattern. */
+        p.peer_id.bytes[0] ^= 0x80;
+        /* Encode i into the bottom byte to make each ID unique. */
+        p.peer_id.bytes[ANTS_PEER_ID_SIZE - 1] = (uint8_t)i;
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 1000 + i), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(&d) == ANTS_DHT_K);
+
+    /* Add one more — bucket is full. */
+    ants_dht_peer_t overflow;
+    memset(&overflow, 0, sizeof overflow);
+    overflow.peer_id.bytes[0] ^= 0x80;
+    overflow.peer_id.bytes[ANTS_PEER_ID_SIZE - 1] = 0xFF;
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &overflow, 9999), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht_routing_table_size(&d) == ANTS_DHT_K);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_kbucket_remove(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* Insert 3 peers. */
+    ants_dht_peer_t p0, p1, p2;
+    test_make_peer(local, 10, &p0);
+    test_make_peer(local, 20, &p1);
+    test_make_peer(local, 30, &p2);
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &p0, 1), ANTS_OK);
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &p1, 2), ANTS_OK);
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &p2, 3), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&d) == 3);
+
+    /* Remove the middle one. */
+    CHECK_EQ(ants_dht__test_remove_peer(&d, &p1.peer_id), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&d) == 2);
+
+    /* Removing a not-present peer returns NOT_IMPLEMENTED (our
+     * placeholder for "not found"). */
+    CHECK_EQ(ants_dht__test_remove_peer(&d, &p1.peer_id), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK(ants_dht_routing_table_size(&d) == 2);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_destroy_frees_heap_entries(void)
+{
+    /* Insert peers, destroy, re-init, destroy again. ASan would catch
+     * any leak across this sequence. */
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+
+    for (int iter = 0; iter < 3; iter++) {
+        CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+        for (uint32_t i = 0; i < 50; i++) {
+            ants_dht_peer_t p;
+            test_make_peer(local, i * 5, &p); /* bits 0, 5, 10, ..., 245 */
+            CHECK_EQ(ants_dht__test_insert_peer(&d, &p, i + 1), ANTS_OK);
+        }
+        CHECK(ants_dht_routing_table_size(&d) == 50);
+        CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+        CHECK(ants_dht_routing_table_size(&d) == 0);
+    }
 }
 
 int main(void)
@@ -197,7 +413,12 @@ int main(void)
     test_destroy_rejects_null();
     test_tick_returns_idle_sentinel();
     test_action_stubs_return_not_implemented();
-    test_introspection_safe_defaults();
+    test_introspection_empty_table();
+    test_bucket_index_math();
+    test_kbucket_insert_and_enumerate();
+    test_kbucket_full_rejects();
+    test_kbucket_remove();
+    test_destroy_frees_heap_entries();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
