@@ -76,7 +76,10 @@ static void check_bytes(const char *what,
 
 static void test_strerror_covers_every_code(void)
 {
-    for (int i = 0; i < (int)ANTS_ERROR__MAX; i++) {
+    /* Defined codes are 0..7 inclusive (matching the #define values
+     * in ants_common.h). Hidden ANTS_ERROR__MAX is no longer public
+     * — see the same header for the ABI-pinning rationale. */
+    for (int i = 0; i <= 7; i++) {
         const char *s = ants_strerror((ants_error_t)i);
         CHECK(s != NULL);
         CHECK(strlen(s) > 0);

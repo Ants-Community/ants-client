@@ -63,7 +63,7 @@ typedef enum {
      * tracker closes the tag context and registers the combined
      * (tag header + tagged item) byte range as a single item in the
      * parent container. */
-    ANTS_CBOR_CTX_TAG,
+    ANTS_CBOR_CTX_TAG
 } ants_cbor_ctx_kind_t;
 
 typedef struct {
@@ -170,7 +170,7 @@ typedef enum {
     ANTS_CBOR_TYPE_MAP,
     ANTS_CBOR_TYPE_TAG,
     ANTS_CBOR_TYPE_BOOL,
-    ANTS_CBOR_TYPE_NULL,
+    ANTS_CBOR_TYPE_NULL
 } ants_cbor_type_t;
 
 /*

@@ -43,7 +43,6 @@ const char *ants_strerror(ants_error_t err)
         return "unsupported type";
     case ANTS_ERROR_OVERFLOW:
         return "overflow";
-    case ANTS_ERROR__MAX:
     default:
         return "unknown";
     }
@@ -449,9 +448,13 @@ ants_error_t ants_cbor_enc_int(ants_cbor_enc_t *enc, int64_t v)
     if (v >= 0) {
         err = cbor_write_head(enc, 0, (uint64_t)v);
     } else {
-        /* CBOR major type 1 encodes -1-n. For v = INT64_MIN, -(v+1) is
-         * (uint64_t)INT64_MAX which fits in u64. */
-        err = cbor_write_head(enc, 1, (uint64_t)(-(v + 1)));
+        /* CBOR major type 1 encodes -1-n where v is negative, so
+         * n = -1 - v. For v = INT64_MIN, `v + 1` is signed overflow
+         * (UB). Compute -1 - v in unsigned arithmetic to avoid the
+         * trap: ~(uint64_t)v is exactly -1 - v for negative v
+         * (two's-complement bit-pattern identity, defined for any
+         * uint64_t input). */
+        err = cbor_write_head(enc, 1, ~(uint64_t)v);
     }
     if (err != ANTS_OK) {
         enc->pos = item_begin;
@@ -475,7 +478,7 @@ ants_error_t ants_cbor_enc_bytes(ants_cbor_enc_t *enc, const uint8_t *b, size_t 
         enc->pos = item_begin;
         return err;
     }
-    if (enc->pos + len > enc->cap) {
+    if (len > enc->cap - enc->pos) {
         enc->pos = item_begin;
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
@@ -501,7 +504,7 @@ ants_error_t ants_cbor_enc_text(ants_cbor_enc_t *enc, const char *s, size_t len)
         enc->pos = item_begin;
         return err;
     }
-    if (enc->pos + len > enc->cap) {
+    if (len > enc->cap - enc->pos) {
         enc->pos = item_begin;
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
@@ -841,7 +844,7 @@ ants_error_t ants_cbor_dec_bytes(ants_cbor_dec_t *dec, const uint8_t **out_buf, 
         return ANTS_ERROR_OVERFLOW;
     }
     size_t len = (size_t)value;
-    if (dec->pos + len > dec->len) {
+    if (len > dec->len - dec->pos) {
         dec->pos = saved;
         return ANTS_ERROR_MALFORMED;
     }
@@ -879,7 +882,7 @@ ants_error_t ants_cbor_dec_text(ants_cbor_dec_t *dec, const char **out_buf, size
         return ANTS_ERROR_OVERFLOW;
     }
     size_t len = (size_t)value;
-    if (dec->pos + len > dec->len) {
+    if (len > dec->len - dec->pos) {
         dec->pos = saved;
         return ANTS_ERROR_MALFORMED;
     }

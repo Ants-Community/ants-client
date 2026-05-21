@@ -2608,15 +2608,28 @@ ge25519_elligator2(unsigned char s[32], const fe25519 r, const unsigned char x_s
 /* ants-client local patch: RFC 9380 §G.2.2 ELL2_NU mode for
  * ECVRF-EDWARDS25519-SHA512-ELL2.
  *
- * Same Elligator2 mapping as ge25519_elligator2 above, but the
- * Edwards x-coordinate sign bit is derived internally from sgn0(u_M)
- * — RFC 9380's rational map gives sgn0(x_E) = sgn0(c) ⊕ sgn0(u_M)
- * ⊕ sgn0(v_M), and the NU ciphersuite fixes sgn0(c) = 0 and
- * sgn0(v_M) = 0, leaving sgn0(x_E) = sgn0(u_M). u_M is the
- * Montgomery x-coordinate after the gx-is-square branch. */
+ * Same Elligator2 step as ge25519_elligator2 above to obtain the
+ * Montgomery x_M; then computes the Montgomery y_M = sqrt(g(x_M))
+ * with sgn0(y_M) chosen per RFC 9380 §G.2.1 line 38 (= e2 = "the
+ * gx-is-a-square branch fired"; equivalently 1 - notsquare). Applies
+ * the RFC 9380 §G.2.2 rational map x_E = c1 * x_M / y_M with c1 =
+ * sqrt(-486664) and sgn0(c1) = 0, takes sgn0(x_E) as the Edwards-x
+ * sign bit. Validated against RFC 9381 §B.4 vectors 19, 20, 21 AND
+ * five independent Python reference vectors. */
 void
 ge25519_elligator2_rfc9380_nu(unsigned char s[32], const fe25519 r)
 {
+    /* c1 = sqrt(-486664) mod p, canonical 32-byte little-endian
+     * encoding with sgn0(c1) = 0 (computed in Python: c1 =
+     * 0x067e45ff_aa046ecc_821a7d4b_d1d3a1c5_7e4ffc03_dc087bd2_
+     * bb06a060_f4ed260f as a LE byte string). */
+    static const unsigned char c1_bytes[32] = {
+        0x06, 0x7e, 0x45, 0xff, 0xaa, 0x04, 0x6e, 0xcc,
+        0x82, 0x1a, 0x7d, 0x4b, 0xd1, 0xd3, 0xa1, 0xc5,
+        0x7e, 0x4f, 0xfc, 0x03, 0xdc, 0x08, 0x7b, 0xd2,
+        0xbb, 0x06, 0xa0, 0x60, 0xf4, 0xed, 0x26, 0x0f
+    };
+
     fe25519       gx;
     fe25519       negx;
     fe25519       rr2;
@@ -2629,33 +2642,79 @@ ge25519_elligator2_rfc9380_nu(unsigned char s[32], const fe25519 r)
     rr2[0]++;
     fe25519_invert(rr2, rr2);
     fe25519_mul32(x, rr2, curve25519_A[0]);
-    fe25519_neg(x, x);
+    fe25519_neg(x, x);                       /* x = -A / (2r^2 + 1) = x_1 */
 
     fe25519_sq(x2, x);
     fe25519_mul(x3, x, x2);
     fe25519_add(gx, x3, x);
     fe25519_mul32(x2, x2, curve25519_A[0]);
-    fe25519_add(gx, x2, gx);
+    fe25519_add(gx, x2, gx);                 /* gx = x_1^3 + A*x_1^2 + x_1 = g(x_1) */
 
     notsquare = fe25519_notsquare(gx);
     fe25519_neg(negx, x);
     fe25519_cmov(x, negx, notsquare);
     fe25519_0(x2);
     fe25519_cmov(x2, curve25519_A, notsquare);
-    fe25519_sub(x, x, x2);
-    /* Now x = u_M (Montgomery x). The Edwards-x sign bit follows the
-     * RFC 9380 Elligator2 + rational-map sign convention. Empirically
-     * verified against RFC 9381 §B.4 vectors 19, 20, 21: the sign bit
-     * is set exactly when the gx-is-not-a-square branch fired. (RFC
-     * 9380's full derivation goes via the rational-map identity
-     * sgn0(x_E) = sgn0(c2) ⊕ sgn0(u_M) ⊕ sgn0(v_M); v_M's sign in
-     * RFC 9380 Elligator2 is chosen to make sgn0(y) match sgn0(u);
-     * combined with sgn0(c2) = 1 from the curve's constant table, the
-     * net effect is that the sign flips iff we took the nonsquare
-     * branch.) */
-    x_sign = (unsigned char) (notsquare << 7);
+    fe25519_sub(x, x, x2);                   /* x = u_M (the chosen Montgomery x) */
 
-    /* yed = (x - 1) / (x + 1) */
+    /* Recompute g(u_M) for the chosen branch. */
+    fe25519_sq(x2, x);
+    fe25519_mul(x3, x, x2);
+    fe25519_add(gx, x3, x);
+    fe25519_mul32(x2, x2, curve25519_A[0]);
+    fe25519_add(gx, x2, gx);                 /* gx = g(u_M) = u_M * (u_M^2 + A*u_M + 1) */
+
+    /* y_M = sqrt(g(u_M)). For p ≡ 5 (mod 8), sqrt via
+     *   cand = g^((p+3)/8) = pow22523(g) * g
+     *   if cand^2 == g: yM = cand
+     *   else:           yM = cand * sqrt(-1)
+     */
+    fe25519 y_M;
+    fe25519 cand, cand_alt;
+    fe25519 pow22523_g;
+    fe25519 cand_sq;
+    fe25519 root_diff;
+    int correct_root;
+
+    fe25519_pow22523(pow22523_g, gx);
+    fe25519_mul(cand, pow22523_g, gx);
+    fe25519_sq(cand_sq, cand);
+    fe25519_sub(root_diff, cand_sq, gx);
+    correct_root = fe25519_iszero(root_diff);
+    fe25519_mul(cand_alt, cand, sqrtm1);
+    fe25519_cmov(cand, cand_alt, (unsigned int) (1 - correct_root));
+    /* Cast through tobytes to obtain a canonical fe25519. */
+    {
+        unsigned char y_M_bytes[32];
+        fe25519_tobytes(y_M_bytes, cand);
+        fe25519_frombytes(y_M, y_M_bytes);
+    }
+
+    /* Fix sign of y_M per RFC 9380 §G.2.1 line 37-38:
+     *   e3 (here `notsquare` is the *inverse* of RFC's e3) drives the
+     *   sign so that sgn0(y_M_final) = (1 - notsquare).
+     * If current sgn0(y_M) != target, negate. */
+    {
+        int target_sgn = 1 - (int) notsquare;
+        int current_sgn = fe25519_isnegative(y_M);
+        fe25519 y_M_neg;
+        fe25519_neg(y_M_neg, y_M);
+        fe25519_cmov(y_M, y_M_neg, (unsigned int) (current_sgn ^ target_sgn));
+    }
+
+    /* x_E = c1 * u_M / y_M */
+    {
+        fe25519 c1;
+        fe25519 y_M_inv;
+        fe25519 x_E;
+        fe25519_frombytes(c1, c1_bytes);
+        fe25519_invert(y_M_inv, y_M);
+        fe25519_mul(x_E, c1, x);
+        fe25519_mul(x_E, x_E, y_M_inv);
+        x_sign = (unsigned char) (fe25519_isnegative(x_E) << 7);
+    }
+
+    /* Compute y_E = (u_M - 1) / (u_M + 1) and encode. */
     {
         fe25519 one;
         fe25519 x_plus_one;
