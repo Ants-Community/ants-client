@@ -19,6 +19,7 @@
 #include "ants_crypto.h"
 #include "ants_dht.h"
 #include "ants_transport.h"
+#include "dht_wire.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -405,6 +406,237 @@ static void test_destroy_frees_heap_entries(void)
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Wire codec round-trip tests                                              */
+/*                                                                          */
+/* Round-trip every message type: encode → decode → assert fields match.   */
+/* The wire codec is in src/dht_wire.{h,c} (private to the dht module).    */
+/* foundation/cbor enforces canonical encoding on the encode side and       */
+/* rejects non-canonical input on the decode side, so a successful round-   */
+/* trip implies the bytes-on-the-wire are deterministic.                    */
+/* ------------------------------------------------------------------------ */
+
+/* Encode buffer big enough for the largest message (FIND_NODE_RESP with
+ * 20 peers × ~80 bytes each + envelope = ~1700 bytes). */
+#define WIRE_BUF_CAP 4096
+
+static void fill_test_peer(ants_dht_peer_t *peer, uint32_t i)
+{
+    memset(peer, 0, sizeof *peer);
+    /* Deterministic peer-id: byte 0 = i, rest = 0xAB. */
+    peer->peer_id.bytes[0] = (uint8_t)(i & 0xFF);
+    for (size_t j = 1; j < ANTS_PEER_ID_SIZE; j++) {
+        peer->peer_id.bytes[j] = 0xAB;
+    }
+    snprintf(peer->multiaddr,
+             sizeof peer->multiaddr,
+             "/ip4/127.0.0.1/udp/%u/quic-v1",
+             (unsigned)(4242 + i));
+}
+
+static void test_wire_peek_type(void)
+{
+    /* Encode a PING, decode just the type via the peek helper. */
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+    ants_dht_ping_req_t ping = {.txid = 7};
+    CHECK_EQ(ants_dht_wire_encode_ping_req(buf, sizeof buf, &len, &ping), ANTS_OK);
+    ants_dht_msg_type_t type;
+    CHECK_EQ(ants_dht_wire_peek_type(buf, len, &type), ANTS_OK);
+    CHECK(type == ANTS_DHT_MSG_PING);
+
+    /* Same for a FIND_NODE_RESP. */
+    ants_dht_find_node_resp_t fnr;
+    memset(&fnr, 0, sizeof fnr);
+    fnr.txid = 42;
+    fnr.peer_count = 2;
+    fill_test_peer(&fnr.peers[0], 0);
+    fill_test_peer(&fnr.peers[1], 1);
+    CHECK_EQ(ants_dht_wire_encode_find_node_resp(buf, sizeof buf, &len, &fnr), ANTS_OK);
+    CHECK_EQ(ants_dht_wire_peek_type(buf, len, &type), ANTS_OK);
+    CHECK(type == ANTS_DHT_MSG_FIND_NODE_RESP);
+}
+
+static void test_wire_ping_roundtrip(void)
+{
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+
+    ants_dht_ping_req_t req = {.txid = 0x12345678};
+    CHECK_EQ(ants_dht_wire_encode_ping_req(buf, sizeof buf, &len, &req), ANTS_OK);
+    /* PING has the smallest possible envelope: map(2) with two uint kv
+     * pairs. Sanity-check it's small. */
+    CHECK(len < 20);
+
+    ants_dht_ping_req_t dec_req;
+    memset(&dec_req, 0, sizeof dec_req);
+    CHECK_EQ(ants_dht_wire_decode_ping_req(buf, len, &dec_req), ANTS_OK);
+    CHECK(dec_req.txid == req.txid);
+
+    /* PING_RESP — same shape, different type tag. */
+    ants_dht_ping_resp_t resp = {.txid = 99};
+    CHECK_EQ(ants_dht_wire_encode_ping_resp(buf, sizeof buf, &len, &resp), ANTS_OK);
+
+    ants_dht_ping_resp_t dec_resp;
+    memset(&dec_resp, 0, sizeof dec_resp);
+    CHECK_EQ(ants_dht_wire_decode_ping_resp(buf, len, &dec_resp), ANTS_OK);
+    CHECK(dec_resp.txid == resp.txid);
+
+    /* Cross-type decode: PING_RESP encoded, decoded as PING — should fail. */
+    CHECK_EQ(ants_dht_wire_decode_ping_req(buf, len, &dec_req), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_wire_find_node_roundtrip(void)
+{
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+
+    /* Request: txid + target. */
+    ants_dht_find_node_req_t req;
+    memset(&req, 0, sizeof req);
+    req.txid = 0xDEADBEEF;
+    for (size_t i = 0; i < ANTS_PEER_ID_SIZE; i++) {
+        req.target.bytes[i] = (uint8_t)(i * 7 + 1);
+    }
+    CHECK_EQ(ants_dht_wire_encode_find_node_req(buf, sizeof buf, &len, &req), ANTS_OK);
+
+    ants_dht_find_node_req_t dec_req;
+    memset(&dec_req, 0, sizeof dec_req);
+    CHECK_EQ(ants_dht_wire_decode_find_node_req(buf, len, &dec_req), ANTS_OK);
+    CHECK(dec_req.txid == req.txid);
+    CHECK(memcmp(dec_req.target.bytes, req.target.bytes, ANTS_PEER_ID_SIZE) == 0);
+
+    /* Response: 0, 1, K peers — boundary cases. */
+    for (size_t n = 0; n <= ANTS_DHT_K; n++) {
+        ants_dht_find_node_resp_t resp;
+        memset(&resp, 0, sizeof resp);
+        resp.txid = (uint32_t)(n + 100);
+        resp.peer_count = n;
+        for (size_t i = 0; i < n; i++) {
+            fill_test_peer(&resp.peers[i], (uint32_t)i);
+        }
+        CHECK_EQ(ants_dht_wire_encode_find_node_resp(buf, sizeof buf, &len, &resp), ANTS_OK);
+
+        ants_dht_find_node_resp_t dec_resp;
+        memset(&dec_resp, 0, sizeof dec_resp);
+        CHECK_EQ(ants_dht_wire_decode_find_node_resp(buf, len, &dec_resp), ANTS_OK);
+        CHECK(dec_resp.txid == resp.txid);
+        CHECK(dec_resp.peer_count == n);
+        for (size_t i = 0; i < n; i++) {
+            CHECK(memcmp(dec_resp.peers[i].peer_id.bytes,
+                         resp.peers[i].peer_id.bytes,
+                         ANTS_PEER_ID_SIZE) == 0);
+            CHECK(strcmp(dec_resp.peers[i].multiaddr, resp.peers[i].multiaddr) == 0);
+        }
+    }
+
+    /* Over-cap peer_count rejected at encode. */
+    ants_dht_find_node_resp_t over;
+    memset(&over, 0, sizeof over);
+    over.peer_count = ANTS_DHT_MAX_PEERS_PER_MSG + 1;
+    CHECK_EQ(ants_dht_wire_encode_find_node_resp(buf, sizeof buf, &len, &over),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_wire_get_peers_roundtrip(void)
+{
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+
+    /* Request. */
+    ants_dht_get_peers_req_t req = {.txid = 0xCAFEBABE, .key = 0x0123456789ABCDEFULL};
+    CHECK_EQ(ants_dht_wire_encode_get_peers_req(buf, sizeof buf, &len, &req), ANTS_OK);
+
+    ants_dht_get_peers_req_t dec_req;
+    memset(&dec_req, 0, sizeof dec_req);
+    CHECK_EQ(ants_dht_wire_decode_get_peers_req(buf, len, &dec_req), ANTS_OK);
+    CHECK(dec_req.txid == req.txid);
+    CHECK(dec_req.key == req.key);
+
+    /* Response with peers + token. */
+    ants_dht_get_peers_resp_t resp;
+    memset(&resp, 0, sizeof resp);
+    resp.txid = 0xFEEDFACE;
+    resp.peer_count = 3;
+    fill_test_peer(&resp.peers[0], 10);
+    fill_test_peer(&resp.peers[1], 20);
+    fill_test_peer(&resp.peers[2], 30);
+    for (size_t i = 0; i < ANTS_DHT_TOKEN_SIZE; i++) {
+        resp.token[i] = (uint8_t)(0x55 ^ i);
+    }
+    CHECK_EQ(ants_dht_wire_encode_get_peers_resp(buf, sizeof buf, &len, &resp), ANTS_OK);
+
+    ants_dht_get_peers_resp_t dec_resp;
+    memset(&dec_resp, 0, sizeof dec_resp);
+    CHECK_EQ(ants_dht_wire_decode_get_peers_resp(buf, len, &dec_resp), ANTS_OK);
+    CHECK(dec_resp.txid == resp.txid);
+    CHECK(dec_resp.peer_count == 3);
+    CHECK(memcmp(dec_resp.token, resp.token, ANTS_DHT_TOKEN_SIZE) == 0);
+    for (size_t i = 0; i < 3; i++) {
+        CHECK(strcmp(dec_resp.peers[i].multiaddr, resp.peers[i].multiaddr) == 0);
+    }
+}
+
+static void test_wire_announce_peer_roundtrip(void)
+{
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+
+    /* Request: key + token. */
+    ants_dht_announce_peer_req_t req;
+    memset(&req, 0, sizeof req);
+    req.txid = 1;
+    req.key = 0xAA55AA55AA55AA55ULL;
+    for (size_t i = 0; i < ANTS_DHT_TOKEN_SIZE; i++) {
+        req.token[i] = (uint8_t)i;
+    }
+    CHECK_EQ(ants_dht_wire_encode_announce_peer_req(buf, sizeof buf, &len, &req), ANTS_OK);
+
+    ants_dht_announce_peer_req_t dec_req;
+    memset(&dec_req, 0, sizeof dec_req);
+    CHECK_EQ(ants_dht_wire_decode_announce_peer_req(buf, len, &dec_req), ANTS_OK);
+    CHECK(dec_req.txid == req.txid);
+    CHECK(dec_req.key == req.key);
+    CHECK(memcmp(dec_req.token, req.token, ANTS_DHT_TOKEN_SIZE) == 0);
+
+    /* Response: ack only. */
+    ants_dht_announce_peer_resp_t resp = {.txid = 2};
+    CHECK_EQ(ants_dht_wire_encode_announce_peer_resp(buf, sizeof buf, &len, &resp), ANTS_OK);
+
+    ants_dht_announce_peer_resp_t dec_resp;
+    memset(&dec_resp, 0, sizeof dec_resp);
+    CHECK_EQ(ants_dht_wire_decode_announce_peer_resp(buf, len, &dec_resp), ANTS_OK);
+    CHECK(dec_resp.txid == resp.txid);
+}
+
+static void test_wire_rejects_truncation(void)
+{
+    /* Encode a valid FIND_NODE_REQ. Truncating the buffer by 1 byte
+     * must reject. */
+    uint8_t buf[WIRE_BUF_CAP];
+    size_t len = 0;
+    ants_dht_find_node_req_t req;
+    memset(&req, 0, sizeof req);
+    req.txid = 42;
+    CHECK_EQ(ants_dht_wire_encode_find_node_req(buf, sizeof buf, &len, &req), ANTS_OK);
+    CHECK(len > 1);
+
+    ants_dht_find_node_req_t dec;
+    /* Trailing-byte truncation: decoder either fails decode or
+     * finalise-fails because fewer bytes remain. */
+    CHECK(ants_dht_wire_decode_find_node_req(buf, len - 1, &dec) != ANTS_OK);
+}
+
+static void test_wire_rejects_buffer_too_small(void)
+{
+    /* Encode into a 4-byte buffer: PING needs more — BUFFER_TOO_SMALL. */
+    uint8_t tiny[4];
+    size_t len = 99;
+    ants_dht_ping_req_t req = {.txid = 1};
+    CHECK_EQ(ants_dht_wire_encode_ping_req(tiny, sizeof tiny, &len, &req),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -419,6 +651,14 @@ int main(void)
     test_kbucket_full_rejects();
     test_kbucket_remove();
     test_destroy_frees_heap_entries();
+
+    test_wire_peek_type();
+    test_wire_ping_roundtrip();
+    test_wire_find_node_roundtrip();
+    test_wire_get_peers_roundtrip();
+    test_wire_announce_peer_roundtrip();
+    test_wire_rejects_truncation();
+    test_wire_rejects_buffer_too_small();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
