@@ -2,11 +2,37 @@
 
 TEE attestation harness. Foundation layer.
 
-**Status:** pending claim.
-**Effort:** 6 EM. **The single longest foundation component**;
-also on the critical path.
+**Status (v1.0):** **API-surface stub only.** Every function returns
+`ANTS_ERROR_NOT_IMPLEMENTED` or the documented safe default. Targeted
+**v2.x** per [RFC-0005](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md)'s
+hardware-trust timeline (2030-2032 silicon-vulnerability-window closure).
+The [CLAIM](https://github.com/Ants-Community/ants/issues/6) remains
+open sine die — no nomination-window deadline.
+
+**Why v1.0 ships the stub:** upstream components (network, reputation,
+identity) reference attestations in their data structures — peer
+handshake bindings, trustee key rotation, bond admission, and committee
+role assumption all carry attestation metadata. Compiling against the
+header now means those components don't need to mock or `#ifdef`
+around a future shape; when the real implementation lands in v2.x,
+integration sites need no changes.
+
+**Why v1.0 doesn't ship the real impl:** TEE attestation is one of the
+four legs of [RFC-0002](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-verifiability.md)
+verifiability — re-execution, scheme (C) probabilistic, reputation,
+and TEE attestation. The other three legs are sufficient for protocol
+soundness; TEE adds a fourth participation path for operators who
+can't run full verification. Per RFC-0005 Round 1, the current
+generation of TEE silicon has a 5-7 year vulnerability window before
+trust assurance is operationally meaningful. Shipping it earlier
+would mean either (a) accepting that window inside the protocol's
+identity root, or (b) wrapping it in caveats that defeat its purpose.
+Better to wait.
+
+**Effort (v2.x):** 6 EM, plus full security audit.
 **Spec:** [RFC-0005](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md) (all sections).
-**Dependencies:** `crypto/` (BLAKE3, Ed25519). External: each vendor's TEE SDK (all C/C++ native, no binding work).
+**Dependencies:** `crypto/` (BLAKE3, Ed25519). External (v2.x): each
+vendor's TEE SDK (all C/C++ native, no binding work).
 
 ## Scope
 
@@ -65,17 +91,17 @@ bool ants_attestation_is_fresh(const ants_attestation_t *att, int64_t now);
 bool ants_attestation_is_revoked(const ants_attestation_t *att);
 ```
 
-## Critical path
+## Not on the v1.0 critical path
 
-Per IMPLEMENTATION.md §"Critical path", this component is the **first
-link** of the critical chain `#3 → #7 → #8 → #13 → #15`. Without a
-working TEE harness, no peer can attest its identity, so no other
-component can be tested end-to-end. The claiming contributor
-materially affects the project's wall-clock timeline.
+Per the updated [IMPLEMENTATION.md](https://github.com/Ants-Community/ants/blob/main/IMPLEMENTATION.md)
+§"Critical path", this component is **no longer on the v1.0 critical
+chain**. v1.0 chain is `#7 → #8 → #13 → #15` (16 EM total). The TEE
+harness is a v2.x deliverable.
 
-Recommended start order: Intel TDX + AMD SEV-SNP first (the two
-x86 server vendors, mature DCAP/KDS endpoints), then ARM CCA, then
-Apple SE, then Qualcomm QSEE. Each vendor adds ~1.2 EM.
+When the real implementation lands (v2.x), the recommended start
+order is: Intel TDX + AMD SEV-SNP first (the two x86 server vendors,
+mature DCAP/KDS endpoints), then ARM CCA, then Apple SE, then
+Qualcomm QSEE. Each vendor adds ~1.2 EM.
 
 ## Good-first-contribution flag
 
