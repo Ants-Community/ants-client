@@ -86,7 +86,15 @@ ants_error_t ants_blake3_derive_key(const char *context,
                                     size_t key_material_len,
                                     uint8_t out[ANTS_BLAKE3_HASH_SIZE]);
 
-/* Incremental API for streaming inputs. */
+/* Incremental API for streaming inputs.
+ *
+ * Per the BLAKE3 spec the context remains valid after `ants_blake3_final`:
+ * subsequent `ants_blake3_update` and `ants_blake3_final` calls produce
+ * a hash over the accumulated input (i.e. the streaming hash continues
+ * exactly as if `final` had not been called). To start a fresh hash,
+ * the caller MUST re-initialise via `ants_blake3_init` (or
+ * `ants_blake3_init_derive`).
+ */
 ants_error_t ants_blake3_init(ants_blake3_ctx_t *ctx);
 ants_error_t ants_blake3_init_derive(ants_blake3_ctx_t *ctx, const char *context);
 ants_error_t ants_blake3_update(ants_blake3_ctx_t *ctx, const uint8_t *data, size_t len);

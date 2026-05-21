@@ -1069,6 +1069,51 @@ static void test_is_canonical_rejects_float(void)
     CHECK_EQ(ants_cbor_is_canonical(input, sizeof input), ANTS_ERROR_UNSUPPORTED_TYPE);
 }
 
+static void test_dec_finalise(void)
+{
+    /* Symmetric to enc_finalise: passes when decoder consumed every
+     * byte AND closed every container, rejects otherwise. */
+
+    /* Encode a single uint, then decode it; finalise must succeed. */
+    uint8_t buf[8];
+    ants_cbor_enc_t enc;
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 42), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+    size_t enc_pos = ants_cbor_enc_size(&enc);
+
+    ants_cbor_dec_t dec;
+    CHECK_EQ(ants_cbor_dec_init(&dec, buf, enc_pos), ANTS_OK);
+    uint64_t v;
+    CHECK_EQ(ants_cbor_dec_uint(&dec, &v), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_finalise(&dec), ANTS_OK);
+
+    /* Trailing-bytes case: feed decoder a buffer longer than the
+     * single encoded item; finalise must reject. */
+    uint8_t buf2[4] = {0x01, 0xFF, 0xFF, 0xFF}; /* uint 1 + 3 stray bytes */
+    ants_cbor_dec_t dec2;
+    CHECK_EQ(ants_cbor_dec_init(&dec2, buf2, sizeof buf2), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_uint(&dec2, &v), ANTS_OK);
+    CHECK_EQ(ants_cbor_dec_finalise(&dec2), ANTS_ERROR_MALFORMED);
+
+    /* Open-container case: start an array, don't finish it. */
+    uint8_t buf3[8];
+    ants_cbor_enc_t enc3;
+    CHECK_EQ(ants_cbor_enc_init(&enc3, buf3, sizeof buf3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc3, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc3, 7), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc3), ANTS_OK);
+
+    ants_cbor_dec_t dec3;
+    CHECK_EQ(ants_cbor_dec_init(&dec3, buf3, ants_cbor_enc_size(&enc3)), ANTS_OK);
+    size_t n;
+    CHECK_EQ(ants_cbor_dec_array(&dec3, &n), ANTS_OK);
+    /* Container open, no items decoded yet → not finalised. */
+    CHECK_EQ(ants_cbor_dec_finalise(&dec3), ANTS_ERROR_MALFORMED);
+
+    CHECK_EQ(ants_cbor_dec_finalise(NULL), ANTS_ERROR_INVALID_ARG);
+}
+
 /* ------------------------------------------------------------------------ */
 
 int main(void)
@@ -1132,6 +1177,8 @@ int main(void)
     test_is_canonical_rejects_underfill_array();
     test_is_canonical_rejects_unreserved_tag();
     test_is_canonical_rejects_float();
+
+    test_dec_finalise();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
