@@ -547,16 +547,151 @@ ants_error_t ants_transport_local_addr(const ants_transport_t *t, char *out_buf,
 /* Dialing                                                                  */
 /* ------------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------------ */
+/* Connection-state internal struct                                         */
+/*                                                                          */
+/* Lives inside the caller's opaque ants_transport_conn_t buffer.           */
+/* Pinned at 8 KB by the public header; the size-check typedef below       */
+/* asserts the struct fits.                                                 */
+/* ------------------------------------------------------------------------ */
+
+struct ants_transport_conn_state {
+    /* The vendored picoquic connection. NULL until picoquic_create_client_cnx
+     * succeeds; cleared back to NULL when picoquic eventually deletes it
+     * (e.g. after the connection drains). */
+    picoquic_cnx_t *cnx;
+
+    /* Back-pointer to the parent transport. Lets connection-scoped
+     * callbacks (phase 3b) reach the caller's event_fn. */
+    struct ants_transport_state *parent;
+
+    /* expected_peer_id from dial(), if any. When set (expected_set != 0)
+     * we use it to verify the handshake binds the right pubkey. */
+    uint8_t expected_peer_id[ANTS_PEER_ID_SIZE];
+    int expected_set;
+};
+
+typedef char ants_transport_conn_state_size_check[(sizeof(struct ants_transport_conn_state) <=
+                                                   sizeof(((ants_transport_conn_t *)0)->_opaque))
+                                                      ? 1
+                                                      : -1];
+
+/* Lazily open an ephemeral UDP socket on a dial-only client (no
+ * listener was configured). The kernel-assigned port doesn't matter —
+ * the dialer just needs SOMETHING to send packets from. */
+static ants_error_t ensure_dial_socket(struct ants_transport_state *state, int family)
+{
+    if (state->sock_fd != ANTS_INVALID_SOCKET) {
+        return ANTS_OK;
+    }
+    state->sock_fd = socket(family, SOCK_DGRAM, IPPROTO_UDP);
+    if (state->sock_fd == ANTS_INVALID_SOCKET) {
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    /* Bind to "any address, ephemeral port". The kernel picks both. */
+    if (family == AF_INET) {
+        struct sockaddr_in sin = {0};
+        sin.sin_family = AF_INET;
+        sin.sin_addr.s_addr = htonl(INADDR_ANY);
+        sin.sin_port = 0;
+        if (bind(state->sock_fd, (struct sockaddr *)&sin, sizeof sin) != 0) {
+            close_socket(state->sock_fd);
+            state->sock_fd = ANTS_INVALID_SOCKET;
+            return ANTS_ERROR_PEER_UNREACHABLE;
+        }
+    } else {
+        struct sockaddr_in6 sin6 = {0};
+        sin6.sin6_family = AF_INET6;
+        sin6.sin6_addr = in6addr_any;
+        sin6.sin6_port = 0;
+        if (bind(state->sock_fd, (struct sockaddr *)&sin6, sizeof sin6) != 0) {
+            close_socket(state->sock_fd);
+            state->sock_fd = ANTS_INVALID_SOCKET;
+            return ANTS_ERROR_PEER_UNREACHABLE;
+        }
+    }
+    if (set_nonblocking(state->sock_fd) != 0) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    state->local_addr_len = sizeof state->local_addr;
+    if (getsockname(
+            state->sock_fd, (struct sockaddr *)&state->local_addr, &state->local_addr_len) != 0) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    return ANTS_OK;
+}
+
 ants_error_t ants_transport_dial(ants_transport_t *t,
                                  const char *multiaddr,
                                  const ants_peer_id_t *expected_peer_id,
                                  ants_transport_conn_t *out_conn)
 {
-    (void)t;
-    (void)multiaddr;
-    (void)expected_peer_id;
-    (void)out_conn;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (t == NULL || multiaddr == NULL || out_conn == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_transport_state *state = (struct ants_transport_state *)(void *)t->_opaque;
+    if (state->quic == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Parse the multiaddr (also validates the format). */
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_addr_len;
+    ants_error_t err = parse_multiaddr(multiaddr, &peer_addr, &peer_addr_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Open an ephemeral local socket if we don't have a listener. */
+    err = ensure_dial_socket(state, peer_addr.ss_family);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Initialise the conn-state buffer. */
+    memset(out_conn->_opaque, 0, sizeof out_conn->_opaque);
+    struct ants_transport_conn_state *cs =
+        (struct ants_transport_conn_state *)(void *)out_conn->_opaque;
+    cs->parent = state;
+    if (expected_peer_id != NULL) {
+        memcpy(cs->expected_peer_id, expected_peer_id->bytes, ANTS_PEER_ID_SIZE);
+        cs->expected_set = 1;
+    }
+
+    /* picoquic_create_client_cnx is the convenience entry point that
+     * creates the connection AND queues the initial packet. We pass
+     * ALPN "ants" and SNI=NULL (we don't use server-name routing —
+     * peer identity comes from the raw-pubkey TLS handshake, plumbed
+     * in phase 3b). The picoquic_stream_data_cb_fn is NULL here; the
+     * bridge that translates picoquic events to ants_transport_event_t
+     * lands in phase 3c. */
+    uint64_t now = picoquic_current_time();
+    cs->cnx = picoquic_create_client_cnx(state->quic,
+                                         (struct sockaddr *)&peer_addr,
+                                         now,
+                                         0,    /* preferred_version (0 = auto) */
+                                         NULL, /* sni */
+                                         "ants",
+                                         NULL, /* callback_fn — phase 3c */
+                                         NULL /* callback_ctx — phase 3c */);
+    if (cs->cnx == NULL) {
+        memset(out_conn->_opaque, 0, sizeof out_conn->_opaque);
+        return ANTS_ERROR_HANDSHAKE_FAILED;
+    }
+
+    /* Phase 3 caveat: without TLS material (RFC 7250 raw pubkey + the
+     * sign_fn wired into picotls — phase 3b), the handshake will fail
+     * once the server-side validation kicks in. The dial *queues* the
+     * INITIAL packet successfully and the caller's tick() will flush
+     * it onto the wire, so the network path is exercised. The CONN_
+     * READY / CONN_CLOSED events surface in phase 3c once the
+     * callback bridge is in place. */
+
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */

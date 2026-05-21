@@ -247,16 +247,78 @@ static void test_listener_bad_multiaddr(void)
     CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_dial_stub(void)
+static void test_dial_rejects_invalid_args(void)
 {
     ants_transport_t t = {{0}};
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.sign_fn = test_noop_sign;
+    cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
+
     ants_transport_conn_t c = {{0}};
-    ants_peer_id_t expected = {{0}};
-    CHECK_EQ(ants_transport_dial(&t, "/ip4/127.0.0.1/udp/4242/quic-v1", &expected, &c),
-             ANTS_ERROR_NOT_IMPLEMENTED);
-    /* NULL expected_peer_id is also accepted (and returns NOT_IMPLEMENTED). */
-    CHECK_EQ(ants_transport_dial(&t, "/ip4/127.0.0.1/udp/4242/quic-v1", NULL, &c),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+
+    /* NULL guards */
+    CHECK_EQ(ants_transport_dial(NULL, "/ip4/127.0.0.1/udp/4242/quic-v1", NULL, &c),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_dial(&t, NULL, NULL, &c), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_dial(&t, "/ip4/127.0.0.1/udp/4242/quic-v1", NULL, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Bad multiaddr */
+    CHECK_EQ(ants_transport_dial(&t, "not-a-multiaddr", NULL, &c), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_dial(&t, "/ip4/127.0.0.1/tcp/4242", NULL, &c), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+}
+
+static void test_dial_to_listener_no_handshake(void)
+{
+    /* Phase 3a: dial() creates a picoquic client connection and queues
+     * the INITIAL packet. Without TLS material wired up (phase 3b), the
+     * actual handshake won't complete, but the dial path is exercised:
+     *   1. parse_multiaddr ok
+     *   2. ephemeral UDP socket bound on the dialer
+     *   3. picoquic_create_client_cnx returns non-NULL
+     *   4. tick() flushes the INITIAL packet onto the wire
+     *
+     * ASan/UBSan would catch any leak or UB along the way. */
+
+    /* Listener: bind a random local port. */
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t listener_cfg;
+    memset(&listener_cfg, 0, sizeof listener_cfg);
+    listener_cfg.sign_fn = test_noop_sign;
+    listener_cfg.event_fn = test_noop_event;
+    listener_cfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &listener_cfg), ANTS_OK);
+
+    char listener_addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, listener_addr, sizeof listener_addr), ANTS_OK);
+
+    /* Dialer: no listener (client-only). */
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dialer_cfg;
+    memset(&dialer_cfg, 0, sizeof dialer_cfg);
+    dialer_cfg.sign_fn = test_noop_sign;
+    dialer_cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_transport_init(&dialer, &dialer_cfg), ANTS_OK);
+
+    /* Dial the listener. NULL expected_peer_id (no MITM check). */
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, listener_addr, NULL, &conn), ANTS_OK);
+
+    /* Run a few ticks on both. The dialer should at least try to send
+     * the INITIAL packet; the listener may receive bytes (which
+     * picoquic_incoming_packet will eventually fail on without TLS
+     * material — that's expected for phase 3a). No crash, no leak. */
+    for (int i = 0; i < 10; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
 }
 
 static void test_stream_stubs(void)
@@ -311,7 +373,8 @@ int main(void)
     test_listener_bind();
     test_local_addr_without_listener();
     test_listener_bad_multiaddr();
-    test_dial_stub();
+    test_dial_rejects_invalid_args();
+    test_dial_to_listener_no_handshake();
     test_stream_stubs();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
