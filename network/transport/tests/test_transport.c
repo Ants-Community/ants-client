@@ -321,18 +321,178 @@ static void test_dial_to_listener_no_handshake(void)
     CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
 }
 
-static void test_stream_stubs(void)
+static void test_stream_rejects_invalid_args(void)
 {
-    ants_transport_conn_t c = {{0}};
+    /* Phase 3c contract: NULL guards, fin-only stream_send with a non-
+     * zero len rejects, and operations on a stream whose parent_conn
+     * is dead (e.g. the zero-init handle a test stack-allocates) return
+     * ANTS_ERROR_PEER_UNREACHABLE rather than NOT_IMPLEMENTED. */
+    ants_transport_conn_t c = {{0}}; /* zero-init: cnx==NULL */
     ants_transport_stream_t s = {{0}};
     uint8_t buf[16] = {0};
     size_t got;
-    CHECK_EQ(ants_transport_open_bidi_stream(&c, &s), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_open_uni_stream(&c, &s), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_stream_send(&s, buf, sizeof buf, false), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_stream_recv(&s, buf, sizeof buf, &got), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_stream_close(&s), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_stream_reset(&s, 42), ANTS_ERROR_NOT_IMPLEMENTED);
+
+    /* NULL arg rejections come first — they're independent of conn state. */
+    CHECK_EQ(ants_transport_open_bidi_stream(NULL, &s), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_open_bidi_stream(&c, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_open_uni_stream(NULL, &s), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_open_uni_stream(&c, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_stream_send(NULL, buf, sizeof buf, false), ANTS_ERROR_INVALID_ARG);
+    /* Non-zero len with NULL data is a contract violation. */
+    CHECK_EQ(ants_transport_stream_send(&s, NULL, sizeof buf, false), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_stream_recv(NULL, buf, sizeof buf, &got), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_stream_recv(&s, buf, sizeof buf, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_stream_close(NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_stream_reset(NULL, 42), ANTS_ERROR_INVALID_ARG);
+
+    /* With a dead/zero conn, opens fail with PEER_UNREACHABLE. */
+    CHECK_EQ(ants_transport_open_bidi_stream(&c, &s), ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK_EQ(ants_transport_open_uni_stream(&c, &s), ANTS_ERROR_PEER_UNREACHABLE);
+    /* Send/close/reset on a stream whose parent_conn pointer is NULL
+     * (default zero-init) also surface PEER_UNREACHABLE. */
+    CHECK_EQ(ants_transport_stream_send(&s, buf, sizeof buf, false), ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK_EQ(ants_transport_stream_close(&s), ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK_EQ(ants_transport_stream_reset(&s, 42), ANTS_ERROR_PEER_UNREACHABLE);
+    /* Recv is a pure observer of the local recv buffer — on a zeroed
+     * stream it reports 0 bytes with no error. */
+    got = 99;
+    CHECK_EQ(ants_transport_stream_recv(&s, buf, sizeof buf, &got), ANTS_OK);
+    CHECK(got == 0);
+}
+
+/* Tiny event recorder: counts kinds seen by the user's event_fn. */
+typedef struct {
+    int conn_ready;
+    int conn_closed;
+    int stream_readable;
+    int stream_fin;
+    int stream_reset;
+    int other;
+} test_event_recorder_t;
+
+static ants_error_t test_recording_event(const ants_transport_event_t *event, void *user_ctx)
+{
+    test_event_recorder_t *r = (test_event_recorder_t *)user_ctx;
+    switch (event->kind) {
+    case ANTS_TRANSPORT_EV_CONN_READY:
+        r->conn_ready++;
+        break;
+    case ANTS_TRANSPORT_EV_CONN_CLOSED:
+        r->conn_closed++;
+        break;
+    case ANTS_TRANSPORT_EV_STREAM_READABLE:
+        r->stream_readable++;
+        break;
+    case ANTS_TRANSPORT_EV_STREAM_FIN:
+        r->stream_fin++;
+        break;
+    case ANTS_TRANSPORT_EV_STREAM_RESET:
+        r->stream_reset++;
+        break;
+    default:
+        r->other++;
+        break;
+    }
+    return ANTS_OK;
+}
+
+static void test_stream_lifecycle(void)
+{
+    /* Phase 3c: open + send + recv + close + reset on a live dial.
+     * Without TLS (phase 3b deferred), the handshake never completes so
+     * no payload reaches the listener — but the local API path is fully
+     * exercised: stream-id allocation, picoquic_set_app_stream_ctx
+     * binding, send queue, FIN propagation, RESET. ASan/UBSan catch
+     * any leak or UB along the way. */
+    test_event_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t lcfg;
+    memset(&lcfg, 0, sizeof lcfg);
+    lcfg.sign_fn = test_noop_sign;
+    lcfg.event_fn = test_recording_event;
+    lcfg.event_ctx = &rec;
+    lcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &lcfg), ANTS_OK);
+
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.sign_fn = test_noop_sign;
+    dcfg.event_fn = test_recording_event;
+    dcfg.event_ctx = &rec;
+    CHECK_EQ(ants_transport_init(&dialer, &dcfg), ANTS_OK);
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+
+    /* Open both stream types. picoquic_get_next_local_stream_id +
+     * picoquic_set_app_stream_ctx must materialise both without error. */
+    ants_transport_stream_t s_bidi = {{0}};
+    ants_transport_stream_t s_uni = {{0}};
+    CHECK_EQ(ants_transport_open_bidi_stream(&conn, &s_bidi), ANTS_OK);
+    CHECK_EQ(ants_transport_open_uni_stream(&conn, &s_uni), ANTS_OK);
+
+    /* Send: bytes queue into picoquic's send buffer. Won't actually flow
+     * until handshake completes (which won't happen without TLS), but
+     * the API path is exercised. */
+    const uint8_t payload[] = "hello";
+    CHECK_EQ(ants_transport_stream_send(&s_bidi, payload, sizeof payload, false /* fin */),
+             ANTS_OK);
+    CHECK_EQ(ants_transport_stream_send(&s_uni, payload, sizeof payload, true /* fin */), ANTS_OK);
+    /* After fin=true, further sends on s_uni reject with INVALID_ARG. */
+    CHECK_EQ(ants_transport_stream_send(&s_uni, payload, sizeof payload, false),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Recv before any inbound bytes: 0 length, no error. */
+    uint8_t buf[16];
+    size_t got = 99;
+    CHECK_EQ(ants_transport_stream_recv(&s_bidi, buf, sizeof buf, &got), ANTS_OK);
+    CHECK(got == 0);
+
+    /* stream_close on bidi sends FIN; idempotent second call also OK. */
+    CHECK_EQ(ants_transport_stream_close(&s_bidi), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_close(&s_bidi), ANTS_OK);
+
+    /* Open one more stream and reset it; reset path is independent of
+     * close path. */
+    ants_transport_stream_t s_reset = {{0}};
+    CHECK_EQ(ants_transport_open_bidi_stream(&conn, &s_reset), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_reset(&s_reset, 42), ANTS_OK);
+
+    /* Drive the I/O loop. picoquic may fire CONN_CLOSED if it detects
+     * the listener has no TLS material; we don't tightly require it
+     * (timing is picoquic-internal) so just verify no crash. */
+    for (int i = 0; i < 20; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+
+    /* peer_disconnect: graceful close queues CONNECTION_CLOSE.
+     * Idempotent if the conn already closed itself. */
+    CHECK_EQ(ants_transport_peer_disconnect(&conn, 0), ANTS_OK);
+
+    /* Flush the close. */
+    for (int i = 0; i < 5; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+
+    /* peer_disconnect is idempotent after the conn is dead. */
+    CHECK_EQ(ants_transport_peer_disconnect(&conn, 0), ANTS_OK);
+
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+
+    /* The recorder is allowed to have observed CONN_CLOSED but is not
+     * required to — picoquic's exact behaviour without TLS depends on
+     * internal state machine handling. We do NOT assert specific counts
+     * here; the phase-3d loopback PR will exercise real event flow. */
+    (void)rec;
 }
 
 static void test_introspection_safe_defaults(void)
@@ -356,12 +516,18 @@ static void test_introspection_safe_defaults(void)
 
 static void test_conn_introspection_stubs(void)
 {
+    /* conn_peer_id and conn_peer_addr still require TLS handshake to
+     * have bound a peer identity — phase 3b. peer_disconnect IS wired
+     * (phase 3c) and is idempotent on a zero-init conn. */
     ants_transport_conn_t c = {{0}};
     ants_peer_id_t pid;
     char addr[ANTS_MULTIADDR_MAX_LEN];
     CHECK_EQ(ants_transport_conn_peer_id(&c, &pid), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_transport_conn_peer_addr(&c, addr, sizeof addr), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_peer_disconnect(&c, 0), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* peer_disconnect on a never-dialed conn is a no-op success. */
+    CHECK_EQ(ants_transport_peer_disconnect(&c, 0), ANTS_OK);
+    /* NULL guard. */
+    CHECK_EQ(ants_transport_peer_disconnect(NULL, 0), ANTS_ERROR_INVALID_ARG);
 }
 
 int main(void)
@@ -375,7 +541,8 @@ int main(void)
     test_listener_bad_multiaddr();
     test_dial_rejects_invalid_args();
     test_dial_to_listener_no_handshake();
-    test_stream_stubs();
+    test_stream_rejects_invalid_args();
+    test_stream_lifecycle();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
 
