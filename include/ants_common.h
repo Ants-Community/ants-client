@@ -81,6 +81,40 @@ typedef int32_t ants_error_t;
  * input exceeds u64, or sum of NCS exceeds u64::MAX). */
 #define ANTS_ERROR_OVERFLOW ((ants_error_t)7)
 
+/* ------------------------------------------------------------------------ */
+/* Network-transport error codes (component #4 + dependants).               */
+/*                                                                          */
+/* These four codes capture transport-state failures that have no protocol- */
+/* content interpretation: routers need to propagate them up so the caller  */
+/* (DHT, gossip, reputation) can demote the peer in its routing table.      */
+/* Codes 8-11 are pinned and append-only; new transport codes go above 11.  */
+/* ------------------------------------------------------------------------ */
+
+/* The peer is unreachable: dial failed, no response within retry budget,
+ * all known addresses exhausted. Distinct from MALFORMED (which means
+ * "we got a wire frame we couldn't parse") and from HANDSHAKE_FAILED
+ * (which means "we reached them but TLS refused"). */
+#define ANTS_ERROR_PEER_UNREACHABLE ((ants_error_t)8)
+
+/* The TLS 1.3 handshake refused or aborted: certificate-equivalent
+ * (RFC 7250 raw pubkey) validation failed, version mismatch, or the
+ * peer terminated the handshake mid-flight. Does NOT cover MITM
+ * detection — see PEER_MISMATCH for that. */
+#define ANTS_ERROR_HANDSHAKE_FAILED ((ants_error_t)9)
+
+/* The peer presented an Ed25519 pubkey different from the
+ * caller-supplied `expected_peer_id`. The handshake fails closed
+ * before any application data flows. This is the anti-MITM defence
+ * for GenesisState bootstrap_dht_seeds per RFC-0010, where the
+ * trusted peer_id is known a priori. */
+#define ANTS_ERROR_PEER_MISMATCH ((ants_error_t)10)
+
+/* The peer sent a QUIC RESET_STREAM frame mid-transfer. Whatever
+ * bytes we received before the reset are still valid; no more will
+ * come. Distinct from PEER_UNREACHABLE (whole connection lost) and
+ * from MALFORMED (we got bytes we couldn't parse). */
+#define ANTS_ERROR_STREAM_RESET ((ants_error_t)11)
+
 /*
  * Convert an ants_error_t to a short human-readable string. The returned
  * pointer is to a static literal — caller must not free it. Returns

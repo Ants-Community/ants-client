@@ -76,17 +76,26 @@ static void check_bytes(const char *what,
 
 static void test_strerror_covers_every_code(void)
 {
-    /* Defined codes are 0..7 inclusive (matching the #define values
-     * in ants_common.h). Hidden ANTS_ERROR__MAX is no longer public
+    /* Defined codes are 0..11 inclusive (matching the #define values
+     * in ants_common.h: 0..7 = foundation-layer codes, 8..11 = network-
+     * transport codes). Hidden ANTS_ERROR__MAX is no longer public
      * — see the same header for the ABI-pinning rationale. */
-    for (int i = 0; i <= 7; i++) {
+    for (int i = 0; i <= 11; i++) {
         const char *s = ants_strerror((ants_error_t)i);
         CHECK(s != NULL);
         CHECK(strlen(s) > 0);
+        /* All codes must have a meaningful string, not the "unknown"
+         * fallback. */
+        CHECK(strcmp(s, "unknown") != 0);
     }
+    /* Out-of-range codes return "unknown". */
     const char *unk = ants_strerror((ants_error_t)9999);
     CHECK(unk != NULL);
     CHECK(strcmp(unk, "unknown") == 0);
+    /* Negative codes too. */
+    const char *neg = ants_strerror((ants_error_t)-1);
+    CHECK(neg != NULL);
+    CHECK(strcmp(neg, "unknown") == 0);
 }
 
 static void test_enc_init_rejects_invalid_args(void)

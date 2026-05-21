@@ -43,6 +43,14 @@ const char *ants_strerror(ants_error_t err)
         return "unsupported type";
     case ANTS_ERROR_OVERFLOW:
         return "overflow";
+    case ANTS_ERROR_PEER_UNREACHABLE:
+        return "peer unreachable";
+    case ANTS_ERROR_HANDSHAKE_FAILED:
+        return "handshake failed";
+    case ANTS_ERROR_PEER_MISMATCH:
+        return "peer pubkey mismatch";
+    case ANTS_ERROR_STREAM_RESET:
+        return "stream reset";
     default:
         return "unknown";
     }
