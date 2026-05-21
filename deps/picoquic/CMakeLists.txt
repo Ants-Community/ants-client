@@ -74,10 +74,25 @@ target_link_libraries(picoquic_core PUBLIC picotls_minicrypto)
 # Force minicrypto as the only crypto provider. The header
 # picoquic_crypto_provider_api.h exposes per-backend init functions;
 # we register only minicrypto.
+#
+# _GNU_SOURCE exposes Linux-specific socket types (struct in_pktinfo
+# in <netinet/in.h>) that picosocks.c relies on; without it the
+# Linux build fails. _DEFAULT_SOURCE is the modern glibc spelling
+# but _GNU_SOURCE covers older glibc too.
 target_compile_definitions(picoquic_core PRIVATE
     PICOQUIC_WITHOUT_OPENSSL=1
     PTLS_WITHOUT_OPENSSL=1
+    $<$<NOT:$<PLATFORM_ID:Windows>>:_GNU_SOURCE=1>
 )
+
+# picoquic uses pthread_mutex_t internally (picoquic_utils.h gates the
+# typedef on _WIN32). Link the threading library on non-Windows.
+# This is vendored code's choice; our own foundation code doesn't
+# spawn threads (per CONTRIBUTING.md "no hidden threads").
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(picoquic_core PUBLIC Threads::Threads)
+endif()
 
 target_compile_features(picoquic_core PUBLIC c_std_99)
 
