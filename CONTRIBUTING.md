@@ -43,6 +43,33 @@ IMPLEMENTATION.md §"How to claim a sub-component" step 5.
   extensions, no platform-specific intrinsics outside the
   platforms/ subdirs of components that explicitly need them
   (e.g., `inference/kernels/platforms/x86_avx2.c`).
+- **The reference client is 100% C.** No C++, no Rust, no Go,
+  no language-FFI wrappers anywhere in the runtime. This applies
+  to:
+  - Our own code (every `.c` and `.h` file in `foundation/`,
+    `network/`, `reputation/`, `cache/`, `inference/`, `economy/`).
+  - Every vendored dependency under `deps/`. If a candidate
+    library is C++ (msquic, eigen3, ONNX runtime, FAISS, hnswlib),
+    Rust (quiche, rust-libp2p), or Go (go-libp2p), it is
+    **disqualified** regardless of how mature or fast it is.
+    The alternative is either a pure-C peer (picoquic vs msquic,
+    BLIS vs eigen3) or writing our own pure-C implementation.
+  - Test code, fuzzing harnesses, and benchmark code.
+  - The only exceptions: `.hpp` files that exist in a vendored
+    source tree but are NEVER compiled by our build (e.g.
+    `deps/blst/src/blst_t.hpp` is present in the snapshot but
+    isn't reached by the single-TU compilation of `server.c`).
+    These are documented in the dep's `README.md` "what is
+    intentionally not vendored" section.
+
+  Why: cross-platform reach without runtime dependencies is the
+  ANTS protocol's day-zero stance (per the manifesto and
+  IMPLEMENTATION.md §"Language and stack"). Any language other
+  than C drags in a runtime, complicates audit, and creates a
+  porting tax on every platform where that runtime hasn't been
+  validated. The trade-off: we accept slower time-to-feature on
+  some primitives in exchange for a uniform single-language
+  audit surface across every line we ship.
 - **Audit-friendliness over cleverness.** Every line does one
   thing. No hidden control flow, no macro magic, no implicit
   conversions on hot paths.
