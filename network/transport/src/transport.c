@@ -29,6 +29,13 @@
 
 #include "ants_crypto.h"
 #include "picoquic.h"
+/* picoquic_internal.h uses pthread types (pthread_mutex_t, pthread_t)
+ * unconditionally on non-Windows. Their visibility under glibc requires
+ * including <pthread.h> ourselves; the picoquic core does this via
+ * _GNU_SOURCE + its own includes, but our compilation unit is separate. */
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <pthread.h>
+#endif
 /* picoquic doesn't expose its master picotls context through the public
  * header. We need it to wire RFC 7250 raw-pubkey TLS (sign_certificate,
  * verify_certificate, use_raw_public_keys). Reaching into the internal
@@ -538,9 +545,9 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
     uint64_t current_time = picoquic_current_time();
 
     state->quic = picoquic_create(max_cnx,
-                                  NULL,   /* cert_file_name — we configure TLS post-create below */
-                                  NULL,   /* key_file_name  — same */
-                                  NULL,   /* cert_root_file_name — raw-pubkey mode, no CA */
+                                  NULL,   /* cert_file_name; TLS configured below */
+                                  NULL,   /* key_file_name; TLS configured below */
+                                  NULL,   /* cert_root_file_name; raw-pubkey, no CA */
                                   "ants", /* default_alpn — registered with peers */
                                   NULL,   /* default_callback_fn — phase 3 */
                                   NULL,   /* default_callback_ctx — phase 3 */
@@ -548,7 +555,7 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
                                   NULL,   /* cnx_id_callback_data */
                                   reset_seed,
                                   current_time,
-                                  NULL, /* p_simulated_time — production uses wall clock */
+                                  NULL, /* p_simulated_time — wall clock in prod */
                                   NULL, /* ticket_file_name — no session resumption yet */
                                   NULL, /* ticket_encryption_key */
                                   0);
