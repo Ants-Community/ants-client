@@ -27,6 +27,15 @@ target_include_directories(picotls_core PRIVATE
 
 target_compile_features(picotls_core PUBLIC c_std_99)
 
+# _GNU_SOURCE exposes Linux glibc functions that picotls relies on
+# (posix_memalign, strdup, syscall) without making them visible
+# under a strict C99 feature-test set. Same generator-expression
+# guard as deps/picoquic — no-op on Windows and macOS (where these
+# are unconditionally exposed).
+target_compile_definitions(picotls_core PRIVATE
+    $<$<NOT:$<PLATFORM_ID:Windows>>:_GNU_SOURCE=1>
+)
+
 # Upstream is built with looser warning flags; the project's pedantic
 # set treats picotls as vendored code (same approach as deps/blst).
 if(NOT MSVC)
@@ -90,6 +99,12 @@ target_include_directories(picotls_minicrypto PRIVATE
 
 target_link_libraries(picotls_minicrypto PUBLIC picotls_core)
 target_compile_features(picotls_minicrypto PUBLIC c_std_99)
+
+# Same _GNU_SOURCE rationale as picotls_core (cifra adapter + uecc
+# also pull glibc functions on Linux). No-op on macOS/Windows.
+target_compile_definitions(picotls_minicrypto PRIVATE
+    $<$<NOT:$<PLATFORM_ID:Windows>>:_GNU_SOURCE=1>
+)
 
 if(NOT MSVC)
     target_compile_options(picotls_minicrypto PRIVATE
