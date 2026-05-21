@@ -186,6 +186,18 @@ static ptls_verify_certificate_t ants_verify_cert_singleton = {
  * comes later (after ants_transport_state) for readability. */
 struct ants_transport_conn_state;
 
+/* Forward declaration of the picoquic bridge callback. picoquic_create
+ * (called from ants_transport_init) takes it as default_callback_fn for
+ * inbound cnx; the definition lives later in the file alongside the
+ * conn-state struct it operates on. */
+static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
+                                    uint64_t stream_id,
+                                    uint8_t *bytes,
+                                    size_t length,
+                                    picoquic_call_back_event_t fin_or_event,
+                                    void *callback_ctx,
+                                    void *stream_ctx);
+
 /* sign_certificate callback: invoked by picotls during the TLS 1.3
  * handshake when this side needs to sign the CertificateVerify message
  * with its private key. We delegate to the caller-supplied sign_fn,
@@ -280,7 +292,19 @@ ants_verify_sign_cb(void *verify_ctx, uint16_t algo, ptls_iovec_t data, ptls_iov
 /* compile-time assert at the bottom catches overrun.                       */
 /* ------------------------------------------------------------------------ */
 
+/* Magic discriminators. picotls's verify_certificate runs for inbound
+ * cnx BEFORE we've had a chance to call picoquic_set_callback to bind a
+ * conn-state — so the callback_ctx it sees is the master's default ctx,
+ * which we set to the transport state. The magic field as the first 4
+ * bytes of both structs lets the verify_certificate handler tell the
+ * two apart without casting blindly. */
+#define ANTS_TRANSPORT_STATE_MAGIC      0x414E5453U /* "ANTS" */
+#define ANTS_TRANSPORT_CONN_STATE_MAGIC 0x414E5443U /* "ANTC" */
+
 struct ants_transport_state {
+    /* MUST be the first field — see magic discriminator note above. */
+    uint32_t magic;
+
     /* The vendored picoquic QUIC context. Allocated by picoquic_create
      * in init; freed by picoquic_free in destroy. */
     picoquic_quic_t *quic;
@@ -321,6 +345,14 @@ struct ants_transport_state {
      *
      * verify_certificate is stateless (just cb + algos), so we use a
      * static singleton — see ants_verify_cert_singleton. */
+
+    /* Head of the linked list of heap-allocated conn-states for inbound
+     * connections (where the listener accepts an INITIAL packet rather
+     * than the caller dialing). Each cs is freed either on CONN_CLOSED
+     * for that cnx or, as a safety net, on ants_transport_destroy when
+     * picoquic_free deletes any still-open inbound cnx without firing
+     * the close callback. */
+    struct ants_transport_conn_state *inbound_conns_head;
 };
 
 /* ants_transport_t MUST be at least as large as the internal state
@@ -330,6 +362,60 @@ struct ants_transport_state {
  * Same pattern as ants_blake3_ctx_size_check in foundation/crypto. */
 typedef char ants_transport_state_size_check
     [(sizeof(struct ants_transport_state) <= sizeof(((ants_transport_t *)0)->_opaque)) ? 1 : -1];
+
+/* ------------------------------------------------------------------------ */
+/* Connection-state internal struct                                         */
+/*                                                                          */
+/* Lives inside the caller's opaque ants_transport_conn_t buffer (outbound  */
+/* dials) or on the heap (inbound cnx — see verify_certificate bootstrap). */
+/* Pinned at 8 KB by the public header; the size-check typedef below       */
+/* asserts the struct fits.                                                 */
+/* ------------------------------------------------------------------------ */
+
+struct ants_transport_conn_state {
+    /* MUST be the first field. Discriminator for verify_certificate to
+     * distinguish a conn-state from the transport state (which is what
+     * picoquic_get_callback_context returns for an inbound cnx that
+     * hasn't yet been rebound). See ANTS_TRANSPORT_*_MAGIC. */
+    uint32_t magic;
+
+    /* The vendored picoquic connection. NULL until picoquic_create_client_cnx
+     * succeeds; cleared back to NULL when picoquic deletes it after a
+     * close callback fires (peer-initiated close, application close, or
+     * stateless reset). All stream APIs must check this is non-NULL
+     * before touching picoquic. */
+    picoquic_cnx_t *cnx;
+
+    /* Back-pointer to the parent transport. The connection-scope
+     * callback uses parent->event_fn / event_ctx to surface events to
+     * the user. */
+    struct ants_transport_state *parent;
+
+    /* expected_peer_id from dial(), if any. When set (expected_set != 0)
+     * the verify_certificate callback fails closed if the peer presents
+     * a different pubkey. */
+    uint8_t expected_peer_id[ANTS_PEER_ID_SIZE];
+    int expected_set;
+
+    /* Peer's Ed25519 pubkey, populated by the verify_certificate
+     * callback once the peer's TLS Certificate message arrives. Mirrored
+     * into ANTS_TRANSPORT_EV_CONN_READY.peer_id by the callback bridge. */
+    uint8_t peer_pubkey[ANTS_ED25519_PUBKEY_SIZE];
+    int peer_pubkey_set;
+
+    /* Inbound-cnx bookkeeping. is_heap == 1 means this struct was
+     * malloc'd by the verify_certificate bootstrap (for an inbound
+     * cnx the caller never dialed) and needs free() on CONN_CLOSED or
+     * transport destroy. next_inbound chains the transport's
+     * inbound_conns_head list so destroy can sweep orphaned cs's. */
+    int is_heap;
+    struct ants_transport_conn_state *next_inbound;
+};
+
+typedef char ants_transport_conn_state_size_check[(sizeof(struct ants_transport_conn_state) <=
+                                                   sizeof(((ants_transport_conn_t *)0)->_opaque))
+                                                      ? 1
+                                                      : -1];
 
 /* ------------------------------------------------------------------------ */
 /* Multiaddr parser                                                         */
@@ -514,6 +600,7 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
      * well-defined values; the picoquic pointer is then explicitly
      * NULL until create() succeeds. */
     memset(t->_opaque, 0, sizeof t->_opaque);
+    state->magic = ANTS_TRANSPORT_STATE_MAGIC;
     state->sock_fd = ANTS_INVALID_SOCKET;
 
     /* Snapshot identity + callbacks. */
@@ -544,15 +631,21 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
     uint8_t reset_seed[PICOQUIC_RESET_SECRET_SIZE] = {0};
     uint64_t current_time = picoquic_current_time();
 
+    /* default_callback = our bridge with transport state as ctx. For
+     * inbound cnx, picotls's verify_certificate (which runs before any
+     * picoquic_callback) calls picoquic_set_callback to rebind to a
+     * fresh per-cnx cs. So in steady state the bridge ALWAYS sees a cs;
+     * the state-as-ctx only persists between cnx creation and verify_
+     * certificate firing. */
     state->quic = picoquic_create(max_cnx,
                                   NULL,   /* cert_file_name; TLS configured below */
                                   NULL,   /* key_file_name; TLS configured below */
                                   NULL,   /* cert_root_file_name; raw-pubkey, no CA */
                                   "ants", /* default_alpn — registered with peers */
-                                  NULL,   /* default_callback_fn — phase 3 */
-                                  NULL,   /* default_callback_ctx — phase 3 */
-                                  NULL,   /* cnx_id_callback */
-                                  NULL,   /* cnx_id_callback_data */
+                                  ants_transport_stream_cb,
+                                  state,
+                                  NULL, /* cnx_id_callback */
+                                  NULL, /* cnx_id_callback_data */
                                   reset_seed,
                                   current_time,
                                   NULL, /* p_simulated_time — wall clock in prod */
@@ -606,6 +699,13 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
     tls_ctx->certificates.count = 1;
     tls_ctx->sign_certificate = &sign_cert->super;
     tls_ctx->verify_certificate = &ants_verify_cert_singleton;
+    /* Mutual TLS authentication. ANTS is a true peer-to-peer protocol:
+     * each side must know the other's pubkey. With require_client_auth=1
+     * the server requests a client certificate, both peers send Certificate
+     * + CertificateVerify, both verify_certificate callbacks fire, and
+     * both event_fn's see CONN_READY with peer_id mirrored from cs->
+     * peer_pubkey. */
+    tls_ctx->require_client_authentication = 1;
 
     /* picoquic_create with NULL cert/key implies client-only mode (sets
      * quic->enforce_client_only = 1, see deps/picoquic .../quicctx.c
@@ -658,6 +758,18 @@ ants_error_t ants_transport_destroy(ants_transport_t *t, uint64_t close_code)
         picoquic_free(state->quic);
         state->quic = NULL;
     }
+    /* Free any heap-allocated inbound conn-states whose CONN_CLOSED
+     * callback never fired before picoquic_free deleted their cnx
+     * (picoquic_delete_cnx silently drops connections without invoking
+     * the close callback). picoquic_free already torn down the cnx
+     * pointers; we just reclaim the cs heap. */
+    struct ants_transport_conn_state *cs = state->inbound_conns_head;
+    while (cs != NULL) {
+        struct ants_transport_conn_state *next = cs->next_inbound;
+        free(cs);
+        cs = next;
+    }
+    state->inbound_conns_head = NULL;
     /* Wipe the rest of the opaque buffer so later misuse of the (now
      * dead) transport is observable as zeroed fields rather than
      * dangling state. */
@@ -837,45 +949,6 @@ ants_error_t ants_transport_local_addr(const ants_transport_t *t, char *out_buf,
 /* Dialing                                                                  */
 /* ------------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------------ */
-/* Connection-state internal struct                                         */
-/*                                                                          */
-/* Lives inside the caller's opaque ants_transport_conn_t buffer.           */
-/* Pinned at 8 KB by the public header; the size-check typedef below       */
-/* asserts the struct fits.                                                 */
-/* ------------------------------------------------------------------------ */
-
-struct ants_transport_conn_state {
-    /* The vendored picoquic connection. NULL until picoquic_create_client_cnx
-     * succeeds; cleared back to NULL when picoquic deletes it after a
-     * close callback fires (peer-initiated close, application close, or
-     * stateless reset). All stream APIs must check this is non-NULL
-     * before touching picoquic. */
-    picoquic_cnx_t *cnx;
-
-    /* Back-pointer to the parent transport. The connection-scope
-     * callback uses parent->event_fn / event_ctx to surface events to
-     * the user. */
-    struct ants_transport_state *parent;
-
-    /* expected_peer_id from dial(), if any. When set (expected_set != 0)
-     * the handshake verification (phase 3b, once TLS is wired) will
-     * fail closed if the peer presents a different pubkey. */
-    uint8_t expected_peer_id[ANTS_PEER_ID_SIZE];
-    int expected_set;
-
-    /* Peer's Ed25519 pubkey, populated by the verify_certificate
-     * callback once the peer's TLS Certificate message arrives. Mirrored
-     * into ANTS_TRANSPORT_EV_CONN_READY.peer_id by the callback bridge. */
-    uint8_t peer_pubkey[ANTS_ED25519_PUBKEY_SIZE];
-    int peer_pubkey_set;
-};
-
-typedef char ants_transport_conn_state_size_check[(sizeof(struct ants_transport_conn_state) <=
-                                                   sizeof(((ants_transport_conn_t *)0)->_opaque))
-                                                      ? 1
-                                                      : -1];
-
 /* verify_certificate callback body. Declared above near the sign_cert
  * adapters; defined here so it can reference the conn-state struct. */
 static int ants_verify_cert_cb(
@@ -897,21 +970,59 @@ static int ants_verify_cert_cb(
         return PTLS_ALERT_BAD_CERTIFICATE;
     }
 
-    /* Map ptls_t back to picoquic_cnx_t back to our conn-state. picoquic
-     * stashes cnx in ptls_get_data_ptr() at connection creation (see
-     * tls_api.c:2125). Our app-level callback context is the cs pointer
-     * (set in ants_transport_dial), retrievable via picoquic_get_callback_
-     * context. On the listener side cs may be NULL — we still verify, we
-     * just skip the mirror. */
+    /* Map ptls_t → picoquic_cnx_t → our conn-state. picoquic stashes cnx
+     * in ptls_get_data_ptr() at connection creation (tls_api.c:2125).
+     * The cnx's callback context is one of two things, distinguished by
+     * the first uint32_t at that address:
+     *   - For outbound (caller dialed): a struct ants_transport_conn_state*
+     *     (magic = CONN_STATE_MAGIC), set by ants_transport_dial.
+     *   - For inbound (peer's INITIAL arrived on our listening socket):
+     *     the default callback context, which is the transport state*
+     *     (magic = STATE_MAGIC). In this case we heap-allocate a fresh
+     *     cs and rebind via picoquic_set_callback so subsequent events
+     *     find it. */
     picoquic_cnx_t *cnx = (picoquic_cnx_t *)*ptls_get_data_ptr(tls);
-    struct ants_transport_conn_state *cs =
-        (cnx != NULL) ? (struct ants_transport_conn_state *)picoquic_get_callback_context(cnx)
-                      : NULL;
+    if (cnx == NULL) {
+        return PTLS_ALERT_INTERNAL_ERROR;
+    }
+    void *cb_ctx = picoquic_get_callback_context(cnx);
+    if (cb_ctx == NULL) {
+        return PTLS_ALERT_INTERNAL_ERROR;
+    }
+    uint32_t magic;
+    memcpy(&magic, cb_ctx, sizeof magic);
+
+    struct ants_transport_conn_state *cs;
+    if (magic == ANTS_TRANSPORT_CONN_STATE_MAGIC) {
+        /* Outbound: caller dialed, cs is already in their _opaque buffer. */
+        cs = (struct ants_transport_conn_state *)cb_ctx;
+    } else if (magic == ANTS_TRANSPORT_STATE_MAGIC) {
+        /* Inbound: bootstrap a fresh cs and rebind picoquic's callback
+         * so future events on this cnx see cs (not the transport state). */
+        struct ants_transport_state *state = (struct ants_transport_state *)cb_ctx;
+        cs = (struct ants_transport_conn_state *)malloc(sizeof *cs);
+        if (cs == NULL) {
+            return PTLS_ERROR_NO_MEMORY;
+        }
+        memset(cs, 0, sizeof *cs);
+        cs->magic = ANTS_TRANSPORT_CONN_STATE_MAGIC;
+        cs->cnx = cnx;
+        cs->parent = state;
+        cs->is_heap = 1;
+        /* Link into the transport's inbound-conns list so destroy() can
+         * sweep any cs's whose CONN_CLOSED never fired. */
+        cs->next_inbound = state->inbound_conns_head;
+        state->inbound_conns_head = cs;
+        picoquic_set_callback(cnx, ants_transport_stream_cb, cs);
+    } else {
+        /* Neither magic matched — refuse to interpret cb_ctx blindly. */
+        return PTLS_ALERT_INTERNAL_ERROR;
+    }
 
     /* Always heap-allocate the pubkey passed to verify_sign — that's
      * the only path that gets cleanup-on-free semantics from picotls.
-     * If cs is reachable we ADDITIONALLY mirror into cs->peer_pubkey so
-     * the CONN_READY event_fn can surface it to the caller. */
+     * We ALSO mirror into cs->peer_pubkey so the CONN_READY event_fn
+     * can surface it to the caller. */
     uint8_t *peer_pub_ptr = (uint8_t *)malloc(ANTS_ED25519_PUBKEY_SIZE);
     if (peer_pub_ptr == NULL) {
         return PTLS_ERROR_NO_MEMORY;
@@ -920,20 +1031,16 @@ static int ants_verify_cert_cb(
         free(peer_pub_ptr);
         return PTLS_ALERT_BAD_CERTIFICATE;
     }
+    memcpy(cs->peer_pubkey, peer_pub_ptr, ANTS_ED25519_PUBKEY_SIZE);
+    cs->peer_pubkey_set = 1;
 
-    if (cs != NULL) {
-        memcpy(cs->peer_pubkey, peer_pub_ptr, ANTS_ED25519_PUBKEY_SIZE);
-        cs->peer_pubkey_set = 1;
-
-        /* expected_peer_id enforcement (anti-MITM for bootstrap_dht_seeds,
-         * RFC-0010). When the caller passed expected_peer_id to dial(),
-         * the handshake fails closed on mismatch. memcmp on public pubkeys
-         * is fine (no secret-dependent timing channel). */
-        if (cs->expected_set &&
-            memcmp(cs->peer_pubkey, cs->expected_peer_id, ANTS_PEER_ID_SIZE) != 0) {
-            free(peer_pub_ptr);
-            return PTLS_ALERT_BAD_CERTIFICATE;
-        }
+    /* expected_peer_id enforcement (anti-MITM for bootstrap_dht_seeds,
+     * RFC-0010). When the caller passed expected_peer_id to dial(), the
+     * handshake fails closed on mismatch. memcmp on public pubkeys is
+     * fine (no secret-dependent timing channel). */
+    if (cs->expected_set && memcmp(cs->peer_pubkey, cs->expected_peer_id, ANTS_PEER_ID_SIZE) != 0) {
+        free(peer_pub_ptr);
+        return PTLS_ALERT_BAD_CERTIFICATE;
     }
 
     *verify_sign = ants_verify_sign_cb;
@@ -1038,6 +1145,18 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     if (callback_ctx == NULL) {
         return 0;
     }
+    /* On inbound cnx, the FIRST callback arrives with callback_ctx ==
+     * default_callback_ctx == &transport_state, BEFORE picotls's verify_
+     * certificate has had a chance to bootstrap a per-cnx cs. In steady
+     * state the bridge always sees a real cs (verify_certificate runs
+     * before any picoquic_callback that surfaces a user-visible event),
+     * but pre-handshake events like stateless_reset can arrive earlier.
+     * Bail silently if we see the transport-state magic. */
+    uint32_t ctx_magic;
+    memcpy(&ctx_magic, callback_ctx, sizeof ctx_magic);
+    if (ctx_magic != ANTS_TRANSPORT_CONN_STATE_MAGIC) {
+        return 0;
+    }
     struct ants_transport_conn_state *cs = (struct ants_transport_conn_state *)callback_ctx;
     struct ants_transport_stream_state *ss = (struct ants_transport_stream_state *)stream_ctx;
     ants_transport_event_fn event_fn = cs->parent->event_fn;
@@ -1073,6 +1192,20 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
          * our pointer so subsequent stream ops fail closed rather than
          * use-after-free. */
         cs->cnx = NULL;
+        /* Heap-allocated cs (inbound bootstrap) needs to be unlinked from
+         * the transport's inbound list and freed. Outbound cs lives in
+         * the caller's _opaque buffer — never free()d by us. */
+        if (cs->is_heap) {
+            struct ants_transport_state *parent = cs->parent;
+            struct ants_transport_conn_state **link = &parent->inbound_conns_head;
+            while (*link != NULL && *link != cs) {
+                link = &(*link)->next_inbound;
+            }
+            if (*link == cs) {
+                *link = cs->next_inbound;
+            }
+            free(cs);
+        }
         break;
 
     case picoquic_callback_stream_data:
@@ -1209,10 +1342,14 @@ ants_error_t ants_transport_dial(ants_transport_t *t,
         return err;
     }
 
-    /* Initialise the conn-state buffer. */
+    /* Initialise the conn-state buffer. Set magic so verify_certificate
+     * can distinguish this caller-owned cs from the transport-state
+     * default ctx (inbound cnx path). is_heap stays 0: this cs lives
+     * in the caller's _opaque buffer, never free()'d by us. */
     memset(out_conn->_opaque, 0, sizeof out_conn->_opaque);
     struct ants_transport_conn_state *cs =
         (struct ants_transport_conn_state *)(void *)out_conn->_opaque;
+    cs->magic = ANTS_TRANSPORT_CONN_STATE_MAGIC;
     cs->parent = state;
     if (expected_peer_id != NULL) {
         memcpy(cs->expected_peer_id, expected_peer_id->bytes, ANTS_PEER_ID_SIZE);
