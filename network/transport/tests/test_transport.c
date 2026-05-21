@@ -101,17 +101,76 @@ static void test_opaque_ctx_layout(void)
     CHECK(sizeof s == ANTS_TRANSPORT_STREAM_CTX_SIZE);
 }
 
-static void test_lifecycle_stubs(void)
+/* Minimal sign callback that does nothing — we never reach the TLS
+ * handshake in phase 1 lifecycle tests. Real callers (and phase 2
+ * tests) wire ants_ed25519_sign here. */
+static ants_error_t test_noop_sign(const uint8_t *transcript,
+                                   size_t transcript_len,
+                                   uint8_t out_sig[ANTS_ED25519_SIG_SIZE],
+                                   void *sign_ctx)
+{
+    (void)transcript;
+    (void)transcript_len;
+    (void)sign_ctx;
+    memset(out_sig, 0, ANTS_ED25519_SIG_SIZE);
+    return ANTS_OK;
+}
+
+static ants_error_t test_noop_event(const ants_transport_event_t *event, void *user_ctx)
+{
+    (void)event;
+    (void)user_ctx;
+    return ANTS_OK;
+}
+
+static void test_init_rejects_invalid_args(void)
 {
     ants_transport_t t = {{0}};
     ants_transport_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
-    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_ERROR_NOT_IMPLEMENTED);
 
-    /* tick() returns UINT32_MAX in the stub so caller loops sleep
-     * indefinitely instead of spinning. */
+    /* NULL transport or config */
+    CHECK_EQ(ants_transport_init(NULL, &cfg), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_init(&t, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* Missing sign_fn or event_fn */
+    cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_ERROR_INVALID_ARG);
+    cfg.event_fn = NULL;
+    cfg.sign_fn = test_noop_sign;
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_init_destroy_roundtrip(void)
+{
+    /* Phase 1: prove the picoquic context is created and freed cleanly.
+     * No networking yet — we just exercise the lifecycle. ASan/UBSan
+     * runs catch any leak or use-after-free. */
+    ants_transport_t t = {{0}};
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.sign_fn = test_noop_sign;
+    cfg.event_fn = test_noop_event;
+    cfg.max_connections = 32;
+    cfg.max_streams_per_conn = 64;
+    cfg.idle_timeout_ms = 30000;
+
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
+    /* tick is still NOT_IMPLEMENTED in phase 1; verify it still
+     * returns the documented safe default UINT32_MAX. */
     CHECK(ants_transport_tick(&t) == UINT32_MAX);
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+
+    /* Re-init the same buffer (verify destroy zeroed cleanly). */
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+
+    /* destroy on a zeroed transport is a no-op (state.quic == NULL). */
+    memset(&t, 0, sizeof t);
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+
+    /* NULL transport rejected. */
+    CHECK_EQ(ants_transport_destroy(NULL, 0), ANTS_ERROR_INVALID_ARG);
 }
 
 static void test_dial_stub(void)
@@ -173,7 +232,8 @@ int main(void)
 {
     test_pinned_constants();
     test_opaque_ctx_layout();
-    test_lifecycle_stubs();
+    test_init_rejects_invalid_args();
+    test_init_destroy_roundtrip();
     test_dial_stub();
     test_stream_stubs();
     test_introspection_safe_defaults();
