@@ -14,7 +14,12 @@
 add_subdirectory(transport)
 
 # Component #5 — Kademlia DHT (shard-key variant)  (3 EM)
-# add_subdirectory(dht)
+#
+# v1.0 ships the API surface as a NOT_IMPLEMENTED stub so upstream
+# components (cache/semantic, reputation, anti-eclipse) can integrate
+# against ants_dht.h now. Phases 2+ wire k-buckets, XOR-distance
+# routing, CBOR-encoded RPCs, and the iterative-lookup state machine.
+add_subdirectory(dht)
 
 # Component #6 — Gossip overlay (L1 CRDT propagation)  (3 EM)
 # add_subdirectory(gossip)
