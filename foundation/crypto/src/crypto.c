@@ -196,8 +196,14 @@ ants_error_t ants_ed25519_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
  * ciphersuite identifier itself, passed verbatim to `hash_to_curve`
  * (RFC 9380) which produces the message hash on G2.
  */
-static const uint8_t ANTS_BLS_DST[] = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
-#define ANTS_BLS_DST_LEN (sizeof ANTS_BLS_DST - 1)
+/* The ciphersuite ID as a C99-conformant byte array. We can't write
+ * `static const uint8_t X[] = "..."` because string literals have
+ * type `char[]` and initialising an `unsigned char[]` from a string
+ * literal is a C99 constraint violation (the GCC/Clang extension
+ * accepts it; MSVC and strict-pedantic builds reject). */
+static const char ANTS_BLS_DST_STR[] = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+#define ANTS_BLS_DST     ((const uint8_t *)ANTS_BLS_DST_STR)
+#define ANTS_BLS_DST_LEN (sizeof ANTS_BLS_DST_STR - 1)
 
 ants_error_t ants_bls_pubkey_from_priv(const uint8_t priv[ANTS_BLS_PRIVKEY_SIZE],
                                        uint8_t out_pub[ANTS_BLS_PUBKEY_SIZE])
@@ -278,12 +284,15 @@ ants_error_t ants_bls_aggregate(const uint8_t (*sigs)[ANTS_BLS_SIG_SIZE],
     if (sigs == NULL || n == 0 || out_sig == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    blst_p2_affine first;
+    /* blst_aggregate_in_g2 with `in == NULL` treats the accumulator as
+     * the identity, decompresses zwire, performs an in-subgroup check
+     * (which blst_p2_uncompress alone does NOT), and stores the
+     * result. We use this for the first element so that subgroup
+     * membership is checked uniformly across all n inputs. */
     blst_p2 acc;
-    if (blst_p2_uncompress(&first, sigs[0]) != BLST_SUCCESS) {
+    if (blst_aggregate_in_g2(&acc, NULL, sigs[0]) != BLST_SUCCESS) {
         return ANTS_ERROR_MALFORMED;
     }
-    blst_p2_from_affine(&acc, &first);
     for (size_t i = 1; i < n; i++) {
         if (blst_aggregate_in_g2(&acc, &acc, sigs[i]) != BLST_SUCCESS) {
             return ANTS_ERROR_MALFORMED;
@@ -310,12 +319,12 @@ ants_error_t ants_bls_verify_aggregate(const uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZ
     if (pubs == NULL || n == 0 || (msg == NULL && msg_len > 0) || sig == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    blst_p1_affine first;
+    /* See note in ants_bls_aggregate: use the NULL-accumulator pattern
+     * so blst_aggregate_in_g1 subgroup-checks the first pubkey. */
     blst_p1 acc_pk;
-    if (blst_p1_uncompress(&first, pubs[0]) != BLST_SUCCESS) {
+    if (blst_aggregate_in_g1(&acc_pk, NULL, pubs[0]) != BLST_SUCCESS) {
         return ANTS_ERROR_MALFORMED;
     }
-    blst_p1_from_affine(&acc_pk, &first);
     for (size_t i = 1; i < n; i++) {
         if (blst_aggregate_in_g1(&acc_pk, &acc_pk, pubs[i]) != BLST_SUCCESS) {
             return ANTS_ERROR_MALFORMED;
@@ -406,12 +415,16 @@ static void vrf_challenge_generation(const uint8_t Y[32],
 /*
  * RFC 9380 §5.4.1 expand_message_xmd with SHA-512.
  *
- * Output: len_in_bytes bytes from SHA-512 in an MGF1-style chain.
- * Used by RFC 9381 ELL2 with len_in_bytes = 48 (= L*m*count for
+ * Streaming variant: `msg` is supplied as two parts (msg1 || msg2) so
+ * callers don't have to concatenate into a stack buffer of bounded
+ * size. Used by RFC 9381 ELL2 with msg1 = PK_string (32 bytes) and
+ * msg2 = alpha (arbitrary length); len_in_bytes = 48 (= L*m*count for
  * Edwards25519 with one field element).
  */
-static void vrf_expand_message_xmd_sha512(const uint8_t *msg,
-                                          size_t msg_len,
+static void vrf_expand_message_xmd_sha512(const uint8_t *msg1,
+                                          size_t msg1_len,
+                                          const uint8_t *msg2,
+                                          size_t msg2_len,
                                           const uint8_t *dst,
                                           size_t dst_len,
                                           uint8_t *out,
@@ -443,8 +456,11 @@ static void vrf_expand_message_xmd_sha512(const uint8_t *msg,
     uint8_t b_0[64];
     crypto_hash_sha512_init(&st);
     crypto_hash_sha512_update(&st, Z_pad, sizeof Z_pad);
-    if (msg_len > 0) {
-        crypto_hash_sha512_update(&st, msg, (unsigned long long)msg_len);
+    if (msg1_len > 0) {
+        crypto_hash_sha512_update(&st, msg1, (unsigned long long)msg1_len);
+    }
+    if (msg2_len > 0) {
+        crypto_hash_sha512_update(&st, msg2, (unsigned long long)msg2_len);
     }
     crypto_hash_sha512_update(&st, l_i_b_str, 2);
     crypto_hash_sha512_update(&st, &I2OSP_0, 1);
@@ -560,31 +576,21 @@ static void vrf_reduce_48_be_to_fe(const uint8_t v[48], fe25519 out)
 static void
 vrf_hash_to_curve(const uint8_t Y[32], const uint8_t *alpha, size_t alpha_len, uint8_t out_H[32])
 {
-    /* DST for ECVRF-EDWARDS25519-SHA512-ELL2 per RFC 9381 §5.5. */
-    static const uint8_t dst[] = "ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
-    const size_t dst_len = sizeof dst - 1; /* exclude the NUL terminator */
+    /* DST for ECVRF-EDWARDS25519-SHA512-ELL2 per RFC 9381 §5.5.
+     * Stored as `const char[]` (not `const uint8_t[]`) so the string
+     * literal initialiser is C99-conformant; passed through a cast at
+     * the use site. */
+    static const char dst_str[] = "ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
+    const uint8_t *dst = (const uint8_t *)dst_str;
+    const size_t dst_len = sizeof dst_str - 1; /* exclude the NUL terminator */
 
-    /* Compose msg = PK || alpha into a stack buffer; alpha is
-     * application-controlled but length is bounded in practice by
-     * the protocol's max-VRF-input size. 1 KiB is generous. */
-    uint8_t msg_buf[1024];
-    size_t msg_len = 32;
-    if (alpha_len > sizeof msg_buf - 32) {
-        /* Out of spec; produce a deterministic but obviously-wrong
-         * output by hashing only the first 32 bytes. Callers should
-         * never trigger this path; we don't expose an error code
-         * here because the rest of the API treats hash_to_curve as
-         * infallible. */
-        alpha_len = sizeof msg_buf - 32;
-    }
-    memcpy(msg_buf, Y, 32);
-    if (alpha_len > 0) {
-        memcpy(msg_buf + 32, alpha, alpha_len);
-        msg_len += alpha_len;
-    }
-
+    /* expand_message_xmd takes msg as two parts (PK || alpha) so we
+     * don't have to concatenate. The previous concat-into-stack-buffer
+     * approach silently truncated alpha > 992 bytes, breaking VRF
+     * injectivity (two distinct long alphas with the same prefix would
+     * produce the same proof). */
     uint8_t uniform[48];
-    vrf_expand_message_xmd_sha512(msg_buf, msg_len, dst, dst_len, uniform, sizeof uniform);
+    vrf_expand_message_xmd_sha512(Y, 32, alpha, alpha_len, dst, dst_len, uniform, sizeof uniform);
 
     fe25519 u_fe;
     vrf_reduce_48_be_to_fe(uniform, u_fe);
@@ -624,18 +630,18 @@ static void vrf_proof_to_hash(const ge25519_p3 *Gamma_p3, uint8_t out_beta[64])
     crypto_hash_sha512_final(&st, out_beta);
 }
 
-ants_error_t ants_vrf_prove(const uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE],
+ants_error_t ants_vrf_prove(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
                             const uint8_t *alpha,
                             size_t alpha_len,
                             uint8_t out_proof[ANTS_VRF_PROOF_SIZE])
 {
-    if (sk == NULL || (alpha == NULL && alpha_len > 0) || out_proof == NULL) {
+    if (priv == NULL || (alpha == NULL && alpha_len > 0) || out_proof == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    /* 1. Expand SK to (x, hashed_sk_upper) and derive Y = x*B. */
+    /* 1. Expand priv to (x, hashed_sk_upper) and derive Y = x*B. */
     uint8_t hashed_sk[64];
     uint8_t x_clamped[32];
-    crypto_hash_sha512(hashed_sk, sk, ANTS_ED25519_PRIVKEY_SIZE);
+    crypto_hash_sha512(hashed_sk, priv, ANTS_ED25519_PRIVKEY_SIZE);
     memcpy(x_clamped, hashed_sk, 32);
     x_clamped[0] &= 0xF8;
     x_clamped[31] &= 0x7F;
@@ -698,23 +704,24 @@ ants_error_t ants_vrf_prove(const uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE],
     return ANTS_OK;
 }
 
-ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
+ants_error_t ants_vrf_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                              const uint8_t *alpha,
                              size_t alpha_len,
                              const uint8_t proof[ANTS_VRF_PROOF_SIZE],
                              uint8_t out_beta[ANTS_VRF_OUTPUT_SIZE])
 {
-    if (pk == NULL || (alpha == NULL && alpha_len > 0) || proof == NULL || out_beta == NULL) {
+    if (pub == NULL || (alpha == NULL && alpha_len > 0) || proof == NULL || out_beta == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
 
     /* 1. Validate Y. Reject non-canonical or low-order encodings. */
-    if (!ge25519_is_canonical(pk) || ge25519_has_small_order(pk)) {
+    if (!ge25519_is_canonical(pub) || ge25519_has_small_order(pub)) {
         return ANTS_ERROR_MALFORMED;
     }
-    /* For step 4 we want -Y, so decompress with the _negate variant. */
+    /* For step 4 we want -Y, so decompress with the _negate variant.
+     * Variable-time is intentional: `pub` is a public input. */
     ge25519_p3 neg_Y;
-    if (ge25519_frombytes_negate_vartime(&neg_Y, pk) != 0) {
+    if (ge25519_frombytes_negate_vartime(&neg_Y, pub) != 0) {
         return ANTS_ERROR_MALFORMED;
     }
 
@@ -752,7 +759,7 @@ ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
 
     /* 3. H = hash_to_curve_ell2(Y, alpha). */
     uint8_t H_bytes[32];
-    vrf_hash_to_curve(pk, alpha, alpha_len, H_bytes);
+    vrf_hash_to_curve(pub, alpha, alpha_len, H_bytes);
     ge25519_p3 H_p3;
     if (ge25519_frombytes(&H_p3, H_bytes) != 0) {
         return ANTS_ERROR_MALFORMED;
@@ -784,7 +791,7 @@ ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
 
     /* 6. c' = challenge_generation(Y, H, Gamma, U, V). */
     uint8_t c_prime[VRF_C_LEN];
-    vrf_challenge_generation(pk, H_bytes, Gamma_bytes, U_bytes, V_bytes, c_prime);
+    vrf_challenge_generation(pub, H_bytes, Gamma_bytes, U_bytes, V_bytes, c_prime);
 
     /* 7. Constant-time compare c' against c_string. */
     {

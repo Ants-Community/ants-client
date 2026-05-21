@@ -50,12 +50,22 @@ extern "C" {
  * Opaque incremental-hash context. Caller allocates (typically on the
  * stack). The internal layout is defined by the vendored upstream
  * library and not part of the protocol ABI.
+ *
+ * Layout note: a union forces the struct's alignment to that of the
+ * widest member (uint64_t), and `_opaque` overlaps `_align` so the
+ * underlying buffer ALSO has uint64_t alignment. Without the union the
+ * `uint8_t _opaque[2048]` field would only require byte alignment,
+ * and a subsequent cast `(blake3_hasher *)ctx->_opaque` could be
+ * undefined behaviour on alignment-strict targets.
  */
-typedef struct {
+typedef union {
     /* Sized for the upstream BLAKE3 hasher state (currently 1912 bytes
-     * for the reference impl). Over-sized to allow alignment without
-     * exposing internals to the caller. */
+     * for the reference impl). Over-sized so a future upstream growth
+     * doesn't force an ABI break, with margin for internal alignment
+     * padding. The compile-time check in crypto.c asserts the actual
+     * size against this bound. */
     uint8_t _opaque[2048];
+    /* Anchor member: forces the union's alignment to uint64_t. */
     uint64_t _align;
 } ants_blake3_ctx_t;
 
@@ -172,21 +182,24 @@ ants_error_t ants_bls_verify_aggregate(const uint8_t (*pubs)[ANTS_BLS_PUBKEY_SIZ
 #define ANTS_VRF_OUTPUT_SIZE 64
 
 /*
- * Produce a VRF proof for input `alpha` using private key `sk`.
+ * Produce a VRF proof for input `alpha` using private key `priv`.
  *   - proof: 80-byte verifiable proof (Γ || c || s per RFC 9381 §3.3).
+ *
+ * The 32-byte `priv` is the same Ed25519 seed used by ants_ed25519_*.
+ * (ECVRF reuses Ed25519 keys per RFC 9381 §5.5.)
  */
-ants_error_t ants_vrf_prove(const uint8_t sk[ANTS_ED25519_PRIVKEY_SIZE],
+ants_error_t ants_vrf_prove(const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
                             const uint8_t *alpha,
                             size_t alpha_len,
                             uint8_t out_proof[ANTS_VRF_PROOF_SIZE]);
 
 /*
- * Verify a VRF proof against public key `pk` and input `alpha`. On
+ * Verify a VRF proof against public key `pub` and input `alpha`. On
  * success, the 64-byte output `beta` is the hash-to-string of the
  * proof; this is the value the protocol consumes for beacon-derived
  * selection.
  */
-ants_error_t ants_vrf_verify(const uint8_t pk[ANTS_ED25519_PUBKEY_SIZE],
+ants_error_t ants_vrf_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                              const uint8_t *alpha,
                              size_t alpha_len,
                              const uint8_t proof[ANTS_VRF_PROOF_SIZE],
