@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -156,9 +157,13 @@ static void test_init_destroy_roundtrip(void)
     cfg.idle_timeout_ms = 30000;
 
     CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
-    /* tick is still NOT_IMPLEMENTED in phase 1; verify it still
-     * returns the documented safe default UINT32_MAX. */
-    CHECK(ants_transport_tick(&t) == UINT32_MAX);
+    /* Phase 2 tick(): on an idle transport without a listening socket
+     * it returns the picoquic wake-delay, typically very large
+     * (UINT32_MAX equivalent). The exact value depends on picoquic
+     * internals; we just check it doesn't return 0 (which would mean
+     * "spin"). */
+    uint32_t wake = ants_transport_tick(&t);
+    CHECK(wake > 0);
     CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
 
     /* Re-init the same buffer (verify destroy zeroed cleanly). */
@@ -171,6 +176,75 @@ static void test_init_destroy_roundtrip(void)
 
     /* NULL transport rejected. */
     CHECK_EQ(ants_transport_destroy(NULL, 0), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_listener_bind(void)
+{
+    /* Phase 2: bind a UDP socket on /ip4/127.0.0.1/udp/0/quic-v1 (port
+     * 0 = kernel-assigned). After init the local_addr API must report
+     * the actually-bound multiaddr with a non-zero port. tick() runs
+     * the I/O loop; on an empty network it returns a finite wake
+     * delay (probably UINT32_MAX-equivalent) but does not crash. */
+    ants_transport_t t = {{0}};
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.sign_fn = test_noop_sign;
+    cfg.event_fn = test_noop_event;
+    cfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    cfg.max_connections = 32;
+    cfg.max_streams_per_conn = 64;
+    cfg.idle_timeout_ms = 30000;
+
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
+
+    /* Local address: non-empty, starts with the right prefix, ends
+     * with /quic-v1, contains a non-zero port. */
+    char addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&t, addr, sizeof addr), ANTS_OK);
+    CHECK(strncmp(addr, "/ip4/127.0.0.1/udp/", 19) == 0);
+    CHECK(strstr(addr, "/quic-v1") != NULL);
+    /* Port is between '/' and '/quic-v1'; verify it's non-zero. */
+    const char *port_start = addr + 19;
+    int port = atoi(port_start);
+    CHECK(port > 0);
+    CHECK(port < 65536);
+
+    /* Run a few ticks to make sure the event loop is harmless on an
+     * idle socket. ASan/UBSan would flag any leak or UB. */
+    for (int i = 0; i < 5; i++) {
+        uint32_t w = ants_transport_tick(&t);
+        CHECK(w > 0); /* idle → non-zero wake delay */
+    }
+
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+}
+
+static void test_local_addr_without_listener(void)
+{
+    ants_transport_t t = {{0}};
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.sign_fn = test_noop_sign;
+    cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_OK);
+
+    char addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    /* No listener configured → NOT_IMPLEMENTED. */
+    CHECK_EQ(ants_transport_local_addr(&t, addr, sizeof addr), ANTS_ERROR_NOT_IMPLEMENTED);
+
+    CHECK_EQ(ants_transport_destroy(&t, 0), ANTS_OK);
+}
+
+static void test_listener_bad_multiaddr(void)
+{
+    ants_transport_t t = {{0}};
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.sign_fn = test_noop_sign;
+    cfg.event_fn = test_noop_event;
+    cfg.listen_multiaddr = "/not/a/real/multiaddr";
+    /* Bad multiaddr → init fails with INVALID_ARG, no leaks. */
+    CHECK_EQ(ants_transport_init(&t, &cfg), ANTS_ERROR_INVALID_ARG);
 }
 
 static void test_dial_stub(void)
@@ -234,6 +308,9 @@ int main(void)
     test_opaque_ctx_layout();
     test_init_rejects_invalid_args();
     test_init_destroy_roundtrip();
+    test_listener_bind();
+    test_local_addr_without_listener();
+    test_listener_bad_multiaddr();
     test_dial_stub();
     test_stream_stubs();
     test_introspection_safe_defaults();

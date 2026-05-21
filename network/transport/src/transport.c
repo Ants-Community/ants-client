@@ -22,7 +22,34 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET ants_socket_t;
+#define ANTS_INVALID_SOCKET INVALID_SOCKET
+#else
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+typedef int ants_socket_t;
+#define ANTS_INVALID_SOCKET (-1)
+#endif
+
+/* Receive buffer per tick(): one MTU per syscall is the typical
+ * picoquic upper-bound packet size. We loop draining the socket until
+ * recvfrom() blocks (EAGAIN). */
+#define ANTS_TRANSPORT_MTU 1500
+
+/* Max packets prepared per tick before yielding control back to the
+ * caller. Prevents a tick() from starving the embedding event loop if
+ * the QUIC ctx has many pending packets to drain. */
+#define ANTS_TRANSPORT_MAX_PACKETS_PER_TICK 32
 
 /* ------------------------------------------------------------------------ */
 /* Internal state                                                           */
@@ -55,6 +82,14 @@ struct ants_transport_state {
     uint32_t max_connections;
     uint32_t max_streams_per_conn;
     uint32_t idle_timeout_ms;
+
+    /* Listening UDP socket. ANTS_INVALID_SOCKET when listen_multiaddr
+     * was NULL (dial-only client). */
+    ants_socket_t sock_fd;
+    /* Local bound address. Captured for ants_transport_conn_peer_addr
+     * symmetry and for echoing back in outgoing packet sendto(). */
+    struct sockaddr_storage local_addr;
+    socklen_t local_addr_len;
 };
 
 /* ants_transport_t MUST be at least as large as the internal state
@@ -64,6 +99,167 @@ struct ants_transport_state {
  * Same pattern as ants_blake3_ctx_size_check in foundation/crypto. */
 typedef char ants_transport_state_size_check
     [(sizeof(struct ants_transport_state) <= sizeof(((ants_transport_t *)0)->_opaque)) ? 1 : -1];
+
+/* ------------------------------------------------------------------------ */
+/* Multiaddr parser                                                         */
+/*                                                                          */
+/* Accepts the libp2p textual form:                                         */
+/*   /ip4/A.B.C.D/udp/PORT/quic-v1                                          */
+/*   /ip6/AAAA::BB/udp/PORT/quic-v1                                        */
+/*                                                                          */
+/* Phase 2 needs only the address+port; the /p2p/<peer_id> trailer is       */
+/* parsed by callers (it's already in expected_peer_id when present).      */
+/* ------------------------------------------------------------------------ */
+
+static ants_error_t
+parse_multiaddr(const char *ma, struct sockaddr_storage *out, socklen_t *out_len)
+{
+    if (ma == NULL || out == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof *out);
+
+    /* Expect leading "/ip4/" or "/ip6/" prefix. */
+    const char *p = ma;
+    int is_ip6;
+    if (strncmp(p, "/ip4/", 5) == 0) {
+        is_ip6 = 0;
+        p += 5;
+    } else if (strncmp(p, "/ip6/", 5) == 0) {
+        is_ip6 = 1;
+        p += 5;
+    } else {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Address ends at the next '/'. Cap at 64 bytes (more than enough
+     * for IPv6 textual form which is 39 chars max). */
+    char addr_buf[64];
+    size_t i = 0;
+    while (*p && *p != '/' && i + 1 < sizeof addr_buf) {
+        addr_buf[i++] = *p++;
+    }
+    if (*p != '/' || i == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    addr_buf[i] = '\0';
+    p++; /* skip '/' */
+
+    /* Expect "udp/" next. */
+    if (strncmp(p, "udp/", 4) != 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    p += 4;
+
+    /* Parse port (1-5 digits). */
+    unsigned long port = 0;
+    if (*p < '0' || *p > '9') {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    while (*p >= '0' && *p <= '9') {
+        port = port * 10 + (unsigned long)(*p - '0');
+        if (port > 65535) {
+            return ANTS_ERROR_INVALID_ARG;
+        }
+        p++;
+    }
+
+    /* Expect "/quic-v1" trailer (or end of string for a port-only
+     * variant — we accept both). */
+    if (*p == '/') {
+        if (strncmp(p, "/quic-v1", 8) != 0) {
+            return ANTS_ERROR_INVALID_ARG;
+        }
+        p += 8;
+        /* Ignore anything after /quic-v1 (e.g. /p2p/...); peer-id is
+         * passed via the expected_peer_id parameter when needed. */
+    }
+
+    if (is_ip6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)out;
+        sin6->sin6_family = AF_INET6;
+        if (inet_pton(AF_INET6, addr_buf, &sin6->sin6_addr) != 1) {
+            return ANTS_ERROR_INVALID_ARG;
+        }
+        sin6->sin6_port = htons((uint16_t)port);
+        *out_len = sizeof(struct sockaddr_in6);
+    } else {
+        struct sockaddr_in *sin = (struct sockaddr_in *)out;
+        sin->sin_family = AF_INET;
+        if (inet_pton(AF_INET, addr_buf, &sin->sin_addr) != 1) {
+            return ANTS_ERROR_INVALID_ARG;
+        }
+        sin->sin_port = htons((uint16_t)port);
+        *out_len = sizeof(struct sockaddr_in);
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Socket helpers                                                           */
+/* ------------------------------------------------------------------------ */
+
+static int set_nonblocking(ants_socket_t fd)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0 ? 0 : -1;
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static void close_socket(ants_socket_t fd)
+{
+    if (fd == ANTS_INVALID_SOCKET) {
+        return;
+    }
+#if defined(_WIN32) || defined(_WIN64)
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+static ants_error_t bind_listen_socket(struct ants_transport_state *state, const char *multiaddr)
+{
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+    ants_error_t err = parse_multiaddr(multiaddr, &addr, &addr_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    state->sock_fd = socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (state->sock_fd == ANTS_INVALID_SOCKET) {
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    if (bind(state->sock_fd, (const struct sockaddr *)&addr, addr_len) != 0) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    if (set_nonblocking(state->sock_fd) != 0) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+
+    /* Capture the actually-bound address (port may have been kernel-
+     * assigned via port 0). */
+    state->local_addr_len = sizeof state->local_addr;
+    if (getsockname(
+            state->sock_fd, (struct sockaddr *)&state->local_addr, &state->local_addr_len) != 0) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    return ANTS_OK;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Lifecycle                                                                */
@@ -87,6 +283,7 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
      * well-defined values; the picoquic pointer is then explicitly
      * NULL until create() succeeds. */
     memset(t->_opaque, 0, sizeof t->_opaque);
+    state->sock_fd = ANTS_INVALID_SOCKET;
 
     /* Snapshot identity + callbacks. */
     memcpy(state->pub, config->pub, ANTS_ED25519_PUBKEY_SIZE);
@@ -136,6 +333,19 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
         return ANTS_ERROR_MALFORMED;
     }
 
+    /* Bind the listening UDP socket if the caller asked for one.
+     * NULL listen_multiaddr means "dial-only client" — no socket yet.
+     * (Phase 3 will lazily open an ephemeral socket on first dial so
+     * dial-only clients can also send packets.) */
+    if (config->listen_multiaddr != NULL) {
+        ants_error_t err = bind_listen_socket(state, config->listen_multiaddr);
+        if (err != ANTS_OK) {
+            picoquic_free(state->quic);
+            memset(t->_opaque, 0, sizeof t->_opaque);
+            return err;
+        }
+    }
+
     /* Idle timeout: picoquic exposes per-connection idle timeouts.
      * Phase 2 will plumb config->idle_timeout_ms through. */
 
@@ -144,12 +354,16 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
 
 ants_error_t ants_transport_destroy(ants_transport_t *t, uint64_t close_code)
 {
-    (void)close_code; /* Phase 2 will pass close_code to per-connection
+    (void)close_code; /* Phase 3 will pass close_code to per-connection
                        * CONNECTION_CLOSE frames. */
     if (t == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_transport_state *state = (struct ants_transport_state *)(void *)t->_opaque;
+    if (state->sock_fd != ANTS_INVALID_SOCKET) {
+        close_socket(state->sock_fd);
+        state->sock_fd = ANTS_INVALID_SOCKET;
+    }
     if (state->quic != NULL) {
         picoquic_free(state->quic);
         state->quic = NULL;
@@ -161,14 +375,172 @@ ants_error_t ants_transport_destroy(ants_transport_t *t, uint64_t close_code)
     return ANTS_OK;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Event loop tick                                                          */
+/*                                                                          */
+/* The core of caller-driven async: drain inbound UDP packets, hand them   */
+/* to picoquic; pump outbound packets from picoquic, send via UDP;         */
+/* return the time the caller may sleep before tick()-ing again.           */
+/*                                                                          */
+/* Phase 2 doesn't yet bridge picoquic's stream/connection callbacks to    */
+/* ants_transport_event_t — that wires up in phase 3 alongside the        */
+/* stream APIs. Phase 2's tick() is therefore a correctness exercise:     */
+/* prove the I/O loop drives picoquic without crashes, leaks, or          */
+/* unbounded loops, and that the wake-delay value is meaningful.          */
+/* ------------------------------------------------------------------------ */
+
+static void tick_drain_incoming(struct ants_transport_state *state, uint64_t now_us)
+{
+    if (state->sock_fd == ANTS_INVALID_SOCKET) {
+        return;
+    }
+    uint8_t buf[ANTS_TRANSPORT_MTU];
+    for (;;) {
+        struct sockaddr_storage from_addr;
+        socklen_t from_len = sizeof from_addr;
+        ssize_t n = recvfrom(
+            state->sock_fd, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from_addr, &from_len);
+        if (n < 0) {
+#if defined(_WIN32) || defined(_WIN64)
+            if (WSAGetLastError() == WSAEWOULDBLOCK)
+                break;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+#endif
+            /* Other errors: stop draining; picoquic will retry next tick. */
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        (void)picoquic_incoming_packet(state->quic,
+                                       buf,
+                                       (size_t)n,
+                                       (struct sockaddr *)&from_addr,
+                                       (struct sockaddr *)&state->local_addr,
+                                       0, /* if_index */
+                                       0, /* received_ecn */
+                                       now_us);
+    }
+}
+
+static void tick_drain_outgoing(struct ants_transport_state *state, uint64_t now_us)
+{
+    if (state->sock_fd == ANTS_INVALID_SOCKET) {
+        return;
+    }
+    uint8_t send_buf[ANTS_TRANSPORT_MTU];
+    for (int i = 0; i < ANTS_TRANSPORT_MAX_PACKETS_PER_TICK; i++) {
+        struct sockaddr_storage peer_addr;
+        struct sockaddr_storage local_addr;
+        int if_index = 0;
+        picoquic_connection_id_t log_cid;
+        picoquic_cnx_t *last_cnx = NULL;
+        size_t send_length = 0;
+        size_t send_msg_size = 0;
+        int rc = picoquic_prepare_next_packet_ex(state->quic,
+                                                 now_us,
+                                                 send_buf,
+                                                 sizeof send_buf,
+                                                 &send_length,
+                                                 &peer_addr,
+                                                 &local_addr,
+                                                 &if_index,
+                                                 &log_cid,
+                                                 &last_cnx,
+                                                 &send_msg_size);
+        if (rc != 0 || send_length == 0) {
+            /* No more packets pending. */
+            break;
+        }
+        socklen_t peer_len = peer_addr.ss_family == AF_INET6
+                                 ? (socklen_t)sizeof(struct sockaddr_in6)
+                                 : (socklen_t)sizeof(struct sockaddr_in);
+        (void)sendto(state->sock_fd,
+                     (const char *)send_buf,
+                     send_length,
+                     0,
+                     (const struct sockaddr *)&peer_addr,
+                     peer_len);
+    }
+}
+
 uint32_t ants_transport_tick(ants_transport_t *t)
 {
-    /* Documented contract: returns the number of ms until next wake.
-     * Until the real implementation lands, return UINT32_MAX so any
-     * caller-driven loop using us as a placeholder simply sleeps
-     * forever rather than spinning. */
-    (void)t;
-    return UINT32_MAX;
+    if (t == NULL) {
+        return UINT32_MAX;
+    }
+    struct ants_transport_state *state = (struct ants_transport_state *)(void *)t->_opaque;
+    if (state->quic == NULL) {
+        return UINT32_MAX;
+    }
+
+    uint64_t now_us = picoquic_current_time();
+    tick_drain_incoming(state, now_us);
+    tick_drain_outgoing(state, now_us);
+
+    /* Ask picoquic when it next wants attention. The function returns
+     * the delay in *microseconds*; we convert to ms (rounding up so the
+     * caller never wakes too late). We pass delay_max as UINT32_MAX
+     * microseconds (~71 minutes), which is well below INT64_MAX so the
+     * later `+ 999` rounding can't overflow. Larger waits become
+     * UINT32_MAX ms (the documented "idle" sentinel). */
+    int64_t wake_us = picoquic_get_next_wake_delay(state->quic, now_us, (int64_t)UINT32_MAX);
+    if (wake_us <= 0) {
+        return 0; /* picoquic wants attention immediately */
+    }
+    int64_t wake_ms = (wake_us + 999) / 1000;
+    if (wake_ms >= UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)wake_ms;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Local-address introspection                                              */
+/*                                                                          */
+/* Phase 2 doesn't yet implement conn-level introspection (no real          */
+/* connections to enumerate). It DOES make the transport's listening       */
+/* address visible via the same multiaddr convention, which the loopback   */
+/* test in phase 3 will need to write into the dialer's config.            */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_transport_local_addr(const ants_transport_t *t, char *out_buf, size_t cap)
+{
+    if (t == NULL || out_buf == NULL || cap == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    const struct ants_transport_state *state =
+        (const struct ants_transport_state *)(const void *)t->_opaque;
+    if (state->sock_fd == ANTS_INVALID_SOCKET || state->local_addr_len == 0) {
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    }
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port_h = 0;
+    const char *family;
+    if (state->local_addr.ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)&state->local_addr;
+        if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip) == NULL) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        port_h = ntohs(sin->sin_port);
+        family = "ip4";
+    } else if (state->local_addr.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&state->local_addr;
+        if (inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof ip) == NULL) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        port_h = ntohs(sin6->sin6_port);
+        family = "ip6";
+    } else {
+        return ANTS_ERROR_MALFORMED;
+    }
+    int written = snprintf(out_buf, cap, "/%s/%s/udp/%u/quic-v1", family, ip, (unsigned)port_h);
+    if (written < 0 || (size_t)written >= cap) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
