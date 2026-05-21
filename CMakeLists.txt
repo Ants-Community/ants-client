@@ -97,6 +97,8 @@ enable_testing()
 add_subdirectory(deps/blake3)
 add_subdirectory(deps/ed25519)
 add_subdirectory(deps/blst)
+add_subdirectory(deps/picotls)
+add_subdirectory(deps/picoquic)
 
 add_subdirectory(foundation)
 add_subdirectory(network)
