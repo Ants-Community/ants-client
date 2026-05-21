@@ -19,6 +19,7 @@
  */
 
 #include "ants_common.h"
+#include "ants_crypto.h"
 #include "ants_transport.h"
 
 #include <stdbool.h>
@@ -102,9 +103,12 @@ static void test_opaque_ctx_layout(void)
     CHECK(sizeof s == ANTS_TRANSPORT_STREAM_CTX_SIZE);
 }
 
-/* Minimal sign callback that does nothing — we never reach the TLS
- * handshake in phase 1 lifecycle tests. Real callers (and phase 2
- * tests) wire ants_ed25519_sign here. */
+/* Minimal sign callback that does nothing — used by the early lifecycle
+ * tests that never drive a real TLS handshake. With phase 3b's RFC 7250
+ * raw-pubkey TLS wired, a dial against a real listener with this noop
+ * sign will fail verify (the zero signature won't validate against the
+ * real transcript), which is fine — those tests don't assert handshake
+ * success. test_real_sign below is what handshake-success tests use. */
 static ants_error_t test_noop_sign(const uint8_t *transcript,
                                    size_t transcript_len,
                                    uint8_t out_sig[ANTS_ED25519_SIG_SIZE],
@@ -115,6 +119,18 @@ static ants_error_t test_noop_sign(const uint8_t *transcript,
     (void)sign_ctx;
     memset(out_sig, 0, ANTS_ED25519_SIG_SIZE);
     return ANTS_OK;
+}
+
+/* Real-key sign callback: signs the TLS handshake transcript with the
+ * Ed25519 private key passed via sign_ctx. This is the minimal in-memory
+ * sign_fn shape documented in ants_transport.h. */
+static ants_error_t test_real_sign(const uint8_t *transcript,
+                                   size_t transcript_len,
+                                   uint8_t out_sig[ANTS_ED25519_SIG_SIZE],
+                                   void *sign_ctx)
+{
+    const uint8_t *priv = (const uint8_t *)sign_ctx;
+    return ants_ed25519_sign(priv, transcript, transcript_len, out_sig);
 }
 
 static ants_error_t test_noop_event(const ants_transport_event_t *event, void *user_ctx)
@@ -495,6 +511,150 @@ static void test_stream_lifecycle(void)
     (void)rec;
 }
 
+static void test_handshake_completes_with_real_keys(void)
+{
+    /* Phase 3b: RFC 7250 raw-pubkey TLS handshake end-to-end. Both
+     * transports use real Ed25519 keypairs. The dialer should observe
+     * ANTS_TRANSPORT_EV_CONN_READY with peer_id == listener's pubkey
+     * within a small number of ticks. */
+    uint8_t dialer_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t dialer_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t listener_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t listener_pub[ANTS_ED25519_PUBKEY_SIZE];
+
+    /* Deterministic test keys (no DRBG dependency in the test). The
+     * actual values don't matter — they just need to be distinct so the
+     * peer_id mirrored in CONN_READY is unambiguous. */
+    memset(dialer_priv, 0x11, sizeof dialer_priv);
+    memset(listener_priv, 0x22, sizeof listener_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(dialer_priv, dialer_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(listener_priv, listener_pub), ANTS_OK);
+
+    test_event_recorder_t dialer_rec;
+    memset(&dialer_rec, 0, sizeof dialer_rec);
+    test_event_recorder_t listener_rec;
+    memset(&listener_rec, 0, sizeof listener_rec);
+
+    /* Listener side. */
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t lcfg;
+    memset(&lcfg, 0, sizeof lcfg);
+    memcpy(lcfg.pub, listener_pub, ANTS_ED25519_PUBKEY_SIZE);
+    lcfg.sign_fn = test_real_sign;
+    lcfg.sign_ctx = listener_priv;
+    lcfg.event_fn = test_recording_event;
+    lcfg.event_ctx = &listener_rec;
+    lcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &lcfg), ANTS_OK);
+
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    /* Dialer side. */
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    memcpy(dcfg.pub, dialer_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.sign_fn = test_real_sign;
+    dcfg.sign_ctx = dialer_priv;
+    dcfg.event_fn = test_recording_event;
+    dcfg.event_ctx = &dialer_rec;
+    CHECK_EQ(ants_transport_init(&dialer, &dcfg), ANTS_OK);
+
+    /* Capture the conn handle for later peer_id inspection. */
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+
+    /* Drive the handshake. The TLS exchange on localhost typically
+     * needs only a handful of ticks; bound generously at 200 to absorb
+     * any kernel-buffer scheduling variance under CI. */
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+        if (dialer_rec.conn_ready > 0) {
+            break;
+        }
+    }
+
+    /* Dialer must observe CONN_READY exactly once, no CONN_CLOSED. */
+    CHECK(dialer_rec.conn_ready == 1);
+    CHECK(dialer_rec.conn_closed == 0);
+
+    /* The CONN_READY event carried the listener's pubkey as peer_id. We
+     * inspect via ants_transport_conn_peer_id... which isn't wired yet,
+     * so instead verify via a fresh dial-with-expected-peer-id check
+     * after this PR. For now, recording the event_fn invocation is
+     * sufficient — the bridge unit-tests the mirror. */
+
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+}
+
+static void test_handshake_rejects_wrong_expected_peer_id(void)
+{
+    /* Phase 3b §expected_peer_id: when the dialer pre-declares a peer_id
+     * and the listener presents a different pubkey, verify_certificate
+     * fails closed and the handshake never completes. */
+    uint8_t dialer_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t dialer_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t listener_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t listener_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(dialer_priv, 0x33, sizeof dialer_priv);
+    memset(listener_priv, 0x44, sizeof listener_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(dialer_priv, dialer_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(listener_priv, listener_pub), ANTS_OK);
+
+    test_event_recorder_t dialer_rec;
+    memset(&dialer_rec, 0, sizeof dialer_rec);
+    test_event_recorder_t listener_rec;
+    memset(&listener_rec, 0, sizeof listener_rec);
+
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t lcfg;
+    memset(&lcfg, 0, sizeof lcfg);
+    memcpy(lcfg.pub, listener_pub, ANTS_ED25519_PUBKEY_SIZE);
+    lcfg.sign_fn = test_real_sign;
+    lcfg.sign_ctx = listener_priv;
+    lcfg.event_fn = test_recording_event;
+    lcfg.event_ctx = &listener_rec;
+    lcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &lcfg), ANTS_OK);
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    memcpy(dcfg.pub, dialer_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.sign_fn = test_real_sign;
+    dcfg.sign_ctx = dialer_priv;
+    dcfg.event_fn = test_recording_event;
+    dcfg.event_ctx = &dialer_rec;
+    CHECK_EQ(ants_transport_init(&dialer, &dcfg), ANTS_OK);
+
+    /* Pre-declare the WRONG peer_id (use dialer's own pubkey as a stand-
+     * in for "anything that doesn't match the listener's"). */
+    ants_peer_id_t wrong_peer_id;
+    memcpy(wrong_peer_id.bytes, dialer_pub, ANTS_PEER_ID_SIZE);
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, &wrong_peer_id, &conn), ANTS_OK);
+
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+
+    /* The handshake must NOT have completed. We may or may not see
+     * CONN_CLOSED depending on whether the failure surfaces as a CLOSE
+     * frame from us or just a handshake stall — what matters is that
+     * CONN_READY never fires. */
+    CHECK(dialer_rec.conn_ready == 0);
+
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+}
+
 static void test_introspection_safe_defaults(void)
 {
     /* The four introspection helpers return safe defaults rather than
@@ -543,6 +703,8 @@ int main(void)
     test_dial_to_listener_no_handshake();
     test_stream_rejects_invalid_args();
     test_stream_lifecycle();
+    test_handshake_completes_with_real_keys();
+    test_handshake_rejects_wrong_expected_peer_id();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
 
