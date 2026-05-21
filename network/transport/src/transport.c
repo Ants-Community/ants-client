@@ -410,12 +410,80 @@ struct ants_transport_conn_state {
      * inbound_conns_head list so destroy can sweep orphaned cs's. */
     int is_heap;
     struct ants_transport_conn_state *next_inbound;
+
+    /* Head of the linked list of heap-allocated stream-states for
+     * peer-opened streams on this cnx. Each ss is freed when the cnx
+     * closes (CONN_CLOSED for this cs sweeps the list). Locally-opened
+     * streams live in the caller's _opaque buffer and are NOT in this
+     * list. */
+    struct ants_transport_stream_state *inbound_streams_head;
 };
 
 typedef char ants_transport_conn_state_size_check[(sizeof(struct ants_transport_conn_state) <=
                                                    sizeof(((ants_transport_conn_t *)0)->_opaque))
                                                       ? 1
                                                       : -1];
+
+/* ------------------------------------------------------------------------ */
+/* Stream state                                                             */
+/*                                                                          */
+/* Lives either inside the caller's opaque ants_transport_stream_t buffer  */
+/* (locally-opened streams, pinned at 1024 bytes by the public header) or   */
+/* on the heap (peer-opened streams — see bootstrap_inbound_stream). The   */
+/* bulk is a linear recv buffer populated by the picoquic callback and     */
+/* drained by stream_recv().                                                */
+/*                                                                          */
+/* Recv buffer discipline: head points to the next byte the caller will     */
+/* read; len is the total occupied size. Caller's drain advances head; when */
+/* head == len both are reset to 0 (compact-on-empty). When an inbound      */
+/* frame exceeds the remaining capacity, the surplus is dropped — QUIC's    */
+/* per-stream flow-control window will eventually back-pressure the peer    */
+/* once we extend MAX_STREAM_DATA management (post v1.0). For phase 3,      */
+/* the 768-byte default is sufficient for the loopback test's small         */
+/* request/response payloads.                                                */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_TRANSPORT_STREAM_RECV_BUF_SIZE 768
+
+struct ants_transport_stream_state {
+    /* Back-pointer to the conn state. NULL only for a zero-initialised
+     * (unopened) stream slot. The callback bridge uses this to reach
+     * conn-scope state and, transitively, the user's event_fn. */
+    struct ants_transport_conn_state *parent_conn;
+
+    /* picoquic stream ID. The low two bits encode direction (00 =
+     * client-bidi, 01 = server-bidi, 10 = client-uni, 11 = server-uni).
+     * Picoquic mints IDs via picoquic_get_next_local_stream_id and
+     * materialises the stream via picoquic_set_app_stream_ctx. */
+    uint64_t stream_id;
+
+    /* Bookkeeping flags. uint8_t to keep the struct tight (we have at
+     * most 1024 bytes total). */
+    uint8_t is_bidi;         /* 1 = bidi, 0 = uni */
+    uint8_t local_fin_sent;  /* 1 once we've sent FIN to peer */
+    uint8_t remote_fin_seen; /* 1 once peer signalled FIN */
+    uint8_t reset_seen;      /* 1 once peer RESET'd the stream */
+
+    /* Inbound-stream bookkeeping. is_heap == 1 means this struct was
+     * malloc'd by the stream-bridge bootstrap (for a stream the peer
+     * opened, not us) and needs free() when the parent cnx closes.
+     * next_inbound chains the parent_conn's inbound_streams_head list
+     * so CONN_CLOSED can sweep them all. */
+    int is_heap;
+    struct ants_transport_stream_state *next_inbound;
+
+    /* Linear recv buffer. The callback bridge appends incoming bytes
+     * here; stream_recv copies them out and advances `head`. */
+    size_t recv_len;
+    size_t recv_head;
+    uint8_t recv_buf[ANTS_TRANSPORT_STREAM_RECV_BUF_SIZE];
+};
+
+typedef char
+    ants_transport_stream_state_size_check[(sizeof(struct ants_transport_stream_state) <=
+                                            sizeof(((ants_transport_stream_t *)0)->_opaque))
+                                               ? 1
+                                               : -1];
 
 /* ------------------------------------------------------------------------ */
 /* Multiaddr parser                                                         */
@@ -761,13 +829,20 @@ ants_error_t ants_transport_destroy(ants_transport_t *t, uint64_t close_code)
     /* Free any heap-allocated inbound conn-states whose CONN_CLOSED
      * callback never fired before picoquic_free deleted their cnx
      * (picoquic_delete_cnx silently drops connections without invoking
-     * the close callback). picoquic_free already torn down the cnx
-     * pointers; we just reclaim the cs heap. */
+     * the close callback). For each orphan cs, ALSO sweep its inbound
+     * streams. picoquic_free already tore down the cnx pointers; we
+     * just reclaim heap. */
     struct ants_transport_conn_state *cs = state->inbound_conns_head;
     while (cs != NULL) {
-        struct ants_transport_conn_state *next = cs->next_inbound;
+        struct ants_transport_conn_state *next_cs = cs->next_inbound;
+        struct ants_transport_stream_state *iss = cs->inbound_streams_head;
+        while (iss != NULL) {
+            struct ants_transport_stream_state *next_iss = iss->next_inbound;
+            free(iss);
+            iss = next_iss;
+        }
         free(cs);
-        cs = next;
+        cs = next_cs;
     }
     state->inbound_conns_head = NULL;
     /* Wipe the rest of the opaque buffer so later misuse of the (now
@@ -1048,57 +1123,6 @@ static int ants_verify_cert_cb(
     return 0;
 }
 
-/* ------------------------------------------------------------------------ */
-/* Stream state                                                             */
-/*                                                                          */
-/* Lives inside the caller's opaque ants_transport_stream_t buffer (pinned  */
-/* at 1024 bytes by the public header). The bulk is a linear recv buffer    */
-/* populated by the picoquic callback and drained by stream_recv().         */
-/*                                                                          */
-/* Recv buffer discipline: head points to the next byte the caller will     */
-/* read; len is the total occupied size. Caller's drain advances head; when */
-/* head == len both are reset to 0 (compact-on-empty). When an inbound      */
-/* frame exceeds the remaining capacity, the surplus is dropped — QUIC's    */
-/* per-stream flow-control window will eventually back-pressure the peer    */
-/* once we extend MAX_STREAM_DATA management (post v1.0). For phase 3c,     */
-/* the 768-byte default is sufficient for the loopback test's small         */
-/* request/response payloads.                                                */
-/* ------------------------------------------------------------------------ */
-
-#define ANTS_TRANSPORT_STREAM_RECV_BUF_SIZE 768
-
-struct ants_transport_stream_state {
-    /* Back-pointer to the conn state. NULL only for a zero-initialised
-     * (unopened) stream slot. The callback bridge uses this to reach
-     * conn-scope state and, transitively, the user's event_fn. */
-    struct ants_transport_conn_state *parent_conn;
-
-    /* picoquic stream ID. The low two bits encode direction (00 =
-     * client-bidi, 01 = server-bidi, 10 = client-uni, 11 = server-uni).
-     * Picoquic mints IDs via picoquic_get_next_local_stream_id and
-     * materialises the stream via picoquic_set_app_stream_ctx. */
-    uint64_t stream_id;
-
-    /* Bookkeeping flags. uint8_t to keep the struct tight (we have at
-     * most 1024 bytes total). */
-    uint8_t is_bidi;         /* 1 = bidi, 0 = uni */
-    uint8_t local_fin_sent;  /* 1 once we've sent FIN to peer */
-    uint8_t remote_fin_seen; /* 1 once peer signalled FIN */
-    uint8_t reset_seen;      /* 1 once peer RESET'd the stream */
-
-    /* Linear recv buffer. The callback bridge appends incoming bytes
-     * here; stream_recv copies them out and advances `head`. */
-    size_t recv_len;
-    size_t recv_head;
-    uint8_t recv_buf[ANTS_TRANSPORT_STREAM_RECV_BUF_SIZE];
-};
-
-typedef char
-    ants_transport_stream_state_size_check[(sizeof(struct ants_transport_stream_state) <=
-                                            sizeof(((ants_transport_stream_t *)0)->_opaque))
-                                               ? 1
-                                               : -1];
-
 /* Append bytes to the stream's recv buffer. Drops the tail if the buffer
  * is full — phase 3c traffic is small request/response pairs so this is
  * acceptable; a later PR extends MAX_STREAM_DATA management to drive
@@ -1125,6 +1149,58 @@ stream_recv_buf_append(struct ants_transport_stream_state *ss, const uint8_t *da
 }
 
 /* ------------------------------------------------------------------------ */
+/* Inbound stream bootstrap                                                 */
+/*                                                                          */
+/* When the peer opens a stream, picoquic delivers the first stream_data    */
+/* or stream_fin event with stream_ctx == NULL (no app context has been    */
+/* bound yet). We mirror the cnx-bootstrap pattern: heap-allocate a fresh   */
+/* ss, link it into the cs's inbound_streams list (so CONN_CLOSED sweeps   */
+/* it), and bind via picoquic_set_app_stream_ctx so subsequent callbacks   */
+/* on the same stream find the ss directly. Fires STREAM_OPENED so the    */
+/* caller can recognise the new stream before STREAM_READABLE delivers    */
+/* the bytes.                                                              */
+/* ------------------------------------------------------------------------ */
+
+static struct ants_transport_stream_state *
+bootstrap_inbound_stream(picoquic_cnx_t *cnx,
+                         struct ants_transport_conn_state *cs,
+                         uint64_t stream_id,
+                         ants_transport_event_fn event_fn,
+                         void *event_ctx)
+{
+    struct ants_transport_stream_state *ss =
+        (struct ants_transport_stream_state *)malloc(sizeof *ss);
+    if (ss == NULL) {
+        return NULL;
+    }
+    memset(ss, 0, sizeof *ss);
+    ss->parent_conn = cs;
+    ss->stream_id = stream_id;
+    /* PICOQUIC_IS_BIDIR_STREAM_ID: low-bit-1 clear → bidirectional. */
+    ss->is_bidi = PICOQUIC_IS_BIDIR_STREAM_ID(stream_id) ? 1 : 0;
+    ss->is_heap = 1;
+    ss->next_inbound = cs->inbound_streams_head;
+    cs->inbound_streams_head = ss;
+
+    if (picoquic_set_app_stream_ctx(cnx, stream_id, ss) != 0) {
+        cs->inbound_streams_head = ss->next_inbound;
+        free(ss);
+        return NULL;
+    }
+
+    /* Notify the caller. payload stays zero — actual bytes (if any) come
+     * in the same picoquic event and we deliver them as STREAM_READABLE
+     * right after this helper returns. */
+    ants_transport_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    ev.conn = (ants_transport_conn_t *)(void *)cs;
+    ev.kind = ANTS_TRANSPORT_EV_STREAM_OPENED;
+    ev.stream = (ants_transport_stream_t *)(void *)ss;
+    (void)event_fn(&ev, event_ctx);
+    return ss;
+}
+
+/* ------------------------------------------------------------------------ */
 /* picoquic callback bridge                                                 */
 /*                                                                          */
 /* Registered per-connection by ants_transport_dial. Translates picoquic    */
@@ -1140,8 +1216,6 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
                                     void *callback_ctx,
                                     void *stream_ctx)
 {
-    (void)cnx;
-    (void)stream_id;
     if (callback_ctx == NULL) {
         return 0;
     }
@@ -1192,6 +1266,18 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
          * our pointer so subsequent stream ops fail closed rather than
          * use-after-free. */
         cs->cnx = NULL;
+        /* Free any heap-allocated inbound stream states for this cnx.
+         * Locally-opened streams live in the caller's _opaque buffer
+         * and are NOT in this list — they're left to the caller. */
+        {
+            struct ants_transport_stream_state *iss = cs->inbound_streams_head;
+            while (iss != NULL) {
+                struct ants_transport_stream_state *next = iss->next_inbound;
+                free(iss);
+                iss = next;
+            }
+            cs->inbound_streams_head = NULL;
+        }
         /* Heap-allocated cs (inbound bootstrap) needs to be unlinked from
          * the transport's inbound list and freed. Outbound cs lives in
          * the caller's _opaque buffer — never free()d by us. */
@@ -1209,8 +1295,19 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
         break;
 
     case picoquic_callback_stream_data:
-        if (ss != NULL && length > 0) {
+        /* Peer-opened streams arrive with stream_ctx == NULL the first
+         * time. Bootstrap a heap ss and fire STREAM_OPENED, then deliver
+         * the data through the normal STREAM_READABLE path. */
+        if (ss == NULL) {
+            ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
+            if (ss == NULL) {
+                return 0; /* allocation failed; drop silently */
+            }
+        }
+        if (length > 0) {
             stream_recv_buf_append(ss, bytes, length);
+            memset(&ev, 0, sizeof ev);
+            ev.conn = (ants_transport_conn_t *)(void *)cs;
             ev.kind = ANTS_TRANSPORT_EV_STREAM_READABLE;
             ev.stream = (ants_transport_stream_t *)(void *)ss;
             ev.payload = bytes;
@@ -1224,37 +1321,47 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
          * then fire STREAM_FIN. Two events keeps the contract simple:
          * payload-bearing events ALWAYS use STREAM_READABLE; FIN is a
          * pure signal. */
-        if (ss != NULL && length > 0) {
+        if (ss == NULL) {
+            ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
+            if (ss == NULL) {
+                return 0;
+            }
+        }
+        if (length > 0) {
             stream_recv_buf_append(ss, bytes, length);
+            memset(&ev, 0, sizeof ev);
+            ev.conn = (ants_transport_conn_t *)(void *)cs;
             ev.kind = ANTS_TRANSPORT_EV_STREAM_READABLE;
             ev.stream = (ants_transport_stream_t *)(void *)ss;
             ev.payload = bytes;
             ev.payload_len = length;
             (void)event_fn(&ev, event_ctx);
-            /* Rebuild ev for the FIN delivery. */
-            memset(&ev, 0, sizeof ev);
-            ev.conn = (ants_transport_conn_t *)(void *)cs;
         }
-        if (ss != NULL) {
-            ss->remote_fin_seen = 1;
-            ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
-            ev.stream = (ants_transport_stream_t *)(void *)ss;
-            (void)event_fn(&ev, event_ctx);
-        }
+        ss->remote_fin_seen = 1;
+        memset(&ev, 0, sizeof ev);
+        ev.conn = (ants_transport_conn_t *)(void *)cs;
+        ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
+        ev.stream = (ants_transport_stream_t *)(void *)ss;
+        (void)event_fn(&ev, event_ctx);
         break;
 
     case picoquic_callback_stream_reset:
     case picoquic_callback_stop_sending:
         /* RESET_STREAM (peer aborts their send-side) and STOP_SENDING
          * (peer aborts their recv-side, i.e. asks us to stop sending)
-         * both invalidate the stream for further use. The caller learns
-         * either way that they cannot rely on more bytes. */
-        if (ss != NULL) {
-            ss->reset_seen = 1;
-            ev.kind = ANTS_TRANSPORT_EV_STREAM_RESET;
-            ev.stream = (ants_transport_stream_t *)(void *)ss;
-            (void)event_fn(&ev, event_ctx);
+         * both invalidate the stream for further use. Peer may reset a
+         * stream we haven't seen any data on yet — bootstrap in that
+         * case so the caller learns about the (now-dead) stream. */
+        if (ss == NULL) {
+            ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
+            if (ss == NULL) {
+                return 0;
+            }
         }
+        ss->reset_seen = 1;
+        ev.kind = ANTS_TRANSPORT_EV_STREAM_RESET;
+        ev.stream = (ants_transport_stream_t *)(void *)ss;
+        (void)event_fn(&ev, event_ctx);
         break;
 
     default:

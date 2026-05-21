@@ -376,14 +376,21 @@ static void test_stream_rejects_invalid_args(void)
     CHECK(got == 0);
 }
 
-/* Tiny event recorder: counts kinds seen by the user's event_fn. */
+/* Tiny event recorder: counts kinds seen by the user's event_fn.
+ * For STREAM_READABLE also captures the latest payload (the bytes
+ * pointed at by event->payload are only valid during the callback, so
+ * we copy). */
+#define TEST_PAYLOAD_CAP 64
 typedef struct {
     int conn_ready;
     int conn_closed;
+    int stream_opened;
     int stream_readable;
     int stream_fin;
     int stream_reset;
     int other;
+    uint8_t last_payload[TEST_PAYLOAD_CAP];
+    size_t last_payload_len;
 } test_event_recorder_t;
 
 static ants_error_t test_recording_event(const ants_transport_event_t *event, void *user_ctx)
@@ -396,8 +403,16 @@ static ants_error_t test_recording_event(const ants_transport_event_t *event, vo
     case ANTS_TRANSPORT_EV_CONN_CLOSED:
         r->conn_closed++;
         break;
+    case ANTS_TRANSPORT_EV_STREAM_OPENED:
+        r->stream_opened++;
+        break;
     case ANTS_TRANSPORT_EV_STREAM_READABLE:
         r->stream_readable++;
+        if (event->payload != NULL && event->payload_len > 0 &&
+            event->payload_len <= TEST_PAYLOAD_CAP) {
+            memcpy(r->last_payload, event->payload, event->payload_len);
+            r->last_payload_len = event->payload_len;
+        }
         break;
     case ANTS_TRANSPORT_EV_STREAM_FIN:
         r->stream_fin++;
@@ -729,6 +744,102 @@ static void test_handshake_rejects_wrong_expected_peer_id(void)
     CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
 }
 
+static void test_loopback_byte_exchange(void)
+{
+    /* Phase 3d-2: peer-opened streams. The dialer opens a bidi stream
+     * and sends a payload; the listener's event_fn must observe both
+     * STREAM_OPENED (peer-bootstrapped ss) and STREAM_READABLE with
+     * the exact bytes. This is the "ANTS network live" milestone for
+     * the transport layer — bytes flow end-to-end over a TLS-secured
+     * QUIC session. */
+    uint8_t dialer_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t dialer_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t listener_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t listener_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(dialer_priv, 0x99, sizeof dialer_priv);
+    memset(listener_priv, 0xAA, sizeof listener_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(dialer_priv, dialer_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(listener_priv, listener_pub), ANTS_OK);
+
+    test_event_recorder_t dialer_rec;
+    memset(&dialer_rec, 0, sizeof dialer_rec);
+    test_event_recorder_t listener_rec;
+    memset(&listener_rec, 0, sizeof listener_rec);
+
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t lcfg;
+    memset(&lcfg, 0, sizeof lcfg);
+    memcpy(lcfg.pub, listener_pub, ANTS_ED25519_PUBKEY_SIZE);
+    lcfg.sign_fn = test_real_sign;
+    lcfg.sign_ctx = listener_priv;
+    lcfg.event_fn = test_recording_event;
+    lcfg.event_ctx = &listener_rec;
+    lcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &lcfg), ANTS_OK);
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    memcpy(dcfg.pub, dialer_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.sign_fn = test_real_sign;
+    dcfg.sign_ctx = dialer_priv;
+    dcfg.event_fn = test_recording_event;
+    dcfg.event_ctx = &dialer_rec;
+    CHECK_EQ(ants_transport_init(&dialer, &dcfg), ANTS_OK);
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+
+    /* Drive the handshake to completion. */
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+        if (dialer_rec.conn_ready >= 1 && listener_rec.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(dialer_rec.conn_ready == 1);
+    CHECK(listener_rec.conn_ready == 1);
+
+    /* Dialer opens a bidi stream and sends "ping\0" with FIN. */
+    ants_transport_stream_t stream = {{0}};
+    CHECK_EQ(ants_transport_open_bidi_stream(&conn, &stream), ANTS_OK);
+    const uint8_t payload[] = "ping";
+    CHECK_EQ(ants_transport_stream_send(&stream, payload, sizeof payload, true /* fin */), ANTS_OK);
+
+    /* Drive until the listener observes the payload (or we give up). */
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+        if (listener_rec.stream_readable >= 1) {
+            break;
+        }
+    }
+
+    /* The listener's event_fn must have seen STREAM_OPENED first, then
+     * STREAM_READABLE with the exact bytes the dialer sent. */
+    CHECK(listener_rec.stream_opened >= 1);
+    CHECK(listener_rec.stream_readable >= 1);
+    CHECK(listener_rec.last_payload_len == sizeof payload);
+    if (listener_rec.last_payload_len == sizeof payload) {
+        CHECK(memcmp(listener_rec.last_payload, payload, sizeof payload) == 0);
+    }
+
+    /* No errors. */
+    CHECK(dialer_rec.conn_closed == 0);
+    CHECK(listener_rec.conn_closed == 0);
+    CHECK(dialer_rec.stream_reset == 0);
+    CHECK(listener_rec.stream_reset == 0);
+
+    /* Clean teardown — sweeps heap-allocated inbound stream + inbound
+     * conn state on the listener side. ASan would flag any leak or
+     * double-free. */
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+}
+
 static void test_introspection_safe_defaults(void)
 {
     /* The four introspection helpers return safe defaults rather than
@@ -780,6 +891,7 @@ int main(void)
     test_handshake_completes_with_real_keys();
     test_inbound_conn_ready_on_listener();
     test_handshake_rejects_wrong_expected_peer_id();
+    test_loopback_byte_exchange();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
 
