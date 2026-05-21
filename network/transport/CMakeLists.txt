@@ -27,6 +27,10 @@ target_include_directories(ants_transport
 # types/constants referenced by the transport header.
 target_link_libraries(ants_transport PUBLIC ants_cbor ants_crypto)
 
+# Phase 1: link picoquic for the real init/destroy lifecycle.
+# Subsequent phases use the same dep for tick / dial / streams.
+target_link_libraries(ants_transport PRIVATE picoquic_core)
+
 target_compile_features(ants_transport PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------

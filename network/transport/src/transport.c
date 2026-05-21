@@ -1,24 +1,69 @@
 /*
- * transport.c — Stub implementation of the P2P transport.
+ * transport.c — P2P transport implementation against vendored picoquic.
  *
- * v1.0 scaffold: every function returns ANTS_ERROR_NOT_IMPLEMENTED or
- * the documented safe default. The real implementation against
- * vendored picoquic lands in subsequent PRs. See ants_transport.h for
- * the API contract.
+ * Phase 1 (this PR): init + destroy + size check. The remaining
+ * functions still return NOT_IMPLEMENTED while we wire them
+ * incrementally in subsequent PRs (phase 2 = tick+dial+listener,
+ * phase 3 = streams+loopback test).
  *
- * Why the stub exists: upstream components (network/dht, network/
- * gossip, reputation/identity) reference the transport API in their
- * data structures and call sites. Having the API compiled — even as a
- * NOT_IMPLEMENTED stub — means those components can integrate against
- * the agreed shape without mocking or ifdef'ing around a future API.
+ * Layout: the caller's opaque ants_transport_t buffer holds a
+ * `struct ants_transport_state` (defined here, not exposed) whose
+ * first field is the picoquic_quic_t pointer. Compile-time check at
+ * the bottom of this file asserts the state fits in
+ * ANTS_TRANSPORT_CTX_SIZE.
  *
- * Same pattern as foundation/tee.
+ * Same opaque-context discipline as foundation/crypto's
+ * ants_blake3_ctx_t and foundation/tee.
  */
 
 #include "ants_transport.h"
 
+#include "picoquic.h"
+
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------------ */
+/* Internal state                                                           */
+/*                                                                          */
+/* The public ants_transport_t is a uint8_t[16384] union; we cast it to    */
+/* this internal struct. Adding fields is safe up to ~16 KB; the           */
+/* compile-time assert at the bottom catches overrun.                       */
+/* ------------------------------------------------------------------------ */
+
+struct ants_transport_state {
+    /* The vendored picoquic QUIC context. Allocated by picoquic_create
+     * in init; freed by picoquic_free in destroy. */
+    picoquic_quic_t *quic;
+
+    /* Snapshot of the caller's local identity. Copied so the caller may
+     * free its config after init. */
+    uint8_t pub[ANTS_ED25519_PUBKEY_SIZE];
+
+    /* Caller's sign callback + opaque cookie. Invoked by picotls during
+     * the TLS 1.3 handshake to sign the transcript. */
+    ants_transport_sign_fn sign_fn;
+    void *sign_ctx;
+
+    /* Caller's event callback + opaque cookie. Phase 2 will invoke this
+     * from inside ants_transport_tick(); phase 1 just stores it. */
+    ants_transport_event_fn event_fn;
+    void *event_ctx;
+
+    /* Connection / stream budget caps from the config. */
+    uint32_t max_connections;
+    uint32_t max_streams_per_conn;
+    uint32_t idle_timeout_ms;
+};
+
+/* ants_transport_t MUST be at least as large as the internal state
+ * struct. The trick: declare a typedef whose array size is -1 (an
+ * invalid type) when the condition fails. C99 compile error then
+ * surfaces at build time rather than corrupting memory at run time.
+ * Same pattern as ants_blake3_ctx_size_check in foundation/crypto. */
+typedef char ants_transport_state_size_check
+    [(sizeof(struct ants_transport_state) <= sizeof(((ants_transport_t *)0)->_opaque)) ? 1 : -1];
 
 /* ------------------------------------------------------------------------ */
 /* Lifecycle                                                                */
@@ -26,16 +71,94 @@
 
 ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_config_t *config)
 {
-    (void)t;
-    (void)config;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (t == NULL || config == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Required fields: sign_fn (TLS handshake signatures) and event_fn
+     * (the only way the caller learns about I/O events). Both must be
+     * non-NULL. The pub key is required so peers can identify us during
+     * the handshake (raw-pubkey TLS per RFC 7250). */
+    if (config->sign_fn == NULL || config->event_fn == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    struct ants_transport_state *state = (struct ants_transport_state *)(void *)t->_opaque;
+    /* Zero the entire opaque buffer so any later fields default to
+     * well-defined values; the picoquic pointer is then explicitly
+     * NULL until create() succeeds. */
+    memset(t->_opaque, 0, sizeof t->_opaque);
+
+    /* Snapshot identity + callbacks. */
+    memcpy(state->pub, config->pub, ANTS_ED25519_PUBKEY_SIZE);
+    state->sign_fn = config->sign_fn;
+    state->sign_ctx = config->sign_ctx;
+    state->event_fn = config->event_fn;
+    state->event_ctx = config->event_ctx;
+    state->max_connections = config->max_connections;
+    state->max_streams_per_conn = config->max_streams_per_conn;
+    state->idle_timeout_ms = config->idle_timeout_ms;
+
+    /* Create the picoquic context.
+     *
+     * Phase-1 caveats (lifted in phase 2/3):
+     *   - cert/key files are NULL. We will plumb RFC 7250 raw-pubkey
+     *     TLS via picotls in phase 2, when dial/listener wire-up
+     *     requires real TLS material.
+     *   - default callback is NULL. Phase 3 will register the bridge
+     *     that translates picoquic stream events to ants_transport_event_t.
+     *   - reset_seed is zeroed. Production callers will supply a real
+     *     16-byte secret; phase 1 doesn't accept connections so this
+     *     doesn't matter yet.
+     *
+     * max_connections=0 in the config means "unbounded" to us, but
+     * picoquic requires a positive bound. Default to 1024 in that case. */
+    uint32_t max_cnx = (config->max_connections == 0) ? 1024 : config->max_connections;
+    uint8_t reset_seed[PICOQUIC_RESET_SECRET_SIZE] = {0};
+    uint64_t current_time = picoquic_current_time();
+
+    state->quic = picoquic_create(max_cnx,
+                                  NULL,   /* cert_file_name */
+                                  NULL,   /* key_file_name */
+                                  NULL,   /* cert_root_file_name */
+                                  "ants", /* default_alpn — registered with peers */
+                                  NULL,   /* default_callback_fn — phase 3 */
+                                  NULL,   /* default_callback_ctx — phase 3 */
+                                  NULL,   /* cnx_id_callback */
+                                  NULL,   /* cnx_id_callback_data */
+                                  reset_seed,
+                                  current_time,
+                                  NULL, /* p_simulated_time — production uses wall clock */
+                                  NULL, /* ticket_file_name — no session resumption yet */
+                                  NULL, /* ticket_encryption_key */
+                                  0);
+    if (state->quic == NULL) {
+        memset(t->_opaque, 0, sizeof t->_opaque);
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Idle timeout: picoquic exposes per-connection idle timeouts.
+     * Phase 2 will plumb config->idle_timeout_ms through. */
+
+    return ANTS_OK;
 }
 
 ants_error_t ants_transport_destroy(ants_transport_t *t, uint64_t close_code)
 {
-    (void)t;
-    (void)close_code;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    (void)close_code; /* Phase 2 will pass close_code to per-connection
+                       * CONNECTION_CLOSE frames. */
+    if (t == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_transport_state *state = (struct ants_transport_state *)(void *)t->_opaque;
+    if (state->quic != NULL) {
+        picoquic_free(state->quic);
+        state->quic = NULL;
+    }
+    /* Wipe the rest of the opaque buffer so later misuse of the (now
+     * dead) transport is observable as zeroed fields rather than
+     * dangling state. */
+    memset(t->_opaque, 0, sizeof t->_opaque);
+    return ANTS_OK;
 }
 
 uint32_t ants_transport_tick(ants_transport_t *t)

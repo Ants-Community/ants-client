@@ -82,6 +82,7 @@ target_link_libraries(picoquic_core PUBLIC picotls_minicrypto)
 target_compile_definitions(picoquic_core PRIVATE
     PICOQUIC_WITHOUT_OPENSSL=1
     PTLS_WITHOUT_OPENSSL=1
+    PTLS_WITHOUT_FUSION=1
     $<$<NOT:$<PLATFORM_ID:Windows>>:_GNU_SOURCE=1>
 )
 
