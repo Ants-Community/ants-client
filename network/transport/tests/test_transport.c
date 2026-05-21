@@ -590,6 +590,80 @@ static void test_handshake_completes_with_real_keys(void)
     CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
 }
 
+static void test_inbound_conn_ready_on_listener(void)
+{
+    /* Phase 3d-1: prove that the listener side ALSO observes CONN_READY
+     * for the inbound cnx. With phase 3b alone, only the dialer's event_fn
+     * fired CONN_READY (it owned the outbound cs); the listener's inbound
+     * cnx had no app-level callback context. Phase 3d-1 wires
+     * verify_certificate to bootstrap a fresh heap-allocated cs on the
+     * listener side, so picoquic's picoquic_callback_ready event surfaces
+     * through the user's event_fn there too. */
+    uint8_t dialer_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t dialer_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t listener_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t listener_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(dialer_priv, 0x77, sizeof dialer_priv);
+    memset(listener_priv, 0x88, sizeof listener_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(dialer_priv, dialer_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(listener_priv, listener_pub), ANTS_OK);
+
+    test_event_recorder_t dialer_rec;
+    memset(&dialer_rec, 0, sizeof dialer_rec);
+    test_event_recorder_t listener_rec;
+    memset(&listener_rec, 0, sizeof listener_rec);
+
+    ants_transport_t listener = {{0}};
+    ants_transport_config_t lcfg;
+    memset(&lcfg, 0, sizeof lcfg);
+    memcpy(lcfg.pub, listener_pub, ANTS_ED25519_PUBKEY_SIZE);
+    lcfg.sign_fn = test_real_sign;
+    lcfg.sign_ctx = listener_priv;
+    lcfg.event_fn = test_recording_event;
+    lcfg.event_ctx = &listener_rec;
+    lcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&listener, &lcfg), ANTS_OK);
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    ants_transport_t dialer = {{0}};
+    ants_transport_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    memcpy(dcfg.pub, dialer_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.sign_fn = test_real_sign;
+    dcfg.sign_ctx = dialer_priv;
+    dcfg.event_fn = test_recording_event;
+    dcfg.event_ctx = &dialer_rec;
+    CHECK_EQ(ants_transport_init(&dialer, &dcfg), ANTS_OK);
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+
+    /* Drive until BOTH sides observe CONN_READY. With mutual TLS
+     * (require_client_authentication=1, enabled in phase 3d-1) both
+     * verify_certificate callbacks fire and both event_fn's see
+     * CONN_READY. */
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+        if (dialer_rec.conn_ready >= 1 && listener_rec.conn_ready >= 1) {
+            break;
+        }
+    }
+
+    CHECK(dialer_rec.conn_ready == 1);
+    CHECK(listener_rec.conn_ready == 1);
+    CHECK(dialer_rec.conn_closed == 0);
+    CHECK(listener_rec.conn_closed == 0);
+
+    /* Clean teardown — exercises the heap-cs free path on the listener
+     * side via either CONN_CLOSED (if the close round-trip flushes
+     * before destroy) or the destroy-time sweep (the orphaned-cs
+     * fallback). ASan would flag any leak or double-free. */
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+}
+
 static void test_handshake_rejects_wrong_expected_peer_id(void)
 {
     /* Phase 3b §expected_peer_id: when the dialer pre-declares a peer_id
@@ -704,6 +778,7 @@ int main(void)
     test_stream_rejects_invalid_args();
     test_stream_lifecycle();
     test_handshake_completes_with_real_keys();
+    test_inbound_conn_ready_on_listener();
     test_handshake_rejects_wrong_expected_peer_id();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
