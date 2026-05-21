@@ -10,6 +10,7 @@
 
 add_library(ants_dht STATIC
     src/dht.c
+    src/dht_wire.c
 )
 
 target_include_directories(ants_dht
@@ -36,5 +37,9 @@ target_compile_features(ants_dht PUBLIC c_std_99)
 if(BUILD_TESTING)
     add_executable(test_dht tests/test_dht.c)
     target_link_libraries(test_dht PRIVATE ants_dht)
+    # Tests need access to the private src/ header for the wire codec
+    # round-trip tests. Not exposed via target_include_directories on
+    # the library — only the test target sees it.
+    target_include_directories(test_dht PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME dht_basic COMMAND test_dht)
 endif()
