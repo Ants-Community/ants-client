@@ -13,6 +13,65 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #4 (transport) feature-complete + Component #5 (DHT) phase 0-3 · 2026-05-21
+
+**ANTS network live at the transport layer.** Ten consecutive PRs land
+the full P2P transport plus the first three phases of the DHT.
+
+**Transport (Component #4) phases 1 → 3d-2** (PRs #18 - #24):
+
+- Vendored picoquic (BSD-3, single-TU port) + picotls (BSD-3, minicrypto
+  backend with cifra + micro-ecc) under `deps/`. Both marked `SYSTEM`
+  include in CMake so their C11-extension warnings don't surface in
+  our compilation units under `-Wpedantic`.
+- Caller-driven async API: opaque `ants_transport_t` (16 KB), tick +
+  registered event callback, no internal threads, no logging.
+- Stream API: bidi + uni open, send (with FIN flag), recv from an
+  internal linear buffer, close, reset. Per-stream state in 1024-byte
+  opaque buffer.
+- **RFC 7250 raw-pubkey TLS 1.3 with mutual auth.** Custom
+  `ptls_sign_certificate_t` delegates to caller-supplied `sign_fn`
+  (TEE-safe). Custom `ptls_verify_certificate_t` parses SPKI-wrapped
+  peer pubkey and verifies `CertificateVerify` via
+  `ants_ed25519_verify`. `expected_peer_id` enforcement on dialer side
+  (anti-MITM for RFC-0010 bootstrap seeds).
+- Inbound (peer-initiated) connections AND streams bootstrap heap-
+  allocated state on demand via the `verify_certificate` and stream-
+  data callback paths respectively, tracked through linked lists in
+  parent state so `destroy()` can sweep orphans.
+- Test milestone (PR #24): two transports with real Ed25519 keypairs,
+  dialer sends `"ping\0"` + FIN on a bidi stream, listener's
+  `event_fn` observes `STREAM_OPENED` and `STREAM_READABLE` with the
+  exact bytes. Clean teardown under ASan + UBSan + TSan.
+
+**DHT (Component #5) phases 0 → 3** (PRs #25 - #27):
+
+- API design (PR #25): `ants_dht.h` pins Kademlia parameters (K=20,
+  α=3, 256 buckets), opaque ctx sizes (32 KB top-level, 8 KB per
+  lookup), event kinds. `ants_dht_shard_key_t` = `uint64_t` per
+  RFC-0002 §DHT LSH. Caller-driven async mirroring transport.
+- k-buckets (PR #26): heap-allocated bucket entries (linked-list MRU
+  at head, K cap, full bucket rejects until phase 6 LRU-eviction-on-
+  PING lands). XOR-distance math: 32-byte XOR, find MSB → bucket
+  index 0..255. `routing_table_size` and `_enumerate` now return real
+  data. `destroy()` sweeps heap entries.
+- CBOR wire codec (PR #27): envelope `{0: type, 1: txid, 2: body}`
+  with integer keys for compactness + natural canonical ordering. 8
+  message types (PING / FIND_NODE / GET_PEERS / ANNOUNCE_PEER plus
+  their responses) with bodies per type. Peer descriptor `{id:
+  bytes(32), addr: text}` — "id" sorts before "addr" canonically
+  because length-tag bytes differ (text(2)=0x62 < text(4)=0x64).
+  **Wire format is DRAFT pending RFC-0008 §DHT formalization.**
+
+**Remaining DHT phases (4-7) for next session:** RPC dispatch over
+transport streams, iterative-lookup state machine, bootstrap +
+maintenance, two-node integration test. Phase 4 is the natural
+next step — uses the wire codec from PR #27 with the stream API
+from PR #21.
+
+CI matrix (7 jobs, all green every PR): Linux gcc/clang Debug+Release,
+macOS clang Debug+Release, TSan Linux clang, clang-format.
+
 ### foundation/crypto: implement Ed25519 (vendored libsodium 1.0.22 ref10) · 2026-05-20
 
 Second crypto primitive landed. Ed25519 sign / verify / pubkey-derive
