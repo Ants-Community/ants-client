@@ -463,6 +463,16 @@ ants_error_t ants_transport_peer_list(const ants_transport_t *t,
                                       size_t cap,
                                       size_t *out_count);
 
+/*
+ * Return the transport's bound local address as a textual multiaddr
+ * (e.g. "/ip4/127.0.0.1/udp/41329/quic-v1"). Useful when the listener
+ * was configured with port 0 (kernel-assigned) and the caller needs to
+ * communicate the actual port to potential dialers. Returns
+ * ANTS_ERROR_NOT_IMPLEMENTED when the transport has no listening
+ * socket (dial-only client).
+ */
+ants_error_t ants_transport_local_addr(const ants_transport_t *t, char *out_buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
