@@ -27,7 +27,17 @@
 
 #include "ants_transport.h"
 
+#include "ants_crypto.h"
 #include "picoquic.h"
+/* picoquic doesn't expose its master picotls context through the public
+ * header. We need it to wire RFC 7250 raw-pubkey TLS (sign_certificate,
+ * verify_certificate, use_raw_public_keys). Reaching into the internal
+ * header is the cleanest path: we vendor picoquic, so any layout shift
+ * surfaces as a compile error on our deliberate version bumps. */
+#include "picoquic_internal.h"
+#include "picotls.h"
+
+#include <stdlib.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -55,10 +65,205 @@ typedef int ants_socket_t;
  * recvfrom() blocks (EAGAIN). */
 #define ANTS_TRANSPORT_MTU 1500
 
+/* ------------------------------------------------------------------------ */
+/* RFC 7250 SubjectPublicKeyInfo (SPKI) wrapping for Ed25519                */
+/*                                                                          */
+/* The TLS 1.3 Certificate message in raw-pubkey mode carries the SPKI of   */
+/* the raw public key (RFC 7250 §3). For Ed25519 the encoding is a fixed   */
+/* 12-byte prefix followed by the 32-byte raw pubkey:                       */
+/*                                                                          */
+/*   30 2a              SEQUENCE, length 42                                 */
+/*     30 05            SEQUENCE, length 5                                  */
+/*       06 03 2b 65 70 OBJECT IDENTIFIER 1.3.101.112 (id-Ed25519)         */
+/*     03 21            BIT STRING, length 33                               */
+/*       00             0 unused bits                                       */
+/*       <pubkey[32]>                                                       */
+/*                                                                          */
+/* Total = 12 + 32 = 44 bytes. Two helpers below: build (encode) and       */
+/* parse (decode). The decoder is constant-time on its prefix check.       */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_TRANSPORT_ED25519_SPKI_SIZE 44
+
+static const uint8_t ANTS_TRANSPORT_ED25519_SPKI_PREFIX[12] = {
+    0x30,
+    0x2a,
+    0x30,
+    0x05,
+    0x06,
+    0x03,
+    0x2b,
+    0x65,
+    0x70,
+    0x03,
+    0x21,
+    0x00,
+};
+
+static void build_ed25519_spki(uint8_t out[ANTS_TRANSPORT_ED25519_SPKI_SIZE],
+                               const uint8_t pubkey[ANTS_ED25519_PUBKEY_SIZE])
+{
+    memcpy(out, ANTS_TRANSPORT_ED25519_SPKI_PREFIX, sizeof ANTS_TRANSPORT_ED25519_SPKI_PREFIX);
+    memcpy(out + sizeof ANTS_TRANSPORT_ED25519_SPKI_PREFIX, pubkey, ANTS_ED25519_PUBKEY_SIZE);
+}
+
+static int
+parse_ed25519_spki(const uint8_t *spki, size_t spki_len, uint8_t out_pub[ANTS_ED25519_PUBKEY_SIZE])
+{
+    if (spki_len != ANTS_TRANSPORT_ED25519_SPKI_SIZE) {
+        return -1;
+    }
+    if (memcmp(spki,
+               ANTS_TRANSPORT_ED25519_SPKI_PREFIX,
+               sizeof ANTS_TRANSPORT_ED25519_SPKI_PREFIX) != 0) {
+        return -1;
+    }
+    memcpy(out_pub, spki + sizeof ANTS_TRANSPORT_ED25519_SPKI_PREFIX, ANTS_ED25519_PUBKEY_SIZE);
+    return 0;
+}
+
 /* Max packets prepared per tick before yielding control back to the
  * caller. Prevents a tick() from starving the embedding event loop if
  * the QUIC ctx has many pending packets to drain. */
 #define ANTS_TRANSPORT_MAX_PACKETS_PER_TICK 32
+
+/* ------------------------------------------------------------------------ */
+/* picotls sign_certificate / verify_certificate adapters                   */
+/*                                                                          */
+/* picotls minicrypto ships sign_certificate for secp256r1 only. For        */
+/* Ed25519 (our peer-identity scheme per RFC-0010) we wire small adapters   */
+/* that call the caller-supplied sign_fn / ants_ed25519_verify.             */
+/*                                                                          */
+/* These structs live inside ants_transport_state (per-transport singleton  */
+/* — the picotls master ctx points at them via pointer slots in            */
+/* ptls_context_t::sign_certificate / verify_certificate).                  */
+/* ------------------------------------------------------------------------ */
+
+/* Sign-side: wraps the caller's sign_fn/sign_ctx alongside the ptls
+ * super struct. picoquic_dispose_sign_certificate `free()`s whatever
+ * pointer is in ctx->sign_certificate, so this struct MUST be heap-
+ * allocated and the malloc'd pointer handed straight to picotls. */
+struct ants_sign_cert {
+    ptls_sign_certificate_t super; /* MUST be first — picotls passes (self) */
+    ants_transport_sign_fn sign_fn;
+    void *sign_ctx;
+};
+
+/* The list of signature algorithms we accept on incoming CertificateVerify.
+ * Terminator is UINT16_MAX per picotls convention. This list is what
+ * picotls advertises in the ClientHello signature_algorithms extension —
+ * peer must offer one of these in CertificateVerify. */
+static const uint16_t ants_supported_sig_algos[] = {PTLS_SIGNATURE_ED25519, UINT16_MAX};
+
+/* Singleton verify_certificate adapter (stateless: same cb + algos for
+ * every transport instance). File scope so its lifetime is the whole
+ * program and we can point every transport's tls_ctx->verify_certificate
+ * at the same address. Picoquic doesn't free this (see line 1418 of
+ * tls_api.c, commented out). */
+static int ants_verify_cert_cb(
+    struct st_ptls_verify_certificate_t *_self,
+    ptls_t *tls,
+    const char *server_name,
+    int (**verify_sign)(void *verify_ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sign),
+    void **verify_data,
+    ptls_iovec_t *certs,
+    size_t num_certs);
+
+static ptls_verify_certificate_t ants_verify_cert_singleton = {
+    .cb = ants_verify_cert_cb,
+    .algos = ants_supported_sig_algos,
+};
+
+/* Forward declaration: the conn-state struct is needed inside the verify
+ * callback to mirror peer_pubkey into per-connection storage. Definition
+ * comes later (after ants_transport_state) for readability. */
+struct ants_transport_conn_state;
+
+/* sign_certificate callback: invoked by picotls during the TLS 1.3
+ * handshake when this side needs to sign the CertificateVerify message
+ * with its private key. We delegate to the caller-supplied sign_fn,
+ * keeping private-key material out of the transport (TEE-safe).
+ *
+ * picotls hands us:
+ *   - input: the bytes to sign (transcript prefix + handshake-context hash,
+ *     already prepared per RFC 8446 §4.4.3 by picotls);
+ *   - algorithms / num_algorithms: the peer's offered signature_algorithms;
+ *   - output: ptls_buffer_t to write the 64-byte Ed25519 signature into;
+ *   - selected_algorithm: out-param we set to PTLS_SIGNATURE_ED25519 (0x0807).
+ *
+ * Returns 0 on success; PTLS_ALERT_* on protocol-level failure. */
+static int ants_sign_cert_cb(ptls_sign_certificate_t *_self,
+                             ptls_t *tls,
+                             ptls_async_job_t **async,
+                             uint16_t *selected_algorithm,
+                             ptls_buffer_t *output,
+                             ptls_iovec_t input,
+                             const uint16_t *algorithms,
+                             size_t num_algorithms)
+{
+    (void)tls;
+    (void)async;
+    struct ants_sign_cert *self = (struct ants_sign_cert *)_self;
+    int ret;
+
+    /* The peer must advertise ed25519. If they don't (e.g. they sent an
+     * outdated signature_algorithms list), fail the handshake. */
+    int found = 0;
+    for (size_t i = 0; i < num_algorithms; i++) {
+        if (algorithms[i] == PTLS_SIGNATURE_ED25519) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        return PTLS_ALERT_HANDSHAKE_FAILURE;
+    }
+
+    /* Delegate to the caller's sign_fn. The signature is fixed-size for
+     * Ed25519 (64 bytes); we stack-allocate it and copy into the picotls
+     * output buffer. */
+    uint8_t sig[ANTS_ED25519_SIG_SIZE];
+    if (self->sign_fn(input.base, input.len, sig, self->sign_ctx) != ANTS_OK) {
+        return PTLS_ERROR_LIBRARY;
+    }
+
+    *selected_algorithm = PTLS_SIGNATURE_ED25519;
+    ptls_buffer_pushv(output, sig, sizeof sig);
+
+    ret = 0;
+Exit:
+    return ret;
+}
+
+/* verify_sign callback: picotls invokes this once the peer's
+ * CertificateVerify message arrives, after our verify_certificate
+ * callback has run. The verify_ctx is a heap-allocated 32-byte buffer
+ * holding the peer's raw Ed25519 pubkey (built by verify_certificate).
+ *
+ * picotls also calls this with data.len == 0 && sign.len == 0 as a
+ * cleanup signal — used here to free verify_ctx on either the verify
+ * path or the cleanup-only path. Either way verify_ctx is freed exactly
+ * once. */
+static int
+ants_verify_sign_cb(void *verify_ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sign)
+{
+    uint8_t *peer_pub = (uint8_t *)verify_ctx;
+    int rc = 0;
+
+    if (data.len == 0 && sign.len == 0) {
+        /* cleanup only — free and return success. */
+    } else if (algo != PTLS_SIGNATURE_ED25519 || sign.len != ANTS_ED25519_SIG_SIZE) {
+        rc = PTLS_ALERT_DECRYPT_ERROR;
+    } else if (ants_ed25519_verify(peer_pub, data.base, data.len, sign.base) != ANTS_OK) {
+        rc = PTLS_ALERT_DECRYPT_ERROR;
+    }
+    free(peer_pub);
+    return rc;
+}
+
+/* verify_certificate callback body — declared above near the singleton.
+ * Defined later (after struct ants_transport_conn_state) so it can
+ * reference cs->peer_pubkey. */
 
 /* ------------------------------------------------------------------------ */
 /* Internal state                                                           */
@@ -99,6 +304,16 @@ struct ants_transport_state {
      * symmetry and for echoing back in outgoing packet sendto(). */
     struct sockaddr_storage local_addr;
     socklen_t local_addr_len;
+
+    /* TLS material owned by picoquic:
+     *   - certificates.list array + each .base byte buffer (freed by
+     *     free_certificates_list in tls_api.c);
+     *   - sign_certificate (freed by picoquic_dispose_sign_certificate).
+     * We malloc them at init time and hand the pointers to picoquic;
+     * picoquic_free reclaims them. No reference stored here.
+     *
+     * verify_certificate is stateless (just cb + algos), so we use a
+     * static singleton — see ants_verify_cert_singleton. */
 };
 
 /* ants_transport_t MUST be at least as large as the internal state
@@ -323,9 +538,9 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
     uint64_t current_time = picoquic_current_time();
 
     state->quic = picoquic_create(max_cnx,
-                                  NULL,   /* cert_file_name */
-                                  NULL,   /* key_file_name */
-                                  NULL,   /* cert_root_file_name */
+                                  NULL,   /* cert_file_name — we configure TLS post-create below */
+                                  NULL,   /* key_file_name  — same */
+                                  NULL,   /* cert_root_file_name — raw-pubkey mode, no CA */
                                   "ants", /* default_alpn — registered with peers */
                                   NULL,   /* default_callback_fn — phase 3 */
                                   NULL,   /* default_callback_ctx — phase 3 */
@@ -341,6 +556,65 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
         memset(t->_opaque, 0, sizeof t->_opaque);
         return ANTS_ERROR_MALFORMED;
     }
+
+    /* RFC 7250 raw-pubkey TLS wiring. picoquic created the picotls master
+     * context but left it minimal (no certs, no sign/verify). We reach
+     * into the internal quic struct to retrieve the master ctx and
+     * configure it:
+     *
+     *   - use_raw_public_keys = 1  → signal raw-pubkey mode in the TLS
+     *     extension on both sides;
+     *   - certificates.list / count → our SPKI-wrapped Ed25519 pubkey;
+     *   - sign_certificate → our adapter that calls config->sign_fn;
+     *   - verify_certificate → static singleton (stateless).
+     *
+     * Ownership: picoquic_free → picoquic_master_tlscontext_free →
+     *   free_certificates_list(certs, count)        // free each .base + list
+     *   picoquic_dispose_sign_certificate(ctx)      // free(ctx->sign_certificate)
+     * So `cert_list`, `cert_spki`, and `sign_cert` MUST be malloc'd and
+     * NOT freed by us. `verify_certificate` is NOT freed by picoquic
+     * (line 1418 of tls_api.c, commented out), so the static singleton
+     * is safe. */
+    ptls_iovec_t *cert_list = (ptls_iovec_t *)malloc(sizeof(ptls_iovec_t));
+    uint8_t *cert_spki = (uint8_t *)malloc(ANTS_TRANSPORT_ED25519_SPKI_SIZE);
+    struct ants_sign_cert *sign_cert = (struct ants_sign_cert *)malloc(sizeof *sign_cert);
+    if (cert_list == NULL || cert_spki == NULL || sign_cert == NULL) {
+        free(cert_list);
+        free(cert_spki);
+        free(sign_cert);
+        picoquic_free(state->quic);
+        memset(t->_opaque, 0, sizeof t->_opaque);
+        return ANTS_ERROR_MALFORMED;
+    }
+    build_ed25519_spki(cert_spki, config->pub);
+    cert_list[0].base = cert_spki;
+    cert_list[0].len = ANTS_TRANSPORT_ED25519_SPKI_SIZE;
+    sign_cert->super.cb = ants_sign_cert_cb;
+    sign_cert->sign_fn = config->sign_fn;
+    sign_cert->sign_ctx = config->sign_ctx;
+
+    ptls_context_t *tls_ctx = (ptls_context_t *)state->quic->tls_master_ctx;
+    tls_ctx->use_raw_public_keys = 1;
+    tls_ctx->certificates.list = cert_list;
+    tls_ctx->certificates.count = 1;
+    tls_ctx->sign_certificate = &sign_cert->super;
+    tls_ctx->verify_certificate = &ants_verify_cert_singleton;
+
+    /* picoquic_create with NULL cert/key implies client-only mode (sets
+     * quic->enforce_client_only = 1, see deps/picoquic .../quicctx.c
+     * line 727), which makes the listener reject every inbound INITIAL
+     * with CONNECTION_REFUSED (0x2). We supply certs/sign via the post-
+     * create configuration above, so this flag is incorrect for us —
+     * clear it so the listener can accept handshakes. */
+    state->quic->enforce_client_only = 0;
+
+    /* Same source file, line 4301: when is_cert_store_not_empty == 0,
+     * picoquic_create_cnx automatically calls picoquic_set_null_verifier()
+     * which nulls our verify_certificate. The flag is meant to track
+     * whether a cert ROOT store is set (CA path), but picoquic uses it
+     * as a generic "is verify wired" signal. We DO have a verifier
+     * (our raw-pubkey adapter), so flip this on. */
+    state->quic->is_cert_store_not_empty = 1;
 
     /* Bind the listening UDP socket if the caller asked for one.
      * NULL listen_multiaddr means "dial-only client" — no socket yet.
@@ -582,12 +856,83 @@ struct ants_transport_conn_state {
      * fail closed if the peer presents a different pubkey. */
     uint8_t expected_peer_id[ANTS_PEER_ID_SIZE];
     int expected_set;
+
+    /* Peer's Ed25519 pubkey, populated by the verify_certificate
+     * callback once the peer's TLS Certificate message arrives. Mirrored
+     * into ANTS_TRANSPORT_EV_CONN_READY.peer_id by the callback bridge. */
+    uint8_t peer_pubkey[ANTS_ED25519_PUBKEY_SIZE];
+    int peer_pubkey_set;
 };
 
 typedef char ants_transport_conn_state_size_check[(sizeof(struct ants_transport_conn_state) <=
                                                    sizeof(((ants_transport_conn_t *)0)->_opaque))
                                                       ? 1
                                                       : -1];
+
+/* verify_certificate callback body. Declared above near the sign_cert
+ * adapters; defined here so it can reference the conn-state struct. */
+static int ants_verify_cert_cb(
+    struct st_ptls_verify_certificate_t *_self,
+    ptls_t *tls,
+    const char *server_name,
+    int (**verify_sign)(void *verify_ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sign),
+    void **verify_data,
+    ptls_iovec_t *certs,
+    size_t num_certs)
+{
+    (void)_self;
+    (void)server_name;
+
+    /* RFC 7250 raw-pubkey TLS sends EXACTLY one cert entry (the SPKI of
+     * the raw key). Reject anything else; reject if length doesn't match
+     * the fixed Ed25519-SPKI size. */
+    if (num_certs != 1 || certs[0].len != ANTS_TRANSPORT_ED25519_SPKI_SIZE) {
+        return PTLS_ALERT_BAD_CERTIFICATE;
+    }
+
+    /* Map ptls_t back to picoquic_cnx_t back to our conn-state. picoquic
+     * stashes cnx in ptls_get_data_ptr() at connection creation (see
+     * tls_api.c:2125). Our app-level callback context is the cs pointer
+     * (set in ants_transport_dial), retrievable via picoquic_get_callback_
+     * context. On the listener side cs may be NULL — we still verify, we
+     * just skip the mirror. */
+    picoquic_cnx_t *cnx = (picoquic_cnx_t *)*ptls_get_data_ptr(tls);
+    struct ants_transport_conn_state *cs =
+        (cnx != NULL) ? (struct ants_transport_conn_state *)picoquic_get_callback_context(cnx)
+                      : NULL;
+
+    /* Always heap-allocate the pubkey passed to verify_sign — that's
+     * the only path that gets cleanup-on-free semantics from picotls.
+     * If cs is reachable we ADDITIONALLY mirror into cs->peer_pubkey so
+     * the CONN_READY event_fn can surface it to the caller. */
+    uint8_t *peer_pub_ptr = (uint8_t *)malloc(ANTS_ED25519_PUBKEY_SIZE);
+    if (peer_pub_ptr == NULL) {
+        return PTLS_ERROR_NO_MEMORY;
+    }
+    if (parse_ed25519_spki(certs[0].base, certs[0].len, peer_pub_ptr) != 0) {
+        free(peer_pub_ptr);
+        return PTLS_ALERT_BAD_CERTIFICATE;
+    }
+
+    if (cs != NULL) {
+        memcpy(cs->peer_pubkey, peer_pub_ptr, ANTS_ED25519_PUBKEY_SIZE);
+        cs->peer_pubkey_set = 1;
+
+        /* expected_peer_id enforcement (anti-MITM for bootstrap_dht_seeds,
+         * RFC-0010). When the caller passed expected_peer_id to dial(),
+         * the handshake fails closed on mismatch. memcmp on public pubkeys
+         * is fine (no secret-dependent timing channel). */
+        if (cs->expected_set &&
+            memcmp(cs->peer_pubkey, cs->expected_peer_id, ANTS_PEER_ID_SIZE) != 0) {
+            free(peer_pub_ptr);
+            return PTLS_ALERT_BAD_CERTIFICATE;
+        }
+    }
+
+    *verify_sign = ants_verify_sign_cb;
+    *verify_data = peer_pub_ptr;
+    return 0;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Stream state                                                             */
@@ -702,7 +1047,13 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     switch (fin_or_event) {
     case picoquic_callback_ready:
         ev.kind = ANTS_TRANSPORT_EV_CONN_READY;
-        /* peer_id stays zero in phase 3c — RFC 7250 binding lands in 3b. */
+        /* RFC 7250 binding: the verify_certificate callback populated
+         * cs->peer_pubkey during the handshake. Mirror it into the
+         * event's peer_id so the caller doesn't need to round-trip
+         * through ants_transport_conn_peer_id. */
+        if (cs->peer_pubkey_set) {
+            memcpy(ev.peer_id.bytes, cs->peer_pubkey, ANTS_PEER_ID_SIZE);
+        }
         (void)event_fn(&ev, event_ctx);
         break;
 

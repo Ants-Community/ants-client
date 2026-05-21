@@ -63,7 +63,7 @@ add_library(picoquic_core STATIC
     picoquic/util.c
 )
 
-target_include_directories(picoquic_core PUBLIC
+target_include_directories(picoquic_core SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/picoquic
 )
 

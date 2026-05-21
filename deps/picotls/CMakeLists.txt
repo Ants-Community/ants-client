@@ -16,7 +16,7 @@ add_library(picotls_core STATIC
     lib/pembase64.c
 )
 
-target_include_directories(picotls_core PUBLIC
+target_include_directories(picotls_core SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_include_directories(picotls_core PRIVATE
@@ -88,7 +88,7 @@ add_library(picotls_minicrypto STATIC
     lib/ffx.c
 )
 
-target_include_directories(picotls_minicrypto PUBLIC
+target_include_directories(picotls_minicrypto SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_include_directories(picotls_minicrypto PRIVATE
