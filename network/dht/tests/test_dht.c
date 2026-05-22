@@ -147,22 +147,22 @@ static void test_tick_returns_idle_sentinel(void)
 
 static void test_action_stubs_return_not_implemented(void)
 {
+    /* After phase 6, all the action APIs are implemented. The only
+     * stubs left would be future-phase additions (none currently).
+     * This test now only exercises the NULL-arg guard surface, which
+     * is part of the stable contract regardless of implementation
+     * status. */
     ants_dht_t d = {{0}};
     ants_dht_lookup_t l = {{0}};
     ants_peer_id_t pid;
     memset(&pid, 0, sizeof pid);
 
-    /* Phase 6 actions still return NOT_IMPLEMENTED. Phase 5 wired up
-     * lookup + lookup_cancel — they now succeed even on a zero-init
-     * dht (the lookup just has no candidates so it never converges
-     * until tick observes it; the test exercises only NULL guards
-     * for those). */
+    /* bootstrap on a zero-init dht: transport is NULL → INVALID_ARG
+     * (treated like a missing required field). */
     CHECK_EQ(ants_dht_bootstrap(&d, "/ip4/127.0.0.1/udp/4242/quic-v1", &pid),
-             ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_dht_announce(&d, 0x12345678ABCDEF00ULL), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_dht_unannounce(&d, 0x12345678ABCDEF00ULL), ANTS_ERROR_NOT_IMPLEMENTED);
+             ANTS_ERROR_INVALID_ARG);
 
-    /* NULL-arg guards (still phase 1 contract). */
+    /* NULL-arg guards. */
     CHECK_EQ(ants_dht_bootstrap(NULL, "/ip4/127.0.0.1/udp/4242/quic-v1", &pid),
              ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_dht_bootstrap(&d, NULL, &pid), ANTS_ERROR_INVALID_ARG);
@@ -1334,6 +1334,359 @@ static void test_lookup_cancel(void)
     CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase 6: server-side dispatch + bootstrap                                */
+/* ------------------------------------------------------------------------ */
+
+static void test_announce_unannounce_local(void)
+{
+    /* Local announce/unannounce should not require transport. They
+     * update the in-state announce sets (both the local-host list and
+     * the server-side announce set) so subsequent GET_PEERS_REQ from
+     * a peer who routes us hits a real entry. */
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    CHECK_EQ(ants_dht_announce(&d, 0xAAAAAAAAAAAAAAAAULL), ANTS_OK);
+    /* Idempotent. */
+    CHECK_EQ(ants_dht_announce(&d, 0xAAAAAAAAAAAAAAAAULL), ANTS_OK);
+    /* Independent keys add separate slots. */
+    CHECK_EQ(ants_dht_announce(&d, 0xBBBBBBBBBBBBBBBBULL), ANTS_OK);
+
+    /* Unannounce drops the entry; second call is a no-op. */
+    CHECK_EQ(ants_dht_unannounce(&d, 0xAAAAAAAAAAAAAAAAULL), ANTS_OK);
+    CHECK_EQ(ants_dht_unannounce(&d, 0xAAAAAAAAAAAAAAAAULL), ANTS_OK);
+
+    /* NULL guards. */
+    CHECK_EQ(ants_dht_announce(NULL, 0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht_unannounce(NULL, 0), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+/* Both A and B run a full DHT. Each transport event_fn forwards to its
+ * own DHT via ants_dht_handle_transport_event, so the server-side
+ * dispatcher is exercised end-to-end. */
+typedef struct {
+    ants_dht_t *dht;
+    int conn_ready;
+    ants_peer_id_t peer_id;
+} test_dht_endpoint_t;
+
+static ants_error_t test_dht_endpoint_event(const ants_transport_event_t *ev, void *ctx)
+{
+    test_dht_endpoint_t *e = (test_dht_endpoint_t *)ctx;
+    if (e->dht != NULL) {
+        ants_dht_handle_transport_event(e->dht, ev);
+    }
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        e->conn_ready++;
+        e->peer_id = ev->peer_id;
+    }
+    return ANTS_OK;
+}
+
+static void test_server_responds_to_ping(void)
+{
+    /* A sends PING to B; B's DHT server dispatcher decodes the request
+     * and answers PING_RESP automatically — no manual server-side stub
+     * on B. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x66, sizeof a_priv);
+    memset(b_priv, 0xCC, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_noop_event;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready == 1);
+    CHECK(b_ep.conn_ready == 1);
+
+    test_rpc_completion_t comp;
+    memset(&comp, 0, sizeof comp);
+    CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (comp.fired >= 1) {
+            break;
+        }
+    }
+    CHECK(comp.fired == 1);
+    CHECK_EQ(comp.last_status, ANTS_OK);
+    CHECK(comp.last_resp_type == ANTS_DHT_MSG_PING_RESP);
+    CHECK(comp.last_ping.txid != 0);
+
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+}
+
+static void test_server_get_peers_with_announce(void)
+{
+    /* B announces shard X locally → its server-side announce set lists
+     * itself. A then sends GET_PEERS X to B; B answers with the
+     * announce list. End-to-end GET_PEERS_RESP encode + decode against
+     * the real server. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x71, sizeof a_priv);
+    memset(b_priv, 0xD2, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_noop_event;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_dht_shard_key_t shard_x = 0xFEEDFACECAFEBABEULL;
+    CHECK_EQ(ants_dht_announce(&db, shard_x), ANTS_OK);
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready == 1);
+    CHECK(b_ep.conn_ready == 1);
+
+    test_rpc_completion_t comp;
+    memset(&comp, 0, sizeof comp);
+    CHECK_EQ(ants_dht__test_send_get_peers(&da, &conn, shard_x, test_rpc_complete_ping, &comp),
+             ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (comp.fired >= 1) {
+            break;
+        }
+    }
+    CHECK(comp.fired == 1);
+    CHECK_EQ(comp.last_status, ANTS_OK);
+
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+}
+
+static void test_bootstrap_completes(void)
+{
+    /* A bootstraps B. After CONN_READY observed (via event delegation),
+     * B should appear in A's routing table with the live conn pointer.
+     * Phase 6 also issues a self-FIND_NODE on completion; with B having
+     * no peers the RPC still succeeds with peer_count=0. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x88, sizeof a_priv);
+    memset(b_priv, 0x44, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_noop_event;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+
+    /* NULL-arg guards on the now-implemented function. */
+    CHECK_EQ(ants_dht_bootstrap(NULL, baddr, &b_pid), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht_bootstrap(&da, NULL, &b_pid), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, NULL), ANTS_ERROR_INVALID_ARG);
+
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready == 1);
+    CHECK(b_ep.conn_ready == 1);
+
+    /* Drive a few more ticks for the self-FIND_NODE round-trip. */
+    for (int i = 0; i < 50; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+    }
+
+    /* A's routing table should now contain B. */
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+    ants_dht_peer_t peers[4];
+    size_t count = 0;
+    CHECK_EQ(ants_dht_routing_table_enumerate(&da, peers, 4, &count), ANTS_OK);
+    CHECK(count == 1);
+    if (count == 1) {
+        CHECK(memcmp(peers[0].peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
+    }
+
+    /* B should still have an empty routing table. */
+    CHECK(ants_dht_routing_table_size(&db) == 0);
+
+    /* Teardown order matters here: when the DHT holds a bootstrap-
+     * allocated heap conn, the transport must be destroyed FIRST so
+     * its CONN_CLOSED callback delegates to dht_handle_transport_event,
+     * which then frees the heap conn via handle_bootstrap_conn_closed.
+     * Destroying the DHT first would free the conn before picoquic
+     * finishes using it (heap-use-after-free during transport_destroy).
+     * For tests that don't use bootstrap (or have already-closed
+     * conns), either order works. */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -1364,6 +1717,11 @@ int main(void)
     test_lookup_no_candidates();
     test_lookup_round_trip();
     test_lookup_cancel();
+
+    test_announce_unannounce_local();
+    test_server_responds_to_ping();
+    test_server_get_peers_with_announce();
+    test_bootstrap_completes();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
