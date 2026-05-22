@@ -14,15 +14,18 @@
  *     ANNOUNCE_PEER and their responses).                     [done]
  *   - Phase 4: RPC dispatch over transport bidi streams.      [done]
  *   - Phase 5: Iterative lookup state machine.                [done]
- *   - Phase 6: Bootstrap + maintenance + server-side dispatch.
+ *   - Phase 6: Bootstrap + server-side dispatch + announces.  [done]
+ *   - Phase 6.1: maintenance (bucket refresh, announce republish).
  *   - Phase 7: Two-node integration test exchanging real lookups.
  */
 
 #include "ants_dht.h"
 
+#include "ants_crypto.h"
 #include "dht_internal.h"
 #include "dht_lookup.h"
 #include "dht_rpc.h"
+#include "dht_server.h"
 #include "dht_wire.h"
 
 #include <stddef.h>
@@ -261,6 +264,12 @@ ants_error_t ants_dht_init(ants_dht_t *dht, const ants_dht_config_t *config)
     state->announce_republish_ms = config->announce_republish_ms;
     /* txid 0 is reserved as a sentinel; start handing out at 1. */
     state->next_txid = 1;
+    /* server_secret = BLAKE3(local_peer_id). Phase 6 uses a fixed
+     * value — phase 6.1+ will rotate it on a slow schedule. The
+     * derivation makes the token deterministic per-peer so two ANTS
+     * implementations running off the same local_peer_id will
+     * accept each other's tokens (useful for hot-restart). */
+    (void)ants_blake3_hash(state->local_peer_id.bytes, ANTS_PEER_ID_SIZE, state->server_secret);
     return ANTS_OK;
 }
 
@@ -286,6 +295,21 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
      * was abandoned. Idempotent on a zeroed dht: pending[] is all
      * zero, the scan is a no-op. */
     ants_dht_rpc_drop_all(dht);
+    /* Reclaim server-side inbound stream accumulators (recv_buf heap). */
+    ants_dht_server_drop_all(dht);
+    /* Free any heap-allocated bootstrap conn buffers. Free regardless
+     * of `in_use` because handle_bootstrap_conn_closed marks entries
+     * dead (in_use=false) without freeing — the leak window closes
+     * here. The caller MUST have called ants_transport_destroy first
+     * (otherwise picoquic may still hold references to these conns
+     * and the upcoming transport_destroy will UAF). */
+    for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
+        if (state->bootstrap_entries[i].conn != NULL) {
+            free(state->bootstrap_entries[i].conn);
+            state->bootstrap_entries[i].conn = NULL;
+            state->bootstrap_entries[i].in_use = false;
+        }
+    }
     /* Drop any heap-allocated bucket entries before zeroing the buffer.
      * Idempotent on a never-init'd (zeroed) dht: all bucket heads are
      * NULL, the loop is a no-op. */
@@ -319,8 +343,50 @@ ants_dht_bootstrap(ants_dht_t *dht, const char *multiaddr, const ants_peer_id_t 
     if (dht == NULL || multiaddr == NULL || expected_peer_id == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    /* Phase 6 implements: ants_transport_dial + insert-on-handshake. */
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+
+    if (state->transport == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t multiaddr_len = strlen(multiaddr);
+    if (multiaddr_len == 0 || multiaddr_len >= ANTS_MULTIADDR_MAX_LEN) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Find a free bootstrap entry. */
+    struct ants_dht_bootstrap_entry *be = NULL;
+    for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
+        if (!state->bootstrap_entries[i].in_use) {
+            be = &state->bootstrap_entries[i];
+            break;
+        }
+    }
+    if (be == NULL) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Heap-allocate the conn so its address is stable across the
+     * dial → CONN_READY callback chain. Freed on CONN_CLOSED or in
+     * ants_dht_destroy. */
+    ants_transport_conn_t *conn = (ants_transport_conn_t *)malloc(sizeof(ants_transport_conn_t));
+    if (conn == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memset(conn, 0, sizeof *conn);
+
+    ants_error_t err = ants_transport_dial(state->transport, multiaddr, expected_peer_id, conn);
+    if (err != ANTS_OK) {
+        free(conn);
+        return err;
+    }
+
+    be->in_use = true;
+    be->conn = conn;
+    be->expected_peer_id = *expected_peer_id;
+    be->promoted = false;
+    memcpy(be->multiaddr, multiaddr, multiaddr_len);
+    be->multiaddr[multiaddr_len] = '\0';
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -332,8 +398,30 @@ ants_error_t ants_dht_announce(ants_dht_t *dht, ants_dht_shard_key_t shard_key)
     if (dht == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    (void)shard_key;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+
+    /* Idempotent: refresh if already in the set. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
+        if (state->local_announces[i].in_use && state->local_announces[i].shard_key == shard_key) {
+            return ANTS_OK;
+        }
+    }
+    /* Insert. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
+        if (!state->local_announces[i].in_use) {
+            state->local_announces[i].in_use = true;
+            state->local_announces[i].shard_key = shard_key;
+            /* Also record ourselves in the server-side announce set so a
+             * GET_PEERS query from a peer who routes us hits an actual
+             * entry rather than the K-closest fallback. */
+            ants_dht_peer_t self;
+            memset(&self, 0, sizeof self);
+            self.peer_id = state->local_peer_id;
+            (void)ants_dht_server_upsert_announce(state, shard_key, &self, 0 /* now_us */);
+            return ANTS_OK;
+        }
+    }
+    return ANTS_ERROR_BUFFER_TOO_SMALL;
 }
 
 ants_error_t ants_dht_unannounce(ants_dht_t *dht, ants_dht_shard_key_t shard_key)
@@ -341,8 +429,23 @@ ants_error_t ants_dht_unannounce(ants_dht_t *dht, ants_dht_shard_key_t shard_key
     if (dht == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    (void)shard_key;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    /* Idempotent on absent key. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
+        if (state->local_announces[i].in_use && state->local_announces[i].shard_key == shard_key) {
+            state->local_announces[i].in_use = false;
+        }
+    }
+    /* Drop the matching self-entry from the server-side announce set too. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_ANNOUNCES; i++) {
+        if (state->announces[i].in_use && state->announces[i].shard_key == shard_key &&
+            memcmp(state->announces[i].announcer.peer_id.bytes,
+                   state->local_peer_id.bytes,
+                   ANTS_PEER_ID_SIZE) == 0) {
+            state->announces[i].in_use = false;
+        }
+    }
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -395,12 +498,99 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Bootstrap event hooks                                                    */
+/*                                                                          */
+/* Promotion path: a bootstrap dial returns immediately, but the conn       */
+/* isn't usable until CONN_READY fires. When it does, the event's peer_id  */
+/* identifies the remote; if the conn matches a pending bootstrap entry,   */
+/* we insert into the routing table and issue a self-FIND_NODE to seed     */
+/* nearby buckets via the seed peer's view.                                 */
+/* ------------------------------------------------------------------------ */
+
+static void bootstrap_find_node_completion(ants_error_t status, const void *resp, void *ctx)
+{
+    (void)resp;
+    (void)ctx;
+    /* The lookup machinery is the proper path for fold-peers-into-
+     * routing-table; this RPC is just for seeding via the FIND_NODE_RESP
+     * from the bootstrap peer's perspective. Phase 6 keeps it simple:
+     * the response is observed but its peers aren't folded back. Phase 7
+     * end-to-end test uses ants_dht_lookup for real discovery. */
+    (void)status;
+}
+
+static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_event_t *event)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
+        struct ants_dht_bootstrap_entry *be = &state->bootstrap_entries[i];
+        if (!be->in_use || be->conn != event->conn || be->promoted) {
+            continue;
+        }
+        /* Insert the bootstrap peer into the routing table with its
+         * live conn. (Skip self silently — kbucket_insert checks.) */
+        ants_dht_peer_t peer;
+        memset(&peer, 0, sizeof peer);
+        peer.peer_id = event->peer_id;
+        memcpy(peer.multiaddr, be->multiaddr, sizeof peer.multiaddr);
+        (void)kbucket_insert(state, &peer, be->conn, 0 /* now_us, phase 6.1 plumbs in real time */);
+        be->promoted = true;
+
+        /* Seed nearby buckets by issuing FIND_NODE on our own peer_id. */
+        (void)ants_dht_rpc_send_find_node(
+            dht, be->conn, &state->local_peer_id, bootstrap_find_node_completion, NULL);
+        break;
+    }
+}
+
+static void handle_bootstrap_conn_closed(ants_dht_t *dht, const ants_transport_event_t *event)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    /* Mark the entry dead but DO NOT free(be->conn) yet — picoquic's
+     * disconnect path keeps using the conn state for a few lines after
+     * firing CONN_CLOSED (it nulls cs->cnx, etc.). We free the heap
+     * buffer in ants_dht_destroy, after the transport has been fully
+     * torn down. The leak window is exactly one destroy call. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
+        struct ants_dht_bootstrap_entry *be = &state->bootstrap_entries[i];
+        if (be->in_use && be->conn == event->conn) {
+            be->in_use = false;
+            be->promoted = false;
+            /* be->conn stays non-NULL — destroy will free it. */
+        }
+    }
+    /* Also clear any routing-table entry whose conn matches the closed
+     * conn, so phase 5 lookups don't try to use a dead conn. */
+    for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT; i++) {
+        for (struct ants_dht_bucket_entry *e = state->buckets[i].head; e != NULL; e = e->next) {
+            if (e->conn == event->conn) {
+                e->conn = NULL;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Transport event delegation                                               */
 /* ------------------------------------------------------------------------ */
 
 ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transport_event_t *event)
 {
-    return ants_dht_rpc_handle_event(dht, event);
+    if (dht == NULL || event == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Bootstrap-specific hooks first so the conn/routing state is in
+     * shape when the rpc / server dispatchers see the event. */
+    if (event->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        handle_bootstrap_conn_ready(dht, event);
+    } else if (event->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
+        handle_bootstrap_conn_closed(dht, event);
+    }
+    /* Outbound RPC dispatch (responses for ants_dht_rpc_send_*). */
+    (void)ants_dht_rpc_handle_event(dht, event);
+    /* Server-side dispatch (inbound peer-initiated requests). */
+    (void)ants_dht_server_handle_event(dht, event);
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */

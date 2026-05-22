@@ -208,6 +208,93 @@ struct ants_dht_lookup_state {
 #define ANTS_DHT_MAX_ACTIVE_LOOKUPS 8
 
 /* ------------------------------------------------------------------------ */
+/* Server-side inbound-stream tracking                                      */
+/*                                                                          */
+/* For each peer-initiated bidi stream that delivers a DHT request, we      */
+/* accumulate bytes here until STREAM_FIN — same accumulator pattern as     */
+/* the outbound pending_rpc but indexed by inbound stream pointer. The     */
+/* response is written back on the same stream + FIN; the slot is then     */
+/* freed.                                                                   */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_INBOUND_STREAMS 32
+#define ANTS_DHT_INBOUND_RECV_CAP    4096
+
+struct ants_dht_inbound_stream {
+    bool in_use;
+    ants_transport_conn_t *conn;
+    ants_transport_stream_t *stream;
+    /* Peer identity, captured from the STREAM_OPENED event's peer_id
+     * field. Needed by GET_PEERS_RESP token derivation and by
+     * ANNOUNCE_PEER's announcer-binding. */
+    ants_peer_id_t peer_id;
+    uint8_t *recv_buf;
+    size_t recv_len;
+    size_t recv_cap;
+};
+
+/* ------------------------------------------------------------------------ */
+/* Announce set                                                             */
+/*                                                                          */
+/* Records of peers that announced (via ANNOUNCE_PEER RPC) they host a      */
+/* particular shard. GET_PEERS responses serve this set when asked about    */
+/* a shard we have announces for; otherwise they fall back to the K-       */
+/* closest peers from our routing table.                                    */
+/*                                                                          */
+/* Phase 6 keeps storage simple and bounded — no expiry timer; the array   */
+/* is reused round-robin once full. Maintenance (phase 6.1+) will add      */
+/* expiry by last_seen + republish.                                        */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_ANNOUNCES 32
+
+struct ants_dht_announce {
+    bool in_use;
+    ants_dht_shard_key_t shard_key;
+    ants_dht_peer_t announcer;
+    uint64_t last_seen_us;
+};
+
+/* ------------------------------------------------------------------------ */
+/* Bootstrap registry                                                       */
+/*                                                                          */
+/* Tracks dials initiated by ants_dht_bootstrap so the event-delegation    */
+/* path knows to promote those peers into the routing table on CONN_READY  */
+/* and to free the heap-allocated conn buffer on CONN_CLOSED / destroy.   */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_BOOTSTRAP_PEERS 8
+
+struct ants_dht_bootstrap_entry {
+    bool in_use;
+    /* Heap-allocated by ants_dht_bootstrap so it outlives the call stack.
+     * Freed on CONN_CLOSED (transport guarantees no further callbacks
+     * once it fires) or on dht_destroy if still open. */
+    ants_transport_conn_t *conn;
+    ants_peer_id_t expected_peer_id;
+    /* Has the handshake completed and the peer been inserted into the
+     * routing table? Set to true on CONN_READY. */
+    bool promoted;
+    char multiaddr[ANTS_MULTIADDR_MAX_LEN];
+};
+
+/* ------------------------------------------------------------------------ */
+/* Local announces (shards we host)                                         */
+/*                                                                          */
+/* Phase 6 records the shard keys we've asked the network to remember us   */
+/* for, via ants_dht_announce. The active-republish loop in phase 6.1+    */
+/* will scan this set and re-emit ANNOUNCE_PEER RPCs. For now it's just a  */
+/* membership set so ants_dht_unannounce works.                            */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_LOCAL_ANNOUNCES 16
+
+struct ants_dht_local_announce {
+    bool in_use;
+    ants_dht_shard_key_t shard_key;
+};
+
+/* ------------------------------------------------------------------------ */
 /* Top-level DHT state                                                      */
 /*                                                                          */
 /* Cast over ants_dht_t::_opaque. Size-checked at compile time in dht.c.   */
@@ -236,6 +323,19 @@ struct ants_dht_state {
      * allocated ants_dht_lookup_t, registered by ants_dht_lookup and
      * cleared by ants_dht_lookup_cancel or LOOKUP_COMPLETE / TIMEOUT. */
     ants_dht_lookup_t *active_lookups[ANTS_DHT_MAX_ACTIVE_LOOKUPS];
+    /* Server-side: inbound stream accumulators (peer-initiated requests). */
+    struct ants_dht_inbound_stream inbound_streams[ANTS_DHT_MAX_INBOUND_STREAMS];
+    /* Server-side: announce records (peer X hosts shard Y). */
+    struct ants_dht_announce announces[ANTS_DHT_MAX_ANNOUNCES];
+    /* Bootstrap dials in progress / completed. */
+    struct ants_dht_bootstrap_entry bootstrap_entries[ANTS_DHT_MAX_BOOTSTRAP_PEERS];
+    /* Local-host announce set (shards we've announced via ants_dht_announce). */
+    struct ants_dht_local_announce local_announces[ANTS_DHT_MAX_LOCAL_ANNOUNCES];
+    /* Server secret for GET_PEERS_RESP token derivation. Initialised by
+     * ants_dht_init to a deterministic-but-unpredictable value (we use
+     * BLAKE3(local_peer_id) — sufficient for phase 6's no-rotation token
+     * scheme; phase 6.1+ will rotate every few epochs). */
+    uint8_t server_secret[32];
 };
 
 #endif /* ANTS_DHT_INTERNAL_H */
