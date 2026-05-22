@@ -1,20 +1,18 @@
 /*
- * dht.c — Kademlia DHT (shard-key variant) stub.
+ * dht.c — Kademlia DHT (shard-key variant).
  *
- * v1.0 scaffold: every function returns ANTS_ERROR_NOT_IMPLEMENTED
- * (or the documented safe default for observers). The API surface is
- * pinned in ants_dht.h so upstream components (cache/semantic,
- * reputation, anti-eclipse) can integrate against it immediately;
- * the real implementation against the k-bucket data structure, XOR-
- * distance routing, and CBOR-encoded RPCs lands in subsequent PRs.
+ * Lifecycle, k-bucket routing table, public-API entry points, and the
+ * RPC-event delegation hook. The actual outbound RPC machinery (CBOR
+ * encode + bidi stream + completion handler) lives in dht_rpc.c; the
+ * shared state layout is defined in dht_internal.h.
  *
- * Implementation phases (planned, matching transport's progression):
- *   - Phase 1 (this PR): API surface stub, opaque-ctx size check,
- *     init/destroy lifecycle that just zeroes the buffer.
- *   - Phase 2: k-bucket data structure + XOR distance helpers.
+ * Implementation phases:
+ *   - Phase 1: API surface stub, opaque-ctx size check, init/destroy
+ *     lifecycle that just zeroes the buffer.                  [done]
+ *   - Phase 2: k-bucket data structure + XOR distance helpers. [done]
  *   - Phase 3: Wire-message CBOR codec (PING, FIND_NODE, GET_PEERS,
- *     ANNOUNCE_PEER and their responses).
- *   - Phase 4: RPC dispatch over transport bidi streams.
+ *     ANNOUNCE_PEER and their responses).                     [done]
+ *   - Phase 4: RPC dispatch over transport bidi streams.      [done]
  *   - Phase 5: Iterative lookup state machine.
  *   - Phase 6: Bootstrap + maintenance (refresh, republish).
  *   - Phase 7: Two-node integration test exchanging real lookups.
@@ -22,64 +20,22 @@
 
 #include "ants_dht.h"
 
+#include "dht_internal.h"
+#include "dht_rpc.h"
+#include "dht_wire.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
-/* K-bucket data structures                                                 */
+/* Storage layout                                                           */
 /*                                                                          */
-/* Standard Kademlia layout:                                                */
-/*   - 256 buckets, one per leading-bit-prefix length of XOR(local, peer);  */
-/*   - Each bucket holds up to ANTS_DHT_K = 20 entries.                     */
-/*   - Entries are heap-allocated linked-list nodes; the bucket head holds  */
-/*     a pointer + a count for O(1) size queries.                           */
-/*                                                                          */
-/* Insertion policy (phase 2): if the peer is already present, refresh its  */
-/* last_seen and move it to the most-recently-seen end of the bucket. If    */
-/* the bucket is full, REJECT the new entry (BUFFER_TOO_SMALL). The LRU-    */
-/* eviction-on-PING policy from the Kademlia paper lands in phase 6 once    */
-/* we can issue PING RPCs over the transport.                                */
+/* struct ants_dht_state, ants_dht_bucket, ants_dht_pending_rpc all live in */
+/* dht_internal.h so dht_rpc.c can share them. Only the size-check assert  */
+/* against the public ANTS_DHT_CTX_SIZE stays here.                        */
 /* ------------------------------------------------------------------------ */
-
-struct ants_dht_bucket_entry {
-    ants_dht_peer_t peer;
-    /* Monotonic timestamp (we use ants_transport_tick-cadence wall time
-     * in microseconds via picoquic_current_time at the bridge, but the
-     * unit's irrelevant for correctness — only relative ordering is). */
-    uint64_t last_seen_us;
-    struct ants_dht_bucket_entry *next;
-};
-
-struct ants_dht_bucket {
-    /* Singly-linked list; head is the most-recently-seen entry. New
-     * inserts go at head; on-touch (already-present) entries get moved
-     * to head. Bucket-tail (LRU) is the eviction candidate. */
-    struct ants_dht_bucket_entry *head;
-    size_t count;
-};
-
-/* ------------------------------------------------------------------------ */
-/* Internal state                                                           */
-/*                                                                          */
-/* The public ants_dht_t is a uint8_t[32768] union; we cast it to this     */
-/* internal struct. Phase 2 adds the bucket array (256 buckets × 16 bytes  */
-/* per bucket head = ~4 KB); entries live on the heap.                     */
-/* ------------------------------------------------------------------------ */
-
-struct ants_dht_state {
-    ants_transport_t *transport;
-    ants_peer_id_t local_peer_id;
-    ants_dht_event_fn event_fn;
-    void *event_ctx;
-    uint32_t refresh_interval_ms;
-    uint32_t lookup_deadline_ms;
-    uint32_t announce_republish_ms;
-    /* Phase 2: 256-bucket routing table. Phase 5+ adds active-lookup
-     * registry and announcement set. */
-    struct ants_dht_bucket buckets[ANTS_DHT_BUCKET_COUNT];
-};
 
 typedef char ants_dht_state_size_check
     [(sizeof(struct ants_dht_state) <= sizeof(((ants_dht_t *)0)->_opaque)) ? 1 : -1];
@@ -292,6 +248,8 @@ ants_error_t ants_dht_init(ants_dht_t *dht, const ants_dht_config_t *config)
     state->refresh_interval_ms = config->refresh_interval_ms;
     state->lookup_deadline_ms = config->lookup_deadline_ms;
     state->announce_republish_ms = config->announce_republish_ms;
+    /* txid 0 is reserved as a sentinel; start handing out at 1. */
+    state->next_txid = 1;
     return ANTS_OK;
 }
 
@@ -301,6 +259,11 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    /* Reclaim every in-flight RPC's heap (stream + recv_buf), firing
+     * each completion with PEER_UNREACHABLE so callers learn the RPC
+     * was abandoned. Idempotent on a zeroed dht: pending[] is all
+     * zero, the scan is a no-op. */
+    ants_dht_rpc_drop_all(dht);
     /* Drop any heap-allocated bucket entries before zeroing the buffer.
      * Idempotent on a never-init'd (zeroed) dht: all bucket heads are
      * NULL, the loop is a no-op. Phase 5+ will also reclaim active-
@@ -405,23 +368,51 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
 }
 
 /* ------------------------------------------------------------------------ */
-/* Internal test hook                                                       */
+/* Transport event delegation                                               */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transport_event_t *event)
+{
+    return ants_dht_rpc_handle_event(dht, event);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Internal test hooks                                                      */
 /*                                                                          */
-/* Production code never calls this — it inserts into the routing table     */
-/* without dialing the peer or verifying liveness. Used by unit tests in    */
-/* phase 2 to populate the table for k-bucket logic verification before     */
-/* the bootstrap (phase 6) and lookup (phase 5) paths are wired.            */
+/* Production code never calls these — they bypass the lookup/bootstrap     */
+/* state machines (which land in phases 5-6) and let phase 2-4 tests       */
+/* exercise the lower-level primitives directly. Forward declarations      */
+/* here silence -Wmissing-prototypes; tests pick them up via extern.       */
 /*                                                                          */
 /* Not in ants_dht.h so callers compiled against the public header don't    */
-/* see it; tests link directly against libants_dht.a via an extern decl.   */
-/* Forward declarations here silence -Wmissing-prototypes without exposing  */
-/* a separate internal header.                                              */
+/* see them.                                                                */
 /* ------------------------------------------------------------------------ */
 
 ants_error_t
 ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_t now_us);
 ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
+
+ants_error_t ants_dht__test_send_ping(ants_dht_t *dht,
+                                      ants_transport_conn_t *conn,
+                                      ants_dht_rpc_completion_fn completion,
+                                      void *ctx);
+ants_error_t ants_dht__test_send_find_node(ants_dht_t *dht,
+                                           ants_transport_conn_t *conn,
+                                           const ants_peer_id_t *target,
+                                           ants_dht_rpc_completion_fn completion,
+                                           void *ctx);
+ants_error_t ants_dht__test_send_get_peers(ants_dht_t *dht,
+                                           ants_transport_conn_t *conn,
+                                           ants_dht_shard_key_t key,
+                                           ants_dht_rpc_completion_fn completion,
+                                           void *ctx);
+ants_error_t ants_dht__test_send_announce_peer(ants_dht_t *dht,
+                                               ants_transport_conn_t *conn,
+                                               ants_dht_shard_key_t key,
+                                               const uint8_t token[ANTS_DHT_TOKEN_SIZE],
+                                               ants_dht_rpc_completion_fn completion,
+                                               void *ctx);
 
 ants_error_t
 ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_t now_us)
@@ -449,4 +440,40 @@ uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t
     }
     const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
     return bucket_index_for_peer(state, peer_id);
+}
+
+ants_error_t ants_dht__test_send_ping(ants_dht_t *dht,
+                                      ants_transport_conn_t *conn,
+                                      ants_dht_rpc_completion_fn completion,
+                                      void *ctx)
+{
+    return ants_dht_rpc_send_ping(dht, conn, completion, ctx);
+}
+
+ants_error_t ants_dht__test_send_find_node(ants_dht_t *dht,
+                                           ants_transport_conn_t *conn,
+                                           const ants_peer_id_t *target,
+                                           ants_dht_rpc_completion_fn completion,
+                                           void *ctx)
+{
+    return ants_dht_rpc_send_find_node(dht, conn, target, completion, ctx);
+}
+
+ants_error_t ants_dht__test_send_get_peers(ants_dht_t *dht,
+                                           ants_transport_conn_t *conn,
+                                           ants_dht_shard_key_t key,
+                                           ants_dht_rpc_completion_fn completion,
+                                           void *ctx)
+{
+    return ants_dht_rpc_send_get_peers(dht, conn, key, completion, ctx);
+}
+
+ants_error_t ants_dht__test_send_announce_peer(ants_dht_t *dht,
+                                               ants_transport_conn_t *conn,
+                                               ants_dht_shard_key_t key,
+                                               const uint8_t token[ANTS_DHT_TOKEN_SIZE],
+                                               ants_dht_rpc_completion_fn completion,
+                                               void *ctx)
+{
+    return ants_dht_rpc_send_announce_peer(dht, conn, key, token, completion, ctx);
 }

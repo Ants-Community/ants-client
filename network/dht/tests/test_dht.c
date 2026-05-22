@@ -19,6 +19,8 @@
 #include "ants_crypto.h"
 #include "ants_dht.h"
 #include "ants_transport.h"
+#include "dht_internal.h"
+#include "dht_rpc.h"
 #include "dht_wire.h"
 
 #include <stdbool.h>
@@ -637,6 +639,442 @@ static void test_wire_rejects_buffer_too_small(void)
              ANTS_ERROR_BUFFER_TOO_SMALL);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase 4: RPC dispatch round-trip                                         */
+/*                                                                          */
+/* Two real transports (A=dialer, B=listener) exchange CBOR-encoded RPC    */
+/* requests/responses over QUIC bidi streams. A drives outbound RPCs       */
+/* through the DHT dispatcher; B acts as a manual server (decode-and-      */
+/* respond) since the server-side dispatch logic lands in phase 5+.        */
+/*                                                                          */
+/* Test hooks declared in dht.c expose the dht_rpc_send_* primitives:      */
+/* ------------------------------------------------------------------------ */
+
+extern ants_error_t ants_dht__test_send_ping(ants_dht_t *dht,
+                                             ants_transport_conn_t *conn,
+                                             ants_dht_rpc_completion_fn completion,
+                                             void *ctx);
+extern ants_error_t ants_dht__test_send_find_node(ants_dht_t *dht,
+                                                  ants_transport_conn_t *conn,
+                                                  const ants_peer_id_t *target,
+                                                  ants_dht_rpc_completion_fn completion,
+                                                  void *ctx);
+extern ants_error_t ants_dht__test_send_get_peers(ants_dht_t *dht,
+                                                  ants_transport_conn_t *conn,
+                                                  ants_dht_shard_key_t key,
+                                                  ants_dht_rpc_completion_fn completion,
+                                                  void *ctx);
+extern ants_error_t ants_dht__test_send_announce_peer(ants_dht_t *dht,
+                                                      ants_transport_conn_t *conn,
+                                                      ants_dht_shard_key_t key,
+                                                      const uint8_t token[ANTS_DHT_TOKEN_SIZE],
+                                                      ants_dht_rpc_completion_fn completion,
+                                                      void *ctx);
+
+/* Real-key sign callback: signs the TLS handshake transcript with the
+ * Ed25519 private key passed via sign_ctx. Same shape as the one in
+ * test_transport.c. */
+static ants_error_t test_real_sign(const uint8_t *transcript,
+                                   size_t transcript_len,
+                                   uint8_t out_sig[ANTS_ED25519_SIG_SIZE],
+                                   void *sign_ctx)
+{
+    const uint8_t *priv = (const uint8_t *)sign_ctx;
+    return ants_ed25519_sign(priv, transcript, transcript_len, out_sig);
+}
+
+/* Server-side state: B accumulates inbound request bytes per stream and
+ * synthesises a response on STREAM_FIN. respond_with selects the RPC
+ * type B should answer with — caller sets it before each round. */
+#define TEST_RPC_BUF_SIZE 2048
+
+typedef struct {
+    ants_transport_stream_t *inbound_stream;
+    uint8_t recv_buf[TEST_RPC_BUF_SIZE];
+    size_t recv_len;
+    ants_dht_msg_type_t respond_with;
+    int stream_opened;
+    int stream_readable;
+    int stream_fin;
+    int response_sent;
+    ants_error_t last_err;
+} test_rpc_server_t;
+
+static void test_rpc_server_reset(test_rpc_server_t *s)
+{
+    s->inbound_stream = NULL;
+    s->recv_len = 0;
+    s->stream_opened = 0;
+    s->stream_readable = 0;
+    s->stream_fin = 0;
+    s->response_sent = 0;
+    s->last_err = ANTS_OK;
+}
+
+/* Build a response based on the inbound request and respond_with. Returns
+ * the encoded length via *out_len; 0 on failure. */
+static ants_error_t
+test_rpc_build_response(test_rpc_server_t *s, uint8_t *out, size_t cap, size_t *out_len)
+{
+    ants_error_t err = ANTS_ERROR_NOT_IMPLEMENTED;
+    switch (s->respond_with) {
+    case ANTS_DHT_MSG_PING_RESP: {
+        ants_dht_ping_req_t req;
+        memset(&req, 0, sizeof req);
+        err = ants_dht_wire_decode_ping_req(s->recv_buf, s->recv_len, &req);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        ants_dht_ping_resp_t resp;
+        resp.txid = req.txid;
+        return ants_dht_wire_encode_ping_resp(out, cap, out_len, &resp);
+    }
+    case ANTS_DHT_MSG_FIND_NODE_RESP: {
+        ants_dht_find_node_req_t req;
+        memset(&req, 0, sizeof req);
+        err = ants_dht_wire_decode_find_node_req(s->recv_buf, s->recv_len, &req);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        ants_dht_find_node_resp_t resp;
+        memset(&resp, 0, sizeof resp);
+        resp.txid = req.txid;
+        /* Synthesise a single fake-peer response so the encode path
+         * exercises the peer-array case. */
+        resp.peer_count = 1;
+        memset(resp.peers[0].peer_id.bytes, 0xCC, ANTS_PEER_ID_SIZE);
+        snprintf(resp.peers[0].multiaddr,
+                 sizeof resp.peers[0].multiaddr,
+                 "/ip4/127.0.0.1/udp/9999/quic-v1");
+        return ants_dht_wire_encode_find_node_resp(out, cap, out_len, &resp);
+    }
+    default:
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    }
+}
+
+static ants_error_t test_rpc_server_event(const ants_transport_event_t *ev, void *ctx)
+{
+    test_rpc_server_t *s = (test_rpc_server_t *)ctx;
+    switch (ev->kind) {
+    case ANTS_TRANSPORT_EV_STREAM_OPENED:
+        s->stream_opened++;
+        s->inbound_stream = ev->stream;
+        s->recv_len = 0;
+        break;
+    case ANTS_TRANSPORT_EV_STREAM_READABLE:
+        s->stream_readable++;
+        if (ev->payload != NULL && ev->payload_len > 0 &&
+            ev->payload_len <= sizeof s->recv_buf - s->recv_len) {
+            memcpy(s->recv_buf + s->recv_len, ev->payload, ev->payload_len);
+            s->recv_len += ev->payload_len;
+        }
+        break;
+    case ANTS_TRANSPORT_EV_STREAM_FIN: {
+        s->stream_fin++;
+        uint8_t resp[TEST_RPC_BUF_SIZE];
+        size_t resp_len = 0;
+        ants_error_t err = test_rpc_build_response(s, resp, sizeof resp, &resp_len);
+        if (err != ANTS_OK) {
+            s->last_err = err;
+            break;
+        }
+        if (s->inbound_stream == NULL) {
+            s->last_err = ANTS_ERROR_INVALID_ARG;
+            break;
+        }
+        err = ants_transport_stream_send(s->inbound_stream, resp, resp_len, true /* fin */);
+        if (err == ANTS_OK) {
+            s->response_sent++;
+        } else {
+            s->last_err = err;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return ANTS_OK;
+}
+
+/* Client-side: forward EVERY transport event to the DHT. The dispatcher
+ * silently ignores non-RPC events. */
+typedef struct {
+    ants_dht_t *dht;
+    int conn_ready;
+} test_rpc_client_t;
+
+static ants_error_t test_rpc_client_event(const ants_transport_event_t *ev, void *ctx)
+{
+    test_rpc_client_t *c = (test_rpc_client_t *)ctx;
+    if (c->dht != NULL) {
+        ants_dht_handle_transport_event(c->dht, ev);
+    }
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        c->conn_ready++;
+    }
+    return ANTS_OK;
+}
+
+/* Completion recorder: captures status + a copy of the decoded response
+ * struct (the response pointer is only valid for the duration of the
+ * callback, so we snapshot what we need). */
+typedef struct {
+    int fired;
+    ants_error_t last_status;
+    ants_dht_msg_type_t last_resp_type;
+    ants_dht_ping_resp_t last_ping;
+    ants_dht_find_node_resp_t last_find_node;
+} test_rpc_completion_t;
+
+static void test_rpc_complete_ping(ants_error_t status, const void *resp, void *ctx)
+{
+    test_rpc_completion_t *c = (test_rpc_completion_t *)ctx;
+    c->fired++;
+    c->last_status = status;
+    if (status == ANTS_OK && resp != NULL) {
+        c->last_resp_type = ANTS_DHT_MSG_PING_RESP;
+        c->last_ping = *(const ants_dht_ping_resp_t *)resp;
+    }
+}
+
+static void test_rpc_complete_find_node(ants_error_t status, const void *resp, void *ctx)
+{
+    test_rpc_completion_t *c = (test_rpc_completion_t *)ctx;
+    c->fired++;
+    c->last_status = status;
+    if (status == ANTS_OK && resp != NULL) {
+        c->last_resp_type = ANTS_DHT_MSG_FIND_NODE_RESP;
+        c->last_find_node = *(const ants_dht_find_node_resp_t *)resp;
+    }
+}
+
+static void test_rpc_send_rejects_invalid_args(void)
+{
+    ants_dht_t d = {{0}};
+    ants_transport_conn_t conn = {{0}};
+    ants_peer_id_t pid;
+    memset(&pid, 0, sizeof pid);
+    uint8_t token[ANTS_DHT_TOKEN_SIZE] = {0};
+
+    /* NULL guards on every send_*. completion required (non-NULL). */
+    CHECK_EQ(ants_dht__test_send_ping(NULL, &conn, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_ping(&d, NULL, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_ping(&d, &conn, NULL, NULL), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_dht__test_send_find_node(NULL, &conn, &pid, test_rpc_complete_find_node, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_find_node(&d, NULL, &pid, test_rpc_complete_find_node, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_find_node(&d, &conn, NULL, test_rpc_complete_find_node, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_find_node(&d, &conn, &pid, NULL, NULL), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_dht__test_send_get_peers(NULL, &conn, 0, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_get_peers(&d, NULL, 0, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_get_peers(&d, &conn, 0, NULL, NULL), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_dht__test_send_announce_peer(NULL, &conn, 0, token, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_announce_peer(&d, NULL, 0, token, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_announce_peer(&d, &conn, 0, NULL, test_rpc_complete_ping, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht__test_send_announce_peer(&d, &conn, 0, token, NULL, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* handle_transport_event NULL guards. */
+    ants_transport_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK_EQ(ants_dht_handle_transport_event(NULL, &ev), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht_handle_transport_event(&d, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_rpc_handle_event_ignores_non_dht(void)
+{
+    /* Initialise a real (but no-transport) DHT and feed it events that
+     * don't belong to any pending RPC. handle_transport_event must
+     * return ANTS_OK without touching the registry. */
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    /* CONN_CLOSED with a conn pointer we never owned — should be a
+     * no-op (no slots match). */
+    ants_transport_conn_t fake_conn = {{0}};
+    ants_transport_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind = ANTS_TRANSPORT_EV_CONN_CLOSED;
+    ev.conn = &fake_conn;
+    CHECK_EQ(ants_dht_handle_transport_event(&d, &ev), ANTS_OK);
+
+    /* STREAM_READABLE with a stream pointer we never owned. */
+    ants_transport_stream_t fake_stream = {{0}};
+    memset(&ev, 0, sizeof ev);
+    ev.kind = ANTS_TRANSPORT_EV_STREAM_READABLE;
+    ev.conn = &fake_conn;
+    ev.stream = &fake_stream;
+    const uint8_t data[] = {0xa2, 0x00, 0x05, 0x01, 0x01};
+    ev.payload = data;
+    ev.payload_len = sizeof data;
+    CHECK_EQ(ants_dht_handle_transport_event(&d, &ev), ANTS_OK);
+
+    /* Stream-scoped event with NULL stream pointer is a no-op too. */
+    memset(&ev, 0, sizeof ev);
+    ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
+    ev.conn = &fake_conn;
+    ev.stream = NULL;
+    CHECK_EQ(ants_dht_handle_transport_event(&d, &ev), ANTS_OK);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_rpc_round_trip(void)
+{
+    /* PING + FIND_NODE round trip over a real QUIC bidi stream. A is
+     * the dialer running the DHT dispatcher; B is the listener acting
+     * as a manual server (decodes the request, encodes a response,
+     * sends it back on the same stream). */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x33, sizeof a_priv);
+    memset(b_priv, 0x77, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_rpc_server_t server;
+    memset(&server, 0, sizeof server);
+    test_rpc_client_t client;
+    memset(&client, 0, sizeof client);
+
+    /* B = listener. */
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_rpc_server_event;
+    bcfg.event_ctx = &server;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    /* A = dialer. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_rpc_client_event;
+    acfg.event_ctx = &client;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    /* A's DHT, configured against A's transport. */
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    client.dht = &da;
+
+    /* Dial. */
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (client.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(client.conn_ready == 1);
+
+    /* --- Round 1: PING --- */
+    server.respond_with = ANTS_DHT_MSG_PING_RESP;
+    test_rpc_completion_t comp_ping;
+    memset(&comp_ping, 0, sizeof comp_ping);
+    CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp_ping), ANTS_OK);
+
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (comp_ping.fired >= 1) {
+            break;
+        }
+    }
+
+    CHECK(server.stream_opened >= 1);
+    CHECK(server.stream_fin >= 1);
+    CHECK(server.response_sent == 1);
+    CHECK(server.last_err == ANTS_OK);
+    CHECK(comp_ping.fired == 1);
+    CHECK_EQ(comp_ping.last_status, ANTS_OK);
+    CHECK(comp_ping.last_resp_type == ANTS_DHT_MSG_PING_RESP);
+    /* PING_RESP carries no body — only the txid. We don't pin a
+     * specific txid value (the registry's monotonic counter would
+     * leak as a test dependency); just verify it's non-zero. */
+    CHECK(comp_ping.last_ping.txid != 0);
+
+    /* --- Round 2: FIND_NODE --- */
+    test_rpc_server_reset(&server);
+    server.respond_with = ANTS_DHT_MSG_FIND_NODE_RESP;
+    test_rpc_completion_t comp_fn;
+    memset(&comp_fn, 0, sizeof comp_fn);
+    ants_peer_id_t target;
+    memset(target.bytes, 0x42, sizeof target.bytes);
+    CHECK_EQ(
+        ants_dht__test_send_find_node(&da, &conn, &target, test_rpc_complete_find_node, &comp_fn),
+        ANTS_OK);
+
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (comp_fn.fired >= 1) {
+            break;
+        }
+    }
+
+    CHECK(server.stream_opened == 1);
+    CHECK(server.stream_fin == 1);
+    CHECK(server.response_sent == 1);
+    CHECK(server.last_err == ANTS_OK);
+    CHECK(comp_fn.fired == 1);
+    CHECK_EQ(comp_fn.last_status, ANTS_OK);
+    CHECK(comp_fn.last_resp_type == ANTS_DHT_MSG_FIND_NODE_RESP);
+    CHECK(comp_fn.last_find_node.peer_count == 1);
+    if (comp_fn.last_find_node.peer_count == 1) {
+        uint8_t expected_pid[ANTS_PEER_ID_SIZE];
+        memset(expected_pid, 0xCC, sizeof expected_pid);
+        CHECK(memcmp(comp_fn.last_find_node.peers[0].peer_id.bytes,
+                     expected_pid,
+                     ANTS_PEER_ID_SIZE) == 0);
+        CHECK(strcmp(comp_fn.last_find_node.peers[0].multiaddr,
+                     "/ip4/127.0.0.1/udp/9999/quic-v1") == 0);
+    }
+
+    /* Teardown: destroy DHT first (pending slots are all free at this
+     * point — every RPC completed). Then destroy transports. ASan
+     * catches any unfreed stream / recv_buf. */
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -659,6 +1097,10 @@ int main(void)
     test_wire_announce_peer_roundtrip();
     test_wire_rejects_truncation();
     test_wire_rejects_buffer_too_small();
+
+    test_rpc_send_rejects_invalid_args();
+    test_rpc_handle_event_ignores_non_dht();
+    test_rpc_round_trip();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

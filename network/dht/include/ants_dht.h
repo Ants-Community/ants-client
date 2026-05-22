@@ -390,6 +390,43 @@ ants_dht_lookup(ants_dht_t *dht, ants_dht_shard_key_t shard_key, ants_dht_lookup
 ants_error_t ants_dht_lookup_cancel(ants_dht_lookup_t *lookup);
 
 /* ------------------------------------------------------------------------ */
+/* Transport event delegation                                               */
+/*                                                                          */
+/* The transport layer accepts a single registered event_fn — the caller's. */
+/* The DHT therefore cannot register its own callback directly; instead it  */
+/* needs the caller to forward transport events into the DHT from inside    */
+/* their own event_fn. This is the one piece of cooperation a DHT-using     */
+/* application must wire up:                                                */
+/*                                                                          */
+/*     static ants_error_t my_transport_event(                              */
+/*         const ants_transport_event_t *ev, void *ctx)                     */
+/*     {                                                                    */
+/*         my_app_t *app = ctx;                                             */
+/*         ants_dht_handle_transport_event(&app->dht, ev);                  */
+/*         // ... any application-specific event handling (e.g. gossip)    */
+/*         return ANTS_OK;                                                  */
+/*     }                                                                    */
+/*                                                                          */
+/* The DHT inspects each event and consumes the ones that belong to one of  */
+/* its in-flight RPCs (matched by stream pointer); all others are ignored,  */
+/* leaving the caller free to handle them as they wish. Calling this with   */
+/* a non-DHT event is a cheap no-op (one pointer scan, then return).        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Hand a transport event to the DHT for in-flight-RPC dispatch. Returns
+ * ANTS_OK on success, including the case where the event did not belong
+ * to any DHT-owned stream. Returns ANTS_ERROR_INVALID_ARG on NULL args.
+ *
+ * Safe to call from inside the caller's own transport event_fn. Does NOT
+ * call back into the transport (no nested dial/send) and does NOT call
+ * the DHT's event_fn — RPC completions are surfaced through the per-RPC
+ * completion handler registered at send time, not through the DHT's
+ * general event callback.
+ */
+ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transport_event_t *event);
+
+/* ------------------------------------------------------------------------ */
 /* Routing-table introspection                                              */
 /* ------------------------------------------------------------------------ */
 
