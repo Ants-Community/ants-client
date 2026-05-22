@@ -13,6 +13,117 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #5 (DHT) feature-complete · 2026-05-22
+
+**ANTS DHT live.** Four consecutive PRs close out Component #5 by
+landing RPC dispatch, the iterative-lookup state machine, bootstrap
+plus server-side request handling, and the end-to-end two-node
+integration test. The DHT now performs full Kademlia
+bootstrap → announce → iterative lookup over the QUIC transport.
+
+**Phase 4 — RPC dispatch over transport bidi streams** (PR #29,
++1320):
+
+- New module `src/dht_rpc.{h,c}` owns the pending-RPC registry
+  (`struct ants_dht_state.pending[]`, 64 slots). Each `send_*` call
+  heap-allocates an `ants_transport_stream_t *`, opens a bidi
+  stream, sends the canonical CBOR-encoded request with FIN, and
+  arms a completion handler.
+- New public API `ants_dht_handle_transport_event(dht, ev)` so the
+  caller can delegate transport events from their own `event_fn`
+  (transport accepts a single registered callback, so the DHT
+  cannot register its own).
+- Dispatch: `STREAM_READABLE` accumulates into a lazy-alloc
+  `recv_buf` (4 KB cap), `STREAM_FIN` peeks the response type +
+  decodes + fires the completion, `STREAM_RESET` fails the slot,
+  `CONN_CLOSED` sweeps every slot on the conn.
+- Storage layout moved to private `src/dht_internal.h` shared
+  between `dht.c` and `dht_rpc.c`.
+- Tests: NULL-arg guards, non-DHT-event no-op path, two-endpoint
+  integration with real Ed25519 + real QUIC for PING and
+  FIND_NODE round-trips.
+
+**Phase 5 — iterative-lookup state machine** (PR #30, +949):
+
+- New module `src/dht_lookup.{h,c}` (441 LoC impl) implements the
+  standard Kademlia GET_PEERS loop: seed candidates from
+  routing-table conn-bearing entries → issue α=3 RPCs at a time
+  toward the closest UNQUERIED → fold each response back into the
+  sorted candidate set → converge when inflight=0 and no UNQUERIED
+  → fire LOOKUP_COMPLETE with up to K closest ANSWERED.
+- `struct ants_dht_bucket_entry` extended with an optional
+  `ants_transport_conn_t *conn` (NULL = known peer, not dialed
+  yet). Phase 6 lazily promotes those.
+- Candidate set sorted ascending by XOR distance from
+  `BLAKE3(target_key_le)`; cap 40 (each entry ~336 B due to full
+  `ants_dht_peer_t` with multiaddr).
+- `ANTS_DHT_LOOKUP_CTX_SIZE` bumped 8 KB → 16 KB.
+- Cancellation invalidates per-RPC completion records so late-
+  firing RPCs no-op safely.
+
+**Phase 6 — bootstrap + server-side dispatch + announces** (PR #31,
++1259):
+
+- New module `src/dht_server.{h,c}` (514 LoC) decodes inbound DHT
+  requests on peer-initiated bidi streams and produces responses.
+  Inbound stream registry (32 slots) accumulates the request until
+  STREAM_FIN; then peek + decode + dispatch to one of four
+  handlers (PING / FIND_NODE / GET_PEERS / ANNOUNCE_PEER); encode
+  the response, send back on the same stream with FIN, release
+  the slot.
+- **Token discipline (BitTorrent style):** GET_PEERS_RESP carries
+  a 16-byte token = `BLAKE3(server_secret || peer_id)[0..16]`.
+  ANNOUNCE_PEER_REQ must echo a valid token or the announce is
+  rejected. `server_secret = BLAKE3(local_peer_id)` (phase 6 uses
+  a fixed value; rotation is deferred).
+- `ants_dht_bootstrap` real impl: heap-allocates the conn, dials
+  via transport, registers in `bootstrap_entries[8]`. On
+  CONN_READY (delegated via `handle_transport_event`), the peer
+  gets promoted into the routing table with its live conn pointer,
+  and a self-FIND_NODE round-trip seeds nearby buckets.
+- `ants_dht_announce` / `_unannounce` real impl: maintains a
+  local-host announce list AND inserts self into the server-side
+  announce set, so a GET_PEERS query from a peer routing us finds
+  a real announcer entry.
+- **Bootstrap conn lifetime quirk worth recording**: picoquic's
+  disconnect path keeps using the conn state for a few lines
+  after firing CONN_CLOSED (it sets `cs->cnx = NULL` afterward).
+  Freeing the heap conn inside the CONN_CLOSED callback therefore
+  produced an ASan UAF on first attempt. Fixed by deferring the
+  free to `ants_dht_destroy`'s sweep — the leak window closes at
+  destroy. **Teardown order matters**: `ants_transport_destroy`
+  MUST precede `ants_dht_destroy` when bootstrap conns are open.
+- Tests: announce/unannounce local; A-pings-B with no manual
+  server stub on B; A-get-peers-B with a real announce; A
+  bootstraps B and B's peer-id ends up in A's routing table.
+
+**Phase 7 — end-to-end two-node integration** (PR #32, +173):
+
+- Single test `test_two_node_end_to_end`. A and B both run full
+  DHTs over listener+dialer transports. Mutual bootstrap (each
+  dials the other, two independent QUIC sessions). Each announces
+  a distinct shard. Each looks up the OTHER's shard. Both observe
+  a LOOKUP_COMPLETE event containing the expected announcer.
+- Exercises every prior phase end-to-end: k-buckets via bootstrap
+  promotion → CBOR wire codec → outbound RPC dispatch → lookup
+  state machine → server-side dispatch with token + announce set.
+
+**Component totals**: ~4250 LoC implementation + ~1900 LoC tests
+across `src/{dht,dht_internal,dht_lookup,dht_rpc,dht_server,dht_wire}.{c,h}`
+plus `include/ants_dht.h`. `dht_basic` test suite runs in ~1.4 s
+under AppleClang Debug + ASan + UBSan (5 QUIC round-trip scenarios
+plus the K-bucket / wire-codec / RPC-dispatch unit tests).
+
+**Phase 6.1 deferred (not on critical path):** periodic bucket
+refresh via PING (evict on dead_strikes), announce republish every
+`announce_republish_ms`, dial-promote for candidates discovered with
+NULL conn during a lookup. Required for production network steady-
+state; not for "the DHT works at all" demonstration.
+
+CI matrix (7 jobs, all green every PR): Linux gcc/clang
+Debug+Release, macOS clang Debug+Release, TSan Linux clang,
+clang-format.
+
 ### network: Component #4 (transport) feature-complete + Component #5 (DHT) phase 0-3 · 2026-05-21
 
 **ANTS network live at the transport layer.** Ten consecutive PRs land
