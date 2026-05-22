@@ -13,14 +13,15 @@
  *   - Phase 3: Wire-message CBOR codec (PING, FIND_NODE, GET_PEERS,
  *     ANNOUNCE_PEER and their responses).                     [done]
  *   - Phase 4: RPC dispatch over transport bidi streams.      [done]
- *   - Phase 5: Iterative lookup state machine.
- *   - Phase 6: Bootstrap + maintenance (refresh, republish).
+ *   - Phase 5: Iterative lookup state machine.                [done]
+ *   - Phase 6: Bootstrap + maintenance + server-side dispatch.
  *   - Phase 7: Two-node integration test exchanging real lookups.
  */
 
 #include "ants_dht.h"
 
 #include "dht_internal.h"
+#include "dht_lookup.h"
 #include "dht_rpc.h"
 #include "dht_wire.h"
 
@@ -95,9 +96,14 @@ static uint32_t bucket_index_for_peer(const struct ants_dht_state *state,
  *   ANTS_ERROR_MALFORMED — malloc failed
  *
  * Pre-existing entries are moved to the head (most-recently-seen) and
- * their last_seen_us is bumped to `now_us`. */
-static ants_error_t
-kbucket_insert(struct ants_dht_state *state, const ants_dht_peer_t *peer, uint64_t now_us)
+ * their last_seen_us is bumped to `now_us`. The `conn` parameter may be
+ * NULL ("known peer, not dialed yet"); a non-NULL conn on a refresh
+ * updates the entry in-place — this is how phase 6 bootstrap "promotes"
+ * a peer from known-only to known-and-dialed without re-inserting. */
+static ants_error_t kbucket_insert(struct ants_dht_state *state,
+                                   const ants_dht_peer_t *peer,
+                                   ants_transport_conn_t *conn,
+                                   uint64_t now_us)
 {
     uint32_t bidx = bucket_index_for_peer(state, &peer->peer_id);
     if (bidx == UINT32_MAX) {
@@ -113,6 +119,12 @@ kbucket_insert(struct ants_dht_state *state, const ants_dht_peer_t *peer, uint64
             *link = hit->next; /* unlink */
             /* Update multiaddr in case the peer moved. */
             memcpy(hit->peer.multiaddr, peer->multiaddr, sizeof hit->peer.multiaddr);
+            /* Only overwrite conn if the caller supplied one. Refreshing
+             * a known-and-dialed peer with conn=NULL should NOT downgrade
+             * it to "known-only" — the conn is still valid. */
+            if (conn != NULL) {
+                hit->conn = conn;
+            }
             hit->last_seen_us = now_us;
             hit->next = bucket->head;
             bucket->head = hit;
@@ -132,6 +144,7 @@ kbucket_insert(struct ants_dht_state *state, const ants_dht_peer_t *peer, uint64
         return ANTS_ERROR_MALFORMED;
     }
     node->peer = *peer;
+    node->conn = conn;
     node->last_seen_us = now_us;
     node->next = bucket->head;
     bucket->head = node;
@@ -213,14 +226,12 @@ static void kbucket_drop_all(struct ants_dht_state *state)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Per-lookup state (phase 5 fills this in)                                 */
+/* Per-lookup state size check                                              */
+/*                                                                          */
+/* The real layout lives in dht_internal.h (shared with dht_lookup.c). The */
+/* size assertion here ensures it fits within the caller-visible           */
+/* ANTS_DHT_LOOKUP_CTX_SIZE buffer.                                         */
 /* ------------------------------------------------------------------------ */
-
-struct ants_dht_lookup_state {
-    /* Placeholder — phase 5 adds: target shard_key, candidate set,
-     * in-flight count, deadline, result peers. */
-    int unused;
-};
 
 typedef char ants_dht_lookup_state_size_check
     [(sizeof(struct ants_dht_lookup_state) <= sizeof(((ants_dht_lookup_t *)0)->_opaque)) ? 1 : -1];
@@ -259,6 +270,17 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    /* Cancel every active lookup first so that the RPC drop_all below
+     * doesn't fire completion handlers into stale lookup records — the
+     * cancellation invalidates all completion records up-front, then
+     * release_slot's call to the (still-registered) completion sees
+     * valid=false and no-ops. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        ants_dht_lookup_t *h = state->active_lookups[i];
+        if (h != NULL) {
+            (void)ants_dht_lookup_do_cancel(h);
+        }
+    }
     /* Reclaim every in-flight RPC's heap (stream + recv_buf), firing
      * each completion with PEER_UNREACHABLE so callers learn the RPC
      * was abandoned. Idempotent on a zeroed dht: pending[] is all
@@ -266,8 +288,7 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
     ants_dht_rpc_drop_all(dht);
     /* Drop any heap-allocated bucket entries before zeroing the buffer.
      * Idempotent on a never-init'd (zeroed) dht: all bucket heads are
-     * NULL, the loop is a no-op. Phase 5+ will also reclaim active-
-     * lookup state here. */
+     * NULL, the loop is a no-op. */
     kbucket_drop_all(state);
     memset(dht->_opaque, 0, sizeof dht->_opaque);
     return ANTS_OK;
@@ -275,9 +296,16 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
 
 uint32_t ants_dht_tick(ants_dht_t *dht)
 {
-    /* No state to drive in phase 1 — return "idle" so the caller's
-     * poll loop doesn't busy-spin on us. */
-    (void)dht;
+    if (dht == NULL) {
+        return UINT32_MAX;
+    }
+    /* Advance every active iterative lookup: issue more RPCs if alpha
+     * isn't saturated, check for convergence, fire LOOKUP_COMPLETE on
+     * any lookup that just converged. */
+    (void)ants_dht_lookup_advance_all(dht);
+    /* Phase 6 will add periodic-refresh and announcement-republish
+     * timers here, at which point this returns a real wake-delay. For
+     * now, "idle" — wake on socket-readable. */
     return UINT32_MAX;
 }
 
@@ -327,8 +355,7 @@ ants_dht_lookup(ants_dht_t *dht, ants_dht_shard_key_t shard_key, ants_dht_lookup
     if (dht == NULL || out_lookup == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    (void)shard_key;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    return ants_dht_lookup_start(dht, shard_key, out_lookup);
 }
 
 ants_error_t ants_dht_lookup_cancel(ants_dht_lookup_t *lookup)
@@ -336,7 +363,7 @@ ants_error_t ants_dht_lookup_cancel(ants_dht_lookup_t *lookup)
     if (lookup == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    return ants_dht_lookup_do_cancel(lookup);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -390,6 +417,10 @@ ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transpo
 
 ants_error_t
 ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_t now_us);
+ants_error_t ants_dht__test_insert_peer_with_conn(ants_dht_t *dht,
+                                                  const ants_dht_peer_t *peer,
+                                                  ants_transport_conn_t *conn,
+                                                  uint64_t now_us);
 ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
 
@@ -421,7 +452,19 @@ ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
-    return kbucket_insert(state, peer, now_us);
+    return kbucket_insert(state, peer, NULL, now_us);
+}
+
+ants_error_t ants_dht__test_insert_peer_with_conn(ants_dht_t *dht,
+                                                  const ants_dht_peer_t *peer,
+                                                  ants_transport_conn_t *conn,
+                                                  uint64_t now_us)
+{
+    if (dht == NULL || peer == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    return kbucket_insert(state, peer, conn, now_us);
 }
 
 ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id)

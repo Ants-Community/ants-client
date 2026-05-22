@@ -114,8 +114,11 @@ typedef uint64_t ants_dht_shard_key_t;
 #define ANTS_DHT_CTX_SIZE 32768
 
 /* Per-lookup state. Tracks the iterative-search candidate set (up to
- * 3K peers), in-flight queries, and the converged result set. */
-#define ANTS_DHT_LOOKUP_CTX_SIZE 8192
+ * 2K peers carrying full peer_id + multiaddr per entry), in-flight
+ * queries, and the converged result set. Larger than the original
+ * 8 KB estimate because each candidate carries the full ants_dht_peer_t
+ * (32 B peer_id + 256 B multiaddr) for downstream consumers. */
+#define ANTS_DHT_LOOKUP_CTX_SIZE 16384
 
 typedef union {
     uint8_t _opaque[ANTS_DHT_CTX_SIZE];

@@ -32,6 +32,11 @@
 
 struct ants_dht_bucket_entry {
     ants_dht_peer_t peer;
+    /* Transport connection to this peer, if known. NULL means the peer
+     * is known (we have its peer_id + multiaddr) but we haven't dialled
+     * it yet — phase 5 lookups skip these; phase 6 maintenance lazily
+     * dials them and updates the conn pointer in-place. */
+    ants_transport_conn_t *conn;
     uint64_t last_seen_us;
     struct ants_dht_bucket_entry *next;
 };
@@ -118,6 +123,91 @@ struct ants_dht_pending_rpc {
 };
 
 /* ------------------------------------------------------------------------ */
+/* Iterative-lookup state                                                   */
+/*                                                                          */
+/* Cast over ants_dht_lookup_t::_opaque. One lookup runs the standard      */
+/* Kademlia iterative GET_PEERS loop: starting from a seed set drawn from  */
+/* the routing table (conn-bearing entries only), it issues α RPCs at a   */
+/* time toward the closest unqueried candidates; each response feeds new   */
+/* peers back into the candidate set, sorted ascending by XOR distance    */
+/* from the target. Convergence is "no more queryable candidates" (every  */
+/* known candidate is ANSWERED or FAILED); a LOOKUP_COMPLETE event fires  */
+/* with the K closest answered peers.                                     */
+/* ------------------------------------------------------------------------ */
+
+/* Maximum candidates the lookup tracks (sorted by ascending XOR distance
+ * from target). Sized so the whole lookup_state fits in the 16 KB
+ * ANTS_DHT_LOOKUP_CTX_SIZE budget. Each candidate carries the full
+ * ants_dht_peer_t (~288 B incl. multiaddr) plus distance + state. */
+#define ANTS_DHT_LOOKUP_CANDIDATE_CAP 40
+
+/* Concurrent in-flight RPCs per lookup. Mirrors ANTS_DHT_ALPHA — the
+ * Kademlia paper's parallelism parameter. */
+#define ANTS_DHT_LOOKUP_INFLIGHT_CAP ANTS_DHT_ALPHA
+
+/* Per-candidate state in the iterative lookup. */
+typedef enum {
+    ANTS_DHT_LOOKUP_CAND_UNQUERIED = 0, /* In candidate set, not yet queried. */
+    ANTS_DHT_LOOKUP_CAND_INFLIGHT = 1,  /* GET_PEERS sent, awaiting response. */
+    ANTS_DHT_LOOKUP_CAND_ANSWERED = 2,  /* Response received and processed. */
+    ANTS_DHT_LOOKUP_CAND_FAILED = 3,    /* RPC failed (no conn / RPC error). */
+} ants_dht_lookup_cand_state_t;
+
+struct ants_dht_lookup_candidate {
+    ants_dht_peer_t peer;
+    /* Transport connection to this peer. NULL → caller (via the routing
+     * table) doesn't have a conn yet; the candidate is kept (visible to
+     * upper layers) but FAILED at the first query attempt. Phase 6 will
+     * lazily promote NULL-conn candidates by dialing them. */
+    ants_transport_conn_t *conn;
+    /* Pre-computed XOR(target_peer_id, peer.peer_id). Compare lexicographically
+     * (big-endian) to determine ordering. */
+    uint8_t distance[ANTS_PEER_ID_SIZE];
+    uint8_t state; /* ants_dht_lookup_cand_state_t */
+    uint8_t _pad[7];
+};
+
+/* Per-in-flight RPC: the completion handler points at one of these
+ * records. valid=false means the lookup has been cancelled / completed
+ * and the late-firing completion should no-op. The DHT's pending_rpc
+ * slot still gets reclaimed in either case (release_slot runs before
+ * the completion fires). */
+struct ants_dht_lookup_completion_record {
+    bool valid;
+    uint8_t _pad[7];
+    ants_dht_lookup_t *lookup_handle;
+    uint32_t candidate_idx;
+    uint32_t _pad2;
+};
+
+struct ants_dht_lookup_state {
+    /* Slot occupancy. true between ants_dht_lookup and either
+     * LOOKUP_COMPLETE / LOOKUP_TIMEOUT firing or ants_dht_lookup_cancel
+     * returning. */
+    bool in_use;
+    /* true once a LOOKUP_COMPLETE / LOOKUP_TIMEOUT event has fired (so
+     * late completions don't fire it again). */
+    bool completed;
+    uint8_t _pad[6];
+    ants_dht_t *parent;
+    ants_dht_shard_key_t target_key;
+    /* BLAKE3(target_key_le_bytes) — the target in peer-id space. The DHT
+     * routes by full 256-bit XOR; the shard-key projection lives here. */
+    uint8_t target_peer_id[ANTS_PEER_ID_SIZE];
+    /* Candidate set, sorted ascending by `distance`. */
+    struct ants_dht_lookup_candidate candidates[ANTS_DHT_LOOKUP_CANDIDATE_CAP];
+    size_t candidate_count;
+    /* Number of candidates currently in INFLIGHT state. */
+    size_t inflight_count;
+    /* Completion records — one slot per concurrent in-flight RPC. */
+    struct ants_dht_lookup_completion_record inflight_recs[ANTS_DHT_LOOKUP_INFLIGHT_CAP];
+};
+
+/* Maximum concurrent active lookups per DHT. Increase if upper layers
+ * (cache/embedding doing Hamming-N near-neighbour expansion) need it. */
+#define ANTS_DHT_MAX_ACTIVE_LOOKUPS 8
+
+/* ------------------------------------------------------------------------ */
 /* Top-level DHT state                                                      */
 /*                                                                          */
 /* Cast over ants_dht_t::_opaque. Size-checked at compile time in dht.c.   */
@@ -142,6 +232,10 @@ struct ants_dht_state {
     /* In-flight RPC registry. Scanned linearly on every transport
      * event (O(64)) — overhead negligible vs. CBOR decode cost. */
     struct ants_dht_pending_rpc pending[ANTS_DHT_MAX_PENDING_RPCS];
+    /* Active-lookup back-pointers. Each entry points to a caller-
+     * allocated ants_dht_lookup_t, registered by ants_dht_lookup and
+     * cleared by ants_dht_lookup_cancel or LOOKUP_COMPLETE / TIMEOUT. */
+    ants_dht_lookup_t *active_lookups[ANTS_DHT_MAX_ACTIVE_LOOKUPS];
 };
 
 #endif /* ANTS_DHT_INTERNAL_H */

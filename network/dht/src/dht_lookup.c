@@ -1,0 +1,441 @@
+/*
+ * dht_lookup.c — Iterative-lookup state machine.
+ *
+ * Implementation of dht_lookup.h. The DHT registers each active
+ * lookup in state->active_lookups (back-pointers to caller-allocated
+ * ants_dht_lookup_t buffers); tick() advances each one, and the RPC
+ * completion handler folds responses back into the lookup's
+ * candidate set.
+ *
+ * The candidate set is kept sorted ascending by XOR distance from
+ * the target peer-id (= BLAKE3(target_key_le_bytes)). Each candidate
+ * is in one of four states: UNQUERIED (newly inserted), INFLIGHT
+ * (GET_PEERS sent), ANSWERED (response folded in), FAILED (no conn
+ * or RPC error). Convergence = inflight_count == 0 AND no UNQUERIED
+ * candidates remain; at that point LOOKUP_COMPLETE fires with up to
+ * K closest ANSWERED peers.
+ *
+ * Late completions (RPC fires after lookup completed or cancelled)
+ * see `record->valid == false` and no-op — the dht_rpc slot is still
+ * reclaimed by release_slot before the completion is invoked.
+ */
+
+#include "dht_lookup.h"
+
+#include "ants_crypto.h"
+#include "ants_dht.h"
+#include "dht_internal.h"
+#include "dht_rpc.h"
+#include "dht_wire.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------------ */
+/* Cast helpers                                                             */
+/* ------------------------------------------------------------------------ */
+
+static struct ants_dht_lookup_state *lookup_get_state(ants_dht_lookup_t *l)
+{
+    return (struct ants_dht_lookup_state *)(void *)l->_opaque;
+}
+
+static ants_dht_lookup_t *lookup_state_to_handle(struct ants_dht_lookup_state *state)
+{
+    /* state lives at the start of lookup_t::_opaque[0]; both addresses
+     * coincide via the union layout. */
+    return (ants_dht_lookup_t *)(void *)state;
+}
+
+static struct ants_dht_state *dht_get_state(ants_dht_t *dht)
+{
+    return (struct ants_dht_state *)(void *)dht->_opaque;
+}
+
+/* ------------------------------------------------------------------------ */
+/* XOR distance helpers                                                     */
+/* ------------------------------------------------------------------------ */
+
+static void xor_distance(const uint8_t a[ANTS_PEER_ID_SIZE],
+                         const uint8_t b[ANTS_PEER_ID_SIZE],
+                         uint8_t out[ANTS_PEER_ID_SIZE])
+{
+    for (size_t i = 0; i < ANTS_PEER_ID_SIZE; i++) {
+        out[i] = a[i] ^ b[i];
+    }
+}
+
+/* Lexicographic compare of two distance vectors (big-endian XOR). */
+static int dist_cmp(const uint8_t a[ANTS_PEER_ID_SIZE], const uint8_t b[ANTS_PEER_ID_SIZE])
+{
+    return memcmp(a, b, ANTS_PEER_ID_SIZE);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Candidate set                                                            */
+/* ------------------------------------------------------------------------ */
+
+/* Insert peer into the candidate set, keeping the array sorted ascending
+ * by XOR distance from target_peer_id. Dedupes by peer_id (refreshing conn
+ * if we now have one and the existing entry had NULL). When full, the new
+ * candidate is dropped — phase 5 keeps this simple; phase 6+ may evict the
+ * worst answered/failed entry if the newcomer is closer. */
+static void cand_insert_sorted(struct ants_dht_lookup_state *lookup,
+                               const ants_dht_peer_t *peer,
+                               ants_transport_conn_t *conn)
+{
+    /* Skip self. */
+    struct ants_dht_state *state = dht_get_state(lookup->parent);
+    if (memcmp(peer->peer_id.bytes, state->local_peer_id.bytes, ANTS_PEER_ID_SIZE) == 0) {
+        return;
+    }
+
+    /* Dedupe by peer_id. */
+    for (size_t i = 0; i < lookup->candidate_count; i++) {
+        if (memcmp(lookup->candidates[i].peer.peer_id.bytes,
+                   peer->peer_id.bytes,
+                   ANTS_PEER_ID_SIZE) == 0) {
+            if (lookup->candidates[i].conn == NULL && conn != NULL) {
+                lookup->candidates[i].conn = conn;
+            }
+            return;
+        }
+    }
+
+    uint8_t dist[ANTS_PEER_ID_SIZE];
+    xor_distance(lookup->target_peer_id, peer->peer_id.bytes, dist);
+
+    /* Find sorted insertion position. */
+    size_t pos = lookup->candidate_count;
+    for (size_t i = 0; i < lookup->candidate_count; i++) {
+        if (dist_cmp(dist, lookup->candidates[i].distance) < 0) {
+            pos = i;
+            break;
+        }
+    }
+
+    /* If set is full, drop the new entry (phase 5 simple policy). */
+    if (lookup->candidate_count == ANTS_DHT_LOOKUP_CANDIDATE_CAP) {
+        return;
+    }
+
+    /* Shift right and insert. */
+    for (size_t i = lookup->candidate_count; i > pos; i--) {
+        lookup->candidates[i] = lookup->candidates[i - 1];
+    }
+    memset(&lookup->candidates[pos], 0, sizeof lookup->candidates[pos]);
+    lookup->candidates[pos].peer = *peer;
+    lookup->candidates[pos].conn = conn;
+    memcpy(lookup->candidates[pos].distance, dist, ANTS_PEER_ID_SIZE);
+    lookup->candidates[pos].state = (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED;
+    lookup->candidate_count++;
+}
+
+/* Seed the candidate set from every routing-table entry with conn != NULL. */
+static void seed_candidates_from_routing(struct ants_dht_lookup_state *lookup,
+                                         const struct ants_dht_state *state)
+{
+    for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT; i++) {
+        for (const struct ants_dht_bucket_entry *e = state->buckets[i].head; e != NULL;
+             e = e->next) {
+            if (e->conn != NULL) {
+                cand_insert_sorted(lookup, &e->peer, e->conn);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Active-lookup registry                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* Find slot in state->active_lookups that points at `handle`. */
+static size_t active_slot_for(struct ants_dht_state *state, const ants_dht_lookup_t *handle)
+{
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        if (state->active_lookups[i] == handle) {
+            return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+static void unregister_lookup(struct ants_dht_state *state, ants_dht_lookup_t *handle)
+{
+    size_t slot = active_slot_for(state, handle);
+    if (slot != (size_t)-1) {
+        state->active_lookups[slot] = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* LOOKUP_COMPLETE event                                                    */
+/* ------------------------------------------------------------------------ */
+
+static void fire_lookup_complete(struct ants_dht_lookup_state *lookup)
+{
+    if (lookup->completed) {
+        return;
+    }
+    lookup->completed = true;
+
+    /* Snapshot the K closest ANSWERED peers into a stack buffer. The
+     * candidate set is already sorted ascending by distance, so a single
+     * pass picks them up in order. */
+    ants_dht_peer_t result_peers[ANTS_DHT_K];
+    size_t result_count = 0;
+    for (size_t i = 0; i < lookup->candidate_count && result_count < ANTS_DHT_K; i++) {
+        if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_ANSWERED) {
+            result_peers[result_count++] = lookup->candidates[i].peer;
+        }
+    }
+
+    struct ants_dht_state *state = dht_get_state(lookup->parent);
+    if (state->event_fn != NULL) {
+        ants_dht_event_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
+        ev.lookup = lookup_state_to_handle(lookup);
+        ev.peers = result_peers;
+        ev.peer_count = result_count;
+        ev.shard_key = lookup->target_key;
+        (void)state->event_fn(&ev, state->event_ctx);
+    }
+
+    /* Invalidate inflight records — late-firing completions will no-op. */
+    for (size_t i = 0; i < ANTS_DHT_LOOKUP_INFLIGHT_CAP; i++) {
+        lookup->inflight_recs[i].valid = false;
+    }
+
+    unregister_lookup(state, lookup_state_to_handle(lookup));
+}
+
+/* ------------------------------------------------------------------------ */
+/* RPC completion handler                                                   */
+/* ------------------------------------------------------------------------ */
+
+static void on_rpc_complete(ants_error_t status, const void *resp, void *ctx)
+{
+    struct ants_dht_lookup_completion_record *rec = (struct ants_dht_lookup_completion_record *)ctx;
+    if (rec == NULL || !rec->valid) {
+        return;
+    }
+    rec->valid = false;
+
+    struct ants_dht_lookup_state *lookup = lookup_get_state(rec->lookup_handle);
+    if (lookup->completed) {
+        return;
+    }
+
+    if ((size_t)rec->candidate_idx >= lookup->candidate_count) {
+        /* Index out of range — shouldn't happen because cand_insert_sorted
+         * cannot shift INFLIGHT entries past CAP (drop-new policy). Defend
+         * with a no-op anyway. */
+        if (lookup->inflight_count > 0) {
+            lookup->inflight_count--;
+        }
+        return;
+    }
+
+    struct ants_dht_lookup_candidate *cand = &lookup->candidates[rec->candidate_idx];
+
+    if (status == ANTS_OK && resp != NULL) {
+        cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_ANSWERED;
+        const ants_dht_get_peers_resp_t *gp = (const ants_dht_get_peers_resp_t *)resp;
+        for (size_t i = 0; i < gp->peer_count; i++) {
+            /* New peers come with no known conn — phase 6 maintenance
+             * promotes them by dialing. */
+            cand_insert_sorted(lookup, &gp->peers[i], NULL);
+        }
+    } else {
+        cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
+    }
+
+    if (lookup->inflight_count > 0) {
+        lookup->inflight_count--;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Issue an RPC for a single candidate                                      */
+/* ------------------------------------------------------------------------ */
+
+/* Returns true if INFLIGHT was set (one slot of α is now occupied); false
+ * if the candidate was FAILED immediately (no conn, or send_get_peers
+ * returned an error). */
+static bool issue_rpc_for_candidate(struct ants_dht_lookup_state *lookup, size_t cand_idx)
+{
+    struct ants_dht_lookup_candidate *cand = &lookup->candidates[cand_idx];
+
+    if (cand->conn == NULL) {
+        cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
+        return false;
+    }
+
+    /* Find a free completion record. We size the record array to
+     * INFLIGHT_CAP = α, so under normal flow at least one is always
+     * free when inflight_count < α. Defensive check anyway. */
+    struct ants_dht_lookup_completion_record *rec = NULL;
+    for (size_t i = 0; i < ANTS_DHT_LOOKUP_INFLIGHT_CAP; i++) {
+        if (!lookup->inflight_recs[i].valid) {
+            rec = &lookup->inflight_recs[i];
+            break;
+        }
+    }
+    if (rec == NULL) {
+        cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
+        return false;
+    }
+
+    rec->valid = true;
+    rec->lookup_handle = lookup_state_to_handle(lookup);
+    rec->candidate_idx = (uint32_t)cand_idx;
+
+    ants_error_t err = ants_dht_rpc_send_get_peers(
+        lookup->parent, cand->conn, lookup->target_key, on_rpc_complete, rec);
+    if (err != ANTS_OK) {
+        rec->valid = false;
+        cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
+        return false;
+    }
+
+    cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT;
+    lookup->inflight_count++;
+    return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Lookup tick                                                              */
+/* ------------------------------------------------------------------------ */
+
+static void lookup_advance(struct ants_dht_lookup_state *lookup)
+{
+    if (lookup->completed) {
+        return;
+    }
+
+    /* Issue new RPCs until inflight count saturates or no UNQUERIED
+     * candidates remain. Walking from the head of the sorted candidate
+     * array picks the closest unqueried candidate each round. */
+    while (lookup->inflight_count < ANTS_DHT_LOOKUP_INFLIGHT_CAP) {
+        size_t idx = (size_t)-1;
+        for (size_t i = 0; i < lookup->candidate_count; i++) {
+            if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == (size_t)-1) {
+            break;
+        }
+        /* If issue_rpc_for_candidate fails to mark INFLIGHT (e.g. no
+         * conn), state becomes FAILED and we continue the loop — no
+         * inflight slot consumed, so the next iteration tries the next
+         * UNQUERIED candidate. */
+        (void)issue_rpc_for_candidate(lookup, idx);
+    }
+
+    /* Convergence: no in-flight RPCs and every candidate has been
+     * resolved (ANSWERED or FAILED). */
+    if (lookup->inflight_count == 0) {
+        for (size_t i = 0; i < lookup->candidate_count; i++) {
+            if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED) {
+                return;
+            }
+        }
+        fire_lookup_complete(lookup);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Public-to-module entry points                                            */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_dht_lookup_start(ants_dht_t *dht,
+                                   ants_dht_shard_key_t target_key,
+                                   ants_dht_lookup_t *out_lookup)
+{
+    struct ants_dht_state *state = dht_get_state(dht);
+
+    /* Find a free active-lookups slot. */
+    size_t slot = (size_t)-1;
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        if (state->active_lookups[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == (size_t)-1) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Initialise the lookup_state in the caller's opaque buffer. */
+    memset(out_lookup->_opaque, 0, sizeof out_lookup->_opaque);
+    struct ants_dht_lookup_state *lookup = lookup_get_state(out_lookup);
+    lookup->in_use = true;
+    lookup->completed = false;
+    lookup->parent = dht;
+    lookup->target_key = target_key;
+
+    /* Derive target_peer_id = BLAKE3(target_key as 8 little-endian bytes). */
+    uint8_t key_le[8];
+    for (int i = 0; i < 8; i++) {
+        key_le[i] = (uint8_t)((target_key >> (i * 8)) & 0xFFu);
+    }
+    ants_error_t err = ants_blake3_hash(key_le, sizeof key_le, lookup->target_peer_id);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    state->active_lookups[slot] = out_lookup;
+
+    /* Seed candidates from the routing table. Initial advance happens on
+     * the next ants_dht_tick — keeping it out of the call chain avoids
+     * firing LOOKUP_COMPLETE synchronously from inside lookup_start
+     * (which would surprise callers iterating active lookups). */
+    seed_candidates_from_routing(lookup, state);
+
+    return ANTS_OK;
+}
+
+ants_error_t ants_dht_lookup_do_cancel(ants_dht_lookup_t *lookup_handle)
+{
+    if (lookup_handle == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_dht_lookup_state *lookup = lookup_get_state(lookup_handle);
+    if (!lookup->in_use || lookup->completed) {
+        return ANTS_OK; /* idempotent */
+    }
+    lookup->completed = true;
+    /* Invalidate inflight records so late completions no-op. The
+     * underlying dht_rpc slots will be reclaimed by release_slot when
+     * their STREAM_FIN / STREAM_RESET / CONN_CLOSED arrives. */
+    for (size_t i = 0; i < ANTS_DHT_LOOKUP_INFLIGHT_CAP; i++) {
+        lookup->inflight_recs[i].valid = false;
+    }
+    struct ants_dht_state *state = dht_get_state(lookup->parent);
+    unregister_lookup(state, lookup_handle);
+    return ANTS_OK;
+}
+
+ants_error_t ants_dht_lookup_advance_all(ants_dht_t *dht)
+{
+    if (dht == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_dht_state *state = dht_get_state(dht);
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        ants_dht_lookup_t *h = state->active_lookups[i];
+        if (h == NULL) {
+            continue;
+        }
+        struct ants_dht_lookup_state *lookup = lookup_get_state(h);
+        if (!lookup->completed) {
+            lookup_advance(lookup);
+        }
+    }
+    return ANTS_OK;
+}
