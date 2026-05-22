@@ -65,7 +65,7 @@ static void test_pinned_constants(void)
     /* Opaque ctx sizes — v1.0 starting estimates. If a future PR
      * tightens these the test must be updated together. */
     CHECK(ANTS_DHT_CTX_SIZE == 32768);
-    CHECK(ANTS_DHT_LOOKUP_CTX_SIZE == 8192);
+    CHECK(ANTS_DHT_LOOKUP_CTX_SIZE == 16384);
 
     /* Event-kind enum: stable for caller switch statements. Adding new
      * kinds is OK; renumbering existing ones is not. */
@@ -152,16 +152,17 @@ static void test_action_stubs_return_not_implemented(void)
     ants_peer_id_t pid;
     memset(&pid, 0, sizeof pid);
 
-    /* Action APIs: all NOT_IMPLEMENTED in phase 1. NULL-arg checks
-     * run first and return INVALID_ARG, so we pass valid pointers. */
+    /* Phase 6 actions still return NOT_IMPLEMENTED. Phase 5 wired up
+     * lookup + lookup_cancel — they now succeed even on a zero-init
+     * dht (the lookup just has no candidates so it never converges
+     * until tick observes it; the test exercises only NULL guards
+     * for those). */
     CHECK_EQ(ants_dht_bootstrap(&d, "/ip4/127.0.0.1/udp/4242/quic-v1", &pid),
              ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_dht_announce(&d, 0x12345678ABCDEF00ULL), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_dht_unannounce(&d, 0x12345678ABCDEF00ULL), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_dht_lookup(&d, 0x12345678ABCDEF00ULL, &l), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_dht_lookup_cancel(&l), ANTS_ERROR_NOT_IMPLEMENTED);
 
-    /* NULL-arg guards. */
+    /* NULL-arg guards (still phase 1 contract). */
     CHECK_EQ(ants_dht_bootstrap(NULL, "/ip4/127.0.0.1/udp/4242/quic-v1", &pid),
              ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_dht_bootstrap(&d, NULL, &pid), ANTS_ERROR_INVALID_ARG);
@@ -209,6 +210,10 @@ static void test_introspection_empty_table(void)
 
 extern ants_error_t
 ants_dht__test_insert_peer(ants_dht_t *dht, const ants_dht_peer_t *peer, uint64_t now_us);
+extern ants_error_t ants_dht__test_insert_peer_with_conn(ants_dht_t *dht,
+                                                         const ants_dht_peer_t *peer,
+                                                         ants_transport_conn_t *conn,
+                                                         uint64_t now_us);
 extern ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 extern uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
 
@@ -748,6 +753,27 @@ test_rpc_build_response(test_rpc_server_t *s, uint8_t *out, size_t cap, size_t *
                  "/ip4/127.0.0.1/udp/9999/quic-v1");
         return ants_dht_wire_encode_find_node_resp(out, cap, out_len, &resp);
     }
+    case ANTS_DHT_MSG_GET_PEERS_RESP: {
+        ants_dht_get_peers_req_t req;
+        memset(&req, 0, sizeof req);
+        err = ants_dht_wire_decode_get_peers_req(s->recv_buf, s->recv_len, &req);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        ants_dht_get_peers_resp_t resp;
+        memset(&resp, 0, sizeof resp);
+        resp.txid = req.txid;
+        resp.peer_count = 1;
+        /* Use a distinct sentinel byte (0xEE) so the lookup-round-trip
+         * test can tell apart a real GET_PEERS_RESP peer from the
+         * find_node sentinel (0xCC). */
+        memset(resp.peers[0].peer_id.bytes, 0xEE, ANTS_PEER_ID_SIZE);
+        snprintf(resp.peers[0].multiaddr,
+                 sizeof resp.peers[0].multiaddr,
+                 "/ip4/127.0.0.1/udp/12345/quic-v1");
+        memset(resp.token, 0xAB, ANTS_DHT_TOKEN_SIZE);
+        return ants_dht_wire_encode_get_peers_resp(out, cap, out_len, &resp);
+    }
     default:
         return ANTS_ERROR_NOT_IMPLEMENTED;
     }
@@ -798,10 +824,13 @@ static ants_error_t test_rpc_server_event(const ants_transport_event_t *ev, void
 }
 
 /* Client-side: forward EVERY transport event to the DHT. The dispatcher
- * silently ignores non-RPC events. */
+ * silently ignores non-RPC events. CONN_READY captures the peer_id of
+ * the remote so the lookup test can seed it into A's routing table
+ * with the live conn pointer. */
 typedef struct {
     ants_dht_t *dht;
     int conn_ready;
+    ants_peer_id_t peer_id;
 } test_rpc_client_t;
 
 static ants_error_t test_rpc_client_event(const ants_transport_event_t *ev, void *ctx)
@@ -812,6 +841,7 @@ static ants_error_t test_rpc_client_event(const ants_transport_event_t *ev, void
     }
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         c->conn_ready++;
+        c->peer_id = ev->peer_id;
     }
     return ANTS_OK;
 }
@@ -1075,6 +1105,235 @@ static void test_rpc_round_trip(void)
     CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase 5: iterative-lookup state machine                                  */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    int lookup_complete;
+    int lookup_timeout;
+    size_t last_peer_count;
+    ants_dht_peer_t last_peers[ANTS_DHT_K];
+    ants_dht_shard_key_t last_shard_key;
+} test_lookup_recorder_t;
+
+static ants_error_t test_lookup_event_fn(const ants_dht_event_t *ev, void *ctx)
+{
+    test_lookup_recorder_t *r = (test_lookup_recorder_t *)ctx;
+    switch (ev->kind) {
+    case ANTS_DHT_EV_LOOKUP_COMPLETE:
+        r->lookup_complete++;
+        r->last_peer_count = ev->peer_count;
+        r->last_shard_key = ev->shard_key;
+        if (ev->peers != NULL && ev->peer_count > 0) {
+            size_t n = ev->peer_count < ANTS_DHT_K ? ev->peer_count : ANTS_DHT_K;
+            memcpy(r->last_peers, ev->peers, n * sizeof *ev->peers);
+        }
+        break;
+    case ANTS_DHT_EV_LOOKUP_TIMEOUT:
+        r->lookup_timeout++;
+        break;
+    default:
+        break;
+    }
+    return ANTS_OK;
+}
+
+static void test_lookup_no_candidates(void)
+{
+    /* A lookup with an empty routing table should converge on the very
+     * first tick: no candidates, no in-flight RPCs, immediate
+     * LOOKUP_COMPLETE with peer_count = 0. Exercises the convergence-
+     * on-empty edge case without any transport. */
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_lookup_event_fn;
+    cfg.event_ctx = &rec;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    ants_dht_lookup_t lookup = {{0}};
+    CHECK_EQ(ants_dht_lookup(&d, 0xDEADBEEFCAFEBABEULL, &lookup), ANTS_OK);
+
+    /* Tick triggers the first lookup_advance which observes the empty
+     * state and fires LOOKUP_COMPLETE synchronously. */
+    (void)ants_dht_tick(&d);
+
+    CHECK(rec.lookup_complete == 1);
+    CHECK(rec.last_peer_count == 0);
+    CHECK(rec.last_shard_key == 0xDEADBEEFCAFEBABEULL);
+
+    /* A second tick must not re-fire (the lookup is completed and
+     * unregistered). */
+    (void)ants_dht_tick(&d);
+    CHECK(rec.lookup_complete == 1);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_lookup_round_trip(void)
+{
+    /* End-to-end iterative lookup with a single seed peer. A's routing
+     * table is seeded with B (post-handshake conn pointer). A.lookup
+     * issues GET_PEERS to B; B's manual server side answers with a
+     * fake peer; A's lookup folds the response in, finds no new
+     * UNQUERIED candidates, converges, fires LOOKUP_COMPLETE with the
+     * B-supplied peer as the result. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x55, sizeof a_priv);
+    memset(b_priv, 0xBB, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_rpc_server_t server;
+    memset(&server, 0, sizeof server);
+    test_rpc_client_t client;
+    memset(&client, 0, sizeof client);
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    /* B = listener. */
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_rpc_server_event;
+    bcfg.event_ctx = &server;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    /* A = dialer with DHT delegation. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_rpc_client_event;
+    acfg.event_ctx = &client;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &rec;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    client.dht = &da;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (client.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(client.conn_ready == 1);
+
+    /* Seed A's routing table with B (peer_id captured from CONN_READY,
+     * conn = the live connection). */
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    b_peer.peer_id = client.peer_id;
+    snprintf(b_peer.multiaddr, sizeof b_peer.multiaddr, "%s", baddr);
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, 100), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    /* Tell the server how to respond. */
+    server.respond_with = ANTS_DHT_MSG_GET_PEERS_RESP;
+
+    /* Issue the lookup and drive both sides until LOOKUP_COMPLETE. */
+    ants_dht_lookup_t lookup = {{0}};
+    ants_dht_shard_key_t target = 0x123456789ABCDEF0ULL;
+    CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
+
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        if (rec.lookup_complete >= 1) {
+            break;
+        }
+    }
+
+    CHECK(server.stream_opened >= 1);
+    CHECK(server.stream_fin >= 1);
+    CHECK(server.response_sent == 1);
+    CHECK(server.last_err == ANTS_OK);
+
+    CHECK(rec.lookup_complete == 1);
+    CHECK(rec.last_shard_key == target);
+    /* B answered with one peer (peer_id = 0xEE bytes, multiaddr =
+     * .../udp/12345/...). The lookup folded it into the candidate set;
+     * it stays UNQUERIED (we have no conn to it) and doesn't appear
+     * in the ANSWERED result. So the result set contains exactly B
+     * itself, which IS ANSWERED. */
+    CHECK(rec.last_peer_count == 1);
+    if (rec.last_peer_count >= 1) {
+        CHECK(memcmp(rec.last_peers[0].peer_id.bytes, client.peer_id.bytes, ANTS_PEER_ID_SIZE) ==
+              0);
+    }
+
+    /* Teardown. */
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+}
+
+static void test_lookup_cancel(void)
+{
+    /* Cancelling a lookup before it converges suppresses the
+     * LOOKUP_COMPLETE event. The slot is unregistered so a later tick
+     * doesn't drive it. (We don't bother issuing real RPCs here — the
+     * cancellation path is exercised even when the lookup is "stuck"
+     * in its seeded-empty state.) */
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_lookup_event_fn;
+    cfg.event_ctx = &rec;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    ants_dht_lookup_t lookup = {{0}};
+    CHECK_EQ(ants_dht_lookup(&d, 0x4242424242424242ULL, &lookup), ANTS_OK);
+
+    /* Cancel before any tick. No event must ever fire. */
+    CHECK_EQ(ants_dht_lookup_cancel(&lookup), ANTS_OK);
+
+    /* Second cancel is idempotent. */
+    CHECK_EQ(ants_dht_lookup_cancel(&lookup), ANTS_OK);
+
+    /* Several ticks: no LOOKUP_COMPLETE / LOOKUP_TIMEOUT can fire. */
+    for (int i = 0; i < 5; i++) {
+        (void)ants_dht_tick(&d);
+    }
+    CHECK(rec.lookup_complete == 0);
+    CHECK(rec.lookup_timeout == 0);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -1101,6 +1360,10 @@ int main(void)
     test_rpc_send_rejects_invalid_args();
     test_rpc_handle_event_ignores_non_dht();
     test_rpc_round_trip();
+
+    test_lookup_no_candidates();
+    test_lookup_round_trip();
+    test_lookup_cancel();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

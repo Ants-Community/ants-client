@@ -10,6 +10,7 @@
 
 add_library(ants_dht STATIC
     src/dht.c
+    src/dht_lookup.c
     src/dht_rpc.c
     src/dht_wire.c
 )
