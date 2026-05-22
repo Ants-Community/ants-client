@@ -1687,6 +1687,177 @@ static void test_bootstrap_completes(void)
     CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase 7: end-to-end two-node DHT integration                             */
+/*                                                                          */
+/* "ANTS DHT live" milestone: A and B both run full DHTs over real QUIC     */
+/* transports. They bootstrap each other (mutual dials), each announces a   */
+/* shard, then each looks up the other's announced shard. Both observe a    */
+/* LOOKUP_COMPLETE event containing the other peer.                         */
+/* ------------------------------------------------------------------------ */
+
+static void test_two_node_end_to_end(void)
+{
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x11, sizeof a_priv);
+    memset(b_priv, 0xEE, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+    test_lookup_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+    test_lookup_recorder_t b_rec;
+    memset(&b_rec, 0, sizeof b_rec);
+
+    /* Both endpoints are listener+dialer so each can bootstrap the
+     * other. Two independent QUIC connections result (one in each
+     * direction) — bootstrap dials are tracked separately in each
+     * DHT's bootstrap_entries; inbound conns on the other side are
+     * handled by the server-side dispatcher. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    acfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+    char aaddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&ta, aaddr, sizeof aaddr), ANTS_OK);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &a_rec;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &b_rec;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    /* Mutual bootstrap. Each endpoint dials the other's listener. */
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+    ants_peer_id_t a_pid;
+    memcpy(a_pid.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&db, aaddr, &a_pid), ANTS_OK);
+
+    /* Drive until both directions complete the handshake (each side
+     * sees one outbound CONN_READY and one inbound CONN_READY). */
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 2 && b_ep.conn_ready >= 2) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready >= 2);
+    CHECK(b_ep.conn_ready >= 2);
+
+    /* Drive the self-FIND_NODE round-trips spawned by each bootstrap.
+     * Both sides have empty initial routing tables (we haven't done
+     * any inserts yet), so FIND_NODE returns peer_count=0 from each
+     * server. */
+    for (int i = 0; i < 100; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+    }
+
+    /* Each routing table should now contain exactly the other peer. */
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+    CHECK(ants_dht_routing_table_size(&db) == 1);
+
+    /* Each peer announces a distinct shard. */
+    ants_dht_shard_key_t shard_x = 0x1111111111111111ULL;
+    ants_dht_shard_key_t shard_y = 0x2222222222222222ULL;
+    CHECK_EQ(ants_dht_announce(&da, shard_x), ANTS_OK);
+    CHECK_EQ(ants_dht_announce(&db, shard_y), ANTS_OK);
+
+    /* A looks up shard_y (announced by B). A's only known peer with a
+     * conn is B; A queries B → B's server returns its announce set
+     * for shard_y = [B] → A folds, B already in candidates (was
+     * seeded), A converges → LOOKUP_COMPLETE fires with B as the
+     * answered peer. */
+    ants_dht_lookup_t la = {{0}};
+    CHECK_EQ(ants_dht_lookup(&da, shard_y, &la), ANTS_OK);
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        if (a_rec.lookup_complete >= 1) {
+            break;
+        }
+    }
+    CHECK(a_rec.lookup_complete == 1);
+    CHECK(a_rec.last_shard_key == shard_y);
+    CHECK(a_rec.last_peer_count == 1);
+    if (a_rec.last_peer_count == 1) {
+        CHECK(memcmp(a_rec.last_peers[0].peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
+    }
+
+    /* Symmetric: B looks up shard_x (announced by A). */
+    ants_dht_lookup_t lb = {{0}};
+    CHECK_EQ(ants_dht_lookup(&db, shard_x, &lb), ANTS_OK);
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        if (b_rec.lookup_complete >= 1) {
+            break;
+        }
+    }
+    CHECK(b_rec.lookup_complete == 1);
+    CHECK(b_rec.last_shard_key == shard_x);
+    CHECK(b_rec.last_peer_count == 1);
+    if (b_rec.last_peer_count == 1) {
+        CHECK(memcmp(b_rec.last_peers[0].peer_id.bytes, a_pub, ANTS_PEER_ID_SIZE) == 0);
+    }
+
+    /* Teardown: bootstrap conns are open, so the transport must die
+     * first so its CONN_CLOSED callbacks reach our DHT and mark
+     * bootstrap entries dead before destroy frees their heap. */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -1722,6 +1893,8 @@ int main(void)
     test_server_responds_to_ping();
     test_server_get_peers_with_announce();
     test_bootstrap_completes();
+
+    test_two_node_end_to_end();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
