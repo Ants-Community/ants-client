@@ -169,10 +169,11 @@ struct ants_dht_pending_rpc {
 
 /* Per-candidate state in the iterative lookup. */
 typedef enum {
-    ANTS_DHT_LOOKUP_CAND_UNQUERIED = 0, /* In candidate set, not yet queried. */
-    ANTS_DHT_LOOKUP_CAND_INFLIGHT = 1,  /* GET_PEERS sent, awaiting response. */
-    ANTS_DHT_LOOKUP_CAND_ANSWERED = 2,  /* Response received and processed. */
-    ANTS_DHT_LOOKUP_CAND_FAILED = 3,    /* RPC failed (no conn / RPC error). */
+    ANTS_DHT_LOOKUP_CAND_UNQUERIED = 0,    /* In candidate set, not yet queried. */
+    ANTS_DHT_LOOKUP_CAND_INFLIGHT = 1,     /* GET_PEERS sent, awaiting response. */
+    ANTS_DHT_LOOKUP_CAND_ANSWERED = 2,     /* Response received and processed. */
+    ANTS_DHT_LOOKUP_CAND_FAILED = 3,       /* RPC failed (no conn / RPC error). */
+    ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL = 4 /* Lazy dial in flight, awaiting CONN_READY. */
 } ants_dht_lookup_cand_state_t;
 
 struct ants_dht_lookup_candidate {
@@ -311,6 +312,37 @@ struct ants_dht_bootstrap_entry {
 
 #define ANTS_DHT_MAX_LOCAL_ANNOUNCES 16
 
+/* ------------------------------------------------------------------------ */
+/* Pending dials (phase 6.1.c dial-promote)                                 */
+/*                                                                          */
+/* When a lookup encounters a closer-than-current candidate that has a      */
+/* known multiaddr but no live conn yet, it issues a lazy dial via the      */
+/* transport and tracks it here until either CONN_READY (promote the conn   */
+/* into the routing table, flip matching candidates to UNQUERIED) or        */
+/* CONN_CLOSED (mark matching candidates FAILED). Cap is small because      */
+/* concurrent lookups α=3 each; in practice we'll have at most a handful   */
+/* of dial-promotes in flight at once.                                      */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_PENDING_DIALS 16
+
+struct ants_dht_pending_dial {
+    bool in_use;
+    /* True once CONN_READY promoted the conn into the routing table.
+     * The slot stays in_use until destroy frees the heap conn; this
+     * flag stops a subsequent CONN_CLOSED from re-promoting (it has
+     * already been folded into routing). */
+    bool promoted;
+    uint8_t _pad[6];
+    /* Heap-allocated by issue_rpc_for_candidate so its address is
+     * stable across the dial → CONN_READY callback chain. Freed on
+     * CONN_CLOSED or in ants_dht_destroy (same lifetime model as
+     * bootstrap_entries[]). */
+    ants_transport_conn_t *conn;
+    ants_peer_id_t expected_peer_id;
+    char multiaddr[ANTS_MULTIADDR_MAX_LEN];
+};
+
 struct ants_dht_local_announce {
     bool in_use;
     /* True once we've fired ANNOUNCE_CONFIRMED for the current cycle
@@ -362,6 +394,9 @@ struct ants_dht_state {
     struct ants_dht_announce announces[ANTS_DHT_MAX_ANNOUNCES];
     /* Bootstrap dials in progress / completed. */
     struct ants_dht_bootstrap_entry bootstrap_entries[ANTS_DHT_MAX_BOOTSTRAP_PEERS];
+    /* Lookup-initiated dials in progress / promoted. Same heap-conn
+     * lifetime as bootstrap_entries[]: freed in destroy. */
+    struct ants_dht_pending_dial pending_dials[ANTS_DHT_MAX_PENDING_DIALS];
     /* Local-host announce set (shards we've announced via ants_dht_announce). */
     struct ants_dht_local_announce local_announces[ANTS_DHT_MAX_LOCAL_ANNOUNCES];
     /* Server secret for GET_PEERS_RESP token derivation. Initialised by

@@ -17,7 +17,7 @@
  *   - Phase 6: Bootstrap + server-side dispatch + announces.  [done]
  *   - Phase 6.1.a: refresh PING + dead_strikes eviction.      [done]
  *   - Phase 6.1.b: announce republish chain.                  [done]
- *   - Phase 6.1.c: dial-promote during lookup.
+ *   - Phase 6.1.c: dial-promote during lookup.                [done]
  *   - Phase 7: Two-node integration test exchanging real lookups. [done]
  */
 
@@ -670,6 +670,15 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
             state->bootstrap_entries[i].in_use = false;
         }
     }
+    /* Same lazy-free discipline for phase 6.1.c dial-promote heap conns. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_DIALS; i++) {
+        if (state->pending_dials[i].conn != NULL) {
+            free(state->pending_dials[i].conn);
+            state->pending_dials[i].conn = NULL;
+            state->pending_dials[i].in_use = false;
+            state->pending_dials[i].promoted = false;
+        }
+    }
     /* Drop any heap-allocated bucket entries before zeroing the buffer.
      * Idempotent on a never-init'd (zeroed) dht: all bucket heads are
      * NULL, the loop is a no-op. */
@@ -950,6 +959,64 @@ static void handle_bootstrap_conn_closed(ants_dht_t *dht, const ants_transport_e
 }
 
 /* ------------------------------------------------------------------------ */
+/* Pending-dial (phase 6.1.c) event hooks                                   */
+/*                                                                          */
+/* When a lookup issues a lazy dial via try_dial_promote, the dial is       */
+/* recorded in pending_dials[]. On CONN_READY for that conn: promote the    */
+/* peer into the routing table (the dial work isn't lost when the lookup   */
+/* completes) and flip every INFLIGHT_DIAL candidate awaiting this         */
+/* peer_id back to UNQUERIED so lookup_advance issues GET_PEERS. On         */
+/* CONN_CLOSED before CONN_READY: mark matching candidates FAILED.         */
+/* ------------------------------------------------------------------------ */
+
+static void handle_pending_dial_conn_ready(ants_dht_t *dht, const ants_transport_event_t *event)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_DIALS; i++) {
+        struct ants_dht_pending_dial *pd = &state->pending_dials[i];
+        if (!pd->in_use || pd->promoted || pd->conn != event->conn) {
+            continue;
+        }
+        /* Verify the connecting peer is the one we expected. The
+         * transport already enforces this for dial() with an expected
+         * peer_id, but defence-in-depth costs nothing here. */
+        if (memcmp(event->peer_id.bytes, pd->expected_peer_id.bytes, ANTS_PEER_ID_SIZE) != 0) {
+            continue;
+        }
+        ants_dht_peer_t peer;
+        memset(&peer, 0, sizeof peer);
+        peer.peer_id = pd->expected_peer_id;
+        memcpy(peer.multiaddr, pd->multiaddr, sizeof peer.multiaddr);
+        (void)kbucket_insert(state, &peer, pd->conn, dht_now_us());
+        ants_dht_lookup_promote_dialed_peer(dht, &pd->expected_peer_id, pd->conn);
+        pd->promoted = true;
+        /* Slot stays in_use until destroy frees pd->conn — same lazy
+         * lifetime model as bootstrap_entries[]. */
+        break;
+    }
+}
+
+static void handle_pending_dial_conn_closed(ants_dht_t *dht, const ants_transport_event_t *event)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_DIALS; i++) {
+        struct ants_dht_pending_dial *pd = &state->pending_dials[i];
+        if (!pd->in_use || pd->conn != event->conn) {
+            continue;
+        }
+        if (!pd->promoted) {
+            /* Dial failed before CONN_READY: surface as candidate
+             * FAILED to every awaiting lookup. */
+            ants_dht_lookup_fail_dialing_candidates(dht, &pd->expected_peer_id);
+        }
+        pd->in_use = false;
+        pd->promoted = false;
+        /* pd->conn stays non-NULL — destroy will free it. Same
+         * picoquic-lifetime concern as bootstrap_entries[]. */
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Transport event delegation                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -959,11 +1026,16 @@ ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transpo
         return ANTS_ERROR_INVALID_ARG;
     }
     /* Bootstrap-specific hooks first so the conn/routing state is in
-     * shape when the rpc / server dispatchers see the event. */
+     * shape when the rpc / server dispatchers see the event. Pending-
+     * dial hooks run next: they promote lookup-dialed peers into the
+     * routing table and flip waiting candidates to UNQUERIED (or FAILED
+     * on CONN_CLOSED before CONN_READY). */
     if (event->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         handle_bootstrap_conn_ready(dht, event);
+        handle_pending_dial_conn_ready(dht, event);
     } else if (event->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
         handle_bootstrap_conn_closed(dht, event);
+        handle_pending_dial_conn_closed(dht, event);
     }
     /* Outbound RPC dispatch (responses for ants_dht_rpc_send_*). */
     (void)ants_dht_rpc_handle_event(dht, event);

@@ -24,6 +24,7 @@
 
 #include "ants_crypto.h"
 #include "ants_dht.h"
+#include "ants_transport.h"
 #include "dht_internal.h"
 #include "dht_rpc.h"
 #include "dht_wire.h"
@@ -31,6 +32,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
@@ -133,16 +135,18 @@ static void cand_insert_sorted(struct ants_dht_lookup_state *lookup,
     lookup->candidate_count++;
 }
 
-/* Seed the candidate set from every routing-table entry with conn != NULL. */
+/* Seed the candidate set from every routing-table entry. NULL-conn
+ * entries are included (phase 6.1.c will dial-promote them on first
+ * query attempt — see issue_rpc_for_candidate). Pre-6.1.c this filter
+ * skipped NULL-conn entries, which made them dead weight in the routing
+ * table; with dial-promote they're a live discovery channel. */
 static void seed_candidates_from_routing(struct ants_dht_lookup_state *lookup,
                                          const struct ants_dht_state *state)
 {
     for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT; i++) {
         for (const struct ants_dht_bucket_entry *e = state->buckets[i].head; e != NULL;
              e = e->next) {
-            if (e->conn != NULL) {
-                cand_insert_sorted(lookup, &e->peer, e->conn);
-            }
+            cand_insert_sorted(lookup, &e->peer, e->conn);
         }
     }
 }
@@ -262,6 +266,64 @@ static void on_rpc_complete(ants_error_t status, const void *resp, void *ctx)
 /* Issue an RPC for a single candidate                                      */
 /* ------------------------------------------------------------------------ */
 
+/* Phase 6.1.c: lazily dial a NULL-conn candidate that has a known
+ * multiaddr. Allocates a pending_dials slot + heap conn, kicks off
+ * `ants_transport_dial`, flips the candidate to INFLIGHT_DIAL. On
+ * CONN_READY (delivered via ants_dht_lookup_promote_dialed_peer) the
+ * candidate goes back to UNQUERIED with the live conn and the next
+ * lookup_advance issues GET_PEERS for real. Returns true if the dial
+ * was issued, false if dial-promote was rejected (no multiaddr, no
+ * free slot, malloc failure, transport_dial error). On false the
+ * candidate is marked FAILED. */
+static bool try_dial_promote(struct ants_dht_lookup_state *lookup,
+                             struct ants_dht_lookup_candidate *cand)
+{
+    if (cand->peer.multiaddr[0] == '\0') {
+        return false;
+    }
+    struct ants_dht_state *state = dht_get_state(lookup->parent);
+    if (state->transport == NULL) {
+        return false;
+    }
+    struct ants_dht_pending_dial *pd = NULL;
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_DIALS; i++) {
+        if (!state->pending_dials[i].in_use) {
+            pd = &state->pending_dials[i];
+            break;
+        }
+    }
+    if (pd == NULL) {
+        return false;
+    }
+    ants_transport_conn_t *conn = (ants_transport_conn_t *)malloc(sizeof(ants_transport_conn_t));
+    if (conn == NULL) {
+        return false;
+    }
+    memset(conn, 0, sizeof *conn);
+    ants_error_t err =
+        ants_transport_dial(state->transport, cand->peer.multiaddr, &cand->peer.peer_id, conn);
+    if (err != ANTS_OK) {
+        free(conn);
+        return false;
+    }
+    memset(pd, 0, sizeof *pd);
+    pd->in_use = true;
+    pd->promoted = false;
+    pd->conn = conn;
+    pd->expected_peer_id = cand->peer.peer_id;
+    size_t addr_len = strlen(cand->peer.multiaddr);
+    if (addr_len >= sizeof pd->multiaddr) {
+        addr_len = sizeof pd->multiaddr - 1;
+    }
+    memcpy(pd->multiaddr, cand->peer.multiaddr, addr_len);
+    pd->multiaddr[addr_len] = '\0';
+    cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL;
+    /* inflight_count NOT incremented: that counter is for in-flight
+     * GET_PEERS RPCs, not for in-flight dials. The convergence check
+     * looks at INFLIGHT_DIAL separately. */
+    return true;
+}
+
 /* Returns true if INFLIGHT was set (one slot of α is now occupied); false
  * if the candidate was FAILED immediately (no conn, or send_get_peers
  * returned an error). */
@@ -270,6 +332,11 @@ static bool issue_rpc_for_candidate(struct ants_dht_lookup_state *lookup, size_t
     struct ants_dht_lookup_candidate *cand = &lookup->candidates[cand_idx];
 
     if (cand->conn == NULL) {
+        /* Phase 6.1.c: if we know the peer's multiaddr, lazy-dial it
+         * and wait for CONN_READY instead of giving up. */
+        if (try_dial_promote(lookup, cand)) {
+            return false; /* inflight_count not consumed; INFLIGHT_DIAL state set */
+        }
         cand->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
         return false;
     }
@@ -337,11 +404,15 @@ static void lookup_advance(struct ants_dht_lookup_state *lookup)
         (void)issue_rpc_for_candidate(lookup, idx);
     }
 
-    /* Convergence: no in-flight RPCs and every candidate has been
-     * resolved (ANSWERED or FAILED). */
+    /* Convergence: no in-flight RPCs, no in-flight dials, and every
+     * candidate has been resolved (ANSWERED or FAILED). INFLIGHT_DIAL
+     * candidates count as in-progress just like INFLIGHT — they're
+     * waiting on CONN_READY before they can transition to INFLIGHT. */
     if (lookup->inflight_count == 0) {
         for (size_t i = 0; i < lookup->candidate_count; i++) {
-            if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED) {
+            uint8_t s = lookup->candidates[i].state;
+            if (s == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED ||
+                s == (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL) {
                 return;
             }
         }
@@ -438,4 +509,57 @@ ants_error_t ants_dht_lookup_advance_all(ants_dht_t *dht)
         }
     }
     return ANTS_OK;
+}
+
+void ants_dht_lookup_promote_dialed_peer(ants_dht_t *dht,
+                                         const ants_peer_id_t *peer_id,
+                                         ants_transport_conn_t *conn)
+{
+    if (dht == NULL || peer_id == NULL) {
+        return;
+    }
+    struct ants_dht_state *state = dht_get_state(dht);
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        ants_dht_lookup_t *h = state->active_lookups[i];
+        if (h == NULL) {
+            continue;
+        }
+        struct ants_dht_lookup_state *lookup = lookup_get_state(h);
+        if (lookup->completed) {
+            continue;
+        }
+        for (size_t j = 0; j < lookup->candidate_count; j++) {
+            struct ants_dht_lookup_candidate *c = &lookup->candidates[j];
+            if (c->state == (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL &&
+                memcmp(c->peer.peer_id.bytes, peer_id->bytes, ANTS_PEER_ID_SIZE) == 0) {
+                c->conn = conn;
+                c->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED;
+            }
+        }
+    }
+}
+
+void ants_dht_lookup_fail_dialing_candidates(ants_dht_t *dht, const ants_peer_id_t *peer_id)
+{
+    if (dht == NULL || peer_id == NULL) {
+        return;
+    }
+    struct ants_dht_state *state = dht_get_state(dht);
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        ants_dht_lookup_t *h = state->active_lookups[i];
+        if (h == NULL) {
+            continue;
+        }
+        struct ants_dht_lookup_state *lookup = lookup_get_state(h);
+        if (lookup->completed) {
+            continue;
+        }
+        for (size_t j = 0; j < lookup->candidate_count; j++) {
+            struct ants_dht_lookup_candidate *c = &lookup->candidates[j];
+            if (c->state == (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL &&
+                memcmp(c->peer.peer_id.bytes, peer_id->bytes, ANTS_PEER_ID_SIZE) == 0) {
+                c->state = (uint8_t)ANTS_DHT_LOOKUP_CAND_FAILED;
+            }
+        }
+    }
 }
