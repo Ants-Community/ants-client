@@ -15,9 +15,18 @@
  *   - Phase 4: RPC dispatch over transport bidi streams.      [done]
  *   - Phase 5: Iterative lookup state machine.                [done]
  *   - Phase 6: Bootstrap + server-side dispatch + announces.  [done]
- *   - Phase 6.1: maintenance (bucket refresh, announce republish).
- *   - Phase 7: Two-node integration test exchanging real lookups.
+ *   - Phase 6.1.a: refresh PING + dead_strikes eviction.      [done]
+ *   - Phase 6.1.b: announce republish chain.
+ *   - Phase 6.1.c: dial-promote during lookup.
+ *   - Phase 7: Two-node integration test exchanging real lookups. [done]
  */
+
+/* POSIX feature test — required on glibc to expose clock_gettime() and
+ * CLOCK_MONOTONIC from <time.h>. macOS exposes them by default; this
+ * define is benign there. Must precede every system header. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "ants_dht.h"
 
@@ -32,6 +41,29 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------------ */
+/* Clock                                                                    */
+/*                                                                          */
+/* Phase 6.1 introduces real wall-clock-ish time for refresh-tick / republish-*/
+/* tick scheduling and for stamping bucket entries' last_seen_us. We use     */
+/* CLOCK_MONOTONIC because we only compare deltas and never want negative   */
+/* jumps from NTP resync. Falls back to CLOCK_REALTIME only if the          */
+/* monotonic clock genuinely isn't available — POSIX requires it on every   */
+/* platform we support, so the fallback is paranoia for unusual builds.    */
+/* ------------------------------------------------------------------------ */
+
+static uint64_t dht_now_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            return 0;
+        }
+    }
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Storage layout                                                           */
@@ -146,6 +178,7 @@ static ants_error_t kbucket_insert(struct ants_dht_state *state,
     if (node == NULL) {
         return ANTS_ERROR_MALFORMED;
     }
+    memset(node, 0, sizeof *node);
     node->peer = *peer;
     node->conn = conn;
     node->last_seen_us = now_us;
@@ -226,6 +259,142 @@ static void kbucket_drop_all(struct ants_dht_state *state)
         state->buckets[i].head = NULL;
         state->buckets[i].count = 0;
     }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Refresh tick — periodic PING + dead-strike eviction                      */
+/*                                                                          */
+/* Every refresh_interval_ms/4 we walk the routing table; any entry whose   */
+/* last_seen_us is older than refresh_interval_ms (and isn't already        */
+/* awaiting a PING response) gets a liveness PING. On PING_RESP the entry's */
+/* dead_strikes resets to 0 and last_seen_us is bumped; on PING failure     */
+/* dead_strikes increments. Three strikes (ANTS_DHT_DEAD_STRIKE_THRESHOLD)  */
+/* evicts the entry and fires PEER_EVICTED.                                  */
+/*                                                                          */
+/* The completion context is heap-allocated because we can't keep a pointer */
+/* to the bucket entry — it may be freed by destroy/remove between PING    */
+/* issuance and response. The peer_id is the stable handle we re-resolve    */
+/* on completion via bucket-index lookup.                                   */
+/* ------------------------------------------------------------------------ */
+
+struct refresh_ping_ctx {
+    ants_dht_t *dht;
+    ants_peer_id_t peer_id;
+};
+
+static struct ants_dht_bucket_entry *find_entry_by_peer_id(struct ants_dht_state *state,
+                                                           const ants_peer_id_t *peer_id)
+{
+    uint32_t bidx = bucket_index_for_peer(state, peer_id);
+    if (bidx == UINT32_MAX) {
+        return NULL;
+    }
+    for (struct ants_dht_bucket_entry *e = state->buckets[bidx].head; e != NULL; e = e->next) {
+        if (memcmp(e->peer.peer_id.bytes, peer_id->bytes, ANTS_PEER_ID_SIZE) == 0) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void refresh_ping_completion(ants_error_t status, const void *resp, void *ctx)
+{
+    (void)resp;
+    struct refresh_ping_ctx *rctx = (struct refresh_ping_ctx *)ctx;
+    if (rctx == NULL) {
+        return;
+    }
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)rctx->dht->_opaque;
+    struct ants_dht_bucket_entry *entry = find_entry_by_peer_id(state, &rctx->peer_id);
+    if (entry == NULL) {
+        /* Entry was removed (e.g. by CONN_CLOSED) between issuing the
+         * PING and observing its completion. Nothing to update. */
+        free(rctx);
+        return;
+    }
+    entry->ping_in_flight = false;
+    if (status == ANTS_OK) {
+        entry->dead_strikes = 0;
+        entry->last_seen_us = dht_now_us();
+        free(rctx);
+        return;
+    }
+    /* Failure path. Bump strike count; evict on threshold. */
+    entry->dead_strikes++;
+    if (entry->dead_strikes >= ANTS_DHT_DEAD_STRIKE_THRESHOLD) {
+        ants_dht_peer_t evicted = entry->peer;
+        (void)kbucket_remove(state, &rctx->peer_id);
+        if (state->event_fn != NULL) {
+            ants_dht_event_t ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind = ANTS_DHT_EV_PEER_EVICTED;
+            ev.peer = evicted;
+            (void)state->event_fn(&ev, state->event_ctx);
+        }
+    }
+    free(rctx);
+}
+
+/* Issue a liveness PING for one bucket entry. Caller already checked the
+ * staleness condition; this function just marks the entry in-flight and
+ * dispatches the RPC. On dispatch failure (e.g. registry full) the entry
+ * stays "stale" — the next sweep will retry. */
+static void issue_refresh_ping(ants_dht_t *dht, struct ants_dht_bucket_entry *entry)
+{
+    struct refresh_ping_ctx *rctx =
+        (struct refresh_ping_ctx *)malloc(sizeof(struct refresh_ping_ctx));
+    if (rctx == NULL) {
+        return;
+    }
+    rctx->dht = dht;
+    rctx->peer_id = entry->peer.peer_id;
+    entry->ping_in_flight = true;
+    ants_error_t err = ants_dht_rpc_send_ping(dht, entry->conn, refresh_ping_completion, rctx);
+    if (err != ANTS_OK) {
+        /* The RPC layer never fired our completion when it returns an
+         * error from the send call (see dht_rpc.c arm_and_send), so we
+         * own the ctx and must reclaim it. Clear in-flight too so the
+         * next sweep can retry. */
+        entry->ping_in_flight = false;
+        free(rctx);
+    }
+}
+
+/* Walk every bucket and PING any stale, conn-bearing, not-already-pending
+ * entries. Runs on every tick; the bucket walk is cheap (~few thousand
+ * pointer derefs even with a full table) and the `ping_in_flight` flag
+ * prevents the same entry from being PINGed twice in the same RTT. Returns
+ * true if the sweep ran (i.e. refresh is enabled), so the caller knows
+ * whether to fire TABLE_REFRESHED. */
+static bool refresh_tick(ants_dht_t *dht, uint64_t now_us)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    if (state->refresh_interval_ms == 0) {
+        return false;
+    }
+
+    uint64_t stale_us = (uint64_t)state->refresh_interval_ms * 1000ULL;
+    for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT; i++) {
+        for (struct ants_dht_bucket_entry *e = state->buckets[i].head; e != NULL; e = e->next) {
+            if (e->conn == NULL || e->ping_in_flight) {
+                continue;
+            }
+            /* last_seen_us of 0 means "never recorded a real time" — a
+             * test hook may have inserted with now_us=0. Treat as stale
+             * if any time has elapsed since init. */
+            uint64_t since = (e->last_seen_us == 0) ? stale_us : (now_us - e->last_seen_us);
+            if (since >= stale_us) {
+                issue_refresh_ping(dht, e);
+            }
+        }
+    }
+    if (state->event_fn != NULL) {
+        ants_dht_event_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.kind = ANTS_DHT_EV_TABLE_REFRESHED;
+        (void)state->event_fn(&ev, state->event_ctx);
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -323,14 +492,22 @@ uint32_t ants_dht_tick(ants_dht_t *dht)
     if (dht == NULL) {
         return UINT32_MAX;
     }
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
     /* Advance every active iterative lookup: issue more RPCs if alpha
      * isn't saturated, check for convergence, fire LOOKUP_COMPLETE on
      * any lookup that just converged. */
     (void)ants_dht_lookup_advance_all(dht);
-    /* Phase 6 will add periodic-refresh and announcement-republish
-     * timers here, at which point this returns a real wake-delay. For
-     * now, "idle" — wake on socket-readable. */
-    return UINT32_MAX;
+    /* Phase 6.1: periodic liveness sweep. Decrements live peers'
+     * dead_strikes on success and evicts after three failures. */
+    (void)refresh_tick(dht, dht_now_us());
+    /* Wake-delay hint: with refresh enabled, suggest the caller tick us
+     * again within refresh_interval_ms/4 so a freshly-stale entry gets
+     * its PING within a quarter of the refresh window. The caller may
+     * tick sooner when transport I/O arrives. */
+    if (state->refresh_interval_ms == 0) {
+        return UINT32_MAX;
+    }
+    return state->refresh_interval_ms / 4u;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -417,7 +594,7 @@ ants_error_t ants_dht_announce(ants_dht_t *dht, ants_dht_shard_key_t shard_key)
             ants_dht_peer_t self;
             memset(&self, 0, sizeof self);
             self.peer_id = state->local_peer_id;
-            (void)ants_dht_server_upsert_announce(state, shard_key, &self, 0 /* now_us */);
+            (void)ants_dht_server_upsert_announce(state, shard_key, &self, dht_now_us());
             return ANTS_OK;
         }
     }
@@ -533,7 +710,7 @@ static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_ev
         memset(&peer, 0, sizeof peer);
         peer.peer_id = event->peer_id;
         memcpy(peer.multiaddr, be->multiaddr, sizeof peer.multiaddr);
-        (void)kbucket_insert(state, &peer, be->conn, 0 /* now_us, phase 6.1 plumbs in real time */);
+        (void)kbucket_insert(state, &peer, be->conn, dht_now_us());
         be->promoted = true;
 
         /* Seed nearby buckets by issuing FIND_NODE on our own peer_id. */
@@ -613,6 +790,20 @@ ants_error_t ants_dht__test_insert_peer_with_conn(ants_dht_t *dht,
                                                   uint64_t now_us);
 ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
+
+/* Snapshot of an entry's maintenance fields. Used by refresh-tick tests
+ * to verify last_seen_us / dead_strikes transitions without exposing the
+ * internal struct layout. */
+typedef struct {
+    bool exists;
+    uint64_t last_seen_us;
+    uint8_t dead_strikes;
+    bool ping_in_flight;
+} ants_dht__test_entry_state_t;
+void ants_dht__test_get_entry_state(const ants_dht_t *dht,
+                                    const ants_peer_id_t *peer_id,
+                                    ants_dht__test_entry_state_t *out);
+uint64_t ants_dht__test_now_us(void);
 
 ants_error_t ants_dht__test_send_ping(ants_dht_t *dht,
                                       ants_transport_conn_t *conn,
@@ -709,4 +900,37 @@ ants_error_t ants_dht__test_send_announce_peer(ants_dht_t *dht,
                                                void *ctx)
 {
     return ants_dht_rpc_send_announce_peer(dht, conn, key, token, completion, ctx);
+}
+
+void ants_dht__test_get_entry_state(const ants_dht_t *dht,
+                                    const ants_peer_id_t *peer_id,
+                                    ants_dht__test_entry_state_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof *out);
+    if (dht == NULL || peer_id == NULL) {
+        return;
+    }
+    const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
+    uint32_t bidx = bucket_index_for_peer(state, peer_id);
+    if (bidx == UINT32_MAX) {
+        return;
+    }
+    for (const struct ants_dht_bucket_entry *e = state->buckets[bidx].head; e != NULL;
+         e = e->next) {
+        if (memcmp(e->peer.peer_id.bytes, peer_id->bytes, ANTS_PEER_ID_SIZE) == 0) {
+            out->exists = true;
+            out->last_seen_us = e->last_seen_us;
+            out->dead_strikes = e->dead_strikes;
+            out->ping_in_flight = e->ping_in_flight;
+            return;
+        }
+    }
+}
+
+uint64_t ants_dht__test_now_us(void)
+{
+    return dht_now_us();
 }
