@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -216,6 +217,20 @@ extern ants_error_t ants_dht__test_insert_peer_with_conn(ants_dht_t *dht,
                                                          uint64_t now_us);
 extern ants_error_t ants_dht__test_remove_peer(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 extern uint32_t ants_dht__test_bucket_index(const ants_dht_t *dht, const ants_peer_id_t *peer_id);
+
+/* Phase 6.1.a maintenance-tick test hooks. State snapshot exposes the
+ * entry's last_seen_us + dead_strikes so tests can verify refresh-tick
+ * effects without inspecting the internal struct directly. */
+typedef struct {
+    bool exists;
+    uint64_t last_seen_us;
+    uint8_t dead_strikes;
+    bool ping_in_flight;
+} ants_dht__test_entry_state_t;
+extern void ants_dht__test_get_entry_state(const ants_dht_t *dht,
+                                           const ants_peer_id_t *peer_id,
+                                           ants_dht__test_entry_state_t *out);
+extern uint64_t ants_dht__test_now_us(void);
 
 /* Helper: zero-init a dht with a deterministic local pubkey. */
 static ants_error_t test_init_with_local(ants_dht_t *d,
@@ -1371,10 +1386,13 @@ static void test_announce_unannounce_local(void)
 
 /* Both A and B run a full DHT. Each transport event_fn forwards to its
  * own DHT via ants_dht_handle_transport_event, so the server-side
- * dispatcher is exercised end-to-end. */
+ * dispatcher is exercised end-to-end. stream_opened counts peer-initiated
+ * bidi streams (used by phase 6.1.a refresh tests to verify a PING was
+ * or wasn't dispatched). */
 typedef struct {
     ants_dht_t *dht;
     int conn_ready;
+    int stream_opened;
     ants_peer_id_t peer_id;
 } test_dht_endpoint_t;
 
@@ -1387,6 +1405,48 @@ static ants_error_t test_dht_endpoint_event(const ants_transport_event_t *ev, vo
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         e->conn_ready++;
         e->peer_id = ev->peer_id;
+    } else if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
+        e->stream_opened++;
+    }
+    return ANTS_OK;
+}
+
+/* DHT-event recorder. Counts the kinds the refresh-tick tests care
+ * about (PEER_EVICTED, TABLE_REFRESHED) so they can observe the
+ * maintenance loop's effects via the registered event_fn rather than
+ * direct struct inspection. */
+typedef struct {
+    int peer_evicted;
+    int table_refreshed;
+    ants_dht_peer_t last_evicted;
+} test_dht_event_recorder_t;
+
+static ants_error_t test_dht_event_recorder(const ants_dht_event_t *ev, void *ctx)
+{
+    test_dht_event_recorder_t *r = (test_dht_event_recorder_t *)ctx;
+    if (ev->kind == ANTS_DHT_EV_PEER_EVICTED) {
+        r->peer_evicted++;
+        r->last_evicted = ev->peer;
+    } else if (ev->kind == ANTS_DHT_EV_TABLE_REFRESHED) {
+        r->table_refreshed++;
+    }
+    return ANTS_OK;
+}
+
+/* Transport event_fn that resets every peer-initiated stream the moment
+ * it opens. Used by the refresh-eviction test as B's "always-fail" peer:
+ * A's PINGs hit a STREAM_RESET, which the dht_rpc dispatcher surfaces as
+ * an RPC failure, bumping A's dead_strikes for the entry. */
+typedef struct {
+    int streams_reset;
+} test_reset_server_t;
+
+static ants_error_t test_reset_server_event(const ants_transport_event_t *ev, void *ctx)
+{
+    test_reset_server_t *s = (test_reset_server_t *)ctx;
+    if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED && ev->stream != NULL) {
+        (void)ants_transport_stream_reset(ev->stream, 99 /* "refresh-test reset" */);
+        s->streams_reset++;
     }
     return ANTS_OK;
 }
@@ -1688,6 +1748,345 @@ static void test_bootstrap_completes(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Phase 6.1.a: refresh PING + dead_strikes eviction                        */
+/*                                                                          */
+/* Three tests cover the refresh-tick state machine end-to-end on real      */
+/* QUIC transports:                                                          */
+/*                                                                          */
+/*   1. test_refresh_pings_stale_peer       — stale entry → PING → refresh  */
+/*   2. test_refresh_evicts_after_threshold — failed PINGs → eviction event */
+/*   3. test_refresh_no_ping_when_fresh     — fresh entry → no PING         */
+/* ------------------------------------------------------------------------ */
+
+static void test_refresh_pings_stale_peer(void)
+{
+    /* A configured with a short refresh_interval_ms; B is a real DHT
+     * that auto-responds to PINGs. A dials B to get a live conn, then
+     * uses the test hook to back-date the entry's last_seen_us. After
+     * ticking, A should observe a successful PING_RESP — visible as
+     * the entry's dead_strikes staying at 0 AND last_seen_us moving
+     * forward past the back-dated value. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x33, sizeof a_priv);
+    memset(b_priv, 0x99, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+    test_dht_event_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_dht_event_recorder;
+    dcfg.event_ctx = &a_rec;
+    dcfg.refresh_interval_ms = 100;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    dcfg.event_ctx = NULL;
+    dcfg.refresh_interval_ms = 0; /* B doesn't need its own refresh. */
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    /* Stack-allocated conn — A owns the buffer, will outlive the test. */
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready >= 1);
+    CHECK(b_ep.conn_ready >= 1);
+
+    /* Insert B into A's routing table with the live conn and a stale
+     * last_seen_us. now_us=1 places the entry safely in the past so
+     * the very next refresh sweep will PING it. */
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, 1 /* very stale */),
+             ANTS_OK);
+
+    /* Snapshot — entry should exist with stale last_seen and no strikes. */
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    ants_dht__test_entry_state_t st0;
+    ants_dht__test_get_entry_state(&da, &b_pid, &st0);
+    CHECK(st0.exists);
+    CHECK(st0.last_seen_us == 1);
+    CHECK(st0.dead_strikes == 0);
+
+    /* Drive ticks. The refresh sweep should issue a PING; B's DHT
+     * responds; A's completion bumps last_seen_us and keeps strikes at 0. */
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        ants_dht__test_entry_state_t st;
+        ants_dht__test_get_entry_state(&da, &b_pid, &st);
+        if (st.exists && st.last_seen_us > 1 && !st.ping_in_flight) {
+            break;
+        }
+    }
+    ants_dht__test_entry_state_t st_final;
+    ants_dht__test_get_entry_state(&da, &b_pid, &st_final);
+    CHECK(st_final.exists);
+    CHECK(st_final.last_seen_us > 1);
+    CHECK(st_final.dead_strikes == 0);
+    CHECK(a_rec.peer_evicted == 0);
+    CHECK(a_rec.table_refreshed >= 1);
+
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
+static void test_refresh_evicts_after_threshold(void)
+{
+    /* B's transport is not wired to a DHT — its event_fn resets every
+     * inbound stream. A's PINGs hit STREAM_RESET; each failure bumps
+     * dead_strikes; on the third strike A's event_fn observes a
+     * PEER_EVICTED event and the entry is gone from the routing table. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x55, sizeof a_priv);
+    memset(b_priv, 0xAA, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_reset_server_t b_srv;
+    memset(&b_srv, 0, sizeof b_srv);
+    test_dht_event_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_reset_server_event;
+    bcfg.event_ctx = &b_srv;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_dht_event_recorder;
+    dcfg.event_ctx = &a_rec;
+    dcfg.refresh_interval_ms = 50;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready >= 1);
+
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, 1 /* stale */), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_PEER_ID_SIZE);
+
+    /* Drive ticks until eviction fires. Sweep cadence is 12.5 ms (50/4),
+     * each PING fails on round-trip within a few ms, so 3 strikes take
+     * ~50-80 ms; 500 ticks gives comfortable margin even on a slow CI. */
+    for (int i = 0; i < 500; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        if (a_rec.peer_evicted >= 1) {
+            break;
+        }
+    }
+    CHECK(a_rec.peer_evicted == 1);
+    CHECK(memcmp(a_rec.last_evicted.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
+    CHECK(ants_dht_routing_table_size(&da) == 0);
+    /* The reset-server should have observed at least three streams (one
+     * per strike); the exact count can be higher under refresh-cadence
+     * timing variance, so we only assert the lower bound. */
+    CHECK(b_srv.streams_reset >= ANTS_DHT_DEAD_STRIKE_THRESHOLD);
+
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+}
+
+static void test_refresh_no_ping_when_fresh(void)
+{
+    /* A configured with a long refresh_interval_ms; B is a full DHT.
+     * A inserts B with a fresh last_seen_us. Ticking for a short window
+     * should NOT trigger any PING — B's stream_opened count stays at 0,
+     * A's entry stays untouched. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x77, sizeof a_priv);
+    memset(b_priv, 0xBB, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    dcfg.refresh_interval_ms = 60000; /* 60 s — well beyond test window. */
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.refresh_interval_ms = 0;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 200; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready >= 1);
+    CHECK(b_ep.conn_ready >= 1);
+
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    uint64_t fresh_now = ants_dht__test_now_us();
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, fresh_now), ANTS_OK);
+
+    int b_streams_before = b_ep.stream_opened;
+    for (int i = 0; i < 100; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+    }
+    /* No refresh PING should have hit B. */
+    CHECK(b_ep.stream_opened == b_streams_before);
+
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&da, &b_pid, &st);
+    CHECK(st.exists);
+    CHECK(st.dead_strikes == 0);
+    CHECK(!st.ping_in_flight);
+    /* last_seen_us hasn't moved because no PING_RESP fired. */
+    CHECK(st.last_seen_us == fresh_now);
+
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Phase 7: end-to-end two-node DHT integration                             */
 /*                                                                          */
 /* "ANTS DHT live" milestone: A and B both run full DHTs over real QUIC     */
@@ -1893,6 +2292,10 @@ int main(void)
     test_server_responds_to_ping();
     test_server_get_peers_with_announce();
     test_bootstrap_completes();
+
+    test_refresh_pings_stale_peer();
+    test_refresh_evicts_after_threshold();
+    test_refresh_no_ping_when_fresh();
 
     test_two_node_end_to_end();
 

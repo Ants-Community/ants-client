@@ -88,6 +88,12 @@ extern "C" {
  * of the XOR distance, so for 256-bit peer IDs we have 256 buckets. */
 #define ANTS_DHT_BUCKET_COUNT 256
 
+/* Number of consecutive failed liveness PINGs after which a routing-table
+ * entry is evicted. Each refresh sweep that PINGs the entry and gets no
+ * (or a failed) response increments dead_strikes; on a successful PING it
+ * resets to zero. Three strikes is the BitTorrent mainline convention. */
+#define ANTS_DHT_DEAD_STRIKE_THRESHOLD 3
+
 /* ------------------------------------------------------------------------ */
 /* Shard-key type                                                           */
 /*                                                                          */

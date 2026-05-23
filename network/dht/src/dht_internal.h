@@ -37,7 +37,23 @@ struct ants_dht_bucket_entry {
      * it yet — phase 5 lookups skip these; phase 6 maintenance lazily
      * dials them and updates the conn pointer in-place. */
     ants_transport_conn_t *conn;
+    /* Wall-clock-ish time (us, CLOCK_MONOTONIC) the entry was last
+     * observed responsive — bumped on insert/refresh and on every
+     * successful liveness PING. Drives refresh-tick eligibility. */
     uint64_t last_seen_us;
+    /* Consecutive failed liveness PINGs since the last success. Reset to
+     * 0 on PING_RESP; incremented on PING failure (STREAM_RESET,
+     * PEER_UNREACHABLE, decode error). On reaching
+     * ANTS_DHT_DEAD_STRIKE_THRESHOLD the entry is evicted. */
+    uint8_t dead_strikes;
+    /* True between issuing a refresh PING and observing its completion.
+     * Suppresses issuing a second PING for the same entry while one is
+     * in flight (which would waste an RPC slot and double-count strikes
+     * on failure). */
+    bool ping_in_flight;
+    /* Pad to align `next` on an 8-byte boundary on 64-bit platforms.
+     * Explicit to keep the struct layout predictable for review. */
+    uint8_t _pad[6];
     struct ants_dht_bucket_entry *next;
 };
 
