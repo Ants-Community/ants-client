@@ -28,6 +28,12 @@ target_link_libraries(ants_embed
         ants_crypto
 )
 
+# libm for sqrt (used in the stub-inference L2 normalisation). On
+# macOS clang links libm implicitly; glibc requires it explicit.
+if(NOT MSVC AND NOT APPLE)
+    target_link_libraries(ants_embed PUBLIC m)
+endif()
+
 target_compile_features(ants_embed PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------
