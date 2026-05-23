@@ -231,6 +231,8 @@ extern void ants_dht__test_get_entry_state(const ants_dht_t *dht,
                                            const ants_peer_id_t *peer_id,
                                            ants_dht__test_entry_state_t *out);
 extern uint64_t ants_dht__test_now_us(void);
+extern size_t ants_dht__test_server_announce_count(const ants_dht_t *dht,
+                                                   ants_dht_shard_key_t shard_key);
 
 /* Helper: zero-init a dht with a deterministic local pubkey. */
 static ants_error_t test_init_with_local(ants_dht_t *d,
@@ -1411,14 +1413,16 @@ static ants_error_t test_dht_endpoint_event(const ants_transport_event_t *ev, vo
     return ANTS_OK;
 }
 
-/* DHT-event recorder. Counts the kinds the refresh-tick tests care
- * about (PEER_EVICTED, TABLE_REFRESHED) so they can observe the
- * maintenance loop's effects via the registered event_fn rather than
- * direct struct inspection. */
+/* DHT-event recorder. Counts the kinds the maintenance-tick tests care
+ * about (PEER_EVICTED, TABLE_REFRESHED, ANNOUNCE_CONFIRMED) so they can
+ * observe the maintenance loop's effects via the registered event_fn
+ * rather than direct struct inspection. */
 typedef struct {
     int peer_evicted;
     int table_refreshed;
+    int announce_confirmed;
     ants_dht_peer_t last_evicted;
+    ants_dht_shard_key_t last_confirmed_key;
 } test_dht_event_recorder_t;
 
 static ants_error_t test_dht_event_recorder(const ants_dht_event_t *ev, void *ctx)
@@ -1429,6 +1433,9 @@ static ants_error_t test_dht_event_recorder(const ants_dht_event_t *ev, void *ct
         r->last_evicted = ev->peer;
     } else if (ev->kind == ANTS_DHT_EV_TABLE_REFRESHED) {
         r->table_refreshed++;
+    } else if (ev->kind == ANTS_DHT_EV_ANNOUNCE_CONFIRMED) {
+        r->announce_confirmed++;
+        r->last_confirmed_key = ev->shard_key;
     }
     return ANTS_OK;
 }
@@ -2087,6 +2094,208 @@ static void test_refresh_no_ping_when_fresh(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Phase 6.1.b: announce republish chain                                    */
+/*                                                                          */
+/* Three tests cover the GET_PEERS → ANNOUNCE_PEER chain end-to-end on      */
+/* real QUIC transports:                                                    */
+/*                                                                          */
+/*   1. test_republish_propagates_to_closest_peer — A announces, B sees it */
+/*   2. test_republish_fires_announce_confirmed   — A observes the event   */
+/*   3. test_republish_only_once_per_cycle        — no event spam           */
+/* ------------------------------------------------------------------------ */
+
+/* Helper: bring up two full-DHT endpoints A and B with mutual transports,
+ * dial A→B, wait for handshake, and return both DHT handles wired to
+ * `a_rec`/`b_rec` event recorders. Caller is responsible for destroy
+ * (transport first, then dht — see the bootstrap-conn-lifetime note in
+ * test_bootstrap_completes). */
+typedef struct {
+    ants_transport_t ta;
+    ants_transport_t tb;
+    ants_dht_t da;
+    ants_dht_t db;
+    test_dht_endpoint_t a_ep;
+    test_dht_endpoint_t b_ep;
+    test_dht_event_recorder_t a_rec;
+    test_dht_event_recorder_t b_rec;
+    ants_transport_conn_t conn;
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+} test_republish_fixture_t;
+
+static void republish_fixture_init(test_republish_fixture_t *fx,
+                                   uint8_t a_seed,
+                                   uint8_t b_seed,
+                                   uint32_t republish_ms)
+{
+    memset(fx, 0, sizeof *fx);
+    memset(fx->a_priv, a_seed, sizeof fx->a_priv);
+    memset(fx->b_priv, b_seed, sizeof fx->b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(fx->a_priv, fx->a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(fx->b_priv, fx->b_pub), ANTS_OK);
+
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, fx->b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = fx->b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &fx->b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&fx->tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&fx->tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, fx->a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = fx->a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &fx->a_ep;
+    CHECK_EQ(ants_transport_init(&fx->ta, &acfg), ANTS_OK);
+
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &fx->ta;
+    memcpy(dcfg.local_peer_id.bytes, fx->a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_dht_event_recorder;
+    dcfg.event_ctx = &fx->a_rec;
+    dcfg.announce_republish_ms = republish_ms;
+    CHECK_EQ(ants_dht_init(&fx->da, &dcfg), ANTS_OK);
+    fx->a_ep.dht = &fx->da;
+
+    dcfg.transport = &fx->tb;
+    memcpy(dcfg.local_peer_id.bytes, fx->b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_dht_event_recorder;
+    dcfg.event_ctx = &fx->b_rec;
+    dcfg.announce_republish_ms = 0; /* B doesn't initiate republishes. */
+    CHECK_EQ(ants_dht_init(&fx->db, &dcfg), ANTS_OK);
+    fx->b_ep.dht = &fx->db;
+
+    CHECK_EQ(ants_transport_dial(&fx->ta, baddr, NULL, &fx->conn), ANTS_OK);
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&fx->ta);
+        ants_transport_tick(&fx->tb);
+        if (fx->a_ep.conn_ready >= 1 && fx->b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(fx->a_ep.conn_ready >= 1);
+    CHECK(fx->b_ep.conn_ready >= 1);
+
+    /* Seed B into A's routing table with the live conn so republish has
+     * a target peer to walk. (Without bootstrap, A's routing table would
+     * be empty even with a live conn.) */
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, fx->b_pub, ANTS_PEER_ID_SIZE);
+    CHECK_EQ(
+        ants_dht__test_insert_peer_with_conn(&fx->da, &b_peer, &fx->conn, ants_dht__test_now_us()),
+        ANTS_OK);
+}
+
+static void republish_fixture_teardown(test_republish_fixture_t *fx)
+{
+    CHECK_EQ(ants_transport_destroy(&fx->ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&fx->tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&fx->da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&fx->db), ANTS_OK);
+}
+
+static void test_republish_propagates_to_closest_peer(void)
+{
+    /* A announces a shard; the republish chain (GET_PEERS → ANNOUNCE_PEER)
+     * runs on the next tick and the announce lands in B's server-side
+     * announces[] set. Verify by counting announces for shard_x on B. */
+    test_republish_fixture_t fx;
+    republish_fixture_init(&fx, 0x12, 0x34, 100 /* republish_ms */);
+
+    ants_dht_shard_key_t shard_x = 0xCAFEBABEFACEFEEDULL;
+    CHECK_EQ(ants_dht_announce(&fx.da, shard_x), ANTS_OK);
+
+    /* Drive ticks. The chain is GET_PEERS round-trip + ANNOUNCE_PEER
+     * round-trip; both fit comfortably in a 300-iter loop on localhost. */
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&fx.ta);
+        ants_transport_tick(&fx.tb);
+        (void)ants_dht_tick(&fx.da);
+        (void)ants_dht_tick(&fx.db);
+        if (ants_dht__test_server_announce_count(&fx.db, shard_x) >= 1) {
+            break;
+        }
+    }
+    /* B's announces[] should contain at least one entry for shard_x
+     * (we don't constrain the count — A's self-entry isn't on B; only
+     * the propagated entry is). */
+    CHECK(ants_dht__test_server_announce_count(&fx.db, shard_x) >= 1);
+
+    republish_fixture_teardown(&fx);
+}
+
+static void test_republish_fires_announce_confirmed(void)
+{
+    /* Same setup; verify A observes exactly one ANNOUNCE_CONFIRMED for
+     * the announced shard. */
+    test_republish_fixture_t fx;
+    republish_fixture_init(&fx, 0x56, 0x78, 100);
+
+    ants_dht_shard_key_t shard_y = 0xDEADBEEF12345678ULL;
+    CHECK_EQ(ants_dht_announce(&fx.da, shard_y), ANTS_OK);
+
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&fx.ta);
+        ants_transport_tick(&fx.tb);
+        (void)ants_dht_tick(&fx.da);
+        (void)ants_dht_tick(&fx.db);
+        if (fx.a_rec.announce_confirmed >= 1) {
+            break;
+        }
+    }
+    CHECK(fx.a_rec.announce_confirmed == 1);
+    CHECK(fx.a_rec.last_confirmed_key == shard_y);
+
+    republish_fixture_teardown(&fx);
+}
+
+static void test_republish_only_once_per_cycle(void)
+{
+    /* A long republish interval means the chain runs once after announce
+     * and never again within the test window. ANNOUNCE_CONFIRMED should
+     * fire exactly once even though we tick hundreds of times. */
+    test_republish_fixture_t fx;
+    republish_fixture_init(&fx, 0x9A, 0xBC, 60000 /* 60 s */);
+
+    ants_dht_shard_key_t shard_z = 0x0123456789ABCDEFULL;
+    CHECK_EQ(ants_dht_announce(&fx.da, shard_z), ANTS_OK);
+
+    /* Drive enough ticks for the chain to complete. */
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&fx.ta);
+        ants_transport_tick(&fx.tb);
+        (void)ants_dht_tick(&fx.da);
+        (void)ants_dht_tick(&fx.db);
+        if (fx.a_rec.announce_confirmed >= 1) {
+            break;
+        }
+    }
+    CHECK(fx.a_rec.announce_confirmed == 1);
+
+    /* Now keep ticking; count must NOT increase. */
+    for (int i = 0; i < 300; i++) {
+        ants_transport_tick(&fx.ta);
+        ants_transport_tick(&fx.tb);
+        (void)ants_dht_tick(&fx.da);
+        (void)ants_dht_tick(&fx.db);
+    }
+    CHECK(fx.a_rec.announce_confirmed == 1);
+
+    republish_fixture_teardown(&fx);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Phase 7: end-to-end two-node DHT integration                             */
 /*                                                                          */
 /* "ANTS DHT live" milestone: A and B both run full DHTs over real QUIC     */
@@ -2296,6 +2505,10 @@ int main(void)
     test_refresh_pings_stale_peer();
     test_refresh_evicts_after_threshold();
     test_refresh_no_ping_when_fresh();
+
+    test_republish_propagates_to_closest_peer();
+    test_republish_fires_announce_confirmed();
+    test_republish_only_once_per_cycle();
 
     test_two_node_end_to_end();
 

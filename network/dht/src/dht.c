@@ -16,7 +16,7 @@
  *   - Phase 5: Iterative lookup state machine.                [done]
  *   - Phase 6: Bootstrap + server-side dispatch + announces.  [done]
  *   - Phase 6.1.a: refresh PING + dead_strikes eviction.      [done]
- *   - Phase 6.1.b: announce republish chain.
+ *   - Phase 6.1.b: announce republish chain.                  [done]
  *   - Phase 6.1.c: dial-promote during lookup.
  *   - Phase 7: Two-node integration test exchanging real lookups. [done]
  */
@@ -54,7 +54,7 @@
 /* platform we support, so the fallback is paranoia for unusual builds.    */
 /* ------------------------------------------------------------------------ */
 
-static uint64_t dht_now_us(void)
+uint64_t dht_now_us(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -398,6 +398,197 @@ static bool refresh_tick(ants_dht_t *dht, uint64_t now_us)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Announce republish — propagate local announces to K-closest storers      */
+/*                                                                          */
+/* Phase 6 stored `ants_dht_announce(key)` only in local + self-server      */
+/* sets. Phase 6.1.b adds the canonical Kademlia announce-propagation       */
+/* chain: for every local announce due for republish (last_republished_at + */
+/* announce_republish_ms <= now), walk the routing table for the K peers    */
+/* closest (by XOR distance) to BLAKE3(shard_key_le); send GET_PEERS to     */
+/* obtain a token; on token receipt send ANNOUNCE_PEER; on the first        */
+/* ANNOUNCE_PEER_RESP of the cycle, fire ANNOUNCE_CONFIRMED.                */
+/*                                                                          */
+/* Failure at any link of the chain just frees the ctx — republish is       */
+/* best-effort, the next cycle retries. Token is BLAKE3(server_secret ||    */
+/* peer_id), stable across a server's lifetime in phase 6, so a smarter     */
+/* future revision could cache it and skip GET_PEERS on subsequent cycles.  */
+/* ------------------------------------------------------------------------ */
+
+struct republish_chain_ctx {
+    ants_dht_t *dht;
+    ants_dht_shard_key_t shard_key;
+    ants_transport_conn_t *target_conn;
+    ants_peer_id_t target_peer_id;
+};
+
+static void mark_announce_confirmed(struct ants_dht_state *state, ants_dht_shard_key_t shard_key)
+{
+    for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
+        if (state->local_announces[i].in_use && state->local_announces[i].shard_key == shard_key &&
+            !state->local_announces[i].confirmed_this_cycle) {
+            state->local_announces[i].confirmed_this_cycle = true;
+            if (state->event_fn != NULL) {
+                ants_dht_event_t ev;
+                memset(&ev, 0, sizeof ev);
+                ev.kind = ANTS_DHT_EV_ANNOUNCE_CONFIRMED;
+                ev.shard_key = shard_key;
+                (void)state->event_fn(&ev, state->event_ctx);
+            }
+            return;
+        }
+    }
+}
+
+static void republish_announce_completion(ants_error_t status, const void *resp, void *ctx)
+{
+    (void)resp;
+    struct republish_chain_ctx *rctx = (struct republish_chain_ctx *)ctx;
+    if (rctx == NULL) {
+        return;
+    }
+    if (status == ANTS_OK) {
+        struct ants_dht_state *state = (struct ants_dht_state *)(void *)rctx->dht->_opaque;
+        mark_announce_confirmed(state, rctx->shard_key);
+    }
+    free(rctx);
+}
+
+static void republish_get_peers_completion(ants_error_t status, const void *resp, void *ctx)
+{
+    struct republish_chain_ctx *rctx = (struct republish_chain_ctx *)ctx;
+    if (rctx == NULL) {
+        return;
+    }
+    if (status != ANTS_OK || resp == NULL) {
+        free(rctx);
+        return;
+    }
+    const ants_dht_get_peers_resp_t *gp = (const ants_dht_get_peers_resp_t *)resp;
+    /* The chain reuses the ctx across the GET_PEERS → ANNOUNCE_PEER hop;
+     * if send_announce_peer rejects the call (returning non-OK), we own
+     * the ctx and reclaim it ourselves. On success the completion will
+     * free it. */
+    ants_error_t err = ants_dht_rpc_send_announce_peer(rctx->dht,
+                                                       rctx->target_conn,
+                                                       rctx->shard_key,
+                                                       gp->token,
+                                                       republish_announce_completion,
+                                                       rctx);
+    if (err != ANTS_OK) {
+        free(rctx);
+    }
+}
+
+/* Find up to K bucket entries closest by XOR distance to `target` that
+ * have a live conn (republish must reach an actual peer, NULL-conn
+ * candidates are skipped — 6.1.c dial-promote will pick them up). Writes
+ * pointers into out_entries; returns the count written. Walks all
+ * buckets — same O(N) insertion-sort pattern as dht_server.c's
+ * find_kclosest_peers, but filtering for conn != NULL. */
+static size_t find_kclosest_conn_entries(struct ants_dht_state *state,
+                                         const uint8_t target[ANTS_PEER_ID_SIZE],
+                                         struct ants_dht_bucket_entry *out_entries[ANTS_DHT_K])
+{
+    uint8_t distances[ANTS_DHT_K][ANTS_PEER_ID_SIZE];
+    size_t count = 0;
+    for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT; i++) {
+        for (struct ants_dht_bucket_entry *e = state->buckets[i].head; e != NULL; e = e->next) {
+            if (e->conn == NULL) {
+                continue;
+            }
+            uint8_t dist[ANTS_PEER_ID_SIZE];
+            xor_distance(target, e->peer.peer_id.bytes, dist);
+            /* Insertion sort: find position, shift, insert. */
+            size_t pos = count;
+            for (size_t j = 0; j < count; j++) {
+                if (memcmp(dist, distances[j], ANTS_PEER_ID_SIZE) < 0) {
+                    pos = j;
+                    break;
+                }
+            }
+            if (pos == ANTS_DHT_K) {
+                continue;
+            }
+            size_t end = count < ANTS_DHT_K ? count : ANTS_DHT_K - 1;
+            for (size_t j = end; j > pos; j--) {
+                out_entries[j] = out_entries[j - 1];
+                memcpy(distances[j], distances[j - 1], ANTS_PEER_ID_SIZE);
+            }
+            out_entries[pos] = e;
+            memcpy(distances[pos], dist, ANTS_PEER_ID_SIZE);
+            if (count < ANTS_DHT_K) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/* Issue the GET_PEERS leg of the republish chain for one (shard, target)
+ * pair. On success the chain transitions through GET_PEERS_RESP →
+ * ANNOUNCE_PEER → ANNOUNCE_PEER_RESP via the completion handlers. */
+static void issue_republish_for(ants_dht_t *dht,
+                                ants_dht_shard_key_t shard_key,
+                                struct ants_dht_bucket_entry *target)
+{
+    struct republish_chain_ctx *rctx =
+        (struct republish_chain_ctx *)malloc(sizeof(struct republish_chain_ctx));
+    if (rctx == NULL) {
+        return;
+    }
+    rctx->dht = dht;
+    rctx->shard_key = shard_key;
+    rctx->target_conn = target->conn;
+    rctx->target_peer_id = target->peer.peer_id;
+    ants_error_t err = ants_dht_rpc_send_get_peers(
+        dht, target->conn, shard_key, republish_get_peers_completion, rctx);
+    if (err != ANTS_OK) {
+        free(rctx);
+    }
+}
+
+/* For every local announce whose republish interval has elapsed, walk
+ * the routing table for the K closest live-conn peers to the shard's
+ * peer-id target and kick off the GET_PEERS → ANNOUNCE_PEER chain. */
+static void republish_tick(ants_dht_t *dht, uint64_t now_us)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    if (state->announce_republish_ms == 0) {
+        return;
+    }
+    uint64_t republish_us = (uint64_t)state->announce_republish_ms * 1000ULL;
+    for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
+        struct ants_dht_local_announce *la = &state->local_announces[i];
+        if (!la->in_use) {
+            continue;
+        }
+        uint64_t since = (la->last_republished_at_us == 0) ? republish_us
+                                                           : (now_us - la->last_republished_at_us);
+        if (since < republish_us) {
+            continue;
+        }
+        /* Mark the new cycle BEFORE issuing RPCs so a fast completion
+         * doesn't observe stale state. */
+        la->last_republished_at_us = now_us;
+        la->confirmed_this_cycle = false;
+        /* Project shard_key into peer-id space. Same projection the
+         * lookup machinery uses (dht_lookup.c) and the server's
+         * GET_PEERS fallback (dht_server.c). */
+        uint8_t key_le[8];
+        for (int j = 0; j < 8; j++) {
+            key_le[j] = (uint8_t)((la->shard_key >> (j * 8)) & 0xFFu);
+        }
+        uint8_t target[ANTS_BLAKE3_HASH_SIZE];
+        (void)ants_blake3_hash(key_le, sizeof key_le, target);
+        struct ants_dht_bucket_entry *closest[ANTS_DHT_K];
+        size_t n = find_kclosest_conn_entries(state, target, closest);
+        for (size_t k = 0; k < n; k++) {
+            issue_republish_for(dht, la->shard_key, closest[k]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Per-lookup state size check                                              */
 /*                                                                          */
 /* The real layout lives in dht_internal.h (shared with dht_lookup.c). The */
@@ -497,17 +688,24 @@ uint32_t ants_dht_tick(ants_dht_t *dht)
      * isn't saturated, check for convergence, fire LOOKUP_COMPLETE on
      * any lookup that just converged. */
     (void)ants_dht_lookup_advance_all(dht);
-    /* Phase 6.1: periodic liveness sweep. Decrements live peers'
-     * dead_strikes on success and evicts after three failures. */
-    (void)refresh_tick(dht, dht_now_us());
-    /* Wake-delay hint: with refresh enabled, suggest the caller tick us
-     * again within refresh_interval_ms/4 so a freshly-stale entry gets
-     * its PING within a quarter of the refresh window. The caller may
-     * tick sooner when transport I/O arrives. */
-    if (state->refresh_interval_ms == 0) {
-        return UINT32_MAX;
+    /* Phase 6.1: periodic liveness sweep + announce-republish chain. */
+    uint64_t now_us = dht_now_us();
+    (void)refresh_tick(dht, now_us);
+    republish_tick(dht, now_us);
+    /* Wake-delay hint = the smaller of refresh_interval_ms/4 and
+     * announce_republish_ms/4 (or UINT32_MAX when both timers are off).
+     * The caller may tick sooner when transport I/O arrives. */
+    uint32_t wake = UINT32_MAX;
+    if (state->refresh_interval_ms != 0) {
+        wake = state->refresh_interval_ms / 4u;
     }
-    return state->refresh_interval_ms / 4u;
+    if (state->announce_republish_ms != 0) {
+        uint32_t rwake = state->announce_republish_ms / 4u;
+        if (rwake < wake) {
+            wake = rwake;
+        }
+    }
+    return wake;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -583,9 +781,13 @@ ants_error_t ants_dht_announce(ants_dht_t *dht, ants_dht_shard_key_t shard_key)
             return ANTS_OK;
         }
     }
-    /* Insert. */
+    /* Insert. Slot may have been previously used (unannounce → reannounce
+     * round-trip); zero the maintenance fields so the new announce gets
+     * republished immediately on the next tick rather than inheriting
+     * stale last_republished_at_us from the previous use. */
     for (size_t i = 0; i < ANTS_DHT_MAX_LOCAL_ANNOUNCES; i++) {
         if (!state->local_announces[i].in_use) {
+            memset(&state->local_announces[i], 0, sizeof state->local_announces[i]);
             state->local_announces[i].in_use = true;
             state->local_announces[i].shard_key = shard_key;
             /* Also record ourselves in the server-side announce set so a
@@ -900,6 +1102,22 @@ ants_error_t ants_dht__test_send_announce_peer(ants_dht_t *dht,
                                                void *ctx)
 {
     return ants_dht_rpc_send_announce_peer(dht, conn, key, token, completion, ctx);
+}
+
+size_t ants_dht__test_server_announce_count(const ants_dht_t *dht, ants_dht_shard_key_t shard_key);
+size_t ants_dht__test_server_announce_count(const ants_dht_t *dht, ants_dht_shard_key_t shard_key)
+{
+    if (dht == NULL) {
+        return 0;
+    }
+    const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
+    size_t n = 0;
+    for (size_t i = 0; i < ANTS_DHT_MAX_ANNOUNCES; i++) {
+        if (state->announces[i].in_use && state->announces[i].shard_key == shard_key) {
+            n++;
+        }
+    }
+    return n;
 }
 
 void ants_dht__test_get_entry_state(const ants_dht_t *dht,

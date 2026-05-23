@@ -22,6 +22,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Monotonic wall-clock-ish time source, microseconds. Defined in dht.c;
+ * shared across the DHT translation units so anywhere we stamp a
+ * last_seen_us / last_republished_at_us / last_announced_us value uses
+ * the same clock. */
+uint64_t dht_now_us(void);
+
 /* ------------------------------------------------------------------------ */
 /* K-bucket entry + bucket head                                             */
 /*                                                                          */
@@ -307,7 +313,18 @@ struct ants_dht_bootstrap_entry {
 
 struct ants_dht_local_announce {
     bool in_use;
+    /* True once we've fired ANNOUNCE_CONFIRMED for the current cycle
+     * (i.e. at least one storer ACKed). Reset to false at the start of
+     * every new republish cycle so each cycle produces at most one
+     * event regardless of how many K-closest storers ACK. */
+    bool confirmed_this_cycle;
+    uint8_t _pad[6];
     ants_dht_shard_key_t shard_key;
+    /* Wall-clock-ish time (us) the current cycle's chain was kicked
+     * off. 0 = never republished — next tick will republish immediately.
+     * The next cycle starts once now_us - last_republished_at_us
+     * exceeds announce_republish_ms. */
+    uint64_t last_republished_at_us;
 };
 
 /* ------------------------------------------------------------------------ */
