@@ -67,6 +67,17 @@ ants_error_t ants_dht_lookup_do_cancel(ants_dht_lookup_t *lookup);
  * Returns ANTS_OK unconditionally. */
 ants_error_t ants_dht_lookup_advance_all(ants_dht_t *dht);
 
+/* Phase 6.1.c dial-promote callbacks invoked from dht.c's transport
+ * event dispatcher. promote_dialed_peer flips every INFLIGHT_DIAL
+ * candidate matching peer_id back to UNQUERIED with the supplied conn
+ * so the next lookup_advance issues GET_PEERS; fail_dialing_candidates
+ * marks them FAILED (CONN_CLOSED before CONN_READY). Both are no-ops
+ * if no lookup is awaiting that peer. */
+void ants_dht_lookup_promote_dialed_peer(ants_dht_t *dht,
+                                         const ants_peer_id_t *peer_id,
+                                         ants_transport_conn_t *conn);
+void ants_dht_lookup_fail_dialing_candidates(ants_dht_t *dht, const ants_peer_id_t *peer_id);
+
 #ifdef __cplusplus
 }
 #endif

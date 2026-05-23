@@ -783,11 +783,13 @@ test_rpc_build_response(test_rpc_server_t *s, uint8_t *out, size_t cap, size_t *
         resp.peer_count = 1;
         /* Use a distinct sentinel byte (0xEE) so the lookup-round-trip
          * test can tell apart a real GET_PEERS_RESP peer from the
-         * find_node sentinel (0xCC). */
+         * find_node sentinel (0xCC). Multiaddr is intentionally empty:
+         * phase 6.1.c dial-promote would otherwise try to dial a port
+         * with no listener and hang the lookup. With empty multiaddr,
+         * try_dial_promote rejects the candidate cleanly and the
+         * lookup converges with B as the sole ANSWERED peer. */
         memset(resp.peers[0].peer_id.bytes, 0xEE, ANTS_PEER_ID_SIZE);
-        snprintf(resp.peers[0].multiaddr,
-                 sizeof resp.peers[0].multiaddr,
-                 "/ip4/127.0.0.1/udp/12345/quic-v1");
+        resp.peers[0].multiaddr[0] = '\0';
         memset(resp.token, 0xAB, ANTS_DHT_TOKEN_SIZE);
         return ants_dht_wire_encode_get_peers_resp(out, cap, out_len, &resp);
     }
@@ -2296,6 +2298,179 @@ static void test_republish_only_once_per_cycle(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Phase 6.1.c: dial-promote during lookup                                  */
+/*                                                                          */
+/* Two tests cover the lazy-dial path:                                      */
+/*                                                                          */
+/*   1. test_lookup_dial_promotes_null_conn_candidate — known peer with no */
+/*      conn gets dialed during lookup, promoted to routing table, queried */
+/*   2. test_lookup_dial_skipped_when_no_multiaddr    — empty multiaddr →  */
+/*      no dial, candidate FAILED, lookup converges with 0 peers           */
+/* ------------------------------------------------------------------------ */
+
+/* Recorder shared with the existing test_lookup_recorder_t infrastructure
+ * — declared upstream so the dial-promote tests can pick LOOKUP_COMPLETE
+ * up directly. */
+
+static void test_lookup_dial_promotes_null_conn_candidate(void)
+{
+    /* A's routing table is seeded with B as a NULL-conn entry that carries
+     * a real multiaddr (B's listener). A's lookup hits B as the closest
+     * candidate, try_dial_promote dials B, CONN_READY fires, the
+     * candidate flips back to UNQUERIED with the live conn, GET_PEERS
+     * goes out, B's full DHT auto-responds, the lookup converges with
+     * B as the sole ANSWERED peer. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0xDD, sizeof a_priv);
+    memset(b_priv, 0x22, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+    test_lookup_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+
+    /* B listens. */
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    /* A dialer-only. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &a_rec;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    dcfg.event_ctx = NULL;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    /* Insert B into A's routing table with NO conn but a real multiaddr.
+     * The seeder picks this up; dial-promote will try to dial. */
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    snprintf(b_peer.multiaddr, sizeof b_peer.multiaddr, "%s", baddr);
+    CHECK_EQ(ants_dht__test_insert_peer(&da, &b_peer, ants_dht__test_now_us()), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    /* Issue the lookup. Drive ticks until LOOKUP_COMPLETE fires —
+     * handshake (~handful of round-trips) + GET_PEERS round-trip fit
+     * comfortably in 500 iters. */
+    ants_dht_lookup_t lookup = {{0}};
+    ants_dht_shard_key_t target = 0xABCD1234ABCD1234ULL;
+    CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
+
+    for (int i = 0; i < 500; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        if (a_rec.lookup_complete >= 1) {
+            break;
+        }
+    }
+    CHECK(a_rec.lookup_complete == 1);
+    CHECK(a_rec.last_shard_key == target);
+    CHECK(a_rec.last_peer_count == 1);
+    if (a_rec.last_peer_count >= 1) {
+        CHECK(memcmp(a_rec.last_peers[0].peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
+    }
+
+    /* B should now be in A's routing table with a live conn (promoted). */
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&da, &b_pid, &st);
+    CHECK(st.exists);
+
+    /* Teardown: a dial-promote conn lives in pending_dials[], so transport
+     * must die first (CONN_CLOSED → ours-to-free, but lazy until destroy)
+     * before dht_destroy frees the heap conn. Same convention as
+     * test_bootstrap_completes. */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
+static void test_lookup_dial_skipped_when_no_multiaddr(void)
+{
+    /* Insert a peer with NULL conn AND empty multiaddr. try_dial_promote
+     * rejects (no address to dial), candidate FAILED, lookup converges
+     * with 0 ANSWERED peers. No transport activity at all. */
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_lookup_event_fn;
+    cfg.event_ctx = &rec;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    /* A peer at a known XOR-distance from local (deterministic bucket
+     * via test_make_peer), NULL conn, empty multiaddr (default-init). */
+    uint8_t local_pub[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_peer_t peer;
+    test_make_peer(local_pub, 42, &peer);
+    peer.multiaddr[0] = '\0';
+    CHECK_EQ(ants_dht__test_insert_peer(&d, &peer, ants_dht__test_now_us()), ANTS_OK);
+
+    ants_dht_lookup_t lookup = {{0}};
+    CHECK_EQ(ants_dht_lookup(&d, 0x1234567890ABCDEFULL, &lookup), ANTS_OK);
+
+    for (int i = 0; i < 10; i++) {
+        (void)ants_dht_tick(&d);
+        if (rec.lookup_complete >= 1) {
+            break;
+        }
+    }
+    CHECK(rec.lookup_complete == 1);
+    CHECK(rec.last_peer_count == 0);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Phase 7: end-to-end two-node DHT integration                             */
 /*                                                                          */
 /* "ANTS DHT live" milestone: A and B both run full DHTs over real QUIC     */
@@ -2509,6 +2684,9 @@ int main(void)
     test_republish_propagates_to_closest_peer();
     test_republish_fires_announce_confirmed();
     test_republish_only_once_per_cycle();
+
+    test_lookup_dial_promotes_null_conn_candidate();
+    test_lookup_dial_skipped_when_no_multiaddr();
 
     test_two_node_end_to_end();
 
