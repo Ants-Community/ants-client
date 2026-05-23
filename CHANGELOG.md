@@ -13,6 +13,114 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #11 (canonical embedding) — scaffold → verify + stub inference → ggml vendored · 2026-05-23
+
+**Cache layer begins.** Component #11 (canonical embedding service)
+goes from "pending claim" to "API stable + hash verification + stub
+inference + ggml ready for real-inference wiring" in three
+consecutive PRs. After this, `cache/semantic` (Component #10) can be
+developed against a stable `ants_embed` contract while phase 4-real
+(BGE-M3 inference via ggml) lands separately.
+
+**PR #38 — Scaffold + API design** (+561):
+
+- New `cache/embedding/include/ants_embed.h` declares the public API:
+  - `ANTS_EMBED_DIM = 1024` (output dimension; protocol-pinned per
+    RFC-0002 §The canonical embedding model)
+  - `ANTS_EMBED_MODEL_ID = "ants-embed-v1"`,
+    `ANTS_EMBED_MODEL_ARCH = "bge-m3"`
+  - `ANTS_EMBED_WEIGHTS_HASH_PINNED[32]` +
+    `ANTS_EMBED_TOKENIZER_HASH_PINNED[32]` — all-zero placeholders
+    per RFC-0008 §5 ("the specific 32-byte values for v1 will be set
+    when the reference client is published")
+  - Opaque `ants_embed_t` (64 KiB; conservative oversize for ggml
+    state), `ants_embed_init`, `ants_embed_destroy`,
+    `ants_embed(ctx, in, in_len, out[1024])`
+- Caller-supplied weights+tokenizer buffers — library never copies
+  hundreds of MB.
+- Stubbed initially (returns `ANTS_ERROR_NOT_IMPLEMENTED`); 7 tests
+  pin the contract.
+
+**PR #39 — Vendor ggml v0.12.0 (portable CPU subset)** (+58991):
+
+- New `deps/ggml/` with ~57K LoC vendored from
+  [ggml-org/ggml @ v0.12.0](https://github.com/ggml-org/ggml/tree/v0.12.0).
+  License: MIT (preserved).
+- Top-level `project()` language list bumped from `C` to `C CXX`
+  (ggml is C++17 since its v0.10 rewrite; our own code stays strict
+  C99 — CXX requirement is contained to `deps/ggml`).
+- All GPU backends OFF (CUDA, Metal, Vulkan, OpenCL, ROCm/HIP, SYCL,
+  MUSA, etc.). Per-arch SIMD kernels OFF via `GGML_CPU_GENERIC`.
+  Niche extensions OFF (HBM, KleidiAI, AMX, llamafile, spacemit).
+- Single static library `ggml` built with `-w` so vendored warnings
+  don't surface in our consumer compilation units. Includes marked
+  SYSTEM — same pattern as `deps/picoquic`.
+- `_GNU_SOURCE` defined on Linux (fixes glibc-only need for
+  `clock_gettime`, `CPU_ZERO`, `pthread_setaffinity_np`, `M_PI`,
+  etc.). First push to PR #39 hit the same glibc-gating that PR #34
+  did with `dht_now_us`.
+- `ggml` library is built but NOT yet linked from `ants_embed`.
+  Phase 4-real wires it in.
+
+**PR #40 — Phase 3 hash verify + phase 4-stub deterministic inference** (+319/-91):
+
+- `ants_embed_init` is real: BLAKE3 the weights+tokenizer buffers,
+  constant-time-compare to the pinned constants. Mismatch →
+  `NON_CANONICAL` (RFC-0002: "no close enough, bit-exact match or
+  rejection"). All-zero pinned hash → skip verification (placeholder
+  semantics per RFC-0008 §5; phase 5 lands the real hashes).
+- Verify helper exposed as `ants_embed__test_verify` test hook so the
+  strict path is tested against synthetic pinned hashes even while
+  the public constants stay zero — covers the path before phase 5
+  makes the real-hash path observable.
+- `ants_embed` is a deterministic STUB:
+  - `seed = BLAKE3(input)`
+  - 128 keyed-chunk BLAKE3 calls produce 4096 bytes
+  - 4-byte LE chunks → floats in `[-1, 1)`
+  - L2-normalise to unit length
+- Properties: same input → same output (same platform), L2-unit-norm,
+  distinct inputs → distinct outputs. NOT bit-exact across platforms
+  (float multiplication ordering). NOT a real BGE-M3 embedding.
+  Purpose: stand-in until phase 4-real wires ggml.
+- `embed` requires `init` first — calling on a zeroed ctx →
+  `INVALID_ARG`.
+- 12 test functions (up from 7 in scaffold): pinned constants +
+  opaque ctx + arg validation + verify path (placeholder + real-hash)
+  + determinism + distinctness + L2-norm + uninitialised-ctx
+  rejection.
+- `libm` linked on non-macOS / non-MSVC for sqrt in the L2
+  normalisation.
+
+**Quirks worth preserving** for future sessions:
+
+- **Never pass `CMakeLists.txt` through `clang-format -i`** — it
+  mangles the CMake syntax catastrophically (CMake parse errors,
+  six-job CI failure). The `clang-format` workflow correctly limits
+  itself to `*.c`/`*.h` files; the human-run `clang-format -i` glob
+  must too. PR #40's first push hit this; force-push + amend fixed
+  it.
+- The C++ requirement is bounded to `deps/ggml`. Our own code
+  remains strict C99. The discipline is enforced by per-target
+  `target_compile_features`.
+
+**Roadmap remaining** (separate PRs, not in this batch):
+
+- **Phase 4-real**: replace the stub with real BGE-M3 inference via
+  the vendored ggml. Requires: BGE-M3 model conversion to GGUF,
+  XLM-Roberta SentencePiece tokenizer integration (likely a
+  tokenizers-cpp or hand-rolled WordPiece loader), forward-pass
+  glue, mean-pool over hidden states, L2-normalise.
+- **Phase 5**: populate `ANTS_EMBED_WEIGHTS_HASH_PINNED` +
+  `ANTS_EMBED_TOKENIZER_HASH_PINNED` against the exact BGE-M3
+  checkpoint the reference client ships with. Publish reference
+  inputs+outputs to `ants-test-vectors/vectors/ants-embed-v1/`.
+  Also the trigger for RFC-0008 §5 to lose its `0x000…000`
+  placeholder note.
+
+CI matrix (7 jobs): PR #38 first-push green; PR #39 needed the
+`_GNU_SOURCE` follow-up; PR #40 first-push hit the CMakeLists.txt
+clang-format mangling, fixed via amend + force-push.
+
 ### network: Component #5 (DHT) phase 6.1 — maintenance loop · 2026-05-23
 
 **Production steady-state behaviour.** Three consecutive PRs land the
