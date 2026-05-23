@@ -142,6 +142,33 @@ ants_error_t ants_tokenizer_init(ants_tokenizer_t *tok,
 ants_error_t ants_tokenizer_destroy(ants_tokenizer_t *tok);
 
 /* ------------------------------------------------------------------------ */
+/* Byte fallback (phase 4-real step 4a)                                     */
+/*                                                                          */
+/* SentencePiece's mechanism for inputs the vocab can't cover: every byte  */
+/* value (0..255) maps to a dedicated fallback token, and Viterbi can      */
+/* always emit a length-1 candidate for whichever byte is at position s.   */
+/* With fallback enabled, encode is guaranteed to find a covering          */
+/* segmentation — ANTS_ERROR_NON_CANONICAL is never returned for an       */
+/* unknown character.                                                      */
+/*                                                                          */
+/* Caller wiring (typical XLM-RoBERTa / BGE-M3 setup):                     */
+/*   - The vocab contains 256 dedicated `<0x00>`...`<0xFF>` tokens with   */
+/*     very low scores.                                                    */
+/*   - Caller builds the byte-fallback ID array mapping byte value → that */
+/*     token's ID, then passes it here.                                    */
+/*   - The score is the per-byte fallback cost; SentencePiece typically   */
+/*     uses something like the lowest score in the vocab.                  */
+/*                                                                          */
+/* Must be called AFTER ants_tokenizer_init (init builds the trie; this   */
+/* just adds an extra always-available candidate to the Viterbi sweep).   */
+/* Calling with byte_fallback_ids == NULL disables fallback (the default).*/
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_tokenizer_set_byte_fallback(ants_tokenizer_t *tok,
+                                              const uint32_t byte_fallback_ids[256],
+                                              float byte_fallback_score);
+
+/* ------------------------------------------------------------------------ */
 /* Encode                                                                   */
 /* ------------------------------------------------------------------------ */
 

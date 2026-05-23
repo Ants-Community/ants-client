@@ -76,7 +76,8 @@ struct trie_edge {
 
 struct ants_tokenizer_state {
     bool initialised;
-    uint8_t _pad[7];
+    bool byte_fallback_enabled;
+    uint8_t _pad[6];
     const ants_tokenizer_vocab_entry_t *vocab;
     size_t n_vocab;
     size_t max_token_len;
@@ -85,6 +86,14 @@ struct ants_tokenizer_state {
     size_t trie_n_nodes;
     struct trie_edge *trie_edges;
     size_t trie_n_edges;
+    /* Byte fallback: when set, every position in encode gets a length-1
+     * candidate using byte_fallback_ids[work[s]] with score
+     * byte_fallback_score. Set via ants_tokenizer_set_byte_fallback;
+     * NULL = disabled. Heap-allocated 256 × uint32_t = 1 KiB; lives
+     * here rather than in the opaque ctx because the ctx is itself
+     * only 1 KiB. */
+    uint32_t *byte_fallback_ids;
+    float byte_fallback_score;
 };
 
 typedef char ants_tokenizer_state_size_check
@@ -398,8 +407,49 @@ ants_error_t ants_tokenizer_destroy(ants_tokenizer_t *tok)
     struct ants_tokenizer_state *state = tok_state(tok);
     if (state->initialised) {
         trie_destroy(state);
+        free(state->byte_fallback_ids);
+        state->byte_fallback_ids = NULL;
     }
     memset(tok->_opaque, 0, sizeof tok->_opaque);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Byte fallback                                                            */
+/*                                                                          */
+/* Heap-allocate the 256-entry byte→ID table; encode then has a length-1   */
+/* candidate for every position. Passing NULL clears any previously-set    */
+/* fallback (reverting to "uncovered → NON_CANONICAL" behaviour).          */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_tokenizer_set_byte_fallback(ants_tokenizer_t *tok,
+                                              const uint32_t byte_fallback_ids[256],
+                                              float byte_fallback_score)
+{
+    if (tok == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_tokenizer_state *state = tok_state(tok);
+    if (!state->initialised) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Clear path: caller passed NULL to disable. */
+    if (byte_fallback_ids == NULL) {
+        free(state->byte_fallback_ids);
+        state->byte_fallback_ids = NULL;
+        state->byte_fallback_enabled = false;
+        state->byte_fallback_score = 0.0f;
+        return ANTS_OK;
+    }
+    uint32_t *copy = (uint32_t *)malloc(256u * sizeof(uint32_t));
+    if (copy == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(copy, byte_fallback_ids, 256u * sizeof(uint32_t));
+    free(state->byte_fallback_ids);
+    state->byte_fallback_ids = copy;
+    state->byte_fallback_score = byte_fallback_score;
+    state->byte_fallback_enabled = true;
     return ANTS_OK;
 }
 
@@ -526,6 +576,21 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
                     back_pos[e] = s;
                     back_id[e] = (uint32_t)tid;
                 }
+            }
+        }
+        /* Byte fallback: when enabled, every position also has a
+         * length-1 candidate emitting byte_fallback_ids[work[s]] with
+         * byte_fallback_score. Viterbi naturally picks whichever path
+         * has the highest accumulated score — fallback tokens have low
+         * scores by convention so they only "win" when no longer vocab
+         * entry covers the position. */
+        if (state->byte_fallback_enabled) {
+            size_t e = s + 1;
+            float cand = dp[s] + state->byte_fallback_score;
+            if (cand > dp[e]) {
+                dp[e] = cand;
+                back_pos[e] = s;
+                back_id[e] = state->byte_fallback_ids[work[s]];
             }
         }
     }
