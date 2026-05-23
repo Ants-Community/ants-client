@@ -190,6 +190,58 @@ ants_error_t ants_tokenizer_decode(const ants_tokenizer_t *tok,
                                    size_t out_cap,
                                    size_t *out_len);
 
+/* ------------------------------------------------------------------------ */
+/* HuggingFace tokenizer.json loader (phase 4-real step 2)                  */
+/*                                                                          */
+/* Parses the `model.vocab` array from a HuggingFace tokenizers JSON       */
+/* config (the format that ships with XLM-RoBERTa, BGE-M3, and every       */
+/* other Unigram-trained model on HuggingFace Hub). The model.vocab is an  */
+/* array of `[token_string, score_float]` pairs; the entry index becomes   */
+/* the token_id.                                                           */
+/*                                                                          */
+/* Caller owns the JSON buffer for the duration of the load call only;    */
+/* the loader copies token text into its own storage so the JSON bytes    */
+/* can be freed immediately after. The returned blob owns its internal    */
+/* allocations and must outlive the tokenizer initialised against it.     */
+/* ------------------------------------------------------------------------ */
+
+typedef struct ants_tokenizer_vocab_blob ants_tokenizer_vocab_blob_t;
+
+/*
+ * Parse `json_bytes` (tokenizer.json content) and build a vocab blob.
+ *
+ * Returns:
+ *   ANTS_OK on success; `*out_blob` points to a heap-allocated blob the
+ *     caller must free via ants_tokenizer_vocab_free.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers or zero-length input.
+ *   ANTS_ERROR_NON_CANONICAL — JSON parse error, missing model.vocab
+ *     array, or vocab entry of the wrong shape (not a [string, number]
+ *     pair).
+ *   ANTS_ERROR_MALFORMED — malloc failure.
+ *
+ * The loader handles the basic JSON string escapes (\\, \", \/, \b, \f,
+ * \n, \r, \t) and the \uXXXX form (4 hex digits → UTF-8). Surrogate
+ * pairs for codepoints above U+FFFF are NOT handled in step 2.
+ */
+ants_error_t ants_tokenizer_load_huggingface_json(const char *json_bytes,
+                                                  size_t json_len,
+                                                  ants_tokenizer_vocab_blob_t **out_blob);
+
+/*
+ * Get the parsed vocab array. The returned pointer + the size below
+ * are exactly what ants_tokenizer_init expects.
+ */
+const ants_tokenizer_vocab_entry_t *
+ants_tokenizer_vocab_entries(const ants_tokenizer_vocab_blob_t *blob);
+size_t ants_tokenizer_vocab_size(const ants_tokenizer_vocab_blob_t *blob);
+
+/*
+ * Free the blob's internal allocations. After this returns the blob
+ * pointer is invalid; any tokenizer initialised against it must already
+ * have been destroyed.
+ */
+void ants_tokenizer_vocab_free(ants_tokenizer_vocab_blob_t *blob);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,6 +11,7 @@
 add_library(ants_embed STATIC
     src/embed.c
     src/tokenizer.c
+    src/tokenizer_json.c
 )
 
 target_include_directories(ants_embed
@@ -27,6 +28,8 @@ target_link_libraries(ants_embed
     PUBLIC
         ants_cbor
         ants_crypto
+    PRIVATE
+        jsmn
 )
 
 # libm for sqrt (used in the stub-inference L2 normalisation). On
@@ -47,4 +50,8 @@ if(BUILD_TESTING)
     add_executable(test_tokenizer tests/test_tokenizer.c)
     target_link_libraries(test_tokenizer PRIVATE ants_embed)
     add_test(NAME tokenizer_basic COMMAND test_tokenizer)
+
+    add_executable(test_tokenizer_json tests/test_tokenizer_json.c)
+    target_link_libraries(test_tokenizer_json PRIVATE ants_embed)
+    add_test(NAME tokenizer_json COMMAND test_tokenizer_json)
 endif()
