@@ -32,6 +32,8 @@
 
 #include "ants_tokenizer.h"
 
+#include "utf8proc.h"
+
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -77,7 +79,8 @@ struct trie_edge {
 struct ants_tokenizer_state {
     bool initialised;
     bool byte_fallback_enabled;
-    uint8_t _pad[6];
+    bool nfkc_enabled;
+    uint8_t _pad[5];
     const ants_tokenizer_vocab_entry_t *vocab;
     size_t n_vocab;
     size_t max_token_len;
@@ -453,6 +456,19 @@ ants_error_t ants_tokenizer_set_byte_fallback(ants_tokenizer_t *tok,
     return ANTS_OK;
 }
 
+ants_error_t ants_tokenizer_set_nfkc_enabled(ants_tokenizer_t *tok, bool enabled)
+{
+    if (tok == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_tokenizer_state *state = tok_state(tok);
+    if (!state->initialised) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    state->nfkc_enabled = enabled;
+    return ANTS_OK;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Pre-tokenization                                                          */
 /* ------------------------------------------------------------------------ */
@@ -528,12 +544,34 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
         return ANTS_ERROR_INVALID_ARG;
     }
 
-    size_t work_cap = input_len * 3u + SP_UNDERSCORE_LEN;
+    /* NFKC normalisation pass (optional). utf8proc_map allocates the
+     * output buffer; we free it after pretokenize copies the bytes. */
+    const uint8_t *src_bytes = (const uint8_t *)input;
+    size_t src_len = input_len;
+    utf8proc_uint8_t *nfkc_buf = NULL;
+    if (state->nfkc_enabled) {
+        utf8proc_ssize_t nfkc_len =
+            utf8proc_map(src_bytes,
+                         (utf8proc_ssize_t)input_len,
+                         &nfkc_buf,
+                         UTF8PROC_STABLE | UTF8PROC_COMPAT | UTF8PROC_COMPOSE);
+        if (nfkc_len < 0 || nfkc_buf == NULL) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+        src_bytes = (const uint8_t *)nfkc_buf;
+        src_len = (size_t)nfkc_len;
+    }
+
+    /* Pre-tokenize. Worst case: every input byte is whitespace and
+     * gets expanded to ▁ (3 bytes), plus the always-prepended ▁. */
+    size_t work_cap = src_len * 3u + SP_UNDERSCORE_LEN;
     uint8_t *work = (uint8_t *)malloc(work_cap);
     if (work == NULL) {
+        free(nfkc_buf);
         return ANTS_ERROR_MALFORMED;
     }
-    size_t N = pretokenize((const uint8_t *)input, input_len, work);
+    size_t N = pretokenize(src_bytes, src_len, work);
+    free(nfkc_buf);
 
     float *dp = (float *)malloc((N + 1) * sizeof(float));
     size_t *back_pos = (size_t *)malloc((N + 1) * sizeof(size_t));

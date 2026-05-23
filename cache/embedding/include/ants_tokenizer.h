@@ -67,6 +67,7 @@
 
 #include "ants_common.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -167,6 +168,24 @@ ants_error_t ants_tokenizer_destroy(ants_tokenizer_t *tok);
 ants_error_t ants_tokenizer_set_byte_fallback(ants_tokenizer_t *tok,
                                               const uint32_t byte_fallback_ids[256],
                                               float byte_fallback_score);
+
+/* ------------------------------------------------------------------------ */
+/* NFKC normalisation (phase 4-real step 4b)                                */
+/*                                                                          */
+/* SentencePiece's standard normaliser canonicalises input to Unicode      */
+/* NFKC (Normalization Form KC: compatibility-decompose, then canonical-  */
+/* compose) before tokenisation. This handles compatibility forms (e.g.   */
+/* "ﬁ" U+FB01 → "fi" two chars), full-width ↔ half-width (e.g.            */
+/* "Ｈｅｌｌｏ" → "Hello"), and other equivalence-class collapses. Cross-     */
+/* peer determinism requires either (a) the tokenizer normalises, or (b) */
+/* the protocol mandates caller-side normalisation; option (a) is safer. */
+/*                                                                          */
+/* Set via `ants_tokenizer_set_nfkc_enabled(tok, true)` — defaults OFF    */
+/* so existing call sites that pre-normalise (or don't need it for ASCII */
+/* inputs) keep their current behaviour.                                  */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_tokenizer_set_nfkc_enabled(ants_tokenizer_t *tok, bool enabled);
 
 /* ------------------------------------------------------------------------ */
 /* Encode                                                                   */

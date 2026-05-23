@@ -416,6 +416,104 @@ static void test_byte_fallback_preserves_compound_tokens(void)
     CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* NFKC (phase 4-real step 4b)                                              */
+/* ------------------------------------------------------------------------ */
+
+/* A larger vocab with the extra letters/compounds needed by the NFKC
+ * tests below (the full-width Hello → Hello collapse + the ﬁ → fi
+ * decomposition both target sequences that the kAsciiVocab can't cover
+ * with single-letter tokens). */
+static const ants_tokenizer_vocab_entry_t kNfkcVocab[] = {
+    {SP, 3, -1.0f, 0},
+    {"H", 1, -2.0f, 1},
+    {"e", 1, -2.0f, 2},
+    {"l", 1, -2.0f, 3},
+    {"o", 1, -2.0f, 4},
+    {"f", 1, -2.0f, 5},
+    {"i", 1, -2.0f, 6},
+    {"n", 1, -2.0f, 7},
+    {SP "Hello", 8, -0.5f, 8},
+    {SP "fine", 7, -0.5f, 9},
+};
+#define kNfkcVocabLen (sizeof kNfkcVocab / sizeof kNfkcVocab[0])
+
+static void test_nfkc_rejects_uninitialised(void)
+{
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_set_nfkc_enabled(NULL, true), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_tokenizer_set_nfkc_enabled(&t, true), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_nfkc_off_by_default(void)
+{
+    /* Without NFKC, full-width "Ｈｅｌｌｏ" (3 bytes/char × 5 = 15 bytes)
+     * is NOT collapsed; the vocab has no Hello in full-width form, so
+     * encode fails with NON_CANONICAL. With NFKC enabled (next test)
+     * the same input does succeed. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kNfkcVocab, kNfkcVocabLen), ANTS_OK);
+
+    const char *fullwidth_hello = "\xEF\xBC\xA8\xEF\xBD\x85\xEF\xBD\x8C\xEF\xBD\x8C\xEF\xBD\x8F";
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, fullwidth_hello, 15, out, 16, &out_n),
+             ANTS_ERROR_NON_CANONICAL);
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
+static void test_nfkc_collapses_compatibility_forms(void)
+{
+    /* With NFKC enabled, "Ｈｅｌｌｏ" (full-width) → "Hello" → Viterbi
+     * picks the compound ▁Hello (token 8) just as it would for
+     * "Hello" plain ASCII. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kNfkcVocab, kNfkcVocabLen), ANTS_OK);
+    CHECK_EQ(ants_tokenizer_set_nfkc_enabled(&t, true), ANTS_OK);
+
+    const char *fullwidth_hello = "\xEF\xBC\xA8\xEF\xBD\x85\xEF\xBD\x8C\xEF\xBD\x8C\xEF\xBD\x8F";
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, fullwidth_hello, 15, out, 16, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+    if (out_n == 1) {
+        CHECK(out[0] == 8); /* ▁Hello */
+    }
+
+    /* Sanity: plain "Hello" still works (NFKC is idempotent on already-
+     * normalised input). */
+    CHECK_EQ(ants_tokenizer_encode(&t, "Hello", 5, out, 16, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+    if (out_n == 1) {
+        CHECK(out[0] == 8);
+    }
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
+static void test_nfkc_handles_ligature_decomposition(void)
+{
+    /* "ﬁne" (with U+FB01 LATIN SMALL LIGATURE FI = 3 UTF-8 bytes EF B7
+     * 81) → "fine" via NFKC compatibility decomposition. The vocab has
+     * ▁fine (token 9) which Viterbi picks. Without NFKC the same input
+     * doesn't match because the vocab has no ligature token. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kNfkcVocab, kNfkcVocabLen), ANTS_OK);
+    CHECK_EQ(ants_tokenizer_set_nfkc_enabled(&t, true), ANTS_OK);
+
+    const char *ligature_fine = "\xEF\xAC\x81ne"; /* U+FB01 + "ne" */
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, ligature_fine, 5, out, 16, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+    if (out_n == 1) {
+        CHECK(out[0] == 9); /* ▁fine */
+    }
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
 static void test_byte_fallback_can_be_disabled(void)
 {
     /* Set fallback, then clear with NULL; "xyz" should once again
@@ -460,6 +558,11 @@ int main(void)
     test_byte_fallback_covers_unknown_chars();
     test_byte_fallback_preserves_compound_tokens();
     test_byte_fallback_can_be_disabled();
+
+    test_nfkc_rejects_uninitialised();
+    test_nfkc_off_by_default();
+    test_nfkc_collapses_compatibility_forms();
+    test_nfkc_handles_ligature_decomposition();
 
     if (failures > 0) {
         fprintf(stderr, "test_tokenizer: %d failure(s)\n", failures);

@@ -30,6 +30,7 @@ target_link_libraries(ants_embed
         ants_crypto
     PRIVATE
         jsmn
+        utf8proc
 )
 
 # libm for sqrt (used in the stub-inference L2 normalisation). On
