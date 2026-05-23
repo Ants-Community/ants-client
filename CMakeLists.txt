@@ -103,6 +103,7 @@ add_subdirectory(deps/blst)
 add_subdirectory(deps/picotls)
 add_subdirectory(deps/picoquic)
 add_subdirectory(deps/ggml)
+add_subdirectory(deps/jsmn)
 
 add_subdirectory(foundation)
 add_subdirectory(network)
