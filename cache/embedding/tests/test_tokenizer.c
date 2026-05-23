@@ -343,6 +343,100 @@ static void test_decode_buffer_too_small(void)
     CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Byte fallback (phase 4-real step 4a)                                     */
+/* ------------------------------------------------------------------------ */
+
+static void test_byte_fallback_rejects_uninitialised(void)
+{
+    ants_tokenizer_t t = {{0}};
+    uint32_t ids[256] = {0};
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(NULL, ids, -10.0f), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(&t, ids, -10.0f), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_byte_fallback_covers_unknown_chars(void)
+{
+    /* Same kAsciiVocab from step 1. Without byte fallback, "xyz"
+     * fails (no vocab covers x/y/z). With byte fallback enabled, the
+     * Viterbi emits length-1 candidates with byte_fallback_ids[x/y/z]
+     * → encode succeeds with 4 tokens [▁ fallback, x_fallback,
+     * y_fallback, z_fallback]. The leading ▁ is provided by the
+     * vocab (kAsciiVocab[10]) and outscores its byte-fallback
+     * counterpart because the ▁ entry exists in the vocab. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kAsciiVocab, kAsciiVocabLen), ANTS_OK);
+
+    /* Build a byte-fallback ID array: ID = 1000 + byte value. */
+    uint32_t ids[256];
+    for (int i = 0; i < 256; i++) {
+        ids[i] = (uint32_t)(1000 + i);
+    }
+    /* Score lower than any vocab score so trie-matched tokens always
+     * win when available. */
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(&t, ids, -50.0f), ANTS_OK);
+
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, "xyz", 3, out, 16, &out_n), ANTS_OK);
+    CHECK(out_n == 4);
+    if (out_n == 4) {
+        CHECK(out[0] == 10);                     /* ▁ from vocab */
+        CHECK(out[1] == (uint32_t)(1000 + 'x')); /* byte fallback */
+        CHECK(out[2] == (uint32_t)(1000 + 'y'));
+        CHECK(out[3] == (uint32_t)(1000 + 'z'));
+    }
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
+static void test_byte_fallback_preserves_compound_tokens(void)
+{
+    /* "hello world" still tokenises to [▁hello, ▁world] with byte
+     * fallback enabled — fallback tokens have a much lower score so
+     * Viterbi prefers the compound vocab entries. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kAsciiVocab, kAsciiVocabLen), ANTS_OK);
+
+    uint32_t ids[256];
+    for (int i = 0; i < 256; i++) {
+        ids[i] = (uint32_t)(2000 + i);
+    }
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(&t, ids, -50.0f), ANTS_OK);
+
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, "hello world", 11, out, 16, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+    if (out_n == 2) {
+        CHECK(out[0] == 11); /* ▁hello */
+        CHECK(out[1] == 12); /* ▁world */
+    }
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
+static void test_byte_fallback_can_be_disabled(void)
+{
+    /* Set fallback, then clear with NULL; "xyz" should once again
+     * return NON_CANONICAL. */
+    ants_tokenizer_t t = {{0}};
+    CHECK_EQ(ants_tokenizer_init(&t, kAsciiVocab, kAsciiVocabLen), ANTS_OK);
+
+    uint32_t ids[256];
+    for (int i = 0; i < 256; i++) {
+        ids[i] = (uint32_t)(3000 + i);
+    }
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(&t, ids, -50.0f), ANTS_OK);
+    CHECK_EQ(ants_tokenizer_set_byte_fallback(&t, NULL, 0.0f), ANTS_OK);
+
+    uint32_t out[16];
+    size_t out_n = 0;
+    CHECK_EQ(ants_tokenizer_encode(&t, "xyz", 3, out, 16, &out_n), ANTS_ERROR_NON_CANONICAL);
+
+    CHECK_EQ(ants_tokenizer_destroy(&t), ANTS_OK);
+}
+
 int main(void)
 {
     test_opaque_ctx_layout();
@@ -361,6 +455,11 @@ int main(void)
     test_decode_rejects_invalid_id();
     test_decode_rejects_invalid_args();
     test_decode_buffer_too_small();
+
+    test_byte_fallback_rejects_uninitialised();
+    test_byte_fallback_covers_unknown_chars();
+    test_byte_fallback_preserves_compound_tokens();
+    test_byte_fallback_can_be_disabled();
 
     if (failures > 0) {
         fprintf(stderr, "test_tokenizer: %d failure(s)\n", failures);
