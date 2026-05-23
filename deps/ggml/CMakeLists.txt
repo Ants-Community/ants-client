@@ -96,6 +96,15 @@ target_compile_definitions(ggml PRIVATE
     GGML_COMMIT="vendored-ants-client"
 )
 
+# Linux glibc needs _GNU_SOURCE to expose the POSIX + GNU surface
+# ggml uses (clock_gettime / CLOCK_MONOTONIC, posix_memalign, getline,
+# CPU_ZERO / pthread_setaffinity_np, getcpu, M_PI under <math.h>).
+# macOS exposes them by default and ignores the define. Same
+# discipline as the dht_now_us guard in network/dht/src/dht.c.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(ggml PRIVATE _GNU_SOURCE)
+endif()
+
 # ggml's source triggers our project's strict warning set in places
 # (e.g. -Wshadow on long inline expressions, -Wcast-qual on
 # `void *` shuffles in backend dispatch). Silence them for the
