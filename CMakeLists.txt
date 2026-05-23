@@ -14,7 +14,10 @@ project(ants_client
         VERSION 0.0.1
         DESCRIPTION "Reference client for the ANTS protocol"
         HOMEPAGE_URL "https://github.com/Ants-Community/ants-client"
-        LANGUAGES C)
+        LANGUAGES C CXX)
+# C++ is required only for the vendored ggml (Component #11 canonical
+# embedding service). Our own code remains strict C99 — only deps/ggml
+# uses C++ (its ggml-cpu/ ops are .cpp since the v0.10 rewrite).
 
 # ---- Language and portability discipline ---------------------------------
 #
@@ -99,6 +102,7 @@ add_subdirectory(deps/ed25519)
 add_subdirectory(deps/blst)
 add_subdirectory(deps/picotls)
 add_subdirectory(deps/picoquic)
+add_subdirectory(deps/ggml)
 
 add_subdirectory(foundation)
 add_subdirectory(network)
