@@ -13,6 +13,132 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #5 (DHT) phase 6.1 — maintenance loop · 2026-05-23
+
+**Production steady-state behaviour.** Three consecutive PRs land the
+deferred phase 6.1 maintenance pieces. After this, the DHT survives
+long-running operation: dead peers get pinged and evicted, announces
+propagate to the K-closest storers, and lookups can dial peers they
+know about but haven't reached yet. The 6.1 work was sliced into three
+PRs (one per sub-piece) to match the established 1-PR-per-phase
+cadence of Component #5.
+
+**Phase 6.1.a — refresh PING + dead_strikes eviction** (PR #34, +651):
+
+- Internal `dht_now_us()` wraps `clock_gettime(CLOCK_MONOTONIC)` with
+  a paranoid `CLOCK_REALTIME` fallback. Decouples the DHT from
+  picoquic. Gated on `_POSIX_C_SOURCE 200809L` (added in a follow-up
+  push to the same PR after Linux CI flagged `struct timespec` as
+  incomplete on glibc).
+- `ants_dht_bucket_entry` gains `dead_strikes` + `ping_in_flight` +
+  6-byte alignment pad. `kbucket_insert` memsets new entries to
+  avoid uninitialised padding bytes.
+- `refresh_tick` walks all 256 buckets on every `dht_tick`; entries
+  with a live conn that haven't been seen in `refresh_interval_ms`
+  get PINGed. `ping_in_flight` prevents double-issuing within the
+  same RTT. An earlier draft throttled the sweep to
+  `refresh_interval_ms/4`, but on a tight test loop the wall clock
+  doesn't advance fast enough between ticks and the throttle
+  starved eviction — removed; the bucket walk is cheap.
+- PING success resets `dead_strikes` + bumps `last_seen_us`; PING
+  failure increments `dead_strikes`; reaching
+  `ANTS_DHT_DEAD_STRIKE_THRESHOLD` (3) evicts the entry and fires
+  `PEER_EVICTED`. `TABLE_REFRESHED` fires after each sweep.
+- New public constant `ANTS_DHT_DEAD_STRIKE_THRESHOLD = 3`
+  (BitTorrent mainline convention).
+- `ants_dht_tick` now returns `refresh_interval_ms/4` (a wake-delay
+  hint) when refresh is enabled, instead of `UINT32_MAX`.
+- Two existing call sites that hardcoded `now_us = 0` now use
+  `dht_now_us()`: `handle_bootstrap_conn_ready` and the self-upsert
+  branch in `ants_dht_announce`.
+- Test hooks: `__test_get_entry_state`, `__test_now_us`. Test plumbing:
+  `test_dht_endpoint_t` gains `stream_opened`; new
+  `test_dht_event_recorder_t` for observing `PEER_EVICTED` /
+  `TABLE_REFRESHED`.
+
+**Phase 6.1.b — announce republish chain** (PR #35, +467):
+
+- `ants_dht_announce(key)` now actually propagates. Every
+  `announce_republish_ms` (or immediately on first announce), the
+  DHT walks the K closest live-conn peers (by XOR distance from
+  `BLAKE3(shard_key_le)`) and chains `GET_PEERS → ANNOUNCE_PEER`
+  per target. The first `ANNOUNCE_PEER_RESP` of the cycle fires
+  `ANNOUNCE_CONFIRMED`. Pre-6.1.b the announce was only recorded
+  locally + self-server-set, so a lookup from a third party
+  couldn't find us — the gap the phase-6 announce comment named.
+- `dht_now_us` un-static + declared in `dht_internal.h` so
+  `dht_server.c` stamps inbound ANNOUNCE_PEER timestamps for real
+  (closed the `0 /* now_us, TODO */` from phase 6).
+- New `struct republish_chain_ctx` (heap-allocated per
+  `(shard, target_peer)`) threads state across the
+  `GET_PEERS → ANNOUNCE_PEER` completions; reuses the same ctx for
+  both hops, freed in the final completion or on RPC-send failure.
+- `find_kclosest_conn_entries` mirrors `dht_server.c`'s
+  `find_kclosest_peers` insertion-sort but filters on `conn != NULL`
+  (6.1.c lifts that restriction by lazily dialing NULL-conn
+  candidates).
+- `ants_dht_announce` memsets a reused slot to avoid inheriting
+  stale `last_republished_at_us` from a previous
+  `unannounce → reannounce`.
+- `ants_dht_tick` wake-delay is now
+  `min(refresh_interval_ms/4, announce_republish_ms/4)`.
+- Test hook: `__test_server_announce_count`. Tests share a
+  `test_republish_fixture_t` (init/teardown helpers).
+
+**Phase 6.1.c — dial-promote during lookup** (PR #36, +437):
+
+- New candidate state `ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL = 4`.
+  Convergence waits for it alongside `UNQUERIED` / `INFLIGHT`.
+- New `struct ants_dht_pending_dial` array on the DHT state (cap
+  16). Same lazy-free model as `bootstrap_entries[]`: heap conns
+  survive `CONN_CLOSED`, freed in `ants_dht_destroy` AFTER
+  `ants_transport_destroy`.
+- `try_dial_promote` in `dht_lookup.c`: NULL-conn candidate with
+  multiaddr → heap-alloc conn → `ants_transport_dial` → flip
+  candidate to `INFLIGHT_DIAL`. `inflight_count` is NOT
+  incremented (it tracks GET_PEERS RPCs, not dials). Empty
+  multiaddr or no free slot → candidate FAILED.
+- `handle_pending_dial_conn_ready` in `dht.c`: match conn pointer,
+  verify expected `peer_id`, `kbucket_insert` (promote the conn
+  into the routing table so future lookups benefit too), then
+  `ants_dht_lookup_promote_dialed_peer` flips every waiting
+  candidate back to `UNQUERIED` with the live conn.
+- `handle_pending_dial_conn_closed` calls
+  `ants_dht_lookup_fail_dialing_candidates` for dials that closed
+  before READY.
+- `seed_candidates_from_routing` now includes NULL-conn entries.
+  Pre-6.1.c they were filtered out (lookup would have immediately
+  marked them FAILED); with dial-promote they're a live discovery
+  channel.
+- Test plumbing fix: synthetic GET_PEERS_RESP peer in
+  `test_rpc_build_response` now uses an empty multiaddr (was
+  `/ip4/127.0.0.1/udp/12345/quic-v1`). Pre-6.1.c the NULL-conn
+  peer was harmlessly FAILED at query; with dial-promote it would
+  try to dial a port with no listener and hang the lookup forever.
+  Empty multiaddr preserves test semantics (LOOKUP_COMPLETE with B
+  as sole ANSWERED peer).
+
+**Notes for future sessions** worth preserving:
+
+- The DHT shares the bootstrap discipline that
+  `ants_transport_destroy` MUST precede `ants_dht_destroy`
+  whenever the DHT may hold heap conns (`bootstrap_entries[]` or
+  `pending_dials[]`). Lookup-only tests that previously didn't
+  follow this convention can now hit the same picoquic UAF if
+  dial-promote runs.
+- `dht_now_us` lives in `dht.c` but is declared in
+  `dht_internal.h` so any DHT translation unit can use it. This
+  is the only declared cross-TU function in the internal header.
+
+**Component totals after phase 6.1**: 35 test functions in
+`test_dht.c` (up from 30); `dht_basic` ctest target runs in ~3.5 s
+under AppleClang Debug + ASan + UBSan (8 real-QUIC round-trip
+scenarios plus the K-bucket / wire-codec / RPC-dispatch unit tests).
+
+CI matrix (7 jobs, all green every PR): Linux gcc/clang
+Debug+Release, macOS clang Debug+Release, TSan Linux clang,
+clang-format.
+
 ### network: Component #5 (DHT) feature-complete · 2026-05-22
 
 **ANTS DHT live.** Four consecutive PRs close out Component #5 by
