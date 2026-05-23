@@ -13,6 +13,140 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #11 (canonical embedding) phase 4-real steps 1-4 — full Unigram tokenizer · 2026-05-23
+
+**Tokenizer infrastructure complete.** Five consecutive PRs land
+every piece needed for cross-peer-deterministic Unigram tokenisation
+against any HuggingFace tokenizer.json (XLM-RoBERTa / BGE-M3 / etc.):
+algorithm, JSON loader, trie acceleration, byte fallback, and NFKC
+normalisation. After this, the only Component #11 work remaining is
+**phase 4-real step 5 (GGUF + BGE-M3 forward pass via ggml)** and
+**phase 5 (pin real hashes + reference vectors)**.
+
+**PR #42 — step 1: Unigram tokenizer + API** (+619):
+
+- New `cache/embedding/include/ants_tokenizer.h` with
+  `ants_tokenizer_t` (1 KiB opaque ctx), `_vocab_entry_t`, init /
+  destroy / encode / decode.
+- Algorithm: pre-tokenize (prepend ▁ U+2581, collapse ASCII-whitespace
+  runs into single ▁) → Viterbi forward over caller-supplied vocab
+  (O(N × V) linear scan; trie comes in step 3) → backtrace.
+- Bit-exact deterministic across platforms.
+- 13 test functions: Viterbi correctness on hand-crafted vocab,
+  letter fallback, whitespace collapse, NON_CANONICAL on uncovered
+  input, BUFFER_TOO_SMALL contract, encode determinism, decode
+  round-trip.
+- **Why hand-rolled instead of vendoring SentencePiece**: upstream
+  is ~60 MB / 151K LoC C++ with protobuf + abseil + darts-clone
+  cascade; algorithm is ~150 LoC. Focused-subset discipline matches
+  ed25519 ref10 + ggml CPU subset.
+
+**PR #43 — step 2: tokenizer.json loader (jsmn vendored)** (+1267):
+
+- New `deps/jsmn/` — single-header minimal JSON tokenizer (~470
+  LoC, MIT). INTERFACE library, `JSMN_STATIC` include in the
+  single consuming TU.
+- New API: opaque `ants_tokenizer_vocab_blob_t` +
+  `ants_tokenizer_load_huggingface_json` + `_vocab_entries` /
+  `_vocab_size` / `_vocab_free` accessors. Heap-allocated blob owns
+  both entries array and packed text_pool.
+- Parses `$.model.vocab` from HuggingFace tokenizer.json. JSON
+  unescape handles `\\`, `\"`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`,
+  `\uXXXX` (BMP only — surrogate pairs deferred).
+- End-to-end load → init → encode produces same Viterbi result as
+  the hand-built vocab in step 1.
+- 8 test functions.
+
+**PR #44 — step 3: trie-based Viterbi lookup** (+355/-84):
+
+- Replaces step 1's O(N × V) linear-scan inner loop with a packed
+  flat trie. For BGE-M3's 250K-entry vocab and ~100-byte inputs
+  that's ~10000× fewer byte-comparisons per encode.
+- Two flat heap arrays in state: `trie_nodes` (terminator + score +
+  child slice ref) + `trie_edges` (sorted byte → child node_idx).
+  Allocated by init, freed by destroy.
+- Two-stage build: stage A builds a sparse tree with dynamic child
+  arrays; stage B DFS-packs into the flat arrays with insertion-
+  sorted children. Build tree freed after packing.
+- Encode now sweeps FORWARD from each start position (Viterbi
+  forward variant): walk the trie one byte at a time over
+  `work[s..]`; every terminator yields a candidate for
+  `dp[s + path_len]`.
+- Test-observable behaviour unchanged — existing tests still pass.
+
+**PR #45 — step 4a: byte fallback** (+192):
+
+- New API: `ants_tokenizer_set_byte_fallback(tok, ids[256], score)`.
+  256-entry byte → token-ID array is copy-stored in heap (1 KiB).
+- Viterbi forward sweep gains a length-1 candidate per position when
+  fallback enabled. Score is additive; fallback only "wins" when no
+  longer vocab entry covers — exactly SentencePiece's semantic.
+- With fallback enabled, encode is guaranteed to find a covering
+  segmentation. `ANTS_ERROR_NON_CANONICAL` never fires for unknown
+  characters.
+- 4 new tests: NULL/uninitialised rejection, "xyz" covered, compound
+  tokens still preferred, NULL clears fallback.
+
+**PR #46 — step 4b: NFKC normalisation via utf8proc** (+~17.7K mostly tables):
+
+- New `deps/utf8proc/` — utf8proc v2.10.0, ~18.7K LoC (mostly the
+  17K-line generated Unicode-tables file). MIT license preserved.
+  Single static library.
+- New API: `ants_tokenizer_set_nfkc_enabled(tok, bool)` — defaults
+  OFF.
+- Encode runs `utf8proc_map(in, ..., UTF8PROC_STABLE | UTF8PROC_COMPAT
+  | UTF8PROC_COMPOSE)` before the ▁-pretokenize pass when enabled.
+- Pipeline order: NFKC → pretokenize → trie-Viterbi → byte fallback.
+  Compatibility forms / ligatures / full-width chars fold into vocab's
+  canonical forms before byte fallback fires.
+- 4 new tests: NULL/uninitialised rejection, default-OFF behaviour,
+  compat-form collapse (full-width `Ｈｅｌｌｏ` → `[▁Hello]`),
+  ligature decomposition (`ﬁne` U+FB01 → `[▁fine]`).
+
+**PR #47 — test/dht: bump poll-loop iter caps 200 → 500** (+13/-13):
+
+- 13 `for (int i = 0; i < 200; i++)` poll loops in `test_dht.c`
+  bumped to 500. Same pattern that newer phase-6.1 tests already
+  use. PR #46's first CI run hit the macOS-Release flake we'd
+  spawned a chip-task for earlier; this fix lands inline now
+  rather than recurring.
+- All affected loops are wait-on-condition with early `break`;
+  fast runners unaffected, slow runners get longer safety margin.
+
+**Tokenizer pipeline status after these 5 PRs**:
+
+```
+caller input bytes
+  │
+  ├─ NFKC normalise (utf8proc; opt-in via set_nfkc_enabled)
+  │
+  ├─ Pre-tokenize (prepend ▁ + collapse whitespace → ▁)
+  │
+  ├─ Trie-Viterbi (O(N × max_token_len × log(branching)))
+  │   ├─ Vocab-trie candidates per position
+  │   └─ Byte fallback length-1 candidates per position
+  │      (opt-in via set_byte_fallback)
+  │
+  └─ Backtrace → uint32_t token IDs
+```
+
+Cross-peer determinism property holds end-to-end: any two
+conformant peers running the same canonical model produce
+identical token sequences for identical input bytes (modulo the
+caller-chosen on/off settings, which are part of the protocol spec).
+
+**Roadmap remaining for Component #11**:
+- **Phase 4-real step 5**: GGUF model loader (consume vendored
+  ggml) + BGE-M3 architecture struct + forward pass + mean-pool +
+  L2-norm. The pezzo grosso restante.
+- **Phase 5**: pin real `ANTS_EMBED_WEIGHTS_HASH_PINNED` +
+  `ANTS_EMBED_TOKENIZER_HASH_PINNED` against the exact BGE-M3
+  checkpoint the reference client ships. Publish reference
+  inputs+outputs to `ants-test-vectors/vectors/ants-embed-v1/`.
+
+CI matrix (7 jobs): all 5 substantive PRs first-push green except
+PR #46 (one re-run for the macOS DHT flake, fix landed in #47).
+
 ### cache: Component #11 (canonical embedding) — scaffold → verify + stub inference → ggml vendored · 2026-05-23
 
 **Cache layer begins.** Component #11 (canonical embedding service)
