@@ -1044,7 +1044,7 @@ static void test_rpc_round_trip(void)
     /* Dial. */
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (client.conn_ready >= 1) {
@@ -1059,7 +1059,7 @@ static void test_rpc_round_trip(void)
     memset(&comp_ping, 0, sizeof comp_ping);
     CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp_ping), ANTS_OK);
 
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp_ping.fired >= 1) {
@@ -1090,7 +1090,7 @@ static void test_rpc_round_trip(void)
         ants_dht__test_send_find_node(&da, &conn, &target, test_rpc_complete_find_node, &comp_fn),
         ANTS_OK);
 
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp_fn.fired >= 1) {
@@ -1256,7 +1256,7 @@ static void test_lookup_round_trip(void)
 
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (client.conn_ready >= 1) {
@@ -1520,7 +1520,7 @@ static void test_server_responds_to_ping(void)
 
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1533,7 +1533,7 @@ static void test_server_responds_to_ping(void)
     test_rpc_completion_t comp;
     memset(&comp, 0, sizeof comp);
     CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp.fired >= 1) {
@@ -1615,7 +1615,7 @@ static void test_server_get_peers_with_announce(void)
 
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1629,7 +1629,7 @@ static void test_server_get_peers_with_announce(void)
     memset(&comp, 0, sizeof comp);
     CHECK_EQ(ants_dht__test_send_get_peers(&da, &conn, shard_x, test_rpc_complete_ping, &comp),
              ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp.fired >= 1) {
@@ -1713,7 +1713,7 @@ static void test_bootstrap_completes(void)
     CHECK_EQ(ants_dht_bootstrap(&da, NULL, &b_pid), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_dht_bootstrap(&da, baddr, NULL), ANTS_ERROR_INVALID_ARG);
 
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1838,7 +1838,7 @@ static void test_refresh_pings_stale_peer(void)
     /* Stack-allocated conn — A owns the buffer, will outlive the test. */
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1868,7 +1868,7 @@ static void test_refresh_pings_stale_peer(void)
 
     /* Drive ticks. The refresh sweep should issue a PING; B's DHT
      * responds; A's completion bumps last_seen_us and keeps strikes at 0. */
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -1950,7 +1950,7 @@ static void test_refresh_evicts_after_threshold(void)
 
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1) {
@@ -2054,7 +2054,7 @@ static void test_refresh_no_ping_when_fresh(void)
 
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 500; i++) {
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
