@@ -2,7 +2,7 @@
 
 Canonical embedding service. Cache layer.
 
-**Status:** pending claim.
+**Status:** scaffold landed (BDFL interim primary; claim still open). API surface + opaque ctx + protocol-pinned constants in `include/ants_embed.h`; stubs return `ANTS_ERROR_NOT_IMPLEMENTED`. Per-phase implementation lands in subsequent PRs: vendor `ggml` → tokenizer loader → BLAKE3 hash verification → BGE-M3 inference → pin the v1 weights/tokenizer hashes (currently `0x000…000` placeholders per RFC-0008 §5).
 **Effort:** 1 EM.
 **Spec:** [RFC-0002 §The canonical embedding model](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-semantic-cache.md), [RFC-0008 §5](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0008-wire-formats.md).
 **Dependencies:** `foundation/crypto` (BLAKE3 for hash verification).

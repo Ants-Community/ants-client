@@ -8,4 +8,4 @@
 # add_subdirectory(semantic)
 
 # Component #11 — Canonical embedding service  (1 EM)
-# add_subdirectory(embedding)
+add_subdirectory(embedding)
