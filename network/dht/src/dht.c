@@ -21,6 +21,13 @@
  *   - Phase 7: Two-node integration test exchanging real lookups. [done]
  */
 
+/* POSIX feature test — required on glibc to expose clock_gettime() and
+ * CLOCK_MONOTONIC from <time.h>. macOS exposes them by default; this
+ * define is benign there. Must precede every system header. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_dht.h"
 
 #include "ants_crypto.h"
