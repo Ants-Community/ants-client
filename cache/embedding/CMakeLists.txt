@@ -10,6 +10,7 @@
 
 add_library(ants_embed STATIC
     src/embed.c
+    src/tokenizer.c
 )
 
 target_include_directories(ants_embed
@@ -42,4 +43,8 @@ if(BUILD_TESTING)
     add_executable(test_embed tests/test_embed.c)
     target_link_libraries(test_embed PRIVATE ants_embed)
     add_test(NAME embed_basic COMMAND test_embed)
+
+    add_executable(test_tokenizer tests/test_tokenizer.c)
+    target_link_libraries(test_tokenizer PRIVATE ants_embed)
+    add_test(NAME tokenizer_basic COMMAND test_tokenizer)
 endif()
