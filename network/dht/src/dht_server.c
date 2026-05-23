@@ -349,12 +349,11 @@ static ants_error_t handle_announce_peer(struct ants_dht_state *state,
 
     /* The announcer is the inbound peer. We don't yet have its
      * multiaddr (the transport's conn_peer_addr is not implemented in
-     * phase 3); use the empty string for now — phase 6.1 will plumb
-     * it through. */
+     * phase 3); use the empty string for now. */
     ants_dht_peer_t announcer;
     memset(&announcer, 0, sizeof announcer);
     announcer.peer_id = slot->peer_id;
-    (void)ants_dht_server_upsert_announce(state, req.key, &announcer, 0 /* now_us, TODO */);
+    (void)ants_dht_server_upsert_announce(state, req.key, &announcer, dht_now_us());
 
     ants_dht_announce_peer_resp_t resp;
     resp.txid = req.txid;
