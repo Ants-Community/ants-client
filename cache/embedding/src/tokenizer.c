@@ -1,23 +1,33 @@
 /*
- * tokenizer.c — SentencePiece Unigram tokenizer (Component #11,
- *               phase 4-real step 1).
+ * tokenizer.c — SentencePiece Unigram tokenizer (Component #11).
  *
- * See include/ants_tokenizer.h for the public-API contract and
- * algorithm overview.
+ * See include/ants_tokenizer.h for the public-API contract.
  *
- * Implementation notes:
+ * Implementation notes (post phase 4-real step 3):
  *
- *   - The Viterbi DP table is heap-allocated per encode call. For
- *     typical embedding inputs (a few hundred bytes) this is
- *     negligible. Hot-path callers can later batch encodes.
- *   - Vocab lookup is O(V) per position (linear scan). For 250K-entry
- *     vocabs that's slow; a trie / hash-prefix index lands in a
- *     follow-up PR. For step 1 the algorithm correctness comes first.
- *   - The pre-tokenization (whitespace → ▁) is done in-place on a
- *     working buffer also heap-allocated per call. Working buffer can
- *     grow input length by up to 3× (every ASCII space becomes 3 UTF-8
- *     bytes for ▁), so we allocate input_len*3 + 3 bytes (the +3 is for
- *     the always-prepended leading ▁ marker, see SentencePiece docs).
+ *   - Init builds a flat-packed trie over the vocab text. Each trie
+ *     node carries an optional (token_id, score) terminator plus a
+ *     sorted edge list. Lookup walks the trie from each Viterbi start
+ *     position; every terminator hit during the walk yields a candidate
+ *     for the corresponding end position. This replaces the step-1
+ *     O(N × V) linear scan with O(N × max_token_len × log(branching))
+ *     — for BGE-M3's 250K vocab that's ~10000× fewer comparisons.
+ *
+ *   - The trie is built once at init time and lives in two heap-
+ *     allocated packed arrays (nodes + edges) referenced from the
+ *     opaque ctx. Destroy frees them.
+ *
+ *   - Decode still uses linear scan (find_by_id). It's only invoked at
+ *     test/debug time; a reverse-index lands later if we hit a hot
+ *     decode path.
+ *
+ *   - The Viterbi DP table and pre-tokenize working buffer are still
+ *     heap-allocated per encode call. Typical embedding inputs are
+ *     hundreds of bytes — negligible.
+ *
+ *   - Pre-tokenize prepends ▁ (U+2581, 3 UTF-8 bytes E2 96 81), then
+ *     collapses ASCII whitespace runs into single ▁. Non-ASCII
+ *     whitespace is NFKC territory (step 4).
  */
 
 #include "ants_tokenizer.h"
@@ -29,12 +39,36 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* SentencePiece word-boundary marker U+2581 ("LOWER ONE EIGHTH BLOCK"),
- * UTF-8 encoding. Used to mark "this token starts a new word". */
 #define SP_UNDERSCORE_BYTE_0 0xE2u
 #define SP_UNDERSCORE_BYTE_1 0x96u
 #define SP_UNDERSCORE_BYTE_2 0x81u
 #define SP_UNDERSCORE_LEN    3
+
+/* ------------------------------------------------------------------------ */
+/* Packed trie                                                              */
+/*                                                                          */
+/* Two flat heap arrays: nodes[] and edges[]. Each node's children live as */
+/* a contiguous slice edges[child_start .. child_start + child_count],     */
+/* sorted ascending by byte. Lookup is binary search within the slice.    */
+/* token_id == -1 means "not a terminator"; otherwise the node ends a     */
+/* vocab entry with the supplied score and token_id.                       */
+/* ------------------------------------------------------------------------ */
+
+struct trie_node {
+    int32_t token_id;     /* -1 if not a terminator. */
+    float score;          /* meaningful only if token_id != -1. */
+    uint32_t child_start; /* index into edges[]. */
+    uint32_t child_count;
+};
+
+struct trie_edge {
+    uint8_t byte;
+    uint8_t _pad[3];
+    uint32_t node_idx; /* index into nodes[]. */
+};
+
+#define TRIE_ROOT_IDX 0u
+#define TRIE_INVALID  UINT32_MAX
 
 /* ------------------------------------------------------------------------ */
 /* Internal state                                                           */
@@ -45,11 +79,12 @@ struct ants_tokenizer_state {
     uint8_t _pad[7];
     const ants_tokenizer_vocab_entry_t *vocab;
     size_t n_vocab;
-    /* Cached: maximum text_len across the vocab. Lets the Viterbi inner
-     * loop skip vocab entries whose text is longer than the remaining
-     * suffix at position i. Cheap optimisation; trie wholesale lands
-     * later. */
     size_t max_token_len;
+    /* Trie data, heap-allocated by init, freed by destroy. */
+    struct trie_node *trie_nodes;
+    size_t trie_n_nodes;
+    struct trie_edge *trie_edges;
+    size_t trie_n_edges;
 };
 
 typedef char ants_tokenizer_state_size_check
@@ -66,6 +101,261 @@ static const struct ants_tokenizer_state *tok_state_const(const ants_tokenizer_t
 }
 
 /* ------------------------------------------------------------------------ */
+/* Trie build                                                               */
+/*                                                                          */
+/* Two-stage construction:                                                  */
+/*   Stage A: build a tree of "build nodes" with dynamically-grown child   */
+/*            arrays. Each insert walks the tree byte-by-byte from root,  */
+/*            creating intermediate build nodes as needed; at the end of   */
+/*            the byte sequence the terminator (token_id, score) is        */
+/*            written into the build node.                                  */
+/*   Stage B: pack the build tree into the flat nodes[] + edges[] arrays. */
+/*            DFS the build tree assigning packed indices; for each node, */
+/*            sort its children by byte (insertion sort; the per-node      */
+/*            branching for natural-language vocabs is small) and write    */
+/*            them into a contiguous slice of edges[].                     */
+/*                                                                          */
+/* The stage-A representation uses ~3× more memory than the stage-B        */
+/* output (sparse vs. packed), but it's only alive during init. The       */
+/* alternative — inserting directly into the packed format with sorted   */
+/* shifts — would be quadratic per insert.                                 */
+/* ------------------------------------------------------------------------ */
+
+struct trie_build_child {
+    uint8_t byte;
+    uint8_t _pad[7];
+    struct trie_build_node *child;
+};
+
+struct trie_build_node {
+    int32_t token_id;
+    float score;
+    struct trie_build_child *children;
+    uint32_t n_children;
+    uint32_t cap_children;
+};
+
+static void trie_build_free(struct trie_build_node *n)
+{
+    if (n == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < n->n_children; i++) {
+        trie_build_free(n->children[i].child);
+    }
+    free(n->children);
+    free(n);
+}
+
+static struct trie_build_node *trie_build_new_node(void)
+{
+    struct trie_build_node *n = (struct trie_build_node *)malloc(sizeof(struct trie_build_node));
+    if (n == NULL) {
+        return NULL;
+    }
+    n->token_id = -1;
+    n->score = 0.0f;
+    n->children = NULL;
+    n->n_children = 0;
+    n->cap_children = 0;
+    return n;
+}
+
+/* Linear-search child by byte (unsorted at build time). */
+static struct trie_build_node *trie_build_find_child(struct trie_build_node *node, uint8_t byte)
+{
+    for (uint32_t i = 0; i < node->n_children; i++) {
+        if (node->children[i].byte == byte) {
+            return node->children[i].child;
+        }
+    }
+    return NULL;
+}
+
+/* Append (byte, child) to node's children, growing the array as needed.
+ * Returns false on alloc failure. */
+static bool
+trie_build_add_child(struct trie_build_node *node, uint8_t byte, struct trie_build_node *child)
+{
+    if (node->n_children == node->cap_children) {
+        uint32_t new_cap = node->cap_children == 0 ? 4u : node->cap_children * 2u;
+        struct trie_build_child *grown = (struct trie_build_child *)realloc(
+            node->children, (size_t)new_cap * sizeof(struct trie_build_child));
+        if (grown == NULL) {
+            return false;
+        }
+        node->children = grown;
+        node->cap_children = new_cap;
+    }
+    node->children[node->n_children].byte = byte;
+    memset(node->children[node->n_children]._pad, 0, sizeof node->children[node->n_children]._pad);
+    node->children[node->n_children].child = child;
+    node->n_children++;
+    return true;
+}
+
+/* Insert one vocab entry's text into the build tree. Returns false on
+ * alloc failure. */
+static bool trie_build_insert(struct trie_build_node *root,
+                              const ants_tokenizer_vocab_entry_t *entry)
+{
+    struct trie_build_node *cur = root;
+    for (size_t i = 0; i < entry->text_len; i++) {
+        uint8_t b = (uint8_t)entry->text[i];
+        struct trie_build_node *next = trie_build_find_child(cur, b);
+        if (next == NULL) {
+            next = trie_build_new_node();
+            if (next == NULL) {
+                return false;
+            }
+            if (!trie_build_add_child(cur, b, next)) {
+                free(next);
+                return false;
+            }
+        }
+        cur = next;
+    }
+    /* Terminator: if the same text appears twice in the vocab, the
+     * last-inserted score wins (deterministic per insert order). */
+    cur->token_id = (int32_t)entry->token_id;
+    cur->score = entry->score;
+    return true;
+}
+
+/* Count nodes + edges in the build tree (DFS). */
+static void
+trie_build_count(const struct trie_build_node *node, size_t *out_nodes, size_t *out_edges)
+{
+    (*out_nodes)++;
+    *out_edges += node->n_children;
+    for (uint32_t i = 0; i < node->n_children; i++) {
+        trie_build_count(node->children[i].child, out_nodes, out_edges);
+    }
+}
+
+/* Insertion-sort the children array by byte (small N — typical
+ * natural-language vocab branching is <16 at most non-root nodes). */
+static void trie_build_sort_children(struct trie_build_child *children, uint32_t n)
+{
+    for (uint32_t i = 1; i < n; i++) {
+        struct trie_build_child tmp = children[i];
+        uint32_t j = i;
+        while (j > 0 && children[j - 1].byte > tmp.byte) {
+            children[j] = children[j - 1];
+            j--;
+        }
+        children[j] = tmp;
+    }
+}
+
+/* Pack `node` (and its subtree) into packed_nodes[*next_node_idx] and
+ * its children's slice into packed_edges[*next_edge_idx]. Returns the
+ * packed index assigned to this node. */
+static uint32_t trie_build_pack(const struct trie_build_node *node,
+                                struct trie_node *packed_nodes,
+                                struct trie_edge *packed_edges,
+                                size_t *next_node_idx,
+                                size_t *next_edge_idx)
+{
+    uint32_t my_idx = (uint32_t)(*next_node_idx);
+    (*next_node_idx)++;
+
+    /* Reserve the edge slice for this node FIRST so children get
+     * later edge ranges that don't overlap. */
+    uint32_t my_edge_start = (uint32_t)(*next_edge_idx);
+    uint32_t my_edge_count = node->n_children;
+    (*next_edge_idx) += my_edge_count;
+
+    packed_nodes[my_idx].token_id = node->token_id;
+    packed_nodes[my_idx].score = node->score;
+    packed_nodes[my_idx].child_start = my_edge_start;
+    packed_nodes[my_idx].child_count = my_edge_count;
+
+    /* Sort this node's children by byte, then recursively pack each
+     * subtree, writing the child packed-index into the edge slot. */
+    trie_build_sort_children(node->children, node->n_children);
+    for (uint32_t i = 0; i < my_edge_count; i++) {
+        packed_edges[my_edge_start + i].byte = node->children[i].byte;
+        memset(
+            packed_edges[my_edge_start + i]._pad, 0, sizeof packed_edges[my_edge_start + i]._pad);
+        uint32_t child_idx = trie_build_pack(
+            node->children[i].child, packed_nodes, packed_edges, next_node_idx, next_edge_idx);
+        packed_edges[my_edge_start + i].node_idx = child_idx;
+    }
+    return my_idx;
+}
+
+/* Build the packed trie from `vocab[]`. On success, returns ANTS_OK and
+ * sets state->trie_nodes / trie_edges + their counts. On failure all
+ * allocations are released and state's trie pointers stay NULL. */
+static ants_error_t trie_build(struct ants_tokenizer_state *state)
+{
+    struct trie_build_node *root = trie_build_new_node();
+    if (root == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    for (size_t i = 0; i < state->n_vocab; i++) {
+        if (!trie_build_insert(root, &state->vocab[i])) {
+            trie_build_free(root);
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+    size_t n_nodes = 0, n_edges = 0;
+    trie_build_count(root, &n_nodes, &n_edges);
+
+    struct trie_node *packed_nodes = (struct trie_node *)malloc(n_nodes * sizeof(struct trie_node));
+    struct trie_edge *packed_edges =
+        (struct trie_edge *)malloc((n_edges > 0 ? n_edges : 1) * sizeof(struct trie_edge));
+    if (packed_nodes == NULL || packed_edges == NULL) {
+        free(packed_nodes);
+        free(packed_edges);
+        trie_build_free(root);
+        return ANTS_ERROR_MALFORMED;
+    }
+    size_t ni = 0, ei = 0;
+    (void)trie_build_pack(root, packed_nodes, packed_edges, &ni, &ei);
+    trie_build_free(root);
+
+    state->trie_nodes = packed_nodes;
+    state->trie_n_nodes = n_nodes;
+    state->trie_edges = packed_edges;
+    state->trie_n_edges = n_edges;
+    return ANTS_OK;
+}
+
+static void trie_destroy(struct ants_tokenizer_state *state)
+{
+    free(state->trie_nodes);
+    free(state->trie_edges);
+    state->trie_nodes = NULL;
+    state->trie_edges = NULL;
+    state->trie_n_nodes = 0;
+    state->trie_n_edges = 0;
+}
+
+/* Binary search for byte b among a node's sorted children. Returns the
+ * child's node_idx or TRIE_INVALID if no match. */
+static uint32_t
+trie_find_child(const struct ants_tokenizer_state *state, uint32_t parent_idx, uint8_t b)
+{
+    const struct trie_node *p = &state->trie_nodes[parent_idx];
+    uint32_t lo = p->child_start;
+    uint32_t hi = p->child_start + p->child_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        uint8_t mb = state->trie_edges[mid].byte;
+        if (mb < b) {
+            lo = mid + 1u;
+        } else if (mb > b) {
+            hi = mid;
+        } else {
+            return state->trie_edges[mid].node_idx;
+        }
+    }
+    return TRIE_INVALID;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Lifecycle                                                                */
 /* ------------------------------------------------------------------------ */
 
@@ -76,7 +366,6 @@ ants_error_t ants_tokenizer_init(ants_tokenizer_t *tok,
     if (tok == NULL || vocab == NULL || n_vocab == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    /* Validate vocab entry shape + compute max_token_len. */
     size_t max_len = 0;
     for (size_t i = 0; i < n_vocab; i++) {
         if (vocab[i].text == NULL || vocab[i].text_len == 0) {
@@ -88,10 +377,16 @@ ants_error_t ants_tokenizer_init(ants_tokenizer_t *tok,
     }
     memset(tok->_opaque, 0, sizeof tok->_opaque);
     struct ants_tokenizer_state *state = tok_state(tok);
-    state->initialised = true;
     state->vocab = vocab;
     state->n_vocab = n_vocab;
     state->max_token_len = max_len;
+    ants_error_t err = trie_build(state);
+    if (err != ANTS_OK) {
+        /* trie_build cleaned up its own intermediate allocations. */
+        memset(tok->_opaque, 0, sizeof tok->_opaque);
+        return err;
+    }
+    state->initialised = true;
     return ANTS_OK;
 }
 
@@ -100,18 +395,16 @@ ants_error_t ants_tokenizer_destroy(ants_tokenizer_t *tok)
     if (tok == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
+    struct ants_tokenizer_state *state = tok_state(tok);
+    if (state->initialised) {
+        trie_destroy(state);
+    }
     memset(tok->_opaque, 0, sizeof tok->_opaque);
     return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
 /* Pre-tokenization                                                          */
-/*                                                                          */
-/* Always prepend ▁ to the input, then replace every ASCII whitespace      */
-/* (space, tab, newline, CR) with ▁. Returns the byte length actually     */
-/* written. Non-ASCII whitespace (U+00A0 NBSP, etc.) is intentionally     */
-/* NOT special-cased — that's an NFKC-normaliser job and step-N           */
-/* territory. Working buffer must hold up to input_len*3 + 3 bytes.       */
 /* ------------------------------------------------------------------------ */
 
 static size_t emit_underscore(uint8_t *out, size_t pos)
@@ -131,8 +424,6 @@ static size_t pretokenize(const uint8_t *in, size_t in_len, uint8_t *out)
 {
     size_t pos = 0;
     pos = emit_underscore(out, pos);
-    /* Skip leading ASCII whitespace — we already emitted the implicit
-     * leading ▁, so consecutive leading spaces shouldn't double up. */
     size_t i = 0;
     while (i < in_len && is_ascii_ws(in[i])) {
         i++;
@@ -141,7 +432,6 @@ static size_t pretokenize(const uint8_t *in, size_t in_len, uint8_t *out)
     while (i < in_len) {
         uint8_t b = in[i];
         if (is_ascii_ws(b)) {
-            /* Collapse runs of whitespace into a single ▁. */
             if (!prev_was_ws) {
                 pos = emit_underscore(out, pos);
                 prev_was_ws = true;
@@ -156,12 +446,16 @@ static size_t pretokenize(const uint8_t *in, size_t in_len, uint8_t *out)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Viterbi                                                                  */
+/* Viterbi (trie-driven forward sweep)                                      */
 /*                                                                          */
-/* dp[i] = highest score reachable at position i, where score = sum of    */
-/* selected token scores. dp[0] = 0; dp[i] = -inf if unreachable.        */
-/* back_pos[i] / back_id[i] hold the start position and token-id of the */
-/* token whose end is i, on the best path.                                */
+/* For each start position s with a reachable dp[s], walk the trie one    */
+/* byte at a time over work[s..]. Every terminator node hit during the    */
+/* walk yields a candidate update for dp[s + path_len]. We stop walking   */
+/* either at the input end or when no child matches the next byte (no    */
+/* longer prefix in the trie covers the suffix starting at s).            */
+/*                                                                          */
+/* Compared to step 1's O(N × V × max_len) "for each end, scan every     */
+/* entry" pass, this is O(N × max_token_len × log(branching)).            */
 /* ------------------------------------------------------------------------ */
 
 #define NEG_INF (-1.0e30f)
@@ -184,8 +478,6 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
         return ANTS_ERROR_INVALID_ARG;
     }
 
-    /* Pre-tokenize. Worst case: every input byte is whitespace and
-     * gets expanded to ▁ (3 bytes), plus the always-prepended ▁. */
     size_t work_cap = input_len * 3u + SP_UNDERSCORE_LEN;
     uint8_t *work = (uint8_t *)malloc(work_cap);
     if (work == NULL) {
@@ -193,7 +485,6 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
     }
     size_t N = pretokenize((const uint8_t *)input, input_len, work);
 
-    /* Allocate DP arrays. */
     float *dp = (float *)malloc((N + 1) * sizeof(float));
     size_t *back_pos = (size_t *)malloc((N + 1) * sizeof(size_t));
     uint32_t *back_id = (uint32_t *)malloc((N + 1) * sizeof(uint32_t));
@@ -211,35 +502,35 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
         back_id[i] = UINT32_MAX;
     }
 
-    /* Forward pass: for each end-position i, find the best (start, token)
-     * pair that lands there. O(N × V) linear scan. */
-    for (size_t i = 1; i <= N; i++) {
-        for (size_t v = 0; v < state->n_vocab; v++) {
-            const ants_tokenizer_vocab_entry_t *entry = &state->vocab[v];
-            size_t L = entry->text_len;
-            if (L == 0 || L > i || L > state->max_token_len) {
-                continue;
+    /* Forward sweep over starts, descending the trie per start. */
+    for (size_t s = 0; s < N; s++) {
+        if (dp[s] == NEG_INF) {
+            continue;
+        }
+        uint32_t node = TRIE_ROOT_IDX;
+        size_t k = 0;
+        while (s + k < N && k < state->max_token_len) {
+            uint8_t b = work[s + k];
+            uint32_t child = trie_find_child(state, node, b);
+            if (child == TRIE_INVALID) {
+                break;
             }
-            size_t start = i - L;
-            if (dp[start] == NEG_INF) {
-                continue;
-            }
-            if (memcmp(work + start, entry->text, L) != 0) {
-                continue;
-            }
-            float cand = dp[start] + entry->score;
-            if (cand > dp[i]) {
-                dp[i] = cand;
-                back_pos[i] = start;
-                back_id[i] = entry->token_id;
+            node = child;
+            k++;
+            int32_t tid = state->trie_nodes[node].token_id;
+            if (tid >= 0) {
+                size_t e = s + k;
+                float cand = dp[s] + state->trie_nodes[node].score;
+                if (cand > dp[e]) {
+                    dp[e] = cand;
+                    back_pos[e] = s;
+                    back_id[e] = (uint32_t)tid;
+                }
             }
         }
     }
 
     if (dp[N] == NEG_INF) {
-        /* No covering segmentation. Phase-N adds byte-fallback that
-         * makes this unreachable; for step 1, callers must ship a
-         * vocab that covers their input alphabet. */
         free(work);
         free(dp);
         free(back_pos);
@@ -247,10 +538,8 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
         return ANTS_ERROR_NON_CANONICAL;
     }
 
-    /* Backtrace, filling a stack-of-IDs in reverse. */
     size_t out_n = 0;
     size_t cur = N;
-    /* First pass: count tokens to size the reversed buffer. */
     while (cur > 0) {
         out_n++;
         cur = back_pos[cur];
@@ -264,8 +553,6 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
 
-    /* Second pass: fill out_token_ids in the correct left-to-right
-     * order by walking back from N and writing into out_token_ids[k-1]. */
     cur = N;
     size_t k = out_n;
     while (cur > 0) {
@@ -283,10 +570,6 @@ ants_error_t ants_tokenizer_encode(const ants_tokenizer_t *tok,
 
 /* ------------------------------------------------------------------------ */
 /* Decode                                                                   */
-/*                                                                          */
-/* Look up each token_id in the vocab (linear scan; trie comes later),     */
-/* concatenate the texts, then post-process ▁ → ' ' and strip the leading */
-/* whitespace inserted by pretokenize's implicit leading ▁.                */
 /* ------------------------------------------------------------------------ */
 
 static const ants_tokenizer_vocab_entry_t *find_by_id(const struct ants_tokenizer_state *state,
@@ -321,29 +604,19 @@ ants_error_t ants_tokenizer_decode(const ants_tokenizer_t *tok,
         return ANTS_ERROR_INVALID_ARG;
     }
 
-    /* Two-pass: first compute required length (then fail fast if cap
-     * insufficient), then write. */
     size_t need = 0;
     for (size_t i = 0; i < n_tokens; i++) {
         const ants_tokenizer_vocab_entry_t *e = find_by_id(state, token_ids[i]);
         if (e == NULL) {
             return ANTS_ERROR_INVALID_ARG;
         }
-        /* Worst-case post-process: every ▁ (3 bytes) collapses to ' '
-         * (1 byte). So written length ≤ concatenated length. We'll
-         * compute the exact post-processed length in the second pass;
-         * for the required-capacity hint use the pre-collapse length. */
         need += e->text_len;
     }
-    /* Conservative pre-collapse estimate as the upper bound. The actual
-     * written length is no greater. */
     *out_len = need;
     if (out_cap < need) {
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
 
-    /* Second pass: write bytes, post-processing ▁ → ' ' and dropping
-     * the leading ▁ inserted by pretokenize. */
     size_t pos = 0;
     bool first = true;
     for (size_t i = 0; i < n_tokens; i++) {
@@ -354,8 +627,6 @@ ants_error_t ants_tokenizer_decode(const ants_tokenizer_t *tok,
                 (uint8_t)e->text[j + 1] == SP_UNDERSCORE_BYTE_1 &&
                 (uint8_t)e->text[j + 2] == SP_UNDERSCORE_BYTE_2) {
                 if (first) {
-                    /* Suppress the very first ▁ (matches encode's
-                     * always-prepended marker). */
                     first = false;
                 } else {
                     out_text[pos++] = ' ';
