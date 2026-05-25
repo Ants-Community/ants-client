@@ -48,8 +48,11 @@ target_compile_features(ants_embed PUBLIC c_std_99)
 # ---- Tests ---------------------------------------------------------------
 
 if(BUILD_TESTING)
+    # test_embed now needs ggml/gguf APIs directly to build a real
+    # BGE-M3-shaped fixture in memory (the stub-input test path is
+    # gone — init goes all the way through gguf + model + tokenizer).
     add_executable(test_embed tests/test_embed.c)
-    target_link_libraries(test_embed PRIVATE ants_embed)
+    target_link_libraries(test_embed PRIVATE ants_embed ggml)
     add_test(NAME embed_basic COMMAND test_embed)
 
     add_executable(test_tokenizer tests/test_tokenizer.c)
