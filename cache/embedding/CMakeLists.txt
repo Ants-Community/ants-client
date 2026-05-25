@@ -10,6 +10,7 @@
 
 add_library(ants_embed STATIC
     src/embed.c
+    src/embed_gguf.c
     src/tokenizer.c
     src/tokenizer_json.c
 )
@@ -31,6 +32,7 @@ target_link_libraries(ants_embed
     PRIVATE
         jsmn
         utf8proc
+        ggml
 )
 
 # libm for sqrt (used in the stub-inference L2 normalisation). On
@@ -55,4 +57,13 @@ if(BUILD_TESTING)
     add_executable(test_tokenizer_json tests/test_tokenizer_json.c)
     target_link_libraries(test_tokenizer_json PRIVATE ants_embed)
     add_test(NAME tokenizer_json COMMAND test_tokenizer_json)
+
+    # The GGUF loader test calls ggml + gguf APIs directly to build
+    # a fixture in-memory; it therefore needs both ants_embed (for
+    # embed_gguf_*) and ggml (for the gguf_init_*/ggml_init_* helpers).
+    # tests/ also needs access to the src/ private header.
+    add_executable(test_embed_gguf tests/test_embed_gguf.c)
+    target_include_directories(test_embed_gguf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_embed_gguf PRIVATE ants_embed ggml)
+    add_test(NAME embed_gguf COMMAND test_embed_gguf)
 endif()
