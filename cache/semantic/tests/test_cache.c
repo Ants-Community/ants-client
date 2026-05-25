@@ -20,6 +20,7 @@
 #include "ants_embed.h"
 #include "ants_semantic_cache.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -168,11 +169,140 @@ static void test_shard_key_null_args(void)
     CHECK_EQ(ants_semantic_cache_shard_key(emb, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_shard_key_scaffold_returns_not_implemented(void)
+/* -- LSH behavioural tests ------------------------------------------------
+ *
+ * Generate deterministic L2-normalised 1024-d embeddings from a seed
+ * (LCG-driven so cross-platform bit-identical), then check that the
+ * shard-key satisfies the locality property: similar embeddings produce
+ * keys with low Hamming distance; orthogonal-ish embeddings produce
+ * keys with Hamming distance near 32 (half the bit width).
+ */
+
+static void make_random_embedding(uint32_t seed, float out[ANTS_EMBED_DIM])
 {
-    float emb[ANTS_EMBED_DIM] = {0};
+    uint32_t s = seed;
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        s = s * 1664525u + 1013904223u;
+        out[i] = ((float)s * (2.0f / 4294967296.0f)) - 1.0f;
+    }
+    double sumsq = 0.0;
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        sumsq += (double)out[i] * (double)out[i];
+    }
+    float inv_norm = (float)(1.0 / sqrt(sumsq));
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        out[i] *= inv_norm;
+    }
+}
+
+/* Make `out` ≈ `base` plus small bounded noise, re-L2-normalised.
+ * noise_scale = 0.02 → cosine similarity ≈ 0.9998. */
+static void make_near_embedding(const float base[ANTS_EMBED_DIM],
+                                uint32_t noise_seed,
+                                float noise_scale,
+                                float out[ANTS_EMBED_DIM])
+{
+    uint32_t s = noise_seed;
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        s = s * 1664525u + 1013904223u;
+        float noise = (((float)s * (2.0f / 4294967296.0f)) - 1.0f) * noise_scale;
+        out[i] = base[i] + noise;
+    }
+    double sumsq = 0.0;
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        sumsq += (double)out[i] * (double)out[i];
+    }
+    float inv_norm = (float)(1.0 / sqrt(sumsq));
+    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
+        out[i] *= inv_norm;
+    }
+}
+
+static int hamming64(uint64_t a, uint64_t b)
+{
+    uint64_t x = a ^ b;
+    int count = 0;
+    while (x) {
+        count++;
+        x &= x - 1; /* clear lowest set bit */
+    }
+    return count;
+}
+
+static void test_shard_key_runs_and_is_nontrivial(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(42, emb);
+
     ants_semantic_cache_shard_key_t key = 0;
-    CHECK_EQ(ants_semantic_cache_shard_key(emb, &key), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_semantic_cache_shard_key(emb, &key), ANTS_OK);
+    /* For a random Gaussian-projected unit vector, each of the 64
+     * sign-bits is roughly 50/50 — neither all-zero nor all-ones with
+     * overwhelming probability. */
+    CHECK(key != 0);
+    CHECK(key != ~(uint64_t)0);
+}
+
+static void test_shard_key_idempotent(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7, emb);
+
+    ants_semantic_cache_shard_key_t k1 = 0;
+    ants_semantic_cache_shard_key_t k2 = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(emb, &k1), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_shard_key(emb, &k2), ANTS_OK);
+    CHECK(k1 == k2);
+}
+
+static void test_shard_key_distinct_for_distinct_inputs(void)
+{
+    float a[ANTS_EMBED_DIM];
+    float b[ANTS_EMBED_DIM];
+    make_random_embedding(1, a);
+    make_random_embedding(2, b);
+
+    ants_semantic_cache_shard_key_t ka = 0;
+    ants_semantic_cache_shard_key_t kb = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(a, &ka), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_shard_key(b, &kb), ANTS_OK);
+    CHECK(ka != kb);
+}
+
+static void test_shard_key_locality(void)
+{
+    /* Locality property (RFC-0002 §DHT routing): similar embeddings
+     * land in the same or adjacent shard. Concretely: H(base, near)
+     * with near = base + 2% noise should be much smaller than H(base,
+     * far) with far an unrelated random vector. */
+    float base[ANTS_EMBED_DIM];
+    float near[ANTS_EMBED_DIM];
+    float far[ANTS_EMBED_DIM];
+    make_random_embedding(100, base);
+    make_near_embedding(base, 555, 0.02f, near);
+    make_random_embedding(101, far);
+
+    ants_semantic_cache_shard_key_t k_base = 0;
+    ants_semantic_cache_shard_key_t k_near = 0;
+    ants_semantic_cache_shard_key_t k_far = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &k_base), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_shard_key(near, &k_near), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_shard_key(far, &k_far), ANTS_OK);
+
+    int h_near = hamming64(k_base, k_near);
+    int h_far = hamming64(k_base, k_far);
+
+    /* The locality property: near is closer in Hamming than far. */
+    CHECK(h_near < h_far);
+
+    /* Cosine sim ≈ 0.9998 for a 2% perturbation. Expected Hamming
+     * ≈ 64 · acos(0.9998) / π ≈ 0.4 bits. Allow up to 8 to absorb
+     * variance over the 64 hyperplanes. */
+    CHECK(h_near <= 8);
+
+    /* Two unrelated unit vectors in 1024-d are nearly orthogonal
+     * (concentration of measure). Expected Hamming ≈ 32 with σ ≈ 4. */
+    CHECK(h_far >= 20 && h_far <= 44);
 }
 
 static void test_entries_safe_on_zero_or_null(void)
@@ -202,7 +332,10 @@ int main(void)
     test_get_null_args();
     test_get_scaffold_returns_not_implemented();
     test_shard_key_null_args();
-    test_shard_key_scaffold_returns_not_implemented();
+    test_shard_key_runs_and_is_nontrivial();
+    test_shard_key_idempotent();
+    test_shard_key_distinct_for_distinct_inputs();
+    test_shard_key_locality();
     test_entries_safe_on_zero_or_null();
     test_clear_null_and_scaffold();
 
