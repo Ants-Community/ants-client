@@ -193,6 +193,68 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
                                               float embedding_out[ANTS_EMBED_DIM]);
 
 /* ------------------------------------------------------------------------ */
+/* Lookup request wire format (RFC-0002 §The lookup protocol)               */
+/*                                                                          */
+/* The consumer's client computes the embedding of its prompt, computes    */
+/* the shard key, queries the DHT for the responsible peers, and sends     */
+/* this request to each candidate in parallel. The receiving peer searches */
+/* its local shard for entries with cosine similarity ≥ threshold and      */
+/* returns up to top_k matches (response wire format lands in step 6).    */
+/*                                                                          */
+/* Wire format (CBOR map with ascending integer keys 1..3):                */
+/*   1 : embedding         bytes(4096)    raw IEEE-754 LE floats           */
+/*   2 : threshold         bytes(4)       raw IEEE-754 LE float            */
+/*   3 : top_k             uint           0 = unbounded                    */
+/*                                                                          */
+/* Threshold + embedding use raw byte representation (not CBOR float       */
+/* native encoding) for the same canonical-numerics rationale as the       */
+/* cache entry record: CBOR's half/single/double "shortest form" choice is */
+/* ambiguous, and the protocol pins the binary footprint instead.          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Serialise a cache lookup request into a buffer using canonical CBOR.
+ *
+ * embedding:           ANTS_EMBED_DIM L2-normalised float32 values
+ * similarity_threshold: minimum cosine similarity for a match
+ * top_k:               max entries the responder should return; 0 means
+ *                       the responder picks (typically all matches above
+ *                       threshold up to a server-side cap)
+ *
+ * Returns:
+ *   ANTS_OK                       — *out_len bytes written;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — out_cap < required.
+ */
+ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANTS_EMBED_DIM],
+                                                       float similarity_threshold,
+                                                       uint32_t top_k,
+                                                       uint8_t *buf,
+                                                       size_t out_cap,
+                                                       size_t *out_len);
+
+/*
+ * Parse a cache lookup request from canonical CBOR bytes.
+ *
+ * embedding_out: caller buffer for ANTS_EMBED_DIM floats; decoder
+ *                unpacks the wire's 4096 LE bytes into it.
+ * out_threshold / out_top_k: populated from the decoded fields.
+ *
+ * Returns:
+ *   ANTS_OK             — fields populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args;
+ *   ANTS_ERROR_MALFORMED   — CBOR parse error, missing required key,
+ *                            wrong type, or trailing bytes;
+ *   ANTS_ERROR_NON_CANONICAL — wrong byte length on a fixed-length
+ *                              field or non-canonical key order.
+ */
+ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
+                                                       size_t len,
+                                                       float embedding_out[ANTS_EMBED_DIM],
+                                                       float *out_threshold,
+                                                       uint32_t *out_top_k);
+
+/* ------------------------------------------------------------------------ */
 /* Opaque context                                                           */
 /*                                                                          */
 /* The state struct holds heap pointers (bucket store, LSH projection      */
