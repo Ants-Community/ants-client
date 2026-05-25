@@ -813,6 +813,111 @@ static void test_entry_wire_decode_invalid_validity(void)
     CHECK_EQ(ants_semantic_cache_entry_decode(buf, n, &out_e, out_emb), ANTS_ERROR_NON_CANONICAL);
 }
 
+/* -- Lookup request wire format (step 5) ----------------------------------
+ *
+ * Round-trip + malformed/non-canonical rejection for the cache lookup
+ * request CBOR codec (3 fields: embedding, threshold, top_k). */
+
+static void test_lookup_request_round_trip(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8000, emb);
+
+    uint8_t buf[8192];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.92f, 5, buf, sizeof buf, &encoded),
+             ANTS_OK);
+    CHECK(encoded > 4096); /* embedding alone is 4096 bytes */
+    CHECK(encoded < sizeof buf);
+
+    float out_emb[ANTS_EMBED_DIM];
+    float out_thr = 0.0f;
+    uint32_t out_topk = 0xFFFFFFFFu;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, encoded, out_emb, &out_thr, &out_topk),
+             ANTS_OK);
+
+    for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
+        CHECK(out_emb[i] == emb[i]);
+    }
+    CHECK(out_thr == 0.92f);
+    CHECK(out_topk == 5u);
+}
+
+static void test_lookup_request_top_k_zero(void)
+{
+    /* top_k = 0 means "unbounded; responder picks". Round-trips fine. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8001, emb);
+
+    uint8_t buf[8192];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 0, buf, sizeof buf, &encoded),
+             ANTS_OK);
+
+    float out_emb[ANTS_EMBED_DIM];
+    float out_thr = 1.0f;
+    uint32_t out_topk = 42;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, encoded, out_emb, &out_thr, &out_topk),
+             ANTS_OK);
+    CHECK(out_thr == 0.5f);
+    CHECK(out_topk == 0u);
+}
+
+static void test_lookup_request_buffer_too_small(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8002, emb);
+
+    /* 100 bytes can't hold the embedding alone. */
+    uint8_t small[100];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, small, sizeof small, &encoded),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+static void test_lookup_request_null_args(void)
+{
+    float emb[ANTS_EMBED_DIM] = {0};
+    uint8_t buf[8192];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(NULL, 0.9f, 1, buf, sizeof buf, &encoded),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, NULL, sizeof buf, &encoded),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, buf, sizeof buf, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    float out_emb[ANTS_EMBED_DIM];
+    float out_thr = 0.0f;
+    uint32_t out_topk = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(NULL, 1, out_emb, &out_thr, &out_topk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, NULL, &out_thr, &out_topk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, NULL, &out_topk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, &out_thr, NULL),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_lookup_request_decode_truncated(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8003, emb);
+
+    uint8_t buf[8192];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 3, buf, sizeof buf, &encoded),
+             ANTS_OK);
+
+    float out_emb[ANTS_EMBED_DIM];
+    float out_thr = 0.0f;
+    uint32_t out_topk = 0;
+    ants_error_t e =
+        ants_semantic_cache_lookup_request_decode(buf, encoded / 2, out_emb, &out_thr, &out_topk);
+    CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -878,6 +983,11 @@ int main(void)
     test_entry_wire_null_args();
     test_entry_wire_decode_truncated();
     test_entry_wire_decode_invalid_validity();
+    test_lookup_request_round_trip();
+    test_lookup_request_top_k_zero();
+    test_lookup_request_buffer_too_small();
+    test_lookup_request_null_args();
+    test_lookup_request_decode_truncated();
     test_clear_removes_entries();
 
     if (failures > 0) {

@@ -78,6 +78,27 @@ static void le_bytes_to_floats(const uint8_t *in, float *out)
     }
 }
 
+/* Pack a single float into 4 LE bytes — same canonical-numerics
+ * discipline as the embedding bytes. */
+static void float_to_le_bytes(float in, uint8_t out[4])
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &in, sizeof(uint32_t));
+    out[0] = (uint8_t)(bits & 0xFFu);
+    out[1] = (uint8_t)((bits >> 8) & 0xFFu);
+    out[2] = (uint8_t)((bits >> 16) & 0xFFu);
+    out[3] = (uint8_t)((bits >> 24) & 0xFFu);
+}
+
+static float le_bytes_to_float(const uint8_t in[4])
+{
+    uint32_t bits = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) |
+                    ((uint32_t)in[3] << 24);
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof(uint32_t));
+    return out;
+}
+
 ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t *entry,
                                               uint8_t *buf,
                                               size_t out_cap,
@@ -341,6 +362,169 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
 
         default:
             /* Unreachable: key range was checked above. */
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+
+    if (!ants_cbor_dec_eof(&dec)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Lookup request wire format (RFC-0002 §The lookup protocol)               */
+/*                                                                          */
+/* CBOR map with integer keys 1..3 in canonical order:                      */
+/*   1: embedding   bytes(4096)   raw LE floats                             */
+/*   2: threshold   bytes(4)      raw LE float                              */
+/*   3: top_k       uint          0 = unbounded                             */
+/* ------------------------------------------------------------------------ */
+
+#define LR_KEY_EMBEDDING 1u
+#define LR_KEY_THRESHOLD 2u
+#define LR_KEY_TOP_K     3u
+
+ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANTS_EMBED_DIM],
+                                                       float similarity_threshold,
+                                                       uint32_t top_k,
+                                                       uint8_t *buf,
+                                                       size_t out_cap,
+                                                       size_t *out_len)
+{
+    if (embedding == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    uint8_t emb_le[EMBEDDING_WIRE_LEN];
+    floats_to_le_bytes(embedding, emb_le);
+
+    uint8_t threshold_le[4];
+    float_to_le_bytes(similarity_threshold, threshold_le);
+
+    ants_cbor_enc_t enc;
+    ants_error_t err = ants_cbor_enc_init(&enc, buf, out_cap);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_map(&enc, 3);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_uint(&enc, LR_KEY_EMBEDDING);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_bytes(&enc, emb_le, EMBEDDING_WIRE_LEN);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_uint(&enc, LR_KEY_THRESHOLD);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_bytes(&enc, threshold_le, 4);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_uint(&enc, LR_KEY_TOP_K);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_uint(&enc, (uint64_t)top_k);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_finalise(&enc);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
+                                                       size_t len,
+                                                       float embedding_out[ANTS_EMBED_DIM],
+                                                       float *out_threshold,
+                                                       uint32_t *out_top_k)
+{
+    if (buf == NULL || embedding_out == NULL || out_threshold == NULL || out_top_k == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_threshold = 0.0f;
+    *out_top_k = 0;
+
+    ants_cbor_dec_t dec;
+    ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    size_t n_kv = 0;
+    err = ants_cbor_dec_map(&dec, &n_kv);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (n_kv != 3) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    for (size_t i = 0; i < 3; i++) {
+        uint64_t key = 0;
+        err = ants_cbor_dec_uint(&dec, &key);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        if (key != (uint64_t)(i + 1)) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+
+        const uint8_t *bytes_ptr = NULL;
+        size_t bytes_len = 0;
+        uint64_t uval = 0;
+
+        switch (key) {
+        case LR_KEY_EMBEDDING:
+            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            if (err != ANTS_OK) {
+                return err;
+            }
+            if (bytes_len != EMBEDDING_WIRE_LEN) {
+                return ANTS_ERROR_NON_CANONICAL;
+            }
+            le_bytes_to_floats(bytes_ptr, embedding_out);
+            break;
+
+        case LR_KEY_THRESHOLD:
+            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            if (err != ANTS_OK) {
+                return err;
+            }
+            if (bytes_len != 4) {
+                return ANTS_ERROR_NON_CANONICAL;
+            }
+            *out_threshold = le_bytes_to_float(bytes_ptr);
+            break;
+
+        case LR_KEY_TOP_K:
+            err = ants_cbor_dec_uint(&dec, &uval);
+            if (err != ANTS_OK) {
+                return err;
+            }
+            if (uval > 0xFFFFFFFFull) {
+                return ANTS_ERROR_NON_CANONICAL;
+            }
+            *out_top_k = (uint32_t)uval;
+            break;
+
+        default:
             return ANTS_ERROR_MALFORMED;
         }
     }
