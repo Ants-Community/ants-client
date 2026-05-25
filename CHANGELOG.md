@@ -13,6 +13,161 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) steps 0-6 — scaffold through wire formats · 2026-05-25
+
+**Local cache layer + wire formats complete.** Seven consecutive PRs
+take `cache/semantic` from "pending claim" to "fully functional in-
+memory cache with LSH shard-key + LRU eviction + both wire formats
+ready for DHT integration". After this, the only Component #10 work
+remaining is **step 7** (DHT-routed publish + lookup networking),
+**step 8** (Hamming-1/2/3 neighbour expansion + multi-shard
+aggregation), and **step 9** (quality-signal aggregation + challenge
+invalidation + decay by validity class).
+
+**PR #54 — step 0: scaffold** (+636):
+
+- New `cache/semantic/{include,src,tests}/` directory tree.
+- Public `ants_semantic_cache.h` declares the API surface:
+  `ants_semantic_cache_t` opaque ctx (4 KiB), config (per_shard_max,
+  total_max), lifecycle (init/destroy), put/get with similarity
+  threshold + BUFFER_TOO_SMALL contract, `shard_key` derivation,
+  `entries`/`clear` diagnostics.
+- Protocol-pinned constants (RFC-0002): `SHARD_KEY_BITS=64`,
+  `DEFAULT_THRESHOLD=0.92f`, `DEFAULT_REPLICATION=3`,
+  `shard_key_t = uint64_t` (matches `ants_dht_shard_key_t`).
+- Every implementation path returns `NOT_IMPLEMENTED`; `destroy` is
+  a safe no-op on zeroed ctxs (matches the pattern in `ants_embed`
+  and `ants_transport`).
+- 13 contract tests (constants, alignment, NULL-arg validation,
+  scaffold-NOT_IMPLEMENTED-everywhere, safe-on-zero behaviours).
+- CMake: `cache/CMakeLists.txt` enables `semantic` after
+  `embedding` (depends on `ANTS_EMBED_DIM`).
+
+**PR #55 — step 1: LSH shard-key** (+317/-21):
+
+- `ants_semantic_cache_shard_key(embedding, *out_key)` implements
+  the RFC-0002 §DHT routing scheme: 64 pseudorandom hyperplanes,
+  sign of each projection → bit of the 64-bit key.
+- **The projection matrix is part of the protocol-pinned bundle**,
+  derived deterministically from a fixed BLAKE3 seed label
+  (`"ants-semantic-cache/v1/projection-matrix"`). Generation:
+  16K BLAKE3 calls × 4 Box-Muller Gaussians per 32-byte chunk
+  = 65536 Gaussian floats = 64 × 1024 matrix. <5 ms total even
+  under ASan+UBSan.
+- Lazy init via `atomic_int` (stdatomic) double-checked-locking;
+  fast path is one acquire-load. Process-global (NOT per-cache).
+- Shard-key path: 64 double-precision dot products in fixed order;
+  cross-host bit-exactness depends on RFC-0009 canonical numerics,
+  single-host determinism is solid.
+- 5 new behavioural tests including the locality property: base +
+  2 % noise → Hamming ≤ 8 vs base; unrelated random → Hamming
+  20–44 (~32 expected for orthogonal). Confirms RFC-0002's
+  "similar embeddings share most bits" claim end-to-end.
+
+**PR #56 — step 2: local-shard storage + cosine lookup** (+450/-46):
+
+- `init`/`destroy`/`put`/`get`/`clear`/`entries` now do real work
+  against an in-memory bucket store. Magic-tagged state ("CNCS")
+  for uninit-vs-init detection.
+- Flat heap array of `cache_entry_t`, grown geometrically (16 → 32
+  → ...). Each entry: precomputed shard_key + L2-normalised
+  embedding (4 KB inline) + heap-allocated value copy + LRU
+  counter.
+- `put`: shard_key, grow if full, malloc+memcpy value, inline
+  embedding + key + lru++. `get`: shard_key, linear scan filtered
+  by matching shard_key, cosine via double-precision dot product,
+  rank by similarity; `NOT_FOUND` if no match above threshold,
+  `BUFFER_TOO_SMALL` with `*out_len = required` if value bigger
+  than caller buffer.
+- **Cross-module**: new `ANTS_ERROR_NOT_FOUND` (code 12) in
+  `include/ants_common.h` for "lookup completed, no result above
+  threshold". Wired into `ants_strerror` + the iterate-all-codes
+  test (foundation/cbor). Reusable by future components (DHT
+  lookup with no peer, etc.).
+- 7 new behavioural tests: round-trip, threshold miss, buffer-
+  too-small, ranking, entries grow, clear-and-reuse.
+
+**PR #57 — step 3: LRU eviction** (+251/-14):
+
+- Enforces `per_shard_max` + `total_max` from the config (advisory
+  in step 2). Pre-insert: total_max check first (may incidentally
+  free a slot in this shard), then per_shard_max.
+- `find_lru(filter_by_shard, key)` picks smallest `last_access`.
+  `evict_at(idx)` frees value, swap-with-last, `n_entries--`. O(1)
+  once the LRU is identified; the array order is internal.
+- `last_access` is bumped on every get hit (step 2) so the
+  eviction picks the genuine LRU rather than oldest insert.
+- 4 new tests: total cap, total cap with get-bumps-recency,
+  per-shard cap, shard-isolation (per-shard eviction does NOT
+  touch other shards).
+
+**PR #58 — step 4: cache-entry wire format** (+880/-1):
+
+- CBOR encode/decode for the producer-signed cache-entry record
+  per RFC-0002 §The cache entry + RFC-0008 §3 deterministic
+  encoding.
+- Public `ants_semantic_cache_entry_t` struct + `_validity_t` enum
+  (ephemeral/weeks/months/years/perennial).
+- Wire format: CBOR map with ascending integer keys 1..10:
+  `embedding` (bytes 4096, raw LE float32), `embedding_model`
+  (text), `prompt_hash` (bytes 32), `response` (bytes),
+  `response_model` (text), `producer` (bytes 32, Ed25519 pubkey),
+  `created` (uint), `validity_class` (uint), `attestation`
+  (bytes), `signature` (bytes 64).
+- Embedding + similarity raw-bytes, NOT CBOR float native:
+  canonical-numerics rationale (CBOR's half/single/double
+  "shortest form" is ambiguous; protocol pins the binary footprint).
+- Decoder zero-copy on text/bytes (aliases into source buffer);
+  embedding unpacked into caller-supplied float buffer.
+- 6 wire-format tests: round-trip, empty attestation, buffer-too-
+  small, NULL args, truncated, patched invalid validity_class.
+
+**PR #59 — step 5: lookup-request wire format** (+356):
+
+- CBOR encode/decode for the cache lookup request:
+  `_lookup_request_encode(embedding, threshold, top_k, ...)`
+  + matching `_decode`.
+- Wire format: map { 1: embedding bytes(4096), 2: threshold
+  bytes(4), 3: top_k uint }. `top_k = 0` means "unbounded
+  (responder picks)".
+- New `float_to_le_bytes` / `le_bytes_to_float` helpers (single-
+  float variant of the embedding pack/unpack).
+- 5 tests: round-trip, top_k=0, buffer-too-small, NULL args,
+  truncated.
+
+**PR #60 — step 6: lookup-response wire format** (+506/-61):
+
+- CBOR encode/decode for the cache lookup response: a list of
+  `{similarity, entry}` matches the responder returns for each
+  lookup request from step 5.
+- **Refactor**: extracted static `entry_validate` / `entry_emit` /
+  `entry_consume` helpers from the existing entry codec; the
+  public entry encode/decode are now thin wrappers around them.
+  `entry_emit` is reused mid-stream by the response encoder to
+  inline a full entry map under match key 2; `entry_consume`
+  likewise on the decode side.
+- Wire format: map { 1: matches[] }, each match = map { 1:
+  similarity bytes(4), 2: nested entry-map(10) }.
+- Decoder semantics for `cap_matches < n_matches`: `*out_n`
+  always set to actual wire count; up to `cap_matches` entries
+  filled; returns `BUFFER_TOO_SMALL` so caller can re-call with
+  bigger buffer.
+- 5 tests: empty matches, 3-match round-trip, partial-cap
+  partial-fill, NULL args, truncated.
+
+**Component #10 status after PR #60**: `cache/semantic` is fully
+functional as an in-memory cache (init, put, get with cosine
+ranking, LRU eviction, shard-key derivation), and both wire
+formats (cache-entry + lookup-request + lookup-response) are
+defined + round-trip-tested. The library has no network code
+yet; **step 7** plugs `ants_dht` + `ants_transport` into the
+publish + lookup paths so peers actually exchange these messages.
+
+CI matrix (7 jobs): all 7 PRs first-push green except PR #54
+(two re-runs absorbed unrelated `dht_basic` + `transport_basic`
+macOS Release flakes — both spawned as chip-tasks for separate
+poll-loop iter-cap bumps).
+
 ### cache: Component #11 (canonical embedding) phase 4-real step 5 — BGE-M3 forward pass · 2026-05-25
 
 **Inference live.** Four consecutive PRs land the remaining phase-4-real
