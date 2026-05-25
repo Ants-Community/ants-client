@@ -51,6 +51,8 @@ const char *ants_strerror(ants_error_t err)
         return "peer pubkey mismatch";
     case ANTS_ERROR_STREAM_RESET:
         return "stream reset";
+    case ANTS_ERROR_NOT_FOUND:
+        return "not found";
     default:
         return "unknown";
     }

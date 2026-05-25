@@ -1,19 +1,26 @@
 /*
  * cache.c — Semantic cache (Component #10).
  *
- * Step 1 (this PR): LSH shard-key lands. The projection matrix is
- * generated lazily on first use from a fixed BLAKE3-derived seed.
- * Every other entry point still returns ANTS_ERROR_NOT_IMPLEMENTED;
- * subsequent steps land:
+ * Step 2 (this PR): local-shard storage + cosine-similarity lookup.
+ * init/destroy/put/get/clear/entries now do real work against an in-
+ * memory bucket store. Eviction (LRU per shard, decay by validity
+ * class) stays in step 3; DHT-routed write/lookup is steps 4-5;
+ * quality signals + challenge invalidation is step 6.
  *
- *   - step 2: Local-shard storage with cosine-similarity lookup.
- *   - step 3: Eviction policy (LRU per shard + decay by validity class).
- *   - step 4: DHT-routed write protocol (replicate to N shard-holders).
- *   - step 5: DHT-routed lookup with Hamming-1/2/3 neighbour expansion
- *             and multi-shard aggregation.
- *   - step 6: Quality-signal aggregation + challenge-based invalidation.
+ * Storage layout:
+ *   - state.entries is a flat heap array of cache_entry_t, grown
+ *     geometrically on put.
+ *   - Each entry holds the L2-normalised embedding (4 KB) + a copy
+ *     of the value bytes + the precomputed shard key + an LRU counter.
+ *   - Lookup is a linear scan over the entries array, filtered by
+ *     matching shard_key, then ranked by cosine similarity (a dot
+ *     product on the already-normalised vectors). Step 5 will
+ *     swap this for an indexed bucket map + Hamming-neighbour
+ *     expansion across the DHT.
  *
- * Destroy is a safe no-op even at scaffold; the rest is gated.
+ * The per_shard_max / total_max caps from ants_semantic_cache_config_t
+ * are advisory in step 2 — recorded on init but not enforced. Step 3
+ * lands LRU eviction that honours them.
  */
 
 #include "ants_semantic_cache.h"
@@ -22,8 +29,10 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* M_PI is gated behind _BSD_SOURCE / _XOPEN_SOURCE on some libcs.
@@ -37,15 +46,54 @@
 /* Internal state                                                           */
 /*                                                                          */
 /* The shard-key projection matrix is a process-global constant (not a     */
-/* per-cache resource), so it lives in static storage outside the          */
-/* ants_semantic_cache_state struct. The state struct is reserved for     */
-/* per-instance data (bucket store, config copy, etc.) landing in step 2+. */
+/* per-cache resource) so it lives in static storage outside this struct.  */
+/* The per-instance state holds the entry store + caps + LRU counter.     */
 /* ------------------------------------------------------------------------ */
+
+/* Magic ("CNCS" = Cache, semaNtic) distinguishes a fully-init state from
+ * a zeroed (never-init) ctx so the public destroy/get/put entry points
+ * can detect uninitialised callers without crashing. Same pattern as
+ * ants_embed_state ("ANSE") and ants_transport_state ("ANTS"). */
+#define ANTS_SEMANTIC_CACHE_STATE_MAGIC 0x434E4353u
+
+#define INITIAL_ENTRY_CAPACITY          16
+
+typedef struct {
+    /* Precomputed shard key for this entry's embedding. Cached so
+     * lookups don't re-project at scan time. */
+    ants_semantic_cache_shard_key_t shard_key;
+
+    /* L2-normalised embedding (4 KB). Stored inline so the lookup
+     * dot-product is one contiguous read per entry. */
+    float embedding[ANTS_EMBED_DIM];
+
+    /* Heap-allocated copy of the caller's value bytes. Owned by the
+     * cache, freed on destroy / clear / future LRU eviction. */
+    uint8_t *value;
+    size_t value_len;
+
+    /* Monotonic LRU counter set on each put and on each get hit.
+     * Unused in step 2; step 3 reads it for eviction. */
+    uint64_t last_access;
+} cache_entry_t;
 
 struct ants_semantic_cache_state {
     uint32_t magic;
     uint8_t _pad[4];
-    /* Heap pointers land here in step 2+. */
+
+    /* Config caps mirrored from ants_semantic_cache_config_t.
+     * Advisory in step 2; step 3 enforces via LRU eviction. */
+    size_t per_shard_max;
+    size_t total_max;
+
+    /* Flat entry array; grown geometrically on put. */
+    cache_entry_t *entries;
+    size_t n_entries;
+    size_t cap_entries;
+
+    /* Monotonic counter; advanced on every put + on every get hit.
+     * Used by step 3 to identify the eviction candidate. */
+    uint64_t lru_counter;
 };
 
 typedef char ants_semantic_cache_state_size_check[(sizeof(struct ants_semantic_cache_state) <=
@@ -181,13 +229,37 @@ static void ensure_projection_initialised(void)
 /* Lifecycle                                                                */
 /* ------------------------------------------------------------------------ */
 
+static void free_all_entries(struct ants_semantic_cache_state *state)
+{
+    for (size_t i = 0; i < state->n_entries; i++) {
+        free(state->entries[i].value);
+        state->entries[i].value = NULL;
+    }
+    state->n_entries = 0;
+}
+
 ants_error_t ants_semantic_cache_init(ants_semantic_cache_t *cache,
                                       const ants_semantic_cache_config_t *config)
 {
     if (cache == NULL || config == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    memset(cache->_opaque, 0, sizeof cache->_opaque);
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+
+    state->entries = (cache_entry_t *)calloc(INITIAL_ENTRY_CAPACITY, sizeof(cache_entry_t));
+    if (state->entries == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    state->cap_entries = INITIAL_ENTRY_CAPACITY;
+    state->n_entries = 0;
+    state->per_shard_max = config->per_shard_max;
+    state->total_max = config->total_max;
+    state->lru_counter = 0;
+    state->magic = ANTS_SEMANTIC_CACHE_STATE_MAGIC;
+    return ANTS_OK;
 }
 
 ants_error_t ants_semantic_cache_destroy(ants_semantic_cache_t *cache)
@@ -195,8 +267,13 @@ ants_error_t ants_semantic_cache_destroy(ants_semantic_cache_t *cache)
     if (cache == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    /* Zero the ctx so a destroyed-then-re-init cycle starts clean.
-     * Safe on a never-initialised ctx (it's all zero already). */
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic == ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        free_all_entries(state);
+        free(state->entries);
+        state->entries = NULL;
+    }
     memset(cache->_opaque, 0, sizeof cache->_opaque);
     return ANTS_OK;
 }
@@ -213,7 +290,60 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
     if (cache == NULL || embedding == NULL || value == NULL || value_len == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    ants_semantic_cache_shard_key_t key = 0;
+    ants_error_t err = ants_semantic_cache_shard_key(embedding, &key);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Geometric growth of the flat entry array. */
+    if (state->n_entries == state->cap_entries) {
+        size_t new_cap = state->cap_entries * 2u;
+        cache_entry_t *grown =
+            (cache_entry_t *)realloc(state->entries, new_cap * sizeof(cache_entry_t));
+        if (grown == NULL) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        /* Zero the new slots so a partial-write failure below leaves
+         * deterministic state. */
+        memset(
+            &grown[state->cap_entries], 0, (new_cap - state->cap_entries) * sizeof(cache_entry_t));
+        state->entries = grown;
+        state->cap_entries = new_cap;
+    }
+
+    cache_entry_t *slot = &state->entries[state->n_entries];
+    uint8_t *copy = (uint8_t *)malloc(value_len);
+    if (copy == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(copy, value, value_len);
+
+    slot->shard_key = key;
+    memcpy(slot->embedding, embedding, ANTS_EMBED_DIM * sizeof(float));
+    slot->value = copy;
+    slot->value_len = value_len;
+    slot->last_access = ++state->lru_counter;
+    state->n_entries++;
+    return ANTS_OK;
+}
+
+/* Cosine similarity for two L2-normalised vectors reduces to a dot
+ * product. Accumulated in double for the 1024-term sum — same
+ * discipline as the LSH dot-product reduction. */
+static double cosine_l2_normalised(const float *a, const float *b)
+{
+    double dot = 0.0;
+    for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
+        dot += (double)a[i] * (double)b[i];
+    }
+    return dot;
 }
 
 ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
@@ -230,8 +360,54 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
     if (out_value != NULL && out_cap == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    (void)similarity_threshold;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    ants_semantic_cache_shard_key_t key = 0;
+    ants_error_t err = ants_semantic_cache_shard_key(embedding, &key);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Linear scan over the entries array, filtered by matching shard
+     * key. The bucket count per shard is small in practice (RFC-0002's
+     * LSH puts only semantically-similar entries together); step 5
+     * will add a hash-table bucket index when the entry count grows. */
+    size_t best_idx = 0;
+    bool best_found = false;
+    double best_sim = -2.0; /* below the [-1, 1] cosine range */
+    for (size_t i = 0; i < state->n_entries; i++) {
+        if (state->entries[i].shard_key != key) {
+            continue;
+        }
+        double sim = cosine_l2_normalised(state->entries[i].embedding, embedding);
+        if (sim > best_sim) {
+            best_sim = sim;
+            best_idx = i;
+            best_found = true;
+        }
+    }
+
+    if (!best_found || best_sim < (double)similarity_threshold) {
+        return ANTS_ERROR_NOT_FOUND;
+    }
+
+    cache_entry_t *hit = &state->entries[best_idx];
+    *out_similarity = (float)best_sim;
+    hit->last_access = ++state->lru_counter;
+
+    if (hit->value_len > out_cap) {
+        *out_len = hit->value_len;
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    if (out_value != NULL) {
+        memcpy(out_value, hit->value, hit->value_len);
+    }
+    *out_len = hit->value_len;
+    return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -276,7 +452,12 @@ size_t ants_semantic_cache_entries(const ants_semantic_cache_t *cache)
     if (cache == NULL) {
         return 0;
     }
-    return 0;
+    const struct ants_semantic_cache_state *state =
+        (const struct ants_semantic_cache_state *)(const void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return 0;
+    }
+    return state->n_entries;
 }
 
 ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache)
@@ -284,5 +465,11 @@ ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache)
     if (cache == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    free_all_entries(state);
+    return ANTS_OK;
 }

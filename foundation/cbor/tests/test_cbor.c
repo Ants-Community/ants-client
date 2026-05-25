@@ -76,11 +76,12 @@ static void check_bytes(const char *what,
 
 static void test_strerror_covers_every_code(void)
 {
-    /* Defined codes are 0..11 inclusive (matching the #define values
+    /* Defined codes are 0..12 inclusive (matching the #define values
      * in ants_common.h: 0..7 = foundation-layer codes, 8..11 = network-
-     * transport codes). Hidden ANTS_ERROR__MAX is no longer public
-     * — see the same header for the ABI-pinning rationale. */
-    for (int i = 0; i <= 11; i++) {
+     * transport codes, 12 = cache/semantic NOT_FOUND). Hidden
+     * ANTS_ERROR__MAX is no longer public — see the same header for
+     * the ABI-pinning rationale. */
+    for (int i = 0; i <= 12; i++) {
         const char *s = ants_strerror((ants_error_t)i);
         CHECK(s != NULL);
         CHECK(strlen(s) > 0);

@@ -115,6 +115,15 @@ typedef int32_t ants_error_t;
  * from MALFORMED (we got bytes we couldn't parse). */
 #define ANTS_ERROR_STREAM_RESET ((ants_error_t)11)
 
+/* A lookup completed but found no entry matching the caller's
+ * constraints (e.g. no cache entry above a similarity threshold,
+ * no DHT peer holding a shard key). Distinct from MALFORMED
+ * (we received something but couldn't parse it) and from
+ * PEER_UNREACHABLE (a transport-layer failure). First introduced
+ * for cache/semantic's get path; reusable by any future component
+ * with a "search succeeded, result absent" outcome. */
+#define ANTS_ERROR_NOT_FOUND ((ants_error_t)12)
+
 /*
  * Convert an ants_error_t to a short human-readable string. The returned
  * pointer is to a static literal — caller must not free it. Returns
