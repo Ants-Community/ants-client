@@ -10,6 +10,7 @@
 
 add_library(ants_semantic_cache STATIC
     src/cache.c
+    src/cache_wire.c
 )
 
 target_include_directories(ants_semantic_cache
