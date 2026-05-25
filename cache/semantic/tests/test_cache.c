@@ -624,6 +624,195 @@ static void test_per_shard_cap_does_not_evict_other_shards(void)
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
+/* -- Cache-entry wire format (step 4) -------------------------------------
+ *
+ * Round-trip + malformed/non-canonical rejection for
+ * ants_semantic_cache_entry_encode / _decode. */
+
+static void fill_test_entry(ants_semantic_cache_entry_t *e,
+                            const float *emb,
+                            const char *response,
+                            const char *resp_model)
+{
+    memset(e, 0, sizeof *e);
+    e->embedding = emb;
+    e->embedding_model = "ants-embed-v1";
+    e->embedding_model_len = strlen("ants-embed-v1");
+    for (uint32_t i = 0; i < ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN; i++) {
+        e->prompt_hash[i] = (uint8_t)(0xA0u + (i & 0x0Fu));
+    }
+    e->response = (const uint8_t *)response;
+    e->response_len = strlen(response);
+    e->response_model = resp_model;
+    e->response_model_len = strlen(resp_model);
+    for (uint32_t i = 0; i < ANTS_SEMANTIC_CACHE_PEER_ID_LEN; i++) {
+        e->producer[i] = (uint8_t)(0xB0u + (i & 0x0Fu));
+    }
+    e->created = 1717000000ull;
+    e->validity_class = ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS;
+    static const uint8_t att[] = {0xC0, 0xDE, 0xCA, 0xFE};
+    e->attestation = att;
+    e->attestation_len = sizeof att;
+    for (uint32_t i = 0; i < ANTS_SEMANTIC_CACHE_SIG_LEN; i++) {
+        e->signature[i] = (uint8_t)(0xD0u + (i & 0x0Fu));
+    }
+}
+
+static void test_entry_wire_round_trip(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7000, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "the response payload", "llama-3.3-70b-instruct");
+
+    /* 8 KB is plenty for this payload (4 KB embedding + < 1 KB metadata
+     * + small response). */
+    uint8_t buf[8192];
+    size_t encoded_len = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, buf, sizeof buf, &encoded_len), ANTS_OK);
+    CHECK(encoded_len > 4096);
+    CHECK(encoded_len < sizeof buf);
+
+    ants_semantic_cache_entry_t out_e;
+    float out_emb[ANTS_EMBED_DIM];
+    CHECK_EQ(ants_semantic_cache_entry_decode(buf, encoded_len, &out_e, out_emb), ANTS_OK);
+
+    /* Compare every field. */
+    for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
+        CHECK(out_emb[i] == emb[i]);
+    }
+    CHECK(out_e.embedding_model_len == strlen("ants-embed-v1"));
+    CHECK(memcmp(out_e.embedding_model, "ants-embed-v1", out_e.embedding_model_len) == 0);
+    CHECK(memcmp(out_e.prompt_hash, in_e.prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN) == 0);
+    CHECK(out_e.response_len == strlen("the response payload"));
+    CHECK(memcmp(out_e.response, "the response payload", out_e.response_len) == 0);
+    CHECK(out_e.response_model_len == strlen("llama-3.3-70b-instruct"));
+    CHECK(memcmp(out_e.response_model, "llama-3.3-70b-instruct", out_e.response_model_len) == 0);
+    CHECK(memcmp(out_e.producer, in_e.producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0);
+    CHECK(out_e.created == 1717000000ull);
+    CHECK(out_e.validity_class == ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS);
+    CHECK(out_e.attestation_len == in_e.attestation_len);
+    CHECK(memcmp(out_e.attestation, in_e.attestation, out_e.attestation_len) == 0);
+    CHECK(memcmp(out_e.signature, in_e.signature, ANTS_SEMANTIC_CACHE_SIG_LEN) == 0);
+}
+
+static void test_entry_wire_empty_attestation(void)
+{
+    /* v0.x allows a zero-length attestation; round-trip must preserve it. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7001, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "r", "rm");
+    in_e.attestation = NULL;
+    in_e.attestation_len = 0;
+
+    uint8_t buf[8192];
+    size_t n = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, buf, sizeof buf, &n), ANTS_OK);
+
+    ants_semantic_cache_entry_t out_e;
+    float out_emb[ANTS_EMBED_DIM];
+    CHECK_EQ(ants_semantic_cache_entry_decode(buf, n, &out_e, out_emb), ANTS_OK);
+    CHECK(out_e.attestation_len == 0);
+}
+
+static void test_entry_wire_buffer_too_small(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7002, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "r", "rm");
+
+    /* 100 bytes can't hold the embedding alone (4096). */
+    uint8_t small[100];
+    size_t n = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, small, sizeof small, &n),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+static void test_entry_wire_null_args(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7003, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "r", "rm");
+
+    uint8_t buf[8192];
+    size_t n = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(NULL, buf, sizeof buf, &n), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, NULL, sizeof buf, &n), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, buf, sizeof buf, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    ants_semantic_cache_entry_t out_e;
+    float out_emb[ANTS_EMBED_DIM];
+    CHECK_EQ(ants_semantic_cache_entry_decode(NULL, 1, &out_e, out_emb), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_entry_decode(buf, 1, NULL, out_emb), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_entry_decode(buf, 1, &out_e, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_entry_wire_decode_truncated(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7004, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "x", "y");
+
+    uint8_t buf[8192];
+    size_t n = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, buf, sizeof buf, &n), ANTS_OK);
+
+    /* Truncate to half — decode must fail. */
+    ants_semantic_cache_entry_t out_e;
+    float out_emb[ANTS_EMBED_DIM];
+    ants_error_t e = ants_semantic_cache_entry_decode(buf, n / 2, &out_e, out_emb);
+    CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_entry_wire_decode_invalid_validity(void)
+{
+    /* Encode with valid validity, then patch the CBOR to set
+     * validity_class = 99. The map order is 1..10; key 8 (validity)
+     * is followed by its uint value. Find the byte and overwrite. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(7005, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "x", "y");
+
+    uint8_t buf[8192];
+    size_t n = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, buf, sizeof buf, &n), ANTS_OK);
+
+    /* The validity byte: search for the sequence [0x08, 0x02] which is
+     * "uint 8 (key) followed by uint 2 (value = MONTHS)". Replace the
+     * second byte with 0x18 0x63 (uint 99 in 1-byte extended form). */
+    size_t patch_off = 0;
+    bool found = false;
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (buf[i] == 0x08 && buf[i + 1] == 0x02) {
+            patch_off = i + 1;
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+    /* CBOR encodes uint 99 as [0x18, 0x63] (2 bytes). Our original
+     * value is 1 byte [0x02]. Re-encoding inline would extend the
+     * map; easier path: overwrite 0x02 with 0x05 (= 5, just past the
+     * 4 max). Decoder rejects 5 with NON_CANONICAL. */
+    buf[patch_off] = 0x05;
+
+    ants_semantic_cache_entry_t out_e;
+    float out_emb[ANTS_EMBED_DIM];
+    CHECK_EQ(ants_semantic_cache_entry_decode(buf, n, &out_e, out_emb), ANTS_ERROR_NON_CANONICAL);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -683,6 +872,12 @@ int main(void)
     test_total_cap_evicts_lru_and_recency_is_bumped_by_get();
     test_per_shard_cap_enforced();
     test_per_shard_cap_does_not_evict_other_shards();
+    test_entry_wire_round_trip();
+    test_entry_wire_empty_attestation();
+    test_entry_wire_buffer_too_small();
+    test_entry_wire_null_args();
+    test_entry_wire_decode_truncated();
+    test_entry_wire_decode_invalid_validity();
     test_clear_removes_entries();
 
     if (failures > 0) {

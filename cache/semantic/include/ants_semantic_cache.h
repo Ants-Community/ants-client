@@ -65,6 +65,133 @@ extern "C" {
  * have to pull in the DHT header just to hold a shard key. */
 typedef uint64_t ants_semantic_cache_shard_key_t;
 
+/* Per RFC-0002 §The cache entry: producer-declared validity class.
+ * Producers who systematically over-declare (e.g. mark ephemeral
+ * content as perennial) get reputation-downweighted by the
+ * verification system. Wire encoding: CBOR uint 0..4. */
+typedef enum {
+    ANTS_SEMANTIC_CACHE_VALIDITY_EPHEMERAL = 0,
+    ANTS_SEMANTIC_CACHE_VALIDITY_WEEKS = 1,
+    ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS = 2,
+    ANTS_SEMANTIC_CACHE_VALIDITY_YEARS = 3,
+    ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL = 4
+} ants_semantic_cache_validity_t;
+
+/* Length of an Ed25519 public key (peer ID) in bytes. */
+#define ANTS_SEMANTIC_CACHE_PEER_ID_LEN 32
+
+/* Length of an Ed25519 signature in bytes. */
+#define ANTS_SEMANTIC_CACHE_SIG_LEN 64
+
+/* Length of a SHA-256 prompt hash in bytes per RFC-0002 §The cache entry. */
+#define ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN 32
+
+/* ------------------------------------------------------------------------ */
+/* Cache-entry wire record (RFC-0002 §The cache entry, RFC-0008 §5)         */
+/*                                                                          */
+/* The producer-signed record that flows over the DHT write protocol.       */
+/* All pointer fields are caller-owned for the duration of an encode call;  */
+/* the encoder copies into the output buffer. After a decode, pointer       */
+/* fields alias into the caller-supplied source buffer (zero-copy) — the    */
+/* source buffer MUST remain valid until the entry is no longer accessed.  */
+/*                                                                          */
+/* The embedding is exchanged as 4096 raw little-endian IEEE-754 bytes,    */
+/* not a CBOR float array — RFC-0008 §canonical-numerics treats the binary */
+/* representation as protocol-defined to avoid CBOR's half/single/double   */
+/* ambiguity. Encoders pack from a float[ANTS_EMBED_DIM]; decoders unpack  */
+/* into a caller-supplied float[ANTS_EMBED_DIM].                            */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    /* Pointer to ANTS_EMBED_DIM L2-normalised float32 values. Caller-
+     * owned. The encoder converts to 4096 LE bytes; the decoder
+     * unpacks into a caller-supplied buffer (see _entry_decode). */
+    const float *embedding;
+
+    /* Embedding model identifier — must be "ants-embed-v1" for v1
+     * conformance per RFC-0008 §5. UTF-8 bytes + length; not
+     * NUL-terminated on the wire. */
+    const char *embedding_model;
+    size_t embedding_model_len;
+
+    /* SHA-256 of the prompt bytes per RFC-0002. The prompt itself
+     * is NOT stored — this is a privacy default; the prompt is
+     * recoverable only by whoever already has it. */
+    uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN];
+
+    /* The cached response payload. Opaque bytes — the protocol
+     * does not interpret it; the response_model identifies the
+     * format. */
+    const uint8_t *response;
+    size_t response_len;
+
+    /* Model that generated the response (e.g. "llama-3.3-70b-instruct"). */
+    const char *response_model;
+    size_t response_model_len;
+
+    /* Ed25519 public key of the attested producer (peer ID). */
+    uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN];
+
+    /* Unix timestamp (seconds) when the entry was minted. */
+    uint64_t created;
+
+    /* Producer-declared validity class. */
+    ants_semantic_cache_validity_t validity_class;
+
+    /* Hardware/TEE attestation bytes per RFC-0003. Opaque to this
+     * layer — the verification engine validates them out-of-band.
+     * May be NULL with len=0 in v0.x; production requires at least
+     * one tier of attestation. */
+    const uint8_t *attestation;
+    size_t attestation_len;
+
+    /* Ed25519 signature over the canonical CBOR encoding of fields
+     * 1..9 (every field above except this one). Verified by the
+     * receiver against the producer pubkey before the entry is
+     * admitted to the local shard. */
+    uint8_t signature[ANTS_SEMANTIC_CACHE_SIG_LEN];
+} ants_semantic_cache_entry_t;
+
+/*
+ * Serialise a cache-entry record into a buffer using canonical CBOR
+ * (RFC-0008 §3 deterministic encoding, integer map keys 1..10).
+ *
+ * Returns:
+ *   ANTS_OK                       — *out_len bytes written to buf;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args, NULL embedding, NULL
+ *                                   response with non-zero len, etc.;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — out_cap insufficient; *out_len set
+ *                                   to required size (probe call:
+ *                                   buf=NULL, out_cap=0).
+ */
+ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t *entry,
+                                              uint8_t *buf,
+                                              size_t out_cap,
+                                              size_t *out_len);
+
+/*
+ * Parse a cache-entry record from canonical CBOR bytes.
+ *
+ * `embedding_out` is a caller-supplied buffer of ANTS_EMBED_DIM
+ * floats; the decoder unpacks the wire's 4096 LE bytes into it and
+ * sets `out_entry->embedding = embedding_out`. Every other pointer
+ * field in *out_entry aliases into `buf`; `buf` MUST remain valid
+ * while *out_entry is in use.
+ *
+ * Returns:
+ *   ANTS_OK             — entry populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args;
+ *   ANTS_ERROR_MALFORMED   — CBOR parse error, missing required key,
+ *                            wrong type, or wrong fixed-length field;
+ *   ANTS_ERROR_NON_CANONICAL — wrong embedding byte length, invalid
+ *                              validity_class value, or non-canonical
+ *                              CBOR ordering.
+ */
+ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
+                                              size_t len,
+                                              ants_semantic_cache_entry_t *out_entry,
+                                              float embedding_out[ANTS_EMBED_DIM]);
+
 /* ------------------------------------------------------------------------ */
 /* Opaque context                                                           */
 /*                                                                          */
