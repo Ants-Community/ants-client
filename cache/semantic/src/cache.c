@@ -507,6 +507,126 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Top-K lookup                                                             */
+/*                                                                          */
+/* Linear scan filtered by shard_key, collect every entry above the         */
+/* threshold into a stack-resident candidate array (capped at               */
+/* TOPK_MAX_CANDIDATES for safety), insertion-sort by similarity desc,      */
+/* then emit min(top_k, cap_matches, n_candidates) matches into the         */
+/* caller buffers. *out_n is always set to min(top_k, n_candidates) —      */
+/* i.e. the size the caller would need to receive every eligible match —   */
+/* so BUFFER_TOO_SMALL can drive a retry with a bigger buffer.              */
+/* ------------------------------------------------------------------------ */
+
+#define TOPK_MAX_CANDIDATES 256u
+
+typedef struct {
+    size_t entry_idx;
+    double similarity;
+} topk_candidate_t;
+
+ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
+                                          const float embedding[ANTS_EMBED_DIM],
+                                          float similarity_threshold,
+                                          uint32_t top_k,
+                                          ants_semantic_cache_lookup_match_t *out_matches,
+                                          float *out_embeddings,
+                                          size_t cap_matches,
+                                          size_t *out_n)
+{
+    if (cache == NULL || embedding == NULL || out_n == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (cap_matches > 0 && (out_matches == NULL || out_embeddings == NULL)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_n = 0;
+
+    ants_semantic_cache_shard_key_t key = 0;
+    ants_error_t err = ants_semantic_cache_shard_key(embedding, &key);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Collect eligible candidates. */
+    topk_candidate_t cands[TOPK_MAX_CANDIDATES];
+    size_t n_cands = 0;
+    for (size_t i = 0; i < state->n_entries; i++) {
+        if (state->entries[i].shard_key != key) {
+            continue;
+        }
+        double sim = cosine_l2_normalised(state->entries[i].embedding, embedding);
+        if (sim < (double)similarity_threshold) {
+            continue;
+        }
+        if (n_cands >= TOPK_MAX_CANDIDATES) {
+            /* In practice this overflow is unreachable for any plausible
+             * shard size; if a future regime makes it reachable we'll
+             * promote cands[] to a heap allocation. */
+            break;
+        }
+        cands[n_cands].entry_idx = i;
+        cands[n_cands].similarity = sim;
+        n_cands++;
+    }
+
+    if (n_cands == 0) {
+        return ANTS_ERROR_NOT_FOUND;
+    }
+
+    /* Insertion-sort desc by similarity. n_cands is bounded by
+     * TOPK_MAX_CANDIDATES so O(n²) is fine. */
+    for (size_t i = 1; i < n_cands; i++) {
+        topk_candidate_t pivot = cands[i];
+        size_t j = i;
+        while (j > 0 && cands[j - 1].similarity < pivot.similarity) {
+            cands[j] = cands[j - 1];
+            j--;
+        }
+        cands[j] = pivot;
+    }
+
+    /* Effective output size: cap by top_k (if non-zero) and by n_cands. */
+    size_t effective_n = n_cands;
+    if (top_k > 0 && (size_t)top_k < effective_n) {
+        effective_n = (size_t)top_k;
+    }
+    *out_n = effective_n;
+
+    /* Write up to cap_matches into the caller buffers. */
+    size_t to_emit = (cap_matches < effective_n) ? cap_matches : effective_n;
+    for (size_t i = 0; i < to_emit; i++) {
+        size_t e_idx = cands[i].entry_idx;
+        cache_entry_t *src = &state->entries[e_idx];
+
+        /* Reset the match's entry view; we populate only the fields
+         * the local store actually knows about (embedding + response). */
+        memset(&out_matches[i].entry, 0, sizeof out_matches[i].entry);
+
+        float *emb_slot = &out_embeddings[i * (size_t)ANTS_EMBED_DIM];
+        memcpy(emb_slot, src->embedding, (size_t)ANTS_EMBED_DIM * sizeof(float));
+        out_matches[i].entry.embedding = emb_slot;
+
+        out_matches[i].entry.response = src->value;
+        out_matches[i].entry.response_len = src->value_len;
+        out_matches[i].similarity = (float)cands[i].similarity;
+
+        /* Bump LRU on every hit returned. */
+        src->last_access = ++state->lru_counter;
+    }
+
+    if (cap_matches < effective_n) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* LSH shard key (RFC-0002 §DHT routing)                                    */
 /* ------------------------------------------------------------------------ */
 

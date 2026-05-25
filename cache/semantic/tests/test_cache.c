@@ -1054,6 +1054,183 @@ static void test_lookup_response_decode_truncated(void)
     CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
 }
 
+/* -- Top-K lookup (step 7a) ----------------------------------------------- */
+
+static void test_get_topk_null_args(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(11000, emb);
+    ants_semantic_cache_lookup_match_t matches[2];
+    float emb_buf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+
+    CHECK_EQ(ants_semantic_cache_get_topk(NULL, emb, 0.9f, 5, matches, emb_buf, 2, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, NULL, 0.9f, 5, matches, emb_buf, 2, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, matches, emb_buf, 2, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    /* cap > 0 with NULL output buffers rejects. */
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, NULL, emb_buf, 2, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, matches, NULL, 2, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_rejects_uninitialised(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    float emb[ANTS_EMBED_DIM] = {0};
+    ants_semantic_cache_lookup_match_t matches[1];
+    float emb_buf[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_get_topk_returns_not_found_on_empty(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(11001, emb);
+    ants_semantic_cache_lookup_match_t matches[1];
+    float emb_buf[ANTS_EMBED_DIM];
+    size_t out_n = 99;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n),
+             ANTS_ERROR_NOT_FOUND);
+    CHECK(out_n == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_returns_sorted_desc(void)
+{
+    /* Two embeddings with a tiny 0.1 % perturbation: same shard with
+     * very high probability, distinct similarities when queried with
+     * `base`. The LSH cell boundary is still a sharp edge so we accept
+     * both outcomes (2 matches with sort verified; 1 match if `near`
+     * crossed a hyperplane). */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    float near[ANTS_EMBED_DIM];
+    make_random_embedding(11100, base);
+    make_near_embedding(base, 0xAA, 0.001f, near);
+
+    CHECK_EQ(ants_semantic_cache_put(&c, base, (const uint8_t *)"BASE", 4), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_put(&c, near, (const uint8_t *)"NEAR", 4), ANTS_OK);
+
+    /* Query with base: self-sim 1.0; sim(base, near) < 1.0. */
+    ants_semantic_cache_lookup_match_t matches[2];
+    float emb_buf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, base, 0.5f, 2, matches, emb_buf, 2, &out_n), ANTS_OK);
+
+    /* First match is always BASE — whether near lands in the same
+     * LSH cell or not. */
+    CHECK(matches[0].entry.response_len == 4);
+    CHECK(memcmp(matches[0].entry.response, "BASE", 4) == 0);
+    CHECK((double)matches[0].similarity > 0.99);
+
+    if (out_n == 2) {
+        /* Same shard: sort verifies BASE before NEAR by sim. */
+        CHECK(matches[0].similarity > matches[1].similarity);
+        CHECK(matches[1].entry.response_len == 4);
+        CHECK(memcmp(matches[1].entry.response, "NEAR", 4) == 0);
+    } else {
+        /* near hashed to a different shard cell; only BASE shows. */
+        CHECK(out_n == 1);
+    }
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_respects_top_k_cap(void)
+{
+    /* 5 entries with the same embedding (and so the same similarity),
+     * top_k=2 → only 2 matches written; *out_n=2 (since effective_n is
+     * min(top_k, n_cands) = 2). */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(11200, emb);
+    for (uint32_t i = 0; i < 5; i++) {
+        uint8_t v = (uint8_t)('a' + i);
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+
+    ants_semantic_cache_lookup_match_t matches[5];
+    float emb_buf[5 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, matches, emb_buf, 5, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_top_k_zero_unbounded(void)
+{
+    /* top_k=0 means unbounded; with cap_matches=3 we get all 3 of the
+     * 3 stored matches. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(11300, emb);
+    for (uint32_t i = 0; i < 3; i++) {
+        uint8_t v = (uint8_t)('x' + i);
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+
+    ants_semantic_cache_lookup_match_t matches[3];
+    float emb_buf[3 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 0, matches, emb_buf, 3, &out_n), ANTS_OK);
+    CHECK(out_n == 3);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_buffer_too_small(void)
+{
+    /* 4 eligible matches, cap_matches=2, top_k=4 → BUFFER_TOO_SMALL
+     * with *out_n=4 (caller's signal that they need a bigger buffer);
+     * first 2 slots written. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(11400, emb);
+    for (uint32_t i = 0; i < 4; i++) {
+        uint8_t v = (uint8_t)('0' + i);
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+
+    ants_semantic_cache_lookup_match_t matches[2];
+    float emb_buf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 4, matches, emb_buf, 2, &out_n),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 4);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -1129,6 +1306,13 @@ int main(void)
     test_lookup_response_decode_partial_cap();
     test_lookup_response_null_args();
     test_lookup_response_decode_truncated();
+    test_get_topk_null_args();
+    test_get_topk_rejects_uninitialised();
+    test_get_topk_returns_not_found_on_empty();
+    test_get_topk_returns_sorted_desc();
+    test_get_topk_respects_top_k_cap();
+    test_get_topk_top_k_zero_unbounded();
+    test_get_topk_buffer_too_small();
     test_clear_removes_entries();
 
     if (failures > 0) {

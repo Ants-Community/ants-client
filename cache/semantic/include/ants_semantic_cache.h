@@ -441,6 +441,46 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
                                      size_t *out_len,
                                      float *out_similarity);
 
+/*
+ * Look up the top-K matching entries in the local shard above
+ * similarity_threshold, sorted descending by cosine similarity.
+ *
+ * top_k:           0 = unbounded (caller buffer is the only cap)
+ * out_matches:     caller buffer for at most cap_matches entries
+ * out_embeddings:  contiguous buffer of cap_matches × ANTS_EMBED_DIM
+ *                  floats; each match.entry.embedding points into
+ *                  out_embeddings[i * ANTS_EMBED_DIM]. The match
+ *                  views' response field aliases the cache's internal
+ *                  heap copy — valid until the next mutation of the
+ *                  cache (put / clear / destroy).
+ * *out_n:          set to the number of matches written
+ *
+ * Limitation in this step: the local store currently persists only
+ * (embedding, value-as-response); the other entry fields
+ * (embedding_model, prompt_hash, producer, response_model, created,
+ * validity_class, attestation, signature) come out zero/empty in
+ * the match views. Full-record storage + population lands when the
+ * inbound write handler lands (step 7a.2).
+ *
+ * Returns:
+ *   ANTS_OK                     — *out_n matches written;
+ *   ANTS_ERROR_NOT_FOUND        — no entries in the local shard
+ *                                 above threshold;
+ *   ANTS_ERROR_INVALID_ARG      — NULL args; cap_matches > 0 with
+ *                                 NULL out_matches or out_embeddings;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — caller buffers held fewer entries
+ *                                 than min(top_k, n_eligible);
+ *                                 *out_n holds the cap actually used.
+ */
+ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
+                                          const float embedding[ANTS_EMBED_DIM],
+                                          float similarity_threshold,
+                                          uint32_t top_k,
+                                          ants_semantic_cache_lookup_match_t *out_matches,
+                                          float *out_embeddings,
+                                          size_t cap_matches,
+                                          size_t *out_n);
+
 /* ------------------------------------------------------------------------ */
 /* LSH shard-key derivation (RFC-0002 §DHT routing)                         */
 /* ------------------------------------------------------------------------ */
