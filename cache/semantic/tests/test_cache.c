@@ -86,13 +86,15 @@ static void test_init_null_args(void)
     CHECK_EQ(ants_semantic_cache_init(&c, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_init_scaffold_returns_not_implemented(void)
+static void test_init_succeeds(void)
 {
-    /* At scaffold, init with valid args still bails NOT_IMPLEMENTED.
-     * Subsequent steps will flip this to ANTS_OK. */
+    /* init with zeroed config (unbounded caps) must succeed and
+     * leave the ctx ready to put/get. */
     ants_semantic_cache_t c = {{0}};
     ants_semantic_cache_config_t cfg = {0};
-    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
 static void test_destroy_safe_on_zero_ctx(void)
@@ -116,12 +118,14 @@ static void test_put_null_args(void)
     CHECK_EQ(ants_semantic_cache_put(&c, emb, value, 0), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_put_scaffold_returns_not_implemented(void)
+static void test_put_rejects_uninitialised(void)
 {
+    /* put on a zeroed (never-init) ctx is an INVALID_ARG, not a
+     * crash. The magic field must be valid before any heap work. */
     ants_semantic_cache_t c = {{0}};
     float emb[ANTS_EMBED_DIM] = {0};
     const uint8_t value[] = {'v', 'a', 'l'};
-    CHECK_EQ(ants_semantic_cache_put(&c, emb, value, 3), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, value, 3), ANTS_ERROR_INVALID_ARG);
 }
 
 static void test_get_null_args(void)
@@ -145,20 +149,16 @@ static void test_get_null_args(void)
              ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_get_scaffold_returns_not_implemented(void)
+static void test_get_rejects_uninitialised(void)
 {
+    /* get on a zeroed ctx is an INVALID_ARG (magic absent). */
     ants_semantic_cache_t c = {{0}};
     float emb[ANTS_EMBED_DIM] = {0};
     uint8_t out[16];
     size_t out_len = 0;
     float sim = 0;
     CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim),
-             ANTS_ERROR_NOT_IMPLEMENTED);
-
-    /* out_value == NULL is allowed (caller may probe required size). */
-    out_len = 0;
-    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, NULL, 0, &out_len, &sim),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+             ANTS_ERROR_INVALID_ARG);
 }
 
 static void test_shard_key_null_args(void)
@@ -313,11 +313,209 @@ static void test_entries_safe_on_zero_or_null(void)
     CHECK(ants_semantic_cache_entries(&c) == 0);
 }
 
-static void test_clear_null_and_scaffold(void)
+static void test_clear_null_safety(void)
 {
+    /* clear on NULL → INVALID_ARG; on never-init zeroed ctx → also
+     * INVALID_ARG (magic absent — clear is not safe-no-op like destroy
+     * because we can't tell apart "valid empty" from "uninitialised"
+     * without the magic check). */
     ants_semantic_cache_t c = {{0}};
     CHECK_EQ(ants_semantic_cache_clear(NULL), ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_clear(&c), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_semantic_cache_clear(&c), ANTS_ERROR_INVALID_ARG);
+}
+
+/* -- Storage + lookup behavioural tests -----------------------------------
+ *
+ * init → put → get round-trips with the LSH+cosine pipeline. The
+ * fixture helpers (make_random_embedding / make_near_embedding / etc.)
+ * defined above are reused.
+ */
+
+static void test_put_then_get_round_trip(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(200, emb);
+    const uint8_t val[] = "the cached response bytes";
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, val, sizeof val - 1), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 1);
+
+    uint8_t out[64];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == sizeof val - 1);
+    CHECK(memcmp(out, val, sizeof val - 1) == 0);
+    /* Self-similarity is 1.0 (L2-normalised embedding · itself = 1). */
+    CHECK(fabs((double)sim - 1.0) < 1e-5);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_returns_not_found_on_empty(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(201, emb);
+
+    uint8_t out[16];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim),
+             ANTS_ERROR_NOT_FOUND);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_below_threshold_returns_not_found(void)
+{
+    /* Insert one entry, query with the SAME embedding (so the shard
+     * key matches deterministically, sidestepping the LSH-cell
+     * boundary that a near-but-not-identical query could land across),
+     * but with an impossibly-high threshold so the lookup misses on
+     * the similarity check rather than the shard-key check. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(300, emb);
+    const uint8_t val[] = "v";
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, val, sizeof val - 1), ANTS_OK);
+
+    uint8_t out[16];
+    size_t out_len = 0;
+    float sim = 0;
+    /* Self-similarity is 1.0; threshold 1.01 cannot be met. */
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 1.01f, out, sizeof out, &out_len, &sim),
+             ANTS_ERROR_NOT_FOUND);
+
+    /* And with a sane threshold the same query DOES hit. */
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(fabs((double)sim - 1.0) < 1e-5);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_buffer_too_small_reports_required(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(400, emb);
+    const uint8_t val[] = "a longer-than-eight-byte payload";
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, val, sizeof val - 1), ANTS_OK);
+
+    uint8_t small_out[8];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, small_out, sizeof small_out, &out_len, &sim),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_len == sizeof val - 1);
+
+    /* Probe with out_value=NULL (out_cap=0) to discover required size. */
+    out_len = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, NULL, 0, &out_len, &sim),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_len == sizeof val - 1);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_ranks_by_similarity(void)
+{
+    /* Two entries with the same shard key but different similarity
+     * to the query embedding: the closer one wins. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    float near[ANTS_EMBED_DIM];
+    make_random_embedding(500, base);
+    /* `near` shares the same shard key as `base` for a 2% perturbation
+     * (locality test above already verifies this with high probability). */
+    make_near_embedding(base, 777, 0.02f, near);
+
+    const uint8_t val_base[] = "BASE";
+    const uint8_t val_near[] = "NEAR";
+    CHECK_EQ(ants_semantic_cache_put(&c, base, val_base, sizeof val_base - 1), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_put(&c, near, val_near, sizeof val_near - 1), ANTS_OK);
+
+    /* Query with `base` itself: cosine with base = 1.0, with near ≈ 0.9998.
+     * Highest-sim must be BASE. */
+    uint8_t out[16];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, base, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 4);
+    CHECK(memcmp(out, "BASE", 4) == 0);
+
+    /* Query with `near`: highest-sim must be NEAR. */
+    CHECK_EQ(ants_semantic_cache_get(&c, near, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 4);
+    CHECK(memcmp(out, "NEAR", 4) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_entries_grows_with_puts(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+
+    /* Put 30 random embeddings — forces the geometric-grow path
+     * (initial cap = 16). */
+    for (uint32_t i = 0; i < 30; i++) {
+        float emb[ANTS_EMBED_DIM];
+        make_random_embedding(1000 + i, emb);
+        const uint8_t v = (uint8_t)('a' + (i % 26));
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+    CHECK(ants_semantic_cache_entries(&c) == 30);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_clear_removes_entries(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(600, emb);
+    const uint8_t v[] = "stuff";
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, v, sizeof v - 1), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 1);
+
+    CHECK_EQ(ants_semantic_cache_clear(&c), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+
+    /* After clear, get returns NOT_FOUND. */
+    uint8_t out[16];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim),
+             ANTS_ERROR_NOT_FOUND);
+
+    /* The ctx is still usable after clear: another put + get works. */
+    const uint8_t w[] = "again";
+    CHECK_EQ(ants_semantic_cache_put(&c, emb, w, sizeof w - 1), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(memcmp(out, "again", 5) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
 int main(void)
@@ -325,19 +523,26 @@ int main(void)
     test_protocol_constants();
     test_opaque_ctx_layout();
     test_init_null_args();
-    test_init_scaffold_returns_not_implemented();
+    test_init_succeeds();
     test_destroy_safe_on_zero_ctx();
     test_put_null_args();
-    test_put_scaffold_returns_not_implemented();
+    test_put_rejects_uninitialised();
     test_get_null_args();
-    test_get_scaffold_returns_not_implemented();
+    test_get_rejects_uninitialised();
     test_shard_key_null_args();
     test_shard_key_runs_and_is_nontrivial();
     test_shard_key_idempotent();
     test_shard_key_distinct_for_distinct_inputs();
     test_shard_key_locality();
     test_entries_safe_on_zero_or_null();
-    test_clear_null_and_scaffold();
+    test_clear_null_safety();
+    test_put_then_get_round_trip();
+    test_get_returns_not_found_on_empty();
+    test_get_below_threshold_returns_not_found();
+    test_get_buffer_too_small_reports_required();
+    test_get_ranks_by_similarity();
+    test_entries_grows_with_puts();
+    test_clear_removes_entries();
 
     if (failures > 0) {
         fprintf(stderr, "test_cache: %d failure(s)\n", failures);
