@@ -99,14 +99,10 @@ static float le_bytes_to_float(const uint8_t in[4])
     return out;
 }
 
-ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t *entry,
-                                              uint8_t *buf,
-                                              size_t out_cap,
-                                              size_t *out_len)
+/* Validate an entry's pointers/lengths/range. Returns INVALID_ARG on
+ * any failure so the encoder can bail before touching the buffer. */
+static ants_error_t entry_validate(const ants_semantic_cache_entry_t *entry)
 {
-    if (entry == NULL || buf == NULL || out_len == NULL) {
-        return ANTS_ERROR_INVALID_ARG;
-    }
     if (entry->embedding == NULL || entry->embedding_model == NULL ||
         entry->response_model == NULL) {
         return ANTS_ERROR_INVALID_ARG;
@@ -120,120 +116,108 @@ ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t 
     if ((unsigned)entry->validity_class > 4u) {
         return ANTS_ERROR_INVALID_ARG;
     }
+    return ANTS_OK;
+}
 
-    /* 4 KB stack buffer for the packed embedding. The caller's
-     * float[1024] stays untouched. */
+/* Emit one cache-entry record as a nested CBOR map(10) onto an already-
+ * open encoder. Used both by the public entry_encode (top-level map)
+ * and by the lookup response encoder (nested per-match map). Caller
+ * has already validated `entry`. */
+static ants_error_t entry_emit(ants_cbor_enc_t *enc, const ants_semantic_cache_entry_t *entry)
+{
     uint8_t emb_le[EMBEDDING_WIRE_LEN];
     floats_to_le_bytes(entry->embedding, emb_le);
 
-    ants_cbor_enc_t enc;
-    ants_error_t err = ants_cbor_enc_init(&enc, buf, out_cap);
-    if (err != ANTS_OK) {
-        return err;
-    }
-
-    err = ants_cbor_enc_map(&enc, 10);
+    ants_error_t err = ants_cbor_enc_map(enc, 10);
     if (err != ANTS_OK) {
         return err;
     }
 
 #define EMIT_KEY(k)                                                                                \
     do {                                                                                           \
-        err = ants_cbor_enc_uint(&enc, (k));                                                       \
+        err = ants_cbor_enc_uint(enc, (k));                                                        \
         if (err != ANTS_OK) {                                                                      \
             return err;                                                                            \
         }                                                                                          \
     } while (0)
 
     EMIT_KEY(KEY_EMBEDDING);
-    err = ants_cbor_enc_bytes(&enc, emb_le, EMBEDDING_WIRE_LEN);
+    err = ants_cbor_enc_bytes(enc, emb_le, EMBEDDING_WIRE_LEN);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_EMBEDDING_MODEL);
-    err = ants_cbor_enc_text(&enc, entry->embedding_model, entry->embedding_model_len);
+    err = ants_cbor_enc_text(enc, entry->embedding_model, entry->embedding_model_len);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_PROMPT_HASH);
-    err = ants_cbor_enc_bytes(&enc, entry->prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN);
+    err = ants_cbor_enc_bytes(enc, entry->prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_RESPONSE);
-    err = ants_cbor_enc_bytes(&enc, entry->response, entry->response_len);
+    err = ants_cbor_enc_bytes(enc, entry->response, entry->response_len);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_RESPONSE_MODEL);
-    err = ants_cbor_enc_text(&enc, entry->response_model, entry->response_model_len);
+    err = ants_cbor_enc_text(enc, entry->response_model, entry->response_model_len);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_PRODUCER);
-    err = ants_cbor_enc_bytes(&enc, entry->producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN);
+    err = ants_cbor_enc_bytes(enc, entry->producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_CREATED);
-    err = ants_cbor_enc_uint(&enc, entry->created);
+    err = ants_cbor_enc_uint(enc, entry->created);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_VALIDITY_CLASS);
-    err = ants_cbor_enc_uint(&enc, (uint64_t)entry->validity_class);
+    err = ants_cbor_enc_uint(enc, (uint64_t)entry->validity_class);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_ATTESTATION);
-    err = ants_cbor_enc_bytes(&enc, entry->attestation, entry->attestation_len);
+    err = ants_cbor_enc_bytes(enc, entry->attestation, entry->attestation_len);
     if (err != ANTS_OK) {
         return err;
     }
 
     EMIT_KEY(KEY_SIGNATURE);
-    err = ants_cbor_enc_bytes(&enc, entry->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
+    err = ants_cbor_enc_bytes(enc, entry->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
     if (err != ANTS_OK) {
         return err;
     }
 
 #undef EMIT_KEY
-
-    err = ants_cbor_enc_finalise(&enc);
-    if (err != ANTS_OK) {
-        return err;
-    }
-
-    *out_len = ants_cbor_enc_size(&enc);
     return ANTS_OK;
 }
 
-ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
-                                              size_t len,
-                                              ants_semantic_cache_entry_t *out_entry,
-                                              float embedding_out[ANTS_EMBED_DIM])
+/* Consume one cache-entry record (CBOR map(10) plus its 10 KVs) from an
+ * already-open decoder into out_entry. Variable-length text/bytes
+ * pointers alias into the decoder's source buffer; the embedding is
+ * unpacked into the caller-supplied embedding_out. The caller is
+ * responsible for any post-decode EOF / trailing-bytes checks. */
+static ants_error_t entry_consume(ants_cbor_dec_t *dec,
+                                  ants_semantic_cache_entry_t *out_entry,
+                                  float embedding_out[ANTS_EMBED_DIM])
 {
-    if (buf == NULL || out_entry == NULL || embedding_out == NULL) {
-        return ANTS_ERROR_INVALID_ARG;
-    }
     memset(out_entry, 0, sizeof *out_entry);
 
-    ants_cbor_dec_t dec;
-    ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
-    if (err != ANTS_OK) {
-        return err;
-    }
-
     size_t n_kv = 0;
-    err = ants_cbor_dec_map(&dec, &n_kv);
+    ants_error_t err = ants_cbor_dec_map(dec, &n_kv);
     if (err != ANTS_OK) {
         return err;
     }
@@ -241,11 +225,10 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
         return ANTS_ERROR_MALFORMED;
     }
 
-    /* Canonical decode: keys MUST appear in ascending order 1..10.
-     * Any deviation is a non-canonical encoding. */
+    /* Canonical decode: keys MUST appear in ascending order 1..10. */
     for (size_t i = 0; i < 10; i++) {
         uint64_t key = 0;
-        err = ants_cbor_dec_uint(&dec, &key);
+        err = ants_cbor_dec_uint(dec, &key);
         if (err != ANTS_OK) {
             return err;
         }
@@ -261,7 +244,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
 
         switch (key) {
         case KEY_EMBEDDING:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -273,7 +256,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_EMBEDDING_MODEL:
-            err = ants_cbor_dec_text(&dec, &text_ptr, &text_len);
+            err = ants_cbor_dec_text(dec, &text_ptr, &text_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -282,7 +265,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_PROMPT_HASH:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -293,7 +276,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_RESPONSE:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -302,7 +285,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_RESPONSE_MODEL:
-            err = ants_cbor_dec_text(&dec, &text_ptr, &text_len);
+            err = ants_cbor_dec_text(dec, &text_ptr, &text_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -311,7 +294,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_PRODUCER:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -322,7 +305,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_CREATED:
-            err = ants_cbor_dec_uint(&dec, &uval);
+            err = ants_cbor_dec_uint(dec, &uval);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -330,7 +313,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_VALIDITY_CLASS:
-            err = ants_cbor_dec_uint(&dec, &uval);
+            err = ants_cbor_dec_uint(dec, &uval);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -341,7 +324,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_ATTESTATION:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -350,7 +333,7 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             break;
 
         case KEY_SIGNATURE:
-            err = ants_cbor_dec_bytes(&dec, &bytes_ptr, &bytes_len);
+            err = ants_cbor_dec_bytes(dec, &bytes_ptr, &bytes_len);
             if (err != ANTS_OK) {
                 return err;
             }
@@ -365,7 +348,57 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
             return ANTS_ERROR_MALFORMED;
         }
     }
+    return ANTS_OK;
+}
 
+ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t *entry,
+                                              uint8_t *buf,
+                                              size_t out_cap,
+                                              size_t *out_len)
+{
+    if (entry == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    ants_error_t err = entry_validate(entry);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    ants_cbor_enc_t enc;
+    err = ants_cbor_enc_init(&enc, buf, out_cap);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = entry_emit(&enc, entry);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_finalise(&enc);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
+                                              size_t len,
+                                              ants_semantic_cache_entry_t *out_entry,
+                                              float embedding_out[ANTS_EMBED_DIM])
+{
+    if (buf == NULL || out_entry == NULL || embedding_out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    ants_cbor_dec_t dec;
+    ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = entry_consume(&dec, out_entry, embedding_out);
+    if (err != ANTS_OK) {
+        return err;
+    }
     if (!ants_cbor_dec_eof(&dec)) {
         return ANTS_ERROR_MALFORMED;
     }
@@ -527,6 +560,200 @@ ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
         default:
             return ANTS_ERROR_MALFORMED;
         }
+    }
+
+    if (!ants_cbor_dec_eof(&dec)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Lookup response wire format (RFC-0002 §The lookup protocol)              */
+/*                                                                          */
+/* Top-level: CBOR map { 1: matches[] }                                      */
+/* Each match: CBOR map { 1: similarity_bytes(4), 2: <entry-map(10)> }      */
+/* ------------------------------------------------------------------------ */
+
+#define LRESP_KEY_MATCHES 1u
+#define LMATCH_KEY_SIM    1u
+#define LMATCH_KEY_ENTRY  2u
+
+ants_error_t
+ants_semantic_cache_lookup_response_encode(const ants_semantic_cache_lookup_match_t *matches,
+                                           size_t n_matches,
+                                           uint8_t *buf,
+                                           size_t out_cap,
+                                           size_t *out_len)
+{
+    if (buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_matches > 0 && matches == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Validate every entry up front so the encoder doesn't get half-
+     * way through emitting before failing. */
+    for (size_t i = 0; i < n_matches; i++) {
+        ants_error_t err = entry_validate(&matches[i].entry);
+        if (err != ANTS_OK) {
+            return err;
+        }
+    }
+
+    ants_cbor_enc_t enc;
+    ants_error_t err = ants_cbor_enc_init(&enc, buf, out_cap);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    err = ants_cbor_enc_map(&enc, 1);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_uint(&enc, LRESP_KEY_MATCHES);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_array(&enc, n_matches);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    for (size_t i = 0; i < n_matches; i++) {
+        uint8_t sim_bytes[4];
+        float_to_le_bytes(matches[i].similarity, sim_bytes);
+
+        err = ants_cbor_enc_map(&enc, 2);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        err = ants_cbor_enc_uint(&enc, LMATCH_KEY_SIM);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        err = ants_cbor_enc_bytes(&enc, sim_bytes, 4);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        err = ants_cbor_enc_uint(&enc, LMATCH_KEY_ENTRY);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        err = entry_emit(&enc, &matches[i].entry);
+        if (err != ANTS_OK) {
+            return err;
+        }
+    }
+
+    err = ants_cbor_enc_finalise(&enc);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_semantic_cache_lookup_response_decode(const uint8_t *buf,
+                                           size_t len,
+                                           ants_semantic_cache_lookup_match_t *out_matches,
+                                           float *out_embeddings,
+                                           size_t cap_matches,
+                                           size_t *out_n)
+{
+    if (buf == NULL || out_n == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (cap_matches > 0 && (out_matches == NULL || out_embeddings == NULL)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_n = 0;
+
+    ants_cbor_dec_t dec;
+    ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    size_t top_kv = 0;
+    err = ants_cbor_dec_map(&dec, &top_kv);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (top_kv != 1) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint64_t top_key = 0;
+    err = ants_cbor_dec_uint(&dec, &top_key);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (top_key != LRESP_KEY_MATCHES) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+
+    size_t n_matches = 0;
+    err = ants_cbor_dec_array(&dec, &n_matches);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    *out_n = n_matches;
+
+    /* Decode up to cap_matches into the caller's buffers. The remaining
+     * wire bytes are not consumed when cap is short; skip the trailing-
+     * EOF check in that case and return BUFFER_TOO_SMALL. */
+    size_t to_decode = (n_matches < cap_matches) ? n_matches : cap_matches;
+
+    for (size_t i = 0; i < to_decode; i++) {
+        size_t mkv = 0;
+        err = ants_cbor_dec_map(&dec, &mkv);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        if (mkv != 2) {
+            return ANTS_ERROR_MALFORMED;
+        }
+
+        /* match key 1: similarity bytes(4) */
+        uint64_t mk = 0;
+        err = ants_cbor_dec_uint(&dec, &mk);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        if (mk != LMATCH_KEY_SIM) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+        const uint8_t *sim_bytes = NULL;
+        size_t sim_len = 0;
+        err = ants_cbor_dec_bytes(&dec, &sim_bytes, &sim_len);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        if (sim_len != 4) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+        out_matches[i].similarity = le_bytes_to_float(sim_bytes);
+
+        /* match key 2: entry (nested map(10)) */
+        err = ants_cbor_dec_uint(&dec, &mk);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        if (mk != LMATCH_KEY_ENTRY) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+
+        float *emb_slot = &out_embeddings[i * (size_t)ANTS_EMBED_DIM];
+        err = entry_consume(&dec, &out_matches[i].entry, emb_slot);
+        if (err != ANTS_OK) {
+            return err;
+        }
+    }
+
+    if (cap_matches < n_matches) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
 
     if (!ants_cbor_dec_eof(&dec)) {

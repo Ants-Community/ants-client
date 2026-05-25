@@ -255,6 +255,83 @@ ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
                                                        uint32_t *out_top_k);
 
 /* ------------------------------------------------------------------------ */
+/* Lookup response wire format (RFC-0002 §The lookup protocol)              */
+/*                                                                          */
+/* The receiving peer searches its local shard for entries with cosine     */
+/* similarity ≥ threshold and returns up to top_k matches in this format.  */
+/*                                                                          */
+/* Wire format (CBOR map with one integer key):                            */
+/*   1 : matches    array of N match objects                               */
+/*                                                                          */
+/* Each match object is a CBOR map with two ascending integer keys:        */
+/*   1 : similarity   bytes(4)        raw IEEE-754 LE float                */
+/*   2 : entry        map(10)         nested cache-entry record (step 4   */
+/*                                     wire format, inlined here)          */
+/* ------------------------------------------------------------------------ */
+
+/* A single (similarity, entry) pair. For encode: caller populates both
+ * fields (pointers in `entry` reference caller-owned data). For decode:
+ * decoder fills both; pointer fields in `entry` alias into the source
+ * buffer (zero-copy), the embedding lives in the caller-supplied
+ * embedding-buffer slice for this match. */
+typedef struct {
+    float similarity;
+    ants_semantic_cache_entry_t entry;
+} ants_semantic_cache_lookup_match_t;
+
+/*
+ * Serialise a list of matches into a buffer using canonical CBOR.
+ *
+ * matches:     array of n_matches entries (caller fills entry pointers)
+ * n_matches:   may be 0 (empty result is a valid response)
+ *
+ * Returns:
+ *   ANTS_OK                       — *out_len bytes written;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args, NULL entry pointer in any
+ *                                   match, or invalid entry fields
+ *                                   (NULL pointers, out-of-range
+ *                                   validity_class, etc.);
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — out_cap < required.
+ */
+ants_error_t
+ants_semantic_cache_lookup_response_encode(const ants_semantic_cache_lookup_match_t *matches,
+                                           size_t n_matches,
+                                           uint8_t *buf,
+                                           size_t out_cap,
+                                           size_t *out_len);
+
+/*
+ * Parse a lookup response from canonical CBOR bytes.
+ *
+ * out_matches:    array of cap_matches match slots filled by the decoder
+ * out_embeddings: contiguous buffer of cap_matches × ANTS_EMBED_DIM
+ *                 floats; out_matches[i].entry.embedding points into
+ *                 out_embeddings[i * ANTS_EMBED_DIM]
+ * cap_matches:    capacity of the two caller buffers
+ * *out_n:         set to the wire's actual match count
+ *
+ * Returns:
+ *   ANTS_OK                       — full payload decoded; *out_n
+ *                                   matches written;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args (or NULL out_matches /
+ *                                   out_embeddings with cap_matches > 0);
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — *out_n > cap_matches; out_matches
+ *                                   holds the first cap_matches matches,
+ *                                   caller may re-call with a bigger
+ *                                   buffer;
+ *   ANTS_ERROR_MALFORMED          — CBOR parse error or trailing bytes;
+ *   ANTS_ERROR_NON_CANONICAL      — wrong key order, wrong fixed-length
+ *                                   field, etc.
+ */
+ants_error_t
+ants_semantic_cache_lookup_response_decode(const uint8_t *buf,
+                                           size_t len,
+                                           ants_semantic_cache_lookup_match_t *out_matches,
+                                           float *out_embeddings,
+                                           size_t cap_matches,
+                                           size_t *out_n);
+
+/* ------------------------------------------------------------------------ */
 /* Opaque context                                                           */
 /*                                                                          */
 /* The state struct holds heap pointers (bucket store, LSH projection      */

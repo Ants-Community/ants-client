@@ -918,6 +918,142 @@ static void test_lookup_request_decode_truncated(void)
     CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
 }
 
+/* -- Lookup response wire format (step 6) ---------------------------------
+ *
+ * Round-trip + partial-cap behaviour + malformed rejection for the
+ * cache lookup response CBOR codec (array of {similarity, entry}). */
+
+static void
+fill_match(ants_semantic_cache_lookup_match_t *m, const float *emb, float sim, const char *resp)
+{
+    fill_test_entry(&m->entry, emb, resp, "resp-model");
+    m->similarity = sim;
+}
+
+static void test_lookup_response_round_trip_zero_matches(void)
+{
+    uint8_t buf[128];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(NULL, 0, buf, sizeof buf, &encoded),
+             ANTS_OK);
+    CHECK(encoded < sizeof buf);
+
+    size_t out_n = 999;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, encoded, NULL, NULL, 0, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 0);
+}
+
+static void test_lookup_response_round_trip_three(void)
+{
+    /* Build 3 matches with distinct embeddings + similarities. */
+    float embs[3][ANTS_EMBED_DIM];
+    ants_semantic_cache_lookup_match_t in[3];
+    make_random_embedding(9000, embs[0]);
+    make_random_embedding(9001, embs[1]);
+    make_random_embedding(9002, embs[2]);
+    fill_match(&in[0], embs[0], 0.95f, "alpha-response");
+    fill_match(&in[1], embs[1], 0.80f, "beta-response");
+    fill_match(&in[2], embs[2], 0.75f, "gamma-response");
+
+    /* 3 entries × ~4.2 KB each → ~13 KB. 32 KB buffer is comfortable. */
+    uint8_t buf[32768];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(in, 3, buf, sizeof buf, &encoded), ANTS_OK);
+    CHECK(encoded > 12000);
+    CHECK(encoded < sizeof buf);
+
+    ants_semantic_cache_lookup_match_t out[3];
+    float out_embs[3 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, encoded, out, out_embs, 3, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 3);
+
+    for (size_t i = 0; i < 3; i++) {
+        CHECK(out[i].similarity == in[i].similarity);
+        CHECK(out[i].entry.response_len == in[i].entry.response_len);
+        CHECK(memcmp(out[i].entry.response, in[i].entry.response, out[i].entry.response_len) == 0);
+        /* Embedding round-trip. */
+        const float *out_emb_i = &out_embs[i * (size_t)ANTS_EMBED_DIM];
+        for (uint32_t k = 0; k < (uint32_t)ANTS_EMBED_DIM; k++) {
+            CHECK(out_emb_i[k] == embs[i][k]);
+        }
+    }
+}
+
+static void test_lookup_response_decode_partial_cap(void)
+{
+    /* Encode 3 matches; decode with cap_matches = 2. Decoder should
+     * return BUFFER_TOO_SMALL with out_n = 3 and the first two slots
+     * filled. Caller may then re-call with a bigger buffer. */
+    float embs[3][ANTS_EMBED_DIM];
+    ants_semantic_cache_lookup_match_t in[3];
+    make_random_embedding(9100, embs[0]);
+    make_random_embedding(9101, embs[1]);
+    make_random_embedding(9102, embs[2]);
+    fill_match(&in[0], embs[0], 0.9f, "x");
+    fill_match(&in[1], embs[1], 0.8f, "y");
+    fill_match(&in[2], embs[2], 0.7f, "z");
+
+    uint8_t buf[32768];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(in, 3, buf, sizeof buf, &encoded), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t out[2];
+    float out_embs[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, encoded, out, out_embs, 2, &out_n),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 3);
+    CHECK(out[0].similarity == 0.9f);
+    CHECK(out[1].similarity == 0.8f);
+}
+
+static void test_lookup_response_null_args(void)
+{
+    uint8_t buf[128];
+    size_t out_len = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(NULL, 1, buf, sizeof buf, &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(NULL, 0, NULL, sizeof buf, &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(NULL, 0, buf, sizeof buf, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    ants_semantic_cache_lookup_match_t out[1];
+    float out_embs[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(NULL, 1, out, out_embs, 1, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, 1, out, out_embs, 1, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    /* cap > 0 with NULL out_matches must reject. */
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, 1, NULL, out_embs, 1, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(buf, 1, out, NULL, 1, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_lookup_response_decode_truncated(void)
+{
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(9200, emb);
+    ants_semantic_cache_lookup_match_t in[1];
+    fill_match(&in[0], emb, 0.9f, "v");
+
+    uint8_t buf[16384];
+    size_t encoded = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_encode(in, 1, buf, sizeof buf, &encoded), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t out[1];
+    float out_embs[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    ants_error_t e =
+        ants_semantic_cache_lookup_response_decode(buf, encoded / 2, out, out_embs, 1, &out_n);
+    CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -988,6 +1124,11 @@ int main(void)
     test_lookup_request_buffer_too_small();
     test_lookup_request_null_args();
     test_lookup_request_decode_truncated();
+    test_lookup_response_round_trip_zero_matches();
+    test_lookup_response_round_trip_three();
+    test_lookup_response_decode_partial_cap();
+    test_lookup_response_null_args();
+    test_lookup_response_decode_truncated();
     test_clear_removes_entries();
 
     if (failures > 0) {
