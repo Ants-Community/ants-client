@@ -13,6 +13,132 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #11 (canonical embedding) phase 4-real step 5 — BGE-M3 forward pass · 2026-05-25
+
+**Inference live.** Four consecutive PRs land the remaining phase-4-real
+layer: GGUF buffer loader, BGE-M3 model binding, forward pass, and
+`embed.c` integration. After this, `ants_embed` is end-to-end functional
+against any caller-supplied BGE-M3 GGUF + HuggingFace tokenizer.json
+that satisfies the protocol-pinned 1024-dim constraint. **Phase 5**
+(pinning real hashes + publishing reference vectors against the
+official BGE-M3 checkpoint) is the only remaining work before
+Component #11 is production-ready.
+
+**PR #49 — step 5a: GGUF buffer loader** (+636):
+
+- New private module `cache/embedding/src/embed_gguf.{h,c}`. Bridges
+  the caller-supplies-a-buffer contract with ggml's caller-supplies-a-
+  `FILE *` loader via `fmemopen(3)`.
+- Opaque `embed_gguf_loader_t`. Thin metadata accessors
+  (`n_kv`/`n_tensors`/`version`, `get_str`/`get_u32`/`get_u64`/`get_f32`,
+  `find_tensor`) each define a sentinel (NULL / negative / `INVALID_ARG`)
+  for the missing-key or wrong-type case so callers don't trip ggml's
+  abort-on-mismatch.
+- `ggml` linked PRIVATE into `ants_embed` — first consumer of the
+  dep vendored back in PR #39.
+- 6 tests build GGUF fixtures in-memory via upstream `gguf_init_empty`
+  + `ggml_init` + `gguf_add_tensor` + `gguf_write_to_file_ptr(tmpfile)`,
+  then read back: empty file, KV round-trip with type-mismatch rejection,
+  FP32 tensor round-trip, bad-args, mid-stream truncation, `free(NULL)`.
+- POSIX-2008 `_POSIX_C_SOURCE 200809L` discipline for `fmemopen` —
+  same pattern as `dht_now_us` in `network/dht/src/dht.c` and the
+  `_GNU_SOURCE` guard in `deps/ggml/CMakeLists.txt`.
+
+**PR #50 — step 5b: BGE-M3 tensor binding** (+881):
+
+- New private module `cache/embedding/src/embed_model.{h,c}`.
+  `bge_m3_model_t` mirrors GGUF metadata (`n_layers`, `n_heads`,
+  `n_embd`, `n_ffn`, `n_vocab` derived from `token_embd` shape,
+  `n_ctx`, `ln_eps`) and holds tensor pointers for the three
+  embeddings + the pre-encoder LN.
+- `bge_m3_layer_t` holds 16 tensor pointers per transformer block
+  (attn QKV + output projection, post-attn LN, FFN up/down, post-FFN
+  LN). Heap-allocated array of `n_layers` entries.
+- `bge_m3_load_from_gguf` gates on `general.architecture == "bert"`,
+  reads six metadata KVs, derives `n_vocab` from `token_embd.weight`,
+  resolves each tensor by name, shape-checks. Typed errors:
+  `MALFORMED` for missing/wrong metadata, `NON_CANONICAL` for missing
+  or wrong-shape tensors.
+- Naming convention follows llama.cpp's BERT mapping
+  (`token_embd.weight`, `blk.{i}.attn_q.weight`,
+  `blk.{i}.attn_output_norm.weight`, `blk.{i}.ffn_up.weight`, etc.) —
+  exactly what `convert_hf_to_gguf.py` emits for a `BertModel` /
+  `XLMRobertaModel` checkpoint. Phase 5 pins them against the actual
+  BGE-M3 GGUF the protocol ships.
+- 10 tests on a 2-layer × 32-embd × 64-ffn × 4-heads fixture cover
+  valid happy-path (with + without optional `token_types.weight`),
+  wrong arch, missing arch KV, missing block_count, n_embd not
+  divisible by n_heads, missing token_embd, missing layer-0
+  `attn_q.weight`, wrong-shape layer-0 `attn_q.weight`, plus
+  NULL-arg defences and `bge_m3_free(NULL)` no-crash.
+
+**PR #51 — step 5c: forward pass** (+793):
+
+- New private module `cache/embedding/src/embed_forward.{h,c}`.
+  `bge_m3_forward(model, ids, n_tokens, type_ids, out)` builds a
+  ggml compute graph per call, executes it via
+  `ggml_graph_compute_with_ctx(..., n_threads=1)` for run-to-run
+  determinism, CLS-pools (column 0 of the final hidden state),
+  L2-normalises in-place.
+- Graph (BERT post-norm): token + position (+type, optional)
+  embedding → pre-encoder LN → N × {QKV linear → reshape +
+  permute to multi-head → scaled scores → softmax → V matmul →
+  permute + reshape back → output projection → residual + LN →
+  up-FFN + GeLU + down-FFN → residual + LN} → CLS pool → L2 norm.
+- Memory budget heuristic scales with `n_layers · n_tokens ·
+  max(n_embd, n_ffn)` plus the score buffer + 16 MB fixed overhead.
+  Phase 5 tightens this once the real BGE-M3 latency is measured.
+- Per-call `ggml_init` / `ggml_free`. Step 5d does NOT hoist the
+  compute context into `ants_embed_t` — buffer reuse across calls
+  is a future-PR optimisation when latency matters.
+- 5 tests on an FNV-1a-keyed pattern-weight fixture (2 layers ×
+  16 embd × 32 ffn × 2 heads × 8 ctx × 50 vocab, weights in
+  [-0.1, +0.1) so FFN doesn't blow up): basic forward, type_embd
+  path, determinism across two independent ggml_init/forward/free
+  cycles, distinct-input distinctness, bad-args (NULL + range).
+
+**PR #52 — step 5d: integrate into ants_embed** (+443 / -185):
+
+- `embed.c` rewritten. The stub from the v0.x scaffold is gone.
+  State struct is now magic-tagged (`"ANSE"`) and holds three
+  heap-owned resources (`gguf_loader`, `model`, `vocab_blob`) plus
+  an inline `ants_tokenizer_t` (1 KiB). Tear-down runs in
+  reverse-dep order: tokenizer → vocab_blob → model → loader.
+- `ants_embed_init` drives the full pipeline: hash-verify weights
+  + tokenizer.json (placeholder pinned hashes still skip per
+  RFC-0008 §5) → `embed_gguf_load` → `bge_m3_load_from_gguf` →
+  protocol-pinned dim check (`model->n_embd == ANTS_EMBED_DIM`,
+  i.e. 1024) → `ants_tokenizer_load_huggingface_json` →
+  `ants_tokenizer_init`.
+- `ants_embed` tokenises input bytes via the loaded tokenizer,
+  caps to `min(model->n_ctx, ANTS_EMBED_MAX_TOKENS = 8192)`,
+  casts uint32→int32, runs `bge_m3_forward`. `BUFFER_TOO_SMALL`
+  from the tokenizer (input longer than `model->n_ctx`) is
+  treated as a graceful truncate-to-cap, not an error.
+- `test_embed.c` adds an in-memory fixture builder (1024-embd × 1
+  layer × 64-ffn × 8-heads × 8-ctx × 50-vocab GGUF with FNV-1a-keyed
+  pattern weights + matching tokenizer.json with 10 ▁-prefixed
+  test tokens). The three "real embed" cases now exercise the full
+  forward against this fixture (deterministic-same-input,
+  distinct-input-distinct-output, L2-normalised output). All
+  pre-existing constants / layout / arg / verify / destroy tests
+  unchanged.
+- Behaviour change: weights MUST be a valid GGUF with
+  `embedding_length = 1024`; tokenizer MUST parse as HuggingFace
+  tokenizer.json. Buffer ownership: both caller buffers MUST
+  outlive the `ants_embed_t` (the gguf loader's `ggml_context`
+  may alias the weights buffer).
+
+**Roadmap remaining for Component #11**:
+
+- **Phase 5**: pin real `ANTS_EMBED_WEIGHTS_HASH_PINNED` +
+  `ANTS_EMBED_TOKENIZER_HASH_PINNED` against the exact BGE-M3
+  checkpoint the reference client ships. Publish reference inputs
+  + 1024-dim outputs to `ants-test-vectors/vectors/ants-embed-v1/`.
+  After phase 5, RFC-0008 §5 placeholder note can be removed.
+
+CI matrix (7 jobs): all 4 PRs first-push green.
+
 ### cache: Component #11 (canonical embedding) phase 4-real steps 1-4 — full Unigram tokenizer · 2026-05-23
 
 **Tokenizer infrastructure complete.** Five consecutive PRs land
