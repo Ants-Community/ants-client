@@ -74,14 +74,27 @@ typedef struct {
      * dot-product is one contiguous read per entry. */
     float embedding[ANTS_EMBED_DIM];
 
-    /* Heap-allocated copy of the caller's value bytes. Owned by the
-     * cache, freed on destroy / clear / future LRU eviction. */
-    uint8_t *value;
-    size_t value_len;
-
     /* Monotonic LRU counter set on each put and on each get hit.
-     * Unused in step 2; step 3 reads it for eviction. */
+     * Used by step 3 eviction to identify the LRU candidate. */
     uint64_t last_access;
+
+    /* Full record copies (heap-allocated). All NULL+len=0 fields are
+     * valid (empty-string / no-attestation are common in v0.x).
+     * The fixed-length byte arrays (prompt_hash / producer / signature)
+     * are inlined. Freed by free_entry. */
+    char *embedding_model;
+    size_t embedding_model_len;
+    uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN];
+    uint8_t *response;
+    size_t response_len;
+    char *response_model;
+    size_t response_model_len;
+    uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN];
+    uint64_t created;
+    ants_semantic_cache_validity_t validity_class;
+    uint8_t *attestation;
+    size_t attestation_len;
+    uint8_t signature[ANTS_SEMANTIC_CACHE_SIG_LEN];
 } cache_entry_t;
 
 struct ants_semantic_cache_state {
@@ -236,11 +249,21 @@ static void ensure_projection_initialised(void)
 /* Lifecycle                                                                */
 /* ------------------------------------------------------------------------ */
 
+/* Release every heap allocation an entry owns and zero the slot so a
+ * destroyed-then-re-used slot starts clean. */
+static void free_entry(cache_entry_t *e)
+{
+    free(e->embedding_model);
+    free(e->response);
+    free(e->response_model);
+    free(e->attestation);
+    memset(e, 0, sizeof *e);
+}
+
 static void free_all_entries(struct ants_semantic_cache_state *state)
 {
     for (size_t i = 0; i < state->n_entries; i++) {
-        free(state->entries[i].value);
-        state->entries[i].value = NULL;
+        free_entry(&state->entries[i]);
     }
     state->n_entries = 0;
 }
@@ -295,8 +318,7 @@ static bool find_lru(const struct ants_semantic_cache_state *state,
  * O(1); the entries[] order is internal so the swap is fine. */
 static void evict_at(struct ants_semantic_cache_state *state, size_t idx)
 {
-    free(state->entries[idx].value);
-    state->entries[idx].value = NULL;
+    free_entry(&state->entries[idx]);
     size_t last = state->n_entries - 1;
     if (idx != last) {
         state->entries[idx] = state->entries[last];
@@ -372,13 +394,52 @@ ants_error_t ants_semantic_cache_destroy(ants_semantic_cache_t *cache)
 /* Put / Get                                                                */
 /* ------------------------------------------------------------------------ */
 
-ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
-                                     const float embedding[ANTS_EMBED_DIM],
-                                     const uint8_t *value,
-                                     size_t value_len)
+/* Validate the entry's pointer/length consistency. Same checks as the
+ * encoder; lifted from cache_wire.c semantics so put_record can bail
+ * before touching the heap. */
+static ants_error_t put_record_validate(const ants_semantic_cache_entry_t *entry)
 {
-    if (cache == NULL || embedding == NULL || value == NULL || value_len == 0) {
+    if (entry == NULL || entry->embedding == NULL || entry->embedding_model == NULL ||
+        entry->response_model == NULL) {
         return ANTS_ERROR_INVALID_ARG;
+    }
+    if (entry->response_len > 0 && entry->response == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (entry->attestation_len > 0 && entry->attestation == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((unsigned)entry->validity_class > 4u) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return ANTS_OK;
+}
+
+/* malloc + memcpy a buffer; returns NULL on len==0 (empty fields are
+ * a valid steady state, NOT an error). Returns NULL also on malloc
+ * failure with len>0, distinguishable by examining len at the call
+ * site. */
+static void *dup_bytes(const void *src, size_t len)
+{
+    if (len == 0) {
+        return NULL;
+    }
+    void *p = malloc(len);
+    if (p != NULL) {
+        memcpy(p, src, len);
+    }
+    return p;
+}
+
+ants_error_t ants_semantic_cache_put_record(ants_semantic_cache_t *cache,
+                                            const ants_semantic_cache_entry_t *entry)
+{
+    if (cache == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    ants_error_t err = put_record_validate(entry);
+    if (err != ANTS_OK) {
+        return err;
     }
     struct ants_semantic_cache_state *state =
         (struct ants_semantic_cache_state *)(void *)cache->_opaque;
@@ -387,18 +448,13 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
     }
 
     ants_semantic_cache_shard_key_t key = 0;
-    ants_error_t err = ants_semantic_cache_shard_key(embedding, &key);
+    err = ants_semantic_cache_shard_key(entry->embedding, &key);
     if (err != ANTS_OK) {
         return err;
     }
 
-    /* Enforce caps BEFORE growth + insert: an eviction here may free
-     * a slot that would otherwise push the array past its capacity.
-     * Order: total_max first (the global cap may incidentally free a
-     * slot in this shard), then per_shard_max. */
     enforce_caps_on_insert(state, key);
 
-    /* Geometric growth of the flat entry array. */
     if (state->n_entries == state->cap_entries) {
         size_t new_cap = state->cap_entries * 2u;
         cache_entry_t *grown =
@@ -406,28 +462,86 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
         if (grown == NULL) {
             return ANTS_ERROR_MALFORMED;
         }
-        /* Zero the new slots so a partial-write failure below leaves
-         * deterministic state. */
         memset(
             &grown[state->cap_entries], 0, (new_cap - state->cap_entries) * sizeof(cache_entry_t));
         state->entries = grown;
         state->cap_entries = new_cap;
     }
 
-    cache_entry_t *slot = &state->entries[state->n_entries];
-    uint8_t *copy = (uint8_t *)malloc(value_len);
-    if (copy == NULL) {
+    /* Allocate every heap-owned copy up front; on any failure roll back
+     * all-or-nothing so the new slot doesn't half-commit. */
+    char *em = (char *)dup_bytes(entry->embedding_model, entry->embedding_model_len);
+    if (em == NULL && entry->embedding_model_len > 0) {
         return ANTS_ERROR_MALFORMED;
     }
-    memcpy(copy, value, value_len);
+    uint8_t *resp = (uint8_t *)dup_bytes(entry->response, entry->response_len);
+    if (resp == NULL && entry->response_len > 0) {
+        free(em);
+        return ANTS_ERROR_MALFORMED;
+    }
+    char *rm = (char *)dup_bytes(entry->response_model, entry->response_model_len);
+    if (rm == NULL && entry->response_model_len > 0) {
+        free(em);
+        free(resp);
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint8_t *att = (uint8_t *)dup_bytes(entry->attestation, entry->attestation_len);
+    if (att == NULL && entry->attestation_len > 0) {
+        free(em);
+        free(resp);
+        free(rm);
+        return ANTS_ERROR_MALFORMED;
+    }
 
+    cache_entry_t *slot = &state->entries[state->n_entries];
     slot->shard_key = key;
-    memcpy(slot->embedding, embedding, ANTS_EMBED_DIM * sizeof(float));
-    slot->value = copy;
-    slot->value_len = value_len;
+    memcpy(slot->embedding, entry->embedding, (size_t)ANTS_EMBED_DIM * sizeof(float));
     slot->last_access = ++state->lru_counter;
+
+    slot->embedding_model = em;
+    slot->embedding_model_len = entry->embedding_model_len;
+    memcpy(slot->prompt_hash, entry->prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN);
+    slot->response = resp;
+    slot->response_len = entry->response_len;
+    slot->response_model = rm;
+    slot->response_model_len = entry->response_model_len;
+    memcpy(slot->producer, entry->producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN);
+    slot->created = entry->created;
+    slot->validity_class = entry->validity_class;
+    slot->attestation = att;
+    slot->attestation_len = entry->attestation_len;
+    memcpy(slot->signature, entry->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
+
     state->n_entries++;
     return ANTS_OK;
+}
+
+ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
+                                     const float embedding[ANTS_EMBED_DIM],
+                                     const uint8_t *value,
+                                     size_t value_len)
+{
+    /* Thin convenience wrapper. The caller provides only an embedding
+     * + opaque value bytes; the cache fills the rest of the record
+     * with placeholders (model = "ants-embed-v1", everything else
+     * zero / empty / EPHEMERAL). For DHT-routed inbound writes use
+     * put_record directly with the full producer-signed record. */
+    if (cache == NULL || embedding == NULL || value == NULL || value_len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    static const char EMB_MODEL[] = "ants-embed-v1";
+    ants_semantic_cache_entry_t e;
+    memset(&e, 0, sizeof e);
+    e.embedding = embedding;
+    e.embedding_model = EMB_MODEL;
+    e.embedding_model_len = sizeof EMB_MODEL - 1u;
+    e.response = value;
+    e.response_len = value_len;
+    e.response_model = "";
+    e.response_model_len = 0;
+    e.validity_class = ANTS_SEMANTIC_CACHE_VALIDITY_EPHEMERAL;
+    /* prompt_hash, producer, signature default to zero per memset. */
+    return ants_semantic_cache_put_record(cache, &e);
 }
 
 /* Cosine similarity for two L2-normalised vectors reduces to a dot
@@ -495,14 +609,14 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
     *out_similarity = (float)best_sim;
     hit->last_access = ++state->lru_counter;
 
-    if (hit->value_len > out_cap) {
-        *out_len = hit->value_len;
+    if (hit->response_len > out_cap) {
+        *out_len = hit->response_len;
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
-    if (out_value != NULL) {
-        memcpy(out_value, hit->value, hit->value_len);
+    if (out_value != NULL && hit->response_len > 0) {
+        memcpy(out_value, hit->response, hit->response_len);
     }
-    *out_len = hit->value_len;
+    *out_len = hit->response_len;
     return ANTS_OK;
 }
 
@@ -604,16 +718,31 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         size_t e_idx = cands[i].entry_idx;
         cache_entry_t *src = &state->entries[e_idx];
 
-        /* Reset the match's entry view; we populate only the fields
-         * the local store actually knows about (embedding + response). */
         memset(&out_matches[i].entry, 0, sizeof out_matches[i].entry);
 
+        /* Embedding into the caller's contiguous embedding buffer
+         * (the one zero-copy exception — every other pointer field
+         * aliases the cache's internal heap copies). */
         float *emb_slot = &out_embeddings[i * (size_t)ANTS_EMBED_DIM];
         memcpy(emb_slot, src->embedding, (size_t)ANTS_EMBED_DIM * sizeof(float));
         out_matches[i].entry.embedding = emb_slot;
 
-        out_matches[i].entry.response = src->value;
-        out_matches[i].entry.response_len = src->value_len;
+        out_matches[i].entry.embedding_model = src->embedding_model;
+        out_matches[i].entry.embedding_model_len = src->embedding_model_len;
+        memcpy(out_matches[i].entry.prompt_hash,
+               src->prompt_hash,
+               ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN);
+        out_matches[i].entry.response = src->response;
+        out_matches[i].entry.response_len = src->response_len;
+        out_matches[i].entry.response_model = src->response_model;
+        out_matches[i].entry.response_model_len = src->response_model_len;
+        memcpy(out_matches[i].entry.producer, src->producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN);
+        out_matches[i].entry.created = src->created;
+        out_matches[i].entry.validity_class = src->validity_class;
+        out_matches[i].entry.attestation = src->attestation;
+        out_matches[i].entry.attestation_len = src->attestation_len;
+        memcpy(out_matches[i].entry.signature, src->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
+
         out_matches[i].similarity = (float)cands[i].similarity;
 
         /* Bump LRU on every hit returned. */
@@ -688,4 +817,101 @@ ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache)
     }
     free_all_entries(state);
     return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Server-side inbound handlers                                             */
+/* ------------------------------------------------------------------------ */
+
+/* Server-side cap on the matches a single lookup response carries.
+ * RFC-0002 §Lookup mentions 5-15 typical; we pick 15 as the upper
+ * bound. Caller's top_k > 15 gets clamped here. */
+#define HANDLE_LOOKUP_SERVER_CAP 15u
+
+ants_error_t ants_semantic_cache_handle_inbound_entry(ants_semantic_cache_t *cache,
+                                                      const uint8_t *entry_cbor,
+                                                      size_t cbor_len)
+{
+    if (cache == NULL || entry_cbor == NULL || cbor_len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    ants_semantic_cache_entry_t entry;
+    float emb_buf[ANTS_EMBED_DIM];
+    ants_error_t err = ants_semantic_cache_entry_decode(entry_cbor, cbor_len, &entry, emb_buf);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* TODO step 7b+: verify entry.signature against entry.producer
+     * (Ed25519 over the canonical CBOR of fields 1..9) before
+     * admitting to the local shard. The current behaviour accepts
+     * any well-formed record; tier-aware attestation engines wire
+     * in later. */
+
+    return ants_semantic_cache_put_record(cache, &entry);
+}
+
+ants_error_t ants_semantic_cache_handle_inbound_lookup(ants_semantic_cache_t *cache,
+                                                       const uint8_t *req_cbor,
+                                                       size_t req_len,
+                                                       uint8_t *resp_buf,
+                                                       size_t resp_cap,
+                                                       size_t *out_resp_len)
+{
+    if (cache == NULL || req_cbor == NULL || req_len == 0 || resp_buf == NULL ||
+        out_resp_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    float query_emb[ANTS_EMBED_DIM];
+    float threshold = 0.0f;
+    uint32_t top_k = 0;
+    ants_error_t err =
+        ants_semantic_cache_lookup_request_decode(req_cbor, req_len, query_emb, &threshold, &top_k);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Server-side cap on the response size so a single greedy client
+     * can't make us materialise an arbitrarily-large response. */
+    uint32_t effective_k =
+        (top_k == 0u || top_k > HANDLE_LOOKUP_SERVER_CAP) ? HANDLE_LOOKUP_SERVER_CAP : top_k;
+
+    ants_semantic_cache_lookup_match_t matches[HANDLE_LOOKUP_SERVER_CAP];
+    /* HANDLE_LOOKUP_SERVER_CAP × ANTS_EMBED_DIM × 4 = 60 KB; heap-
+     * allocate to avoid stack-budget surprises on platforms with
+     * tight default stacks. */
+    float *match_embs =
+        (float *)malloc((size_t)HANDLE_LOOKUP_SERVER_CAP * (size_t)ANTS_EMBED_DIM * sizeof(float));
+    if (match_embs == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    size_t n_matches = 0;
+    err = ants_semantic_cache_get_topk(cache,
+                                       query_emb,
+                                       threshold,
+                                       effective_k,
+                                       matches,
+                                       match_embs,
+                                       (size_t)HANDLE_LOOKUP_SERVER_CAP,
+                                       &n_matches);
+    if (err == ANTS_ERROR_NOT_FOUND) {
+        n_matches = 0;
+        err = ANTS_OK;
+    } else if (err != ANTS_OK) {
+        free(match_embs);
+        return err;
+    }
+    /* get_topk bounds *out_n to min(top_k, n_cands); since cap_matches
+     * == effective_k == capped top_k, n_matches <= effective_k <=
+     * HANDLE_LOOKUP_SERVER_CAP. Defensive clamp anyway. */
+    if (n_matches > HANDLE_LOOKUP_SERVER_CAP) {
+        n_matches = HANDLE_LOOKUP_SERVER_CAP;
+    }
+
+    err = ants_semantic_cache_lookup_response_encode(
+        matches, n_matches, resp_buf, resp_cap, out_resp_len);
+    free(match_embs);
+    return err;
 }

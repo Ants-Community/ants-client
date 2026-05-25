@@ -1231,6 +1231,222 @@ static void test_get_topk_buffer_too_small(void)
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
+/* -- put_record + inbound handlers (step 7a.2) ---------------------------- */
+
+static void test_put_record_round_trip(void)
+{
+    /* Put a full producer-signed record via put_record; query it back
+     * via get_topk and verify every field round-trips through the
+     * cache's internal storage. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12000, emb);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "the full record response", "bge-m3-canonical");
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &in_e), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t matches[1];
+    float emb_buf[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+    const ants_semantic_cache_entry_t *out_e = &matches[0].entry;
+
+    CHECK(out_e->embedding_model_len == strlen("ants-embed-v1"));
+    CHECK(memcmp(out_e->embedding_model, "ants-embed-v1", out_e->embedding_model_len) == 0);
+    CHECK(memcmp(out_e->prompt_hash, in_e.prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN) == 0);
+    CHECK(out_e->response_len == strlen("the full record response"));
+    CHECK(memcmp(out_e->response, "the full record response", out_e->response_len) == 0);
+    CHECK(out_e->response_model_len == strlen("bge-m3-canonical"));
+    CHECK(memcmp(out_e->response_model, "bge-m3-canonical", out_e->response_model_len) == 0);
+    CHECK(memcmp(out_e->producer, in_e.producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0);
+    CHECK(out_e->created == 1717000000ull);
+    CHECK(out_e->validity_class == ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS);
+    CHECK(out_e->attestation_len == in_e.attestation_len);
+    CHECK(memcmp(out_e->attestation, in_e.attestation, out_e->attestation_len) == 0);
+    CHECK(memcmp(out_e->signature, in_e.signature, ANTS_SEMANTIC_CACHE_SIG_LEN) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_put_record_null_args(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12001, emb);
+    ants_semantic_cache_entry_t e;
+    fill_test_entry(&e, emb, "v", "vm");
+
+    CHECK_EQ(ants_semantic_cache_put_record(NULL, &e), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, NULL), ANTS_ERROR_INVALID_ARG);
+    e.embedding = NULL;
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_entry_round_trip(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12100, emb);
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "round-trip response", "model-x");
+
+    uint8_t cbor[8192];
+    size_t cbor_len = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, cbor, sizeof cbor, &cbor_len), ANTS_OK);
+
+    CHECK_EQ(ants_semantic_cache_handle_inbound_entry(&c, cbor, cbor_len), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 1);
+
+    uint8_t out[64];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == strlen("round-trip response"));
+    CHECK(memcmp(out, "round-trip response", out_len) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_entry_malformed(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    uint8_t garbage[64];
+    memset(garbage, 0xAB, sizeof garbage);
+    ants_error_t e = ants_semantic_cache_handle_inbound_entry(&c, garbage, sizeof garbage);
+    CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_lookup_round_trip(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12200, emb);
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "inbound-lookup response", "model-q");
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &in_e), ANTS_OK);
+
+    uint8_t req[8192];
+    size_t req_len = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, req, sizeof req, &req_len),
+             ANTS_OK);
+
+    uint8_t resp[16384];
+    size_t resp_len = 0;
+    CHECK_EQ(
+        ants_semantic_cache_handle_inbound_lookup(&c, req, req_len, resp, sizeof resp, &resp_len),
+        ANTS_OK);
+    CHECK(resp_len > 0);
+
+    ants_semantic_cache_lookup_match_t out_matches[5];
+    float out_embs[5 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(
+                 resp, resp_len, out_matches, out_embs, 5, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 1);
+    CHECK(out_matches[0].entry.response_len == strlen("inbound-lookup response"));
+    CHECK(memcmp(out_matches[0].entry.response,
+                 "inbound-lookup response",
+                 out_matches[0].entry.response_len) == 0);
+    CHECK(memcmp(out_matches[0].entry.producer, in_e.producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) ==
+          0);
+    CHECK(memcmp(out_matches[0].entry.signature, in_e.signature, ANTS_SEMANTIC_CACHE_SIG_LEN) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_lookup_empty_cache(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12300, emb);
+    uint8_t req[8192];
+    size_t req_len = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, req, sizeof req, &req_len),
+             ANTS_OK);
+
+    uint8_t resp[256];
+    size_t resp_len = 0;
+    CHECK_EQ(
+        ants_semantic_cache_handle_inbound_lookup(&c, req, req_len, resp, sizeof resp, &resp_len),
+        ANTS_OK);
+
+    size_t out_n = 999;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(resp, resp_len, NULL, NULL, 0, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_lookup_buffer_too_small(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12400, emb);
+    ants_semantic_cache_entry_t in_e;
+    fill_test_entry(&in_e, emb, "x", "y");
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &in_e), ANTS_OK);
+
+    uint8_t req[8192];
+    size_t req_len = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 5, req, sizeof req, &req_len),
+             ANTS_OK);
+
+    uint8_t small[100];
+    size_t resp_len = 0;
+    CHECK_EQ(
+        ants_semantic_cache_handle_inbound_lookup(&c, req, req_len, small, sizeof small, &resp_len),
+        ANTS_ERROR_BUFFER_TOO_SMALL);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_lookup_malformed_request(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    uint8_t garbage[32];
+    memset(garbage, 0xAB, sizeof garbage);
+    uint8_t resp[256];
+    size_t resp_len = 0;
+    ants_error_t e = ants_semantic_cache_handle_inbound_lookup(
+        &c, garbage, sizeof garbage, resp, sizeof resp, &resp_len);
+    CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -1313,6 +1529,14 @@ int main(void)
     test_get_topk_respects_top_k_cap();
     test_get_topk_top_k_zero_unbounded();
     test_get_topk_buffer_too_small();
+    test_put_record_round_trip();
+    test_put_record_null_args();
+    test_handle_inbound_entry_round_trip();
+    test_handle_inbound_entry_malformed();
+    test_handle_inbound_lookup_round_trip();
+    test_handle_inbound_lookup_empty_cache();
+    test_handle_inbound_lookup_buffer_too_small();
+    test_handle_inbound_lookup_malformed_request();
     test_clear_removes_entries();
 
     if (failures > 0) {

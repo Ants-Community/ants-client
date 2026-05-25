@@ -406,6 +406,29 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
                                      const uint8_t *value,
                                      size_t value_len);
 
+/*
+ * Insert a full producer-signed cache-entry record (e.g. one
+ * received over the DHT write protocol) into the local shard.
+ * Every field of `entry` is copied into the cache's heap; the
+ * caller may free its `entry` buffers immediately on return.
+ *
+ * Compared to ants_semantic_cache_put, this persists ALL metadata
+ * (embedding_model, prompt_hash, producer, response_model,
+ * attestation, signature, created, validity_class) — required for
+ * inbound DHT publishes whose responses re-emit the same record
+ * to lookup clients.
+ *
+ * Returns:
+ *   ANTS_OK                — entry stored;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, NULL embedding, NULL
+ *                            embedding_model/response_model, NULL
+ *                            response with non-zero len, etc.
+ *                            (same validation as the encoder);
+ *   ANTS_ERROR_MALFORMED   — malloc failure.
+ */
+ants_error_t ants_semantic_cache_put_record(ants_semantic_cache_t *cache,
+                                            const ants_semantic_cache_entry_t *entry);
+
 /* ------------------------------------------------------------------------ */
 /* Lookup (RFC-0002 §The lookup protocol — local side)                      */
 /* ------------------------------------------------------------------------ */
@@ -455,12 +478,12 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
  *                  cache (put / clear / destroy).
  * *out_n:          set to the number of matches written
  *
- * Limitation in this step: the local store currently persists only
- * (embedding, value-as-response); the other entry fields
- * (embedding_model, prompt_hash, producer, response_model, created,
- * validity_class, attestation, signature) come out zero/empty in
- * the match views. Full-record storage + population lands when the
- * inbound write handler lands (step 7a.2).
+ **Note (step 7a.2 onward)**: the local store persists every entry
+ * field, and the match views reflect the full record. Pointer fields
+ * (embedding_model / response / response_model / attestation) alias
+ * the cache's internal heap copies; fixed-length fields (prompt_hash,
+ * producer, signature, plus scalars created / validity_class) are
+ * copied in. All caveats about validity-on-mutation apply.
  *
  * Returns:
  *   ANTS_OK                     — *out_n matches written;
@@ -480,6 +503,56 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
                                           float *out_embeddings,
                                           size_t cap_matches,
                                           size_t *out_n);
+
+/* ------------------------------------------------------------------------ */
+/* Server-side inbound handlers (RFC-0002 §Write / §Lookup protocols)       */
+/*                                                                          */
+/* When a peer receives a cache-entry record (write path) or a lookup       */
+/* request (read path) on a bidi stream, the transport hands the raw       */
+/* CBOR bytes to these handlers. They are pure local operations — no      */
+/* network I/O — so they're trivial to test end-to-end against synthetic   */
+/* wire payloads. The DHT-routed publish + query paths that drive these   */
+/* handlers from the outside land in steps 7b/7c.                          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Handle an inbound cache-entry write: decode the CBOR record per
+ * step 4, validate the producer signature (currently a TODO — step
+ * 7b+ wires in Ed25519 verify via ants_crypto), and persist the
+ * full record into the local shard via put_record.
+ *
+ * Returns:
+ *   ANTS_OK                  — entry admitted;
+ *   ANTS_ERROR_INVALID_ARG   — NULL args or zero-length buffer;
+ *   ANTS_ERROR_MALFORMED     — CBOR parse failure or malloc failure;
+ *   ANTS_ERROR_NON_CANONICAL — wrong fixed-length field or wrong
+ *                              CBOR ordering on the wire.
+ */
+ants_error_t ants_semantic_cache_handle_inbound_entry(ants_semantic_cache_t *cache,
+                                                      const uint8_t *entry_cbor,
+                                                      size_t cbor_len);
+
+/*
+ * Handle an inbound cache lookup request: decode the CBOR request
+ * per step 5, run a top-K scan over the local shard (capped at
+ * 15 entries server-side per RFC-0002 §Lookup), encode the matching
+ * results per step 6 into the caller-supplied response buffer.
+ *
+ * Returns:
+ *   ANTS_OK                     — *out_resp_len bytes of encoded
+ *                                 response written (zero matches is
+ *                                 a valid response);
+ *   ANTS_ERROR_INVALID_ARG      — NULL args or zero-length req;
+ *   ANTS_ERROR_MALFORMED /
+ *   ANTS_ERROR_NON_CANONICAL    — request decode failure;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — resp_cap insufficient.
+ */
+ants_error_t ants_semantic_cache_handle_inbound_lookup(ants_semantic_cache_t *cache,
+                                                       const uint8_t *req_cbor,
+                                                       size_t req_len,
+                                                       uint8_t *resp_buf,
+                                                       size_t resp_cap,
+                                                       size_t *out_resp_len);
 
 /* ------------------------------------------------------------------------ */
 /* LSH shard-key derivation (RFC-0002 §DHT routing)                         */
