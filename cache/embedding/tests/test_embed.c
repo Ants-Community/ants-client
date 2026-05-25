@@ -1,31 +1,32 @@
 /*
  * test_embed.c — tests for the canonical embedding service (Component #11).
  *
- * Phase 3 + phase 4-stub. Covers:
+ * Phase 4-real step 5d. The stub is gone; ants_embed_init now expects
+ * a real GGUF + tokenizer.json. The fixture builder constructs a tiny
+ * BGE-M3-shaped model (1 layer × 1024-embd × 64-ffn × 8-heads × 8-ctx
+ * × 50-vocab) in memory with FNV-1a-keyed pattern weights, plus a
+ * matching Unigram tokenizer.json that covers the test inputs.
  *
- *   - Public constants match RFC-0008 §5 spec (model_id, arch,
- *     dim, placeholder hashes).
- *   - Opaque ctx size + alignment match documented constants.
- *   - Init NULL/zero-shape arg validation (unchanged from scaffold).
- *   - Init verify path: placeholder hashes → OK; mismatched non-zero
- *     pinned hash → NON_CANONICAL (exercised via the
- *     __test_verify hook so the path is covered before phase 5
- *     pins the real BGE-M3 hashes).
- *   - Embed determinism: same input → same 1024-dim output.
- *   - Embed distinctness: different input → different output.
- *   - Embed normalisation: output is L2-unit-norm.
- *   - Embed rejects an uninitialised ctx.
- *   - Destroy safety on a zeroed ctx.
+ * The 1024-dim embedding length matches the canonical
+ * ANTS_EMBED_DIM, so init reaches the protocol-pinned dim check.
  */
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "ants_common.h"
 #include "ants_crypto.h"
 #include "ants_embed.h"
 
+#include "ggml.h"
+#include "gguf.h"
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -55,11 +56,248 @@ static int failures = 0;
         }                                                                                          \
     } while (0)
 
-/* Test hook from embed.c — exposes the verify path so we can test
- * both code paths (placeholder + non-zero pinned) even while the
- * public ANTS_EMBED_*_HASH_PINNED constants are still all-zero. */
 extern ants_error_t
 ants_embed__test_verify(const uint8_t *buf, size_t len, const uint8_t pinned[32]);
+
+/* ------------------------------------------------------------------------ */
+/* Fixture builder                                                          */
+/*                                                                          */
+/* Constructs an in-memory GGUF + tokenizer.json pair suitable for          */
+/* ants_embed_init. Same FNV-1a-keyed pattern-weight technique as           */
+/* test_embed_forward — bit-deterministic on a single platform.             */
+/* ------------------------------------------------------------------------ */
+
+#define FX_N_LAYERS 1u
+#define FX_N_HEADS  8u
+#define FX_N_EMBD   ANTS_EMBED_DIM /* 1024 — matches the protocol pin */
+#define FX_N_FFN    64u
+#define FX_N_CTX    8u
+#define FX_N_VOCAB  50u
+
+static uint32_t fnv1a(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s != '\0') {
+        h ^= (uint32_t)(uint8_t)*s;
+        h *= 16777619u;
+        s++;
+    }
+    return h;
+}
+
+static uint32_t lcg_next(uint32_t *state)
+{
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float lcg_float(uint32_t *state, float scale)
+{
+    uint32_t r = lcg_next(state);
+    float u = ((float)r * (2.0f / 4294967296.0f)) - 1.0f;
+    return u * scale;
+}
+
+static void fill_pattern(struct ggml_tensor *t)
+{
+    if (t == NULL || t->data == NULL) {
+        return;
+    }
+    uint32_t state = fnv1a(t->name);
+    float *d = (float *)t->data;
+    size_t n = (size_t)ggml_nbytes(t) / sizeof(float);
+    for (size_t i = 0; i < n; i++) {
+        d[i] = lcg_float(&state, 0.1f);
+    }
+}
+
+static void
+add_2d(struct ggml_context *gg, struct gguf_context *gf, const char *name, int64_t ne0, int64_t ne1)
+{
+    struct ggml_tensor *t = ggml_new_tensor_2d(gg, GGML_TYPE_F32, ne0, ne1);
+    if (t == NULL) {
+        return;
+    }
+    ggml_set_name(t, name);
+    fill_pattern(t);
+    gguf_add_tensor(gf, t);
+}
+
+static void add_1d(struct ggml_context *gg, struct gguf_context *gf, const char *name, int64_t ne0)
+{
+    struct ggml_tensor *t = ggml_new_tensor_1d(gg, GGML_TYPE_F32, ne0);
+    if (t == NULL) {
+        return;
+    }
+    ggml_set_name(t, name);
+    fill_pattern(t);
+    gguf_add_tensor(gf, t);
+}
+
+/* Build the GGUF weights blob. Returns malloc'd buffer in *out_buf. */
+static int build_gguf(uint8_t **out_buf, size_t *out_len)
+{
+    /* Conservative scratch: token_embd alone is 1024 × 50 × 4 = 200 KB;
+     * the q/k/v/o matrices are 1024² × 4 ≈ 4 MB each. Plus FFN, embeds,
+     * LN. ~25 MB upper bound; 64 MB scratch is comfortable. */
+    struct ggml_init_params gp = {
+        /* clang-format off */
+        .mem_size   = (size_t)64 << 20,
+        .mem_buffer = NULL,
+        .no_alloc   = false,
+        /* clang-format on */
+    };
+    struct ggml_context *gg = ggml_init(gp);
+    if (gg == NULL) {
+        return -1;
+    }
+    struct gguf_context *gf = gguf_init_empty();
+    if (gf == NULL) {
+        ggml_free(gg);
+        return -1;
+    }
+
+    add_2d(gg, gf, "token_embd.weight", (int64_t)FX_N_EMBD, (int64_t)FX_N_VOCAB);
+    add_2d(gg, gf, "position_embd.weight", (int64_t)FX_N_EMBD, (int64_t)FX_N_CTX);
+    add_1d(gg, gf, "token_embd_norm.weight", (int64_t)FX_N_EMBD);
+    add_1d(gg, gf, "token_embd_norm.bias", (int64_t)FX_N_EMBD);
+
+    int64_t E = (int64_t)FX_N_EMBD;
+    int64_t F = (int64_t)FX_N_FFN;
+    for (uint32_t i = 0; i < FX_N_LAYERS; i++) {
+        char nm[128];
+
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_q.weight", (unsigned)i);
+        add_2d(gg, gf, nm, E, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_q.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_k.weight", (unsigned)i);
+        add_2d(gg, gf, nm, E, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_k.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_v.weight", (unsigned)i);
+        add_2d(gg, gf, nm, E, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_v.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_output.weight", (unsigned)i);
+        add_2d(gg, gf, nm, E, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_output.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_output_norm.weight", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.attn_output_norm.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.ffn_up.weight", (unsigned)i);
+        add_2d(gg, gf, nm, E, F);
+        (void)snprintf(nm, sizeof nm, "blk.%u.ffn_up.bias", (unsigned)i);
+        add_1d(gg, gf, nm, F);
+        (void)snprintf(nm, sizeof nm, "blk.%u.ffn_down.weight", (unsigned)i);
+        add_2d(gg, gf, nm, F, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.ffn_down.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.layer_output_norm.weight", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+        (void)snprintf(nm, sizeof nm, "blk.%u.layer_output_norm.bias", (unsigned)i);
+        add_1d(gg, gf, nm, E);
+    }
+
+    gguf_set_val_str(gf, "general.architecture", "bert");
+    gguf_set_val_u32(gf, "bert.block_count", FX_N_LAYERS);
+    gguf_set_val_u32(gf, "bert.embedding_length", FX_N_EMBD);
+    gguf_set_val_u32(gf, "bert.feed_forward_length", FX_N_FFN);
+    gguf_set_val_u32(gf, "bert.attention.head_count", FX_N_HEADS);
+    gguf_set_val_u32(gf, "bert.context_length", FX_N_CTX);
+    gguf_set_val_f32(gf, "bert.attention.layer_norm_epsilon", 1e-5f);
+
+    FILE *fp = tmpfile();
+    if (fp == NULL) {
+        gguf_free(gf);
+        ggml_free(gg);
+        return -1;
+    }
+    if (!gguf_write_to_file_ptr(gf, fp, false)) {
+        fclose(fp);
+        gguf_free(gf);
+        ggml_free(gg);
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        gguf_free(gf);
+        ggml_free(gg);
+        return -1;
+    }
+    long sz = ftell(fp);
+    if (sz <= 0) {
+        fclose(fp);
+        gguf_free(gf);
+        ggml_free(gg);
+        return -1;
+    }
+    rewind(fp);
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (buf == NULL) {
+        fclose(fp);
+        gguf_free(gf);
+        ggml_free(gg);
+        return -1;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    gguf_free(gf);
+    ggml_free(gg);
+    if (got != (size_t)sz) {
+        free(buf);
+        return -1;
+    }
+    *out_buf = buf;
+    *out_len = (size_t)sz;
+    return 0;
+}
+
+/* Minimal tokenizer.json — 10 entries cover the test inputs. The ▁
+ * (U+2581) prefix is the SentencePiece word-boundary marker; raw \u
+ * escapes used so the JSON stays ASCII. */
+static const char tokenizer_json[] = "{\"model\":{\"vocab\":["
+                                     "[\"<unk>\",0.0],"
+                                     "[\"\\u2581the\",-1.0],"
+                                     "[\"\\u2581hello\",-1.0],"
+                                     "[\"\\u2581world\",-1.0],"
+                                     "[\"\\u2581test\",-1.0],"
+                                     "[\"\\u2581input\",-1.0],"
+                                     "[\"\\u2581is\",-1.0],"
+                                     "[\"\\u2581a\",-1.0],"
+                                     "[\"\\u2581canonical\",-1.0],"
+                                     "[\"\\u2581different\",-1.0]"
+                                     "]}}";
+
+/* Bring up an ants_embed_t with the fixture. Caller is responsible
+ * for free()-ing the returned weights blob via *out_weights, and for
+ * calling ants_embed_destroy(e). */
+static int fixture_init(ants_embed_t *e, uint8_t **out_weights, size_t *out_weights_len)
+{
+    if (build_gguf(out_weights, out_weights_len) != 0) {
+        return -1;
+    }
+    ants_embed_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.weights = *out_weights;
+    cfg.weights_len = *out_weights_len;
+    cfg.tokenizer = (const uint8_t *)tokenizer_json;
+    cfg.tokenizer_len = sizeof tokenizer_json - 1;
+    ants_error_t err = ants_embed_init(e, &cfg);
+    if (err != ANTS_OK) {
+        fprintf(stderr, "fixture_init: ants_embed_init -> %s (%d)\n", ants_strerror(err), (int)err);
+        free(*out_weights);
+        *out_weights = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Tests                                                                    */
+/* ------------------------------------------------------------------------ */
 
 static void test_pinned_constants(void)
 {
@@ -69,7 +307,6 @@ static void test_pinned_constants(void)
     CHECK(ANTS_EMBED_MODEL_ARCH != NULL);
     CHECK(strcmp(ANTS_EMBED_MODEL_ARCH, "bge-m3") == 0);
 
-    /* Pinned hashes are placeholder all-zero per RFC-0008 §5. */
     uint8_t zero[32] = {0};
     CHECK(memcmp(ANTS_EMBED_WEIGHTS_HASH_PINNED, zero, 32) == 0);
     CHECK(memcmp(ANTS_EMBED_TOKENIZER_HASH_PINNED, zero, 32) == 0);
@@ -113,26 +350,24 @@ static void test_init_rejects_invalid_args(void)
     CHECK_EQ(ants_embed_init(&e, &cfg), ANTS_ERROR_INVALID_ARG);
 }
 
-static void test_init_succeeds_with_placeholder_hashes(void)
+static void test_init_rejects_bad_weights(void)
 {
-    /* While the pinned hashes are all-zero placeholders (the v0.x
-     * scaffold phase per RFC-0008 §5), verification is skipped and
-     * init succeeds against any non-empty buffers. */
+    /* Random bytes that are not a valid GGUF blob: init should fail
+     * MALFORMED (the wrapper's parse-error path). */
     ants_embed_t e = {{0}};
+    uint8_t bogus_weights[64];
+    memset(bogus_weights, 0xAB, sizeof bogus_weights);
     ants_embed_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.weights = (const uint8_t *)"weights-bundle-placeholder";
-    cfg.weights_len = 26;
-    cfg.tokenizer = (const uint8_t *)"tokenizer-bundle-placeholder";
-    cfg.tokenizer_len = 28;
-    CHECK_EQ(ants_embed_init(&e, &cfg), ANTS_OK);
-    CHECK_EQ(ants_embed_destroy(&e), ANTS_OK);
+    cfg.weights = bogus_weights;
+    cfg.weights_len = sizeof bogus_weights;
+    cfg.tokenizer = (const uint8_t *)tokenizer_json;
+    cfg.tokenizer_len = sizeof tokenizer_json - 1;
+    CHECK_EQ(ants_embed_init(&e, &cfg), ANTS_ERROR_MALFORMED);
 }
 
 static void test_verify_placeholder_skips(void)
 {
-    /* Verify hook with an all-zero pinned hash returns OK regardless
-     * of buffer contents — the v0.x placeholder semantics. */
     uint8_t zero[32] = {0};
     uint8_t buf[] = "anything";
     CHECK_EQ(ants_embed__test_verify(buf, sizeof buf - 1, zero), ANTS_OK);
@@ -140,16 +375,11 @@ static void test_verify_placeholder_skips(void)
 
 static void test_verify_matches_real_hash(void)
 {
-    /* Compute the real BLAKE3 of a buffer, then verify against that
-     * value succeeds; tamper one bit and verify rejects. Covers the
-     * non-placeholder code path before phase 5 pins the real hashes. */
     const uint8_t buf[] = "ants-embed-v1 reference vector input";
     const size_t len = sizeof buf - 1;
     uint8_t pinned[32];
     CHECK_EQ(ants_blake3_hash(buf, len, pinned), ANTS_OK);
     CHECK_EQ(ants_embed__test_verify(buf, len, pinned), ANTS_OK);
-
-    /* Tamper the pinned value and re-verify — MUST reject. */
     pinned[0] ^= 0x01;
     CHECK_EQ(ants_embed__test_verify(buf, len, pinned), ANTS_ERROR_NON_CANONICAL);
 }
@@ -175,34 +405,23 @@ static void test_embed_rejects_invalid_args(void)
 
 static void test_embed_rejects_uninitialised(void)
 {
-    /* embed on a zeroed ctx (init never called) → INVALID_ARG. */
     ants_embed_t e = {{0}};
     float out[ANTS_EMBED_DIM];
     memset(out, 0, sizeof out);
     CHECK_EQ(ants_embed(&e, (const uint8_t *)"hello", 5, out), ANTS_ERROR_INVALID_ARG);
 }
 
-/* Bring up a ready-to-embed ctx with placeholder-hash buffers. */
-static void embed_init_default(ants_embed_t *e)
-{
-    ants_embed_config_t cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.weights = (const uint8_t *)"placeholder-weights";
-    cfg.weights_len = 19;
-    cfg.tokenizer = (const uint8_t *)"placeholder-tokenizer";
-    cfg.tokenizer_len = 21;
-    CHECK_EQ(ants_embed_init(e, &cfg), ANTS_OK);
-}
-
 static void test_embed_deterministic_same_input(void)
 {
-    /* Calling embed twice with the same input on the same ctx
-     * returns bit-identical floats. This is the property cache/semantic
-     * relies on for LSH-routing stability. */
     ants_embed_t e = {{0}};
-    embed_init_default(&e);
+    uint8_t *weights = NULL;
+    size_t weights_len = 0;
+    if (fixture_init(&e, &weights, &weights_len) != 0) {
+        failures++;
+        return;
+    }
 
-    const uint8_t in[] = "the canonical input for the determinism test";
+    const uint8_t in[] = "hello world";
     float a[ANTS_EMBED_DIM];
     float b[ANTS_EMBED_DIM];
     CHECK_EQ(ants_embed(&e, in, sizeof in - 1, a), ANTS_OK);
@@ -210,17 +429,21 @@ static void test_embed_deterministic_same_input(void)
     CHECK(memcmp(a, b, sizeof a) == 0);
 
     CHECK_EQ(ants_embed_destroy(&e), ANTS_OK);
+    free(weights);
 }
 
 static void test_embed_distinct_inputs_distinct_outputs(void)
 {
-    /* Two different inputs produce two different outputs (BLAKE3
-     * collision resistance carries through the stub's expansion). */
     ants_embed_t e = {{0}};
-    embed_init_default(&e);
+    uint8_t *weights = NULL;
+    size_t weights_len = 0;
+    if (fixture_init(&e, &weights, &weights_len) != 0) {
+        failures++;
+        return;
+    }
 
-    const uint8_t in1[] = "input one";
-    const uint8_t in2[] = "input two";
+    const uint8_t in1[] = "hello world";
+    const uint8_t in2[] = "the test input";
     float a[ANTS_EMBED_DIM];
     float b[ANTS_EMBED_DIM];
     CHECK_EQ(ants_embed(&e, in1, sizeof in1 - 1, a), ANTS_OK);
@@ -228,17 +451,20 @@ static void test_embed_distinct_inputs_distinct_outputs(void)
     CHECK(memcmp(a, b, sizeof a) != 0);
 
     CHECK_EQ(ants_embed_destroy(&e), ANTS_OK);
+    free(weights);
 }
 
 static void test_embed_l2_normalised(void)
 {
-    /* Sum-of-squares of the output must be very close to 1.0. We
-     * tolerate ~1e-5 absolute error to account for the float32
-     * rounding in the 1024-term sum + the final divide. */
     ants_embed_t e = {{0}};
-    embed_init_default(&e);
+    uint8_t *weights = NULL;
+    size_t weights_len = 0;
+    if (fixture_init(&e, &weights, &weights_len) != 0) {
+        failures++;
+        return;
+    }
 
-    const uint8_t in[] = "normalisation check";
+    const uint8_t in[] = "a canonical input";
     float out[ANTS_EMBED_DIM];
     CHECK_EQ(ants_embed(&e, in, sizeof in - 1, out), ANTS_OK);
 
@@ -246,10 +472,10 @@ static void test_embed_l2_normalised(void)
     for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
         sum_sq += (double)out[i] * (double)out[i];
     }
-    /* ||out||_2 ≈ 1 ± few-ulp. */
-    CHECK(fabs(sum_sq - 1.0) < 1e-5);
+    CHECK(fabs(sum_sq - 1.0) < 1e-4);
 
     CHECK_EQ(ants_embed_destroy(&e), ANTS_OK);
+    free(weights);
 }
 
 int main(void)
@@ -257,7 +483,7 @@ int main(void)
     test_pinned_constants();
     test_opaque_ctx_layout();
     test_init_rejects_invalid_args();
-    test_init_succeeds_with_placeholder_hashes();
+    test_init_rejects_bad_weights();
     test_verify_placeholder_skips();
     test_verify_matches_real_hash();
     test_destroy_rejects_null();

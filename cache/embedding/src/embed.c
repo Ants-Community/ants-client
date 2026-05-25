@@ -1,51 +1,48 @@
 /*
- * embed.c — Canonical embedding service (Component #11).
+ * embed.c — Canonical embedding service (Component #11), phase 4-real
+ * step 5d.
  *
- * Phase 3 + Phase 4 (stub-inference variant). The hash-verification
- * path is implemented for real: when the protocol-pinned hash is
- * non-zero, the buffer is BLAKE3'd and constant-time-compared; a
- * mismatch refuses initialisation. When the pinned hash is all-zero
- * (the placeholder state per RFC-0008 §5: "the specific 32-byte
- * values for v1 will be set when the reference client is published"),
- * verification is skipped — this is the v0.x phase where the
- * canonical bundle has not yet been pinned. The non-zero path becomes
- * meaningful as soon as phase 5 lands the real BGE-M3 hashes.
+ * The stub from step 5-stub is gone. ants_embed_init now drives the
+ * full BGE-M3 pipeline:
  *
- * The inference path is a STUB. ants_embed currently derives a
- * deterministic 1024-dim L2-normalised float vector from the input
- * bytes via BLAKE3-keyed expansion. It is NOT a real BGE-M3
- * embedding; it has zero semantic meaning. It exists so:
+ *   1. Hash-verify both the weights and the tokenizer JSON against
+ *      the pinned BLAKE3 (placeholders skip per RFC-0008 §5).
+ *   2. Parse the weights as a GGUF (embed_gguf).
+ *   3. Bind the BGE-M3 tensors (embed_model). Validates that the
+ *      file declares ANTS_EMBED_DIM as its embedding_length —
+ *      anything else fails ANTS_ERROR_NON_CANONICAL, even if the
+ *      file is internally consistent.
+ *   4. Parse the tokenizer.json into a vocab blob.
+ *   5. Init the Unigram tokenizer (NFKC + byte-fallback NOT enabled
+ *      at this step; caller-supplied vocab is expected to cover
+ *      whitespace-separated UTF-8 input).
  *
- *   - cache/semantic can be developed and tested against a stable
- *     ants_embed contract (same input → same output, every call,
- *     on the same platform),
- *   - the API surface and lifecycle ordering are exercised end-to-
- *     end (init → embed → destroy),
- *   - and a future PR can replace ONLY the inference implementation
- *     without touching the public API.
+ * ants_embed runs the BGE-M3 forward via embed_forward:
  *
- * Replacing the stub with real ggml-backed BGE-M3 inference is phase
- * 4-real (a follow-up PR that consumes the vendored deps/ggml). The
- * test vectors at ants-test-vectors/vectors/ants-embed-v1/ will be
- * populated jointly with that PR, against a fixed BGE-M3 checkpoint.
+ *   tokenize input bytes → cap to model->n_ctx → cast uint32 → int32 →
+ *   bge_m3_forward → out (already L2-normalised inside forward).
+ *
+ * The opaque ctx still holds only the small state struct plus the
+ * inline tokenizer; the gguf loader, model, and vocab blob live in
+ * heap allocations referenced through state pointers.
  */
 
 #include "ants_embed.h"
 
 #include "ants_crypto.h"
+#include "ants_tokenizer.h"
+#include "embed_forward.h"
+#include "embed_gguf.h"
+#include "embed_model.h"
 
-#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
 /* Protocol-pinned constants                                                */
-/*                                                                          */
-/* All-zero placeholders for the hashes per RFC-0008 §5. The real values    */
-/* land in phase 5 of this component, jointly with the test-vector pack    */
-/* publication (ants-test-vectors/vectors/ants-embed-v1/).                  */
 /* ------------------------------------------------------------------------ */
 
 const char *const ANTS_EMBED_MODEL_ID = "ants-embed-v1";
@@ -55,36 +52,43 @@ const uint8_t ANTS_EMBED_WEIGHTS_HASH_PINNED[32] = {0};
 const uint8_t ANTS_EMBED_TOKENIZER_HASH_PINNED[32] = {0};
 
 /* ------------------------------------------------------------------------ */
-/* Internal state layout                                                    */
+/* Internal state                                                           */
+/*                                                                          */
+/* magic = "ANSE" identifies a fully-initialised state; embed_destroy on a  */
+/* zeroed (never-initialised) ctx is a no-op because magic == 0 there.     */
+/* Same discipline as ants_transport_state in network/transport/src.       */
 /* ------------------------------------------------------------------------ */
 
+#define ANTS_EMBED_STATE_MAGIC 0x414E5345u /* 'A','N','S','E' */
+
 struct ants_embed_state {
-    bool initialised;
-    uint8_t _pad[7];
+    uint32_t magic;
+    uint8_t _pad[4];
+
+    /* Caller-owned buffers (kept for documentation; the heap resources
+     * below reference into the weights blob for tensor data). */
     const uint8_t *weights;
     size_t weights_len;
     const uint8_t *tokenizer;
     size_t tokenizer_len;
+
+    /* Heap-owned resources. Destroy order: tokenizer (uses vocab_blob)
+     * → vocab_blob → model (uses loader's ggml_context) → loader. */
+    embed_gguf_loader_t *gguf_loader;
+    bge_m3_model_t *model;
+    ants_tokenizer_vocab_blob_t *vocab_blob;
+
+    /* Inline tokenizer ctx (1 KiB; ants_tokenizer_t is a union). */
+    ants_tokenizer_t tok;
 };
 
 typedef char ants_embed_state_size_check
     [(sizeof(struct ants_embed_state) <= sizeof(((ants_embed_t *)0)->_opaque)) ? 1 : -1];
 
 /* ------------------------------------------------------------------------ */
-/* Hash verification                                                        */
-/*                                                                          */
-/* Per RFC-0002: "no close enough, bit-exact match or rejection". The      */
-/* check has two semantically distinct paths:                              */
-/*                                                                          */
-/*   - pinned == all-zero: v0.x placeholder phase. We have no real hash to */
-/*     compare against, so verification is skipped (the caller is on their */
-/*     own to ship the right weights). Returns ANTS_OK.                    */
-/*   - pinned != all-zero: BLAKE3 the buffer, constant-time-compare to    */
-/*     the pinned value. Mismatch → ANTS_ERROR_NON_CANONICAL.              */
-/*                                                                          */
-/* Exposed via a test hook (ants_embed__test_verify) so the verify path   */
-/* can be exercised end-to-end even while the public pinned constants are */
-/* still placeholder zeros.                                                */
+/* Hash verification (unchanged from the stub PR; verify path exposed as
+ * a test hook so the strict path stays covered while the public pinned
+ * constants are still placeholder zeros).                                  */
 /* ------------------------------------------------------------------------ */
 
 static bool pinned_is_placeholder(const uint8_t pinned[32])
@@ -111,7 +115,6 @@ ants_error_t ants_embed__test_verify(const uint8_t *buf, size_t len, const uint8
     if (err != ANTS_OK) {
         return err;
     }
-    /* Constant-time compare via XOR-accumulate over all 32 bytes. */
     uint8_t diff = 0;
     for (size_t i = 0; i < ANTS_BLAKE3_HASH_SIZE; i++) {
         diff |= (uint8_t)(actual[i] ^ pinned[i]);
@@ -122,6 +125,28 @@ ants_error_t ants_embed__test_verify(const uint8_t *buf, size_t len, const uint8
 /* ------------------------------------------------------------------------ */
 /* Lifecycle                                                                */
 /* ------------------------------------------------------------------------ */
+
+static void tear_down(struct ants_embed_state *state)
+{
+    if (state == NULL) {
+        return;
+    }
+    if (state->magic == ANTS_EMBED_STATE_MAGIC) {
+        (void)ants_tokenizer_destroy(&state->tok);
+    }
+    if (state->vocab_blob != NULL) {
+        ants_tokenizer_vocab_free(state->vocab_blob);
+        state->vocab_blob = NULL;
+    }
+    if (state->model != NULL) {
+        bge_m3_free(state->model);
+        state->model = NULL;
+    }
+    if (state->gguf_loader != NULL) {
+        embed_gguf_free(state->gguf_loader);
+        state->gguf_loader = NULL;
+    }
+}
 
 ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *config)
 {
@@ -134,6 +159,9 @@ ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *confi
     if (config->tokenizer == NULL || config->tokenizer_len == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
+
+    /* Hash-verify both buffers up front. Mismatch (against a non-zero
+     * pinned hash) refuses initialisation before we touch ggml. */
     ants_error_t err = ants_embed__test_verify(
         config->weights, config->weights_len, ANTS_EMBED_WEIGHTS_HASH_PINNED);
     if (err != ANTS_OK) {
@@ -144,13 +172,51 @@ ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *confi
     if (err != ANTS_OK) {
         return err;
     }
+
     memset(ctx->_opaque, 0, sizeof ctx->_opaque);
     struct ants_embed_state *state = (struct ants_embed_state *)(void *)ctx->_opaque;
-    state->initialised = true;
     state->weights = config->weights;
     state->weights_len = config->weights_len;
     state->tokenizer = config->tokenizer;
     state->tokenizer_len = config->tokenizer_len;
+
+    /* Parse GGUF + bind the model. */
+    err = embed_gguf_load(config->weights, config->weights_len, &state->gguf_loader);
+    if (err != ANTS_OK) {
+        tear_down(state);
+        return err;
+    }
+    err = bge_m3_load_from_gguf(state->gguf_loader, &state->model);
+    if (err != ANTS_OK) {
+        tear_down(state);
+        return err;
+    }
+
+    /* Protocol-pinned dim check: the canonical model is 1024-dim. A
+     * GGUF that's internally consistent but with a different dim
+     * (e.g. BGE-M3-small) is REJECTED here even though the binder
+     * accepted it. */
+    if (state->model->n_embd != ANTS_EMBED_DIM) {
+        tear_down(state);
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+
+    /* Parse tokenizer.json + bring up the Unigram tokenizer. */
+    err = ants_tokenizer_load_huggingface_json(
+        (const char *)config->tokenizer, config->tokenizer_len, &state->vocab_blob);
+    if (err != ANTS_OK) {
+        tear_down(state);
+        return err;
+    }
+    const ants_tokenizer_vocab_entry_t *vocab = ants_tokenizer_vocab_entries(state->vocab_blob);
+    size_t vocab_size = ants_tokenizer_vocab_size(state->vocab_blob);
+    err = ants_tokenizer_init(&state->tok, vocab, vocab_size);
+    if (err != ANTS_OK) {
+        tear_down(state);
+        return err;
+    }
+
+    state->magic = ANTS_EMBED_STATE_MAGIC;
     return ANTS_OK;
 }
 
@@ -159,35 +225,21 @@ ants_error_t ants_embed_destroy(ants_embed_t *ctx)
     if (ctx == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
+    struct ants_embed_state *state = (struct ants_embed_state *)(void *)ctx->_opaque;
+    tear_down(state);
     memset(ctx->_opaque, 0, sizeof ctx->_opaque);
     return ANTS_OK;
 }
 
 /* ------------------------------------------------------------------------ */
-/* Stub inference                                                           */
-/*                                                                          */
-/* Deterministic 1024-dim float embedding derived from the input bytes via */
-/* BLAKE3. Algorithm:                                                      */
-/*                                                                          */
-/*   seed = BLAKE3(input)                            (32 bytes)            */
-/*   For chunk_idx in 0..127:                                              */
-/*       chunk_input = seed || chunk_idx_LE32       (36 bytes)             */
-/*       bytes[chunk_idx*32 .. +32] = BLAKE3(chunk_input)                  */
-/*   For i in 0..1023:                                                     */
-/*       bits = uint32_LE from bytes[i*4 .. +4]                            */
-/*       out[i] = (bits/2^32)*2 - 1                  in [-1, 1)            */
-/*   L2-normalise out to unit length.                                       */
-/*                                                                          */
-/* Properties:                                                              */
-/*   - deterministic: same input → same output (same platform);            */
-/*   - L2-normalised: ||out||_2 == 1.0 ± tiny FP rounding;                 */
-/*   - distinct inputs → distinct outputs (BLAKE3 collision resistance);   */
-/*   - NOT bit-exact across platforms (float multiplication ordering);    */
-/*   - NOT a real BGE-M3 embedding — zero semantic meaning. The whole     */
-/*     point is to be a stand-in until phase 4-real ggml inference lands. */
+/* Inference                                                                */
 /* ------------------------------------------------------------------------ */
 
-#define EMBED_STUB_CHUNK_COUNT (ANTS_EMBED_DIM / 8) /* 128 BLAKE3 calls × 32 B = 4096 B */
+/* Bound on token ids the forward pass accepts in a single call. BGE-M3
+ * supports up to 8192 positions; we cap to the model's declared n_ctx
+ * at runtime. The stack-allocated array below sizes for the worst
+ * case so we don't malloc per call. */
+#define ANTS_EMBED_MAX_TOKENS 8192
 
 ants_error_t ants_embed(ants_embed_t *ctx,
                         const uint8_t *input_bytes,
@@ -201,60 +253,37 @@ ants_error_t ants_embed(ants_embed_t *ctx,
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_embed_state *state = (struct ants_embed_state *)(void *)ctx->_opaque;
-    if (!state->initialised) {
+    if (state->magic != ANTS_EMBED_STATE_MAGIC) {
         return ANTS_ERROR_INVALID_ARG;
     }
 
-    uint8_t seed[ANTS_BLAKE3_HASH_SIZE];
-    ants_error_t err = ants_blake3_hash(input_bytes, input_len, seed);
-    if (err != ANTS_OK) {
+    /* Tokenize. ants_tokenizer_encode emits uint32_t ids; we cap to
+     * min(model->n_ctx, ANTS_EMBED_MAX_TOKENS) and cast down to int32_t
+     * for the forward pass (vocab << 2^31 so the cast is lossless). */
+    const size_t cap_tokens = (state->model->n_ctx < (uint32_t)ANTS_EMBED_MAX_TOKENS)
+                                  ? state->model->n_ctx
+                                  : (uint32_t)ANTS_EMBED_MAX_TOKENS;
+    uint32_t ids_u32[ANTS_EMBED_MAX_TOKENS];
+    size_t n_tokens = 0;
+    ants_error_t err = ants_tokenizer_encode(
+        &state->tok, (const char *)input_bytes, input_len, ids_u32, cap_tokens, &n_tokens);
+    /* BUFFER_TOO_SMALL is not a hard failure here: the input was longer
+     * than what the model can attend to in one window. ants_tokenizer
+     * leaves *out_count at the count it WOULD have written; we truncate
+     * to cap_tokens. */
+    if (err == ANTS_ERROR_BUFFER_TOO_SMALL) {
+        n_tokens = cap_tokens;
+    } else if (err != ANTS_OK) {
         return err;
     }
-
-    /* 4096 bytes of derived material via 128 keyed BLAKE3 calls. */
-    uint8_t bytes[ANTS_EMBED_DIM * 4];
-    uint8_t chunk_input[ANTS_BLAKE3_HASH_SIZE + 4];
-    memcpy(chunk_input, seed, ANTS_BLAKE3_HASH_SIZE);
-    for (uint32_t chunk_idx = 0; chunk_idx < EMBED_STUB_CHUNK_COUNT; chunk_idx++) {
-        chunk_input[ANTS_BLAKE3_HASH_SIZE + 0] = (uint8_t)(chunk_idx & 0xFFu);
-        chunk_input[ANTS_BLAKE3_HASH_SIZE + 1] = (uint8_t)((chunk_idx >> 8) & 0xFFu);
-        chunk_input[ANTS_BLAKE3_HASH_SIZE + 2] = (uint8_t)((chunk_idx >> 16) & 0xFFu);
-        chunk_input[ANTS_BLAKE3_HASH_SIZE + 3] = (uint8_t)((chunk_idx >> 24) & 0xFFu);
-        err = ants_blake3_hash(
-            chunk_input, sizeof chunk_input, &bytes[chunk_idx * ANTS_BLAKE3_HASH_SIZE]);
-        if (err != ANTS_OK) {
-            return err;
-        }
-    }
-
-    /* Map 4-byte LE chunks to floats in [-1, 1). */
-    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
-        uint32_t bits = (uint32_t)bytes[i * 4 + 0] | ((uint32_t)bytes[i * 4 + 1] << 8) |
-                        ((uint32_t)bytes[i * 4 + 2] << 16) | ((uint32_t)bytes[i * 4 + 3] << 24);
-        /* 2^32 = 4294967296.0. Mapping is exact for bits a multiple of 256,
-         * close enough otherwise (FP rounding is the same on every IEEE 754
-         * conformant target). */
-        float u01 = (float)bits * (1.0f / 4294967296.0f);
-        out[i] = u01 * 2.0f - 1.0f;
-    }
-
-    /* L2-normalise so ||out||_2 == 1. Accumulate in double to keep
-     * rounding noise minimal across the 1024-term sum. */
-    double sum_sq = 0.0;
-    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
-        double v = (double)out[i];
-        sum_sq += v * v;
-    }
-    double norm = sqrt(sum_sq);
-    if (norm < 1e-30) {
-        /* Pathological all-zero output — would require a BLAKE3 preimage
-         * that produces 1024 zero u32s, which is cryptographically
-         * impossible. Defensive bail just to keep the divide safe. */
+    if (n_tokens == 0) {
         return ANTS_ERROR_NON_CANONICAL;
     }
-    float inv_norm = (float)(1.0 / norm);
-    for (size_t i = 0; i < ANTS_EMBED_DIM; i++) {
-        out[i] *= inv_norm;
+
+    int32_t ids_i32[ANTS_EMBED_MAX_TOKENS];
+    for (size_t i = 0; i < n_tokens; i++) {
+        ids_i32[i] = (int32_t)ids_u32[i];
     }
-    return ANTS_OK;
+
+    return bge_m3_forward(state->model, ids_i32, (uint32_t)n_tokens, NULL, out);
 }
