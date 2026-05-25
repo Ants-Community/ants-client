@@ -2,7 +2,7 @@
 
 Semantic cache (DHT-routed). Cache layer.
 
-**Status:** pending claim.
+**Status:** scaffold landed (API + stubs); LSH + storage + DHT integration pending.
 **Effort:** 5 EM.
 **Spec:** [RFC-0002 v0.4](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-semantic-cache.md).
 **Dependencies:** `network/dht`, `reputation/identity`, `cache/embedding`.
