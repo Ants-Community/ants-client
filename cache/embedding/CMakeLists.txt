@@ -11,6 +11,7 @@
 add_library(ants_embed STATIC
     src/embed.c
     src/embed_gguf.c
+    src/embed_model.c
     src/tokenizer.c
     src/tokenizer_json.c
 )
@@ -66,4 +67,11 @@ if(BUILD_TESTING)
     target_include_directories(test_embed_gguf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_embed_gguf PRIVATE ants_embed ggml)
     add_test(NAME embed_gguf COMMAND test_embed_gguf)
+
+    # Same access pattern as test_embed_gguf — the model binder needs
+    # the GGUF wrapper + ggml for fixture construction.
+    add_executable(test_embed_model tests/test_embed_model.c)
+    target_include_directories(test_embed_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_embed_model PRIVATE ants_embed ggml)
+    add_test(NAME embed_model COMMAND test_embed_model)
 endif()
