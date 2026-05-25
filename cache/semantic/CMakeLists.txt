@@ -19,12 +19,23 @@ target_include_directories(ants_semantic_cache
 )
 
 # ants_strerror lives in ants_cbor for now (same transitional placement
-# the other components use). ants_embed for ANTS_EMBED_DIM.
+# the other components use). ants_embed for ANTS_EMBED_DIM. ants_crypto
+# (BLAKE3) is PRIVATE — used internally to derive the LSH projection
+# matrix from a fixed seed label; not exposed in our public API.
 target_link_libraries(ants_semantic_cache
     PUBLIC
         ants_cbor
         ants_embed
+    PRIVATE
+        ants_crypto
 )
+
+# libm for sqrt/log/cos used by the LSH Box-Muller transform. On
+# macOS clang links libm implicitly; glibc requires it explicit. Same
+# guard cache/embedding uses for its stub L2-normalisation.
+if(NOT MSVC AND NOT APPLE)
+    target_link_libraries(ants_semantic_cache PUBLIC m)
+endif()
 
 target_compile_features(ants_semantic_cache PUBLIC c_std_99)
 
