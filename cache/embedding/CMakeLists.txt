@@ -10,6 +10,7 @@
 
 add_library(ants_embed STATIC
     src/embed.c
+    src/embed_forward.c
     src/embed_gguf.c
     src/embed_model.c
     src/tokenizer.c
@@ -74,4 +75,11 @@ if(BUILD_TESTING)
     target_include_directories(test_embed_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_embed_model PRIVATE ants_embed ggml)
     add_test(NAME embed_model COMMAND test_embed_model)
+
+    # Forward-pass test runs the BGE-M3 graph end-to-end on a tiny
+    # FNV-1a-keyed pattern-weight fixture.
+    add_executable(test_embed_forward tests/test_embed_forward.c)
+    target_include_directories(test_embed_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_embed_forward PRIVATE ants_embed ggml)
+    add_test(NAME embed_forward COMMAND test_embed_forward)
 endif()
