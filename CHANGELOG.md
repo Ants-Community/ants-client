@@ -13,6 +13,88 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 7a — top-K + storage refactor + inbound handlers · 2026-05-25
+
+**Server-side end-to-end ready.** Two consecutive PRs close the
+local half of the DHT-routed write + lookup protocols. After this,
+the cache can fully receive a producer-signed entry off the wire
+(`handle_inbound_entry`), persist it with every field intact, and
+serve canonical-CBOR responses to inbound lookup requests
+(`handle_inbound_lookup`). The remaining Component #10 work is
+the **client side** — DHT-routed publish (step 7b) and DHT-routed
+query (step 7c) — plus Hamming neighbour expansion (step 8) and
+the quality-signal layer (step 9).
+
+**PR #62 — step 7a: top-K lookup** (+344):
+
+- `ants_semantic_cache_get_topk(cache, embedding, threshold, top_k,
+  out_matches, out_embeddings, cap_matches, *out_n)`: linear scan
+  filtered by shard_key, collect every entry above threshold into
+  a 256-slot stack-resident candidate array, insertion-sort desc
+  by similarity, emit `min(top_k, cap_matches, n_eligible)` matches
+  into caller buffers. `*out_n` is always `min(top_k, n_eligible)`
+  — the count the caller needs to allocate to receive every
+  eligible match — so `BUFFER_TOO_SMALL` can drive a retry with
+  a bigger buffer.
+- `last_access` bumped on every match emitted (LRU semantics:
+  retrieval refreshes recency, consistent with the existing get
+  path).
+- Storage limitation flagged in the header: at step 7a the local
+  store still persists only `(embedding, value-as-response)`, so
+  every other entry field comes back zero/empty in the match
+  views.
+- 7 new tests: NULL args, uninit ctx, empty cache, sorted-desc
+  with LSH-cell-boundary tolerance, top_k cap, top_k=0 unbounded,
+  buffer-too-small with `out_n=full_count`.
+
+**PR #63 — step 7a.2: full-record storage + inbound handlers** (+568/-45):
+
+- **Storage refactor**: `cache_entry_t` now carries the full
+  producer-signed record. Heap-allocated copies of `embedding_model`,
+  `response`, `response_model`, `attestation`; inlined fixed-length
+  `prompt_hash`, `producer`, `signature`; scalars `created`,
+  `validity_class`. `free_entry()` helper releases every owned
+  allocation (called by `free_all_entries`, `evict_at`, `destroy`,
+  `clear`).
+- `get_topk` now populates the full `match.entry` view: pointer
+  fields alias the cache's internal heap copies, fixed-length
+  fields are `memcpy`'d, scalars copied.
+- **New public API**:
+  - `ants_semantic_cache_put_record(cache, *entry)`: all-or-nothing
+    copy of every field. Pre-validates exactly as the encoder does;
+    rolls back any partial mallocs on failure.
+  - `ants_semantic_cache_handle_inbound_entry(cache, cbor, len)`:
+    decode the step-4 wire bytes + `put_record`. Signature
+    verification is a documented TODO for step 7b+ (Ed25519 over
+    canonical fields 1..9 vs `producer` pubkey).
+  - `ants_semantic_cache_handle_inbound_lookup(cache, req, req_len,
+    resp_buf, resp_cap, *out_len)`: decode the step-5 request →
+    `get_topk` with server-side cap of 15 (defensive against
+    greedy clients) → encode the step-6 response. Heap-allocates
+    the 60 KB match-embedding scratch so the stack stays clean
+    even on platforms with tight defaults.
+- `ants_semantic_cache_put(emb, value)` is now a thin convenience
+  wrapper that builds a placeholder record (model = `"ants-embed-v1"`,
+  everything else zero / EPHEMERAL) and calls `put_record`. All
+  pre-existing put / get / get_topk / eviction tests pass
+  unchanged.
+- 8 new tests including the round-trip end-to-end check:
+  `put_record` → `entry_encode` → `handle_inbound_entry` ↔
+  `lookup_request_encode` → `handle_inbound_lookup` →
+  `lookup_response_decode`, verifying every entry field
+  byte-for-byte through the whole pipeline.
+
+**Component #10 status after PR #63**: every byte of the local
+server side is exercised — wire formats, LSH routing, full-record
+storage, LRU eviction, top-K cosine ranking, inbound write +
+lookup handlers. Two peers running this cache can already exchange
+records if you hand-wire the bytes between them. Steps 7b/7c put
+the DHT + transport in the middle so peers discover each other
+without a side-channel.
+
+CI matrix (7 jobs): both PRs first-push green; #62 absorbed one
+unrelated DHT-flake re-run.
+
 ### cache: Component #10 (semantic cache) steps 0-6 — scaffold through wire formats · 2026-05-25
 
 **Local cache layer + wire formats complete.** Seven consecutive PRs
