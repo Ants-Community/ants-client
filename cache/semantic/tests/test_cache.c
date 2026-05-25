@@ -487,6 +487,143 @@ static void test_entries_grows_with_puts(void)
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
+/* -- LRU eviction (step 3) ------------------------------------------------
+ *
+ * These exercise the per_shard_max + total_max caps. Both default to 0
+ * (unbounded) in earlier tests, so the existing 30-put grow test still
+ * holds; here we explicitly set the caps and verify eviction picks the
+ * LRU candidate. */
+
+static void test_total_cap_enforced(void)
+{
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    cfg.total_max = 3;
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    for (uint32_t i = 0; i < 10; i++) {
+        float emb[ANTS_EMBED_DIM];
+        make_random_embedding(2000 + i, emb);
+        uint8_t v = (uint8_t)('a' + i);
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+    /* Total cap holds: entries stays at 3 after 10 puts. */
+    CHECK(ants_semantic_cache_entries(&c) == 3);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_total_cap_evicts_lru_and_recency_is_bumped_by_get(void)
+{
+    /* Cap = 2. Sequence:
+     *   put A     -> entries = {A}              (A.last_access = 1)
+     *   put B     -> entries = {A, B}           (B.last_access = 2)
+     *   get A     -> hit, bumps A               (A.last_access = 3)
+     *   put C     -> cap exceeded; B is LRU     (evict B; C.last_access = 4)
+     * Expectations after: A + C present, B gone. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    cfg.total_max = 2;
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float a[ANTS_EMBED_DIM];
+    float b[ANTS_EMBED_DIM];
+    float d[ANTS_EMBED_DIM];
+    make_random_embedding(3001, a);
+    make_random_embedding(3002, b);
+    make_random_embedding(3003, d);
+    CHECK_EQ(ants_semantic_cache_put(&c, a, (const uint8_t *)"A", 1), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_put(&c, b, (const uint8_t *)"B", 1), ANTS_OK);
+
+    uint8_t out[8];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, a, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+
+    CHECK_EQ(ants_semantic_cache_put(&c, d, (const uint8_t *)"D", 1), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 2);
+
+    /* A is still present. */
+    CHECK_EQ(ants_semantic_cache_get(&c, a, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 1 && out[0] == 'A');
+
+    /* B is gone. */
+    CHECK_EQ(ants_semantic_cache_get(&c, b, 0.9f, out, sizeof out, &out_len, &sim),
+             ANTS_ERROR_NOT_FOUND);
+
+    /* D is present. */
+    CHECK_EQ(ants_semantic_cache_get(&c, d, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 1 && out[0] == 'D');
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_per_shard_cap_enforced(void)
+{
+    /* Put 5 entries that all share the same shard key (same embedding,
+     * different values). With per_shard_max = 2 only 2 should remain. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    cfg.per_shard_max = 2;
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(4000, emb);
+    for (uint32_t i = 0; i < 5; i++) {
+        uint8_t v = (uint8_t)('0' + i);
+        CHECK_EQ(ants_semantic_cache_put(&c, emb, &v, 1), ANTS_OK);
+    }
+    CHECK(ants_semantic_cache_entries(&c) == 2);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_per_shard_cap_does_not_evict_other_shards(void)
+{
+    /* per_shard_max = 1 on two different shards. After 3 puts (2 in
+     * shard A, 1 in shard B), entries should be 2 (one per shard).
+     * The shard-B entry is NOT evicted by puts into shard A. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    cfg.per_shard_max = 1;
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb_a[ANTS_EMBED_DIM];
+    float emb_b[ANTS_EMBED_DIM];
+    make_random_embedding(5001, emb_a);
+    make_random_embedding(5002, emb_b);
+
+    /* Two unrelated unit vectors in 1024-d are almost certainly in
+     * different LSH cells (probability of same 64-bit shard key over
+     * a Gaussian-hyperplane random LSH is ~ 2^-32 with concentration
+     * of measure; this is testably zero in practice). */
+    ants_semantic_cache_shard_key_t ka = 0;
+    ants_semantic_cache_shard_key_t kb = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(emb_a, &ka), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_shard_key(emb_b, &kb), ANTS_OK);
+    CHECK(ka != kb);
+
+    CHECK_EQ(ants_semantic_cache_put(&c, emb_a, (const uint8_t *)"A1", 2), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_put(&c, emb_b, (const uint8_t *)"B1", 2), ANTS_OK);
+    /* Second put into shard A: evicts the older shard-A entry, leaves
+     * shard B alone. */
+    CHECK_EQ(ants_semantic_cache_put(&c, emb_a, (const uint8_t *)"A2", 2), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&c) == 2);
+
+    /* Shard B is intact. */
+    uint8_t out[8];
+    size_t out_len = 0;
+    float sim = 0;
+    CHECK_EQ(ants_semantic_cache_get(&c, emb_b, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 2 && memcmp(out, "B1", 2) == 0);
+
+    /* Shard A now holds A2 (A1 was evicted). */
+    CHECK_EQ(ants_semantic_cache_get(&c, emb_a, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
+    CHECK(out_len == 2 && memcmp(out, "A2", 2) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
 static void test_clear_removes_entries(void)
 {
     ants_semantic_cache_t c = {{0}};
@@ -542,6 +679,10 @@ int main(void)
     test_get_buffer_too_small_reports_required();
     test_get_ranks_by_similarity();
     test_entries_grows_with_puts();
+    test_total_cap_enforced();
+    test_total_cap_evicts_lru_and_recency_is_bumped_by_get();
+    test_per_shard_cap_enforced();
+    test_per_shard_cap_does_not_evict_other_shards();
     test_clear_removes_entries();
 
     if (failures > 0) {

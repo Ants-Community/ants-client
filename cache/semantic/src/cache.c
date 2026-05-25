@@ -1,26 +1,33 @@
 /*
  * cache.c — Semantic cache (Component #10).
  *
- * Step 2 (this PR): local-shard storage + cosine-similarity lookup.
- * init/destroy/put/get/clear/entries now do real work against an in-
- * memory bucket store. Eviction (LRU per shard, decay by validity
- * class) stays in step 3; DHT-routed write/lookup is steps 4-5;
- * quality signals + challenge invalidation is step 6.
+ * Step 3 (this PR): LRU eviction now enforces the per_shard_max +
+ * total_max caps from ants_semantic_cache_config_t. Remaining steps:
+ * DHT-routed write protocol (4), DHT-routed lookup with Hamming-
+ * neighbour expansion (5), quality-signal aggregation + challenge
+ * invalidation (6). Decay by validity class — also part of RFC-0002
+ * §Quality — composes with the eviction logic in step 6.
  *
  * Storage layout:
  *   - state.entries is a flat heap array of cache_entry_t, grown
  *     geometrically on put.
  *   - Each entry holds the L2-normalised embedding (4 KB) + a copy
- *     of the value bytes + the precomputed shard key + an LRU counter.
- *   - Lookup is a linear scan over the entries array, filtered by
- *     matching shard_key, then ranked by cosine similarity (a dot
- *     product on the already-normalised vectors). Step 5 will
- *     swap this for an indexed bucket map + Hamming-neighbour
- *     expansion across the DHT.
+ *     of the value bytes + the precomputed shard key + a monotonic
+ *     last_access counter set on every put and every get hit.
+ *   - Lookup is a linear scan filtered by shard_key, ranked by cosine
+ *     similarity (dot product on the already-normalised vectors).
+ *   - Eviction picks the entry with the smallest last_access and
+ *     swap-with-last-removes it (O(1) once the LRU is identified;
+ *     the find itself is O(n) or O(n_in_shard)).
  *
- * The per_shard_max / total_max caps from ants_semantic_cache_config_t
- * are advisory in step 2 — recorded on init but not enforced. Step 3
- * lands LRU eviction that honours them.
+ * Cap semantics:
+ *   - total_max  = 0 → unbounded across all shards.
+ *   - per_shard_max = 0 → unbounded within any single shard.
+ *   - Both caps are pre-insert: when a put would push n_entries past
+ *     total_max OR the shard's count past per_shard_max, the LRU
+ *     candidate is evicted FIRST and the new entry takes its slot.
+ *   - Order: total_max check first (may incidentally free a slot in
+ *     the shard); then per_shard_max check.
  */
 
 #include "ants_semantic_cache.h"
@@ -238,6 +245,89 @@ static void free_all_entries(struct ants_semantic_cache_state *state)
     state->n_entries = 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* LRU eviction                                                             */
+/* ------------------------------------------------------------------------ */
+
+/* Count entries whose shard_key matches `key`. O(n_entries) linear scan;
+ * step 5 will swap this for a hash-table bucket index. */
+static size_t count_in_shard(const struct ants_semantic_cache_state *state,
+                             ants_semantic_cache_shard_key_t key)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < state->n_entries; i++) {
+        if (state->entries[i].shard_key == key) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Find the entry with the smallest last_access. When `filter_by_shard`
+ * is true, only entries with shard_key == `key` are considered.
+ * Returns true and sets *out_idx on success, false if no matching
+ * entry exists (e.g. shard empty). */
+static bool find_lru(const struct ants_semantic_cache_state *state,
+                     bool filter_by_shard,
+                     ants_semantic_cache_shard_key_t key,
+                     size_t *out_idx)
+{
+    uint64_t min_access = UINT64_MAX;
+    size_t min_idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < state->n_entries; i++) {
+        if (filter_by_shard && state->entries[i].shard_key != key) {
+            continue;
+        }
+        if (state->entries[i].last_access < min_access) {
+            min_access = state->entries[i].last_access;
+            min_idx = i;
+            found = true;
+        }
+    }
+    if (found) {
+        *out_idx = min_idx;
+    }
+    return found;
+}
+
+/* Free the entry at `idx` and swap the last entry into its slot.
+ * O(1); the entries[] order is internal so the swap is fine. */
+static void evict_at(struct ants_semantic_cache_state *state, size_t idx)
+{
+    free(state->entries[idx].value);
+    state->entries[idx].value = NULL;
+    size_t last = state->n_entries - 1;
+    if (idx != last) {
+        state->entries[idx] = state->entries[last];
+    }
+    memset(&state->entries[last], 0, sizeof state->entries[last]);
+    state->n_entries--;
+}
+
+/* Pre-insert cap enforcement. Called by put() right before appending
+ * a new entry for shard_key `key`. Evicts the global LRU if total_max
+ * would be exceeded, then the shard LRU if per_shard_max would. */
+static void enforce_caps_on_insert(struct ants_semantic_cache_state *state,
+                                   ants_semantic_cache_shard_key_t key)
+{
+    if (state->total_max > 0 && state->n_entries >= state->total_max) {
+        size_t idx = 0;
+        if (find_lru(state, false, 0, &idx)) {
+            evict_at(state, idx);
+        }
+    }
+    if (state->per_shard_max > 0) {
+        size_t shard_count = count_in_shard(state, key);
+        if (shard_count >= state->per_shard_max) {
+            size_t idx = 0;
+            if (find_lru(state, true, key, &idx)) {
+                evict_at(state, idx);
+            }
+        }
+    }
+}
+
 ants_error_t ants_semantic_cache_init(ants_semantic_cache_t *cache,
                                       const ants_semantic_cache_config_t *config)
 {
@@ -301,6 +391,12 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
     if (err != ANTS_OK) {
         return err;
     }
+
+    /* Enforce caps BEFORE growth + insert: an eviction here may free
+     * a slot that would otherwise push the array past its capacity.
+     * Order: total_max first (the global cap may incidentally free a
+     * slot in this shard), then per_shard_max. */
+    enforce_caps_on_insert(state, key);
 
     /* Geometric growth of the flat entry array. */
     if (state->n_entries == state->cap_entries) {
