@@ -852,6 +852,15 @@ ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache)
  * bound. Caller's top_k > 15 gets clamped here. */
 #define HANDLE_LOOKUP_SERVER_CAP 15u
 
+/* Module-private helper in cache_wire.c (no public header): emits the
+ * CBOR map(9) over fields 1..9 — the canonical signing payload the
+ * producer's Ed25519 signature covers. Probe-mode (buf=NULL, out_cap=0)
+ * returns BUFFER_TOO_SMALL with *out_len = required size. */
+extern ants_error_t cache_entry_emit_signing_payload(const ants_semantic_cache_entry_t *entry,
+                                                     uint8_t *buf,
+                                                     size_t out_cap,
+                                                     size_t *out_len);
+
 ants_error_t ants_semantic_cache_handle_inbound_entry(ants_semantic_cache_t *cache,
                                                       const uint8_t *entry_cbor,
                                                       size_t cbor_len)
@@ -867,11 +876,34 @@ ants_error_t ants_semantic_cache_handle_inbound_entry(ants_semantic_cache_t *cac
         return err;
     }
 
-    /* TODO step 7b+: verify entry.signature against entry.producer
-     * (Ed25519 over the canonical CBOR of fields 1..9) before
-     * admitting to the local shard. The current behaviour accepts
-     * any well-formed record; tier-aware attestation engines wire
-     * in later. */
+    /* Verify the producer's Ed25519 signature over the canonical CBOR
+     * of fields 1..9 (RFC-0002 §The cache entry). The signature is
+     * checked BEFORE the entry touches the local shard: a forged or
+     * tampered record never reaches put_record, so a malicious peer
+     * can't get a planted entry to outlive a single rejected stream.
+     *
+     * The signing payload is fields 1..9 — strictly smaller than the
+     * full record's CBOR (which adds the signature field, 67 bytes of
+     * overhead), so `cbor_len` is always a safe upper bound for the
+     * allocation. */
+    uint8_t *signing_buf = (uint8_t *)malloc(cbor_len);
+    if (signing_buf == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    size_t signing_len = 0;
+    err = cache_entry_emit_signing_payload(&entry, signing_buf, cbor_len, &signing_len);
+    if (err != ANTS_OK) {
+        free(signing_buf);
+        return err;
+    }
+    err = ants_ed25519_verify(entry.producer, signing_buf, signing_len, entry.signature);
+    free(signing_buf);
+    if (err != ANTS_OK) {
+        /* ants_ed25519_verify maps invalid signatures to MALFORMED; any
+         * other code (INVALID_ARG on bad key length, etc.) propagates
+         * verbatim. Either way the record is not admitted. */
+        return err;
+    }
 
     return ants_semantic_cache_put_record(cache, &entry);
 }

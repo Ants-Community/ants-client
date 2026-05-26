@@ -18,14 +18,25 @@
 
 #include "ants_cbor.h"
 #include "ants_common.h"
+#include "ants_crypto.h"
 #include "ants_embed.h"
 #include "ants_semantic_cache.h"
+
+/* Module-private helper in cache_wire.c — emits the canonical CBOR
+ * signing payload (map(9) over fields 1..9) the producer signs. Used
+ * here to construct test fixtures whose signatures verify under the
+ * new handle_inbound_entry Ed25519 gate. */
+extern ants_error_t cache_entry_emit_signing_payload(const ants_semantic_cache_entry_t *entry,
+                                                     uint8_t *buf,
+                                                     size_t out_cap,
+                                                     size_t *out_len);
 
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -656,6 +667,45 @@ static void fill_test_entry(ants_semantic_cache_entry_t *e,
     e->attestation_len = sizeof att;
     for (uint32_t i = 0; i < ANTS_SEMANTIC_CACHE_SIG_LEN; i++) {
         e->signature[i] = (uint8_t)(0xD0u + (i & 0x0Fu));
+    }
+}
+
+/* Same as fill_test_entry but produces a record whose `producer`
+ * matches `priv`'s public key and whose `signature` is the actual
+ * Ed25519 signature over the canonical signing payload (CBOR map(9)
+ * of fields 1..9). Used by tests that exercise the handle_inbound_
+ * entry verify gate; the plain fill_test_entry still works for
+ * tests that only round-trip the wire format. */
+static void fill_signed_test_entry(ants_semantic_cache_entry_t *e,
+                                   const float *emb,
+                                   const char *response,
+                                   const char *resp_model,
+                                   const uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE])
+{
+    fill_test_entry(e, emb, response, resp_model);
+
+    uint8_t pub[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv, pub), ANTS_OK);
+    memcpy(e->producer, pub, ANTS_ED25519_PUBKEY_SIZE);
+
+    /* Comfortable upper bound for any realistic cache-entry signing
+     * payload (full record is ~5 KB max in v0.x; the payload is
+     * smaller still). Stack-allocated so the helper has no heap
+     * dependency. */
+    uint8_t payload[16384];
+    size_t payload_len = 0;
+    CHECK_EQ(cache_entry_emit_signing_payload(e, payload, sizeof payload, &payload_len), ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(priv, payload, payload_len, e->signature), ANTS_OK);
+}
+
+/* Deterministic Ed25519 private key for tests. Any 32-byte seed
+ * produces a valid private key for ed25519-donna / libsodium-style
+ * libraries; we pick a fixed pattern so test outputs stay
+ * reproducible. */
+static void make_test_priv(uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE], uint8_t seed_byte)
+{
+    for (uint32_t i = 0; i < ANTS_ED25519_PRIVKEY_SIZE; i++) {
+        priv[i] = (uint8_t)(seed_byte + (uint8_t)i);
     }
 }
 
@@ -1786,8 +1836,10 @@ static void test_handle_inbound_entry_round_trip(void)
 
     float emb[ANTS_EMBED_DIM];
     make_random_embedding(12100, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x11);
     ants_semantic_cache_entry_t in_e;
-    fill_test_entry(&in_e, emb, "round-trip response", "model-x");
+    fill_signed_test_entry(&in_e, emb, "round-trip response", "model-x", priv);
 
     uint8_t cbor[8192];
     size_t cbor_len = 0;
@@ -1816,6 +1868,70 @@ static void test_handle_inbound_entry_malformed(void)
     memset(garbage, 0xAB, sizeof garbage);
     ants_error_t e = ants_semantic_cache_handle_inbound_entry(&c, garbage, sizeof garbage);
     CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_entry_rejects_tampered_signature(void)
+{
+    /* A producer-signed record whose signature has been flipped MUST
+     * be rejected before the entry touches the local shard. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12150, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x22);
+    ants_semantic_cache_entry_t in_e;
+    fill_signed_test_entry(&in_e, emb, "tampered", "m", priv);
+    in_e.signature[0] ^= 0x01u; /* flip one bit — invalid signature. */
+
+    uint8_t cbor[8192];
+    size_t cbor_len = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, cbor, sizeof cbor, &cbor_len), ANTS_OK);
+
+    ants_error_t err = ants_semantic_cache_handle_inbound_entry(&c, cbor, cbor_len);
+    /* ants_ed25519_verify reports invalid signatures as MALFORMED. */
+    CHECK_EQ(err, ANTS_ERROR_MALFORMED);
+    CHECK(ants_semantic_cache_entries(&c) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_handle_inbound_entry_rejects_wrong_producer_pubkey(void)
+{
+    /* A record signed with key A but claiming `producer = pub(B)` must
+     * be rejected. Defends against a peer relaying someone else's
+     * record while substituting their own producer field. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(12160, emb);
+    uint8_t priv_a[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t priv_b[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv_a, 0x33);
+    make_test_priv(priv_b, 0x77);
+
+    ants_semantic_cache_entry_t in_e;
+    fill_signed_test_entry(&in_e, emb, "spoofed", "m", priv_a);
+    /* Overwrite producer with key B's pubkey AFTER signing with A's
+     * privkey. The signature is now valid over data whose `producer`
+     * field disagrees with the actual signing key. */
+    uint8_t pub_b[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv_b, pub_b), ANTS_OK);
+    memcpy(in_e.producer, pub_b, ANTS_ED25519_PUBKEY_SIZE);
+
+    uint8_t cbor[8192];
+    size_t cbor_len = 0;
+    CHECK_EQ(ants_semantic_cache_entry_encode(&in_e, cbor, sizeof cbor, &cbor_len), ANTS_OK);
+
+    ants_error_t err = ants_semantic_cache_handle_inbound_entry(&c, cbor, cbor_len);
+    CHECK_EQ(err, ANTS_ERROR_MALFORMED);
     CHECK(ants_semantic_cache_entries(&c) == 0);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
@@ -2026,6 +2142,8 @@ int main(void)
     test_put_record_null_args();
     test_handle_inbound_entry_round_trip();
     test_handle_inbound_entry_malformed();
+    test_handle_inbound_entry_rejects_tampered_signature();
+    test_handle_inbound_entry_rejects_wrong_producer_pubkey();
     test_handle_inbound_lookup_round_trip();
     test_handle_inbound_lookup_empty_cache();
     test_handle_inbound_lookup_buffer_too_small();
