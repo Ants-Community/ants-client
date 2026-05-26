@@ -16,6 +16,7 @@
  * the contract checks (constants, alignment, NULL safety) stay.
  */
 
+#include "ants_cbor.h"
 #include "ants_common.h"
 #include "ants_embed.h"
 #include "ants_semantic_cache.h"
@@ -825,7 +826,7 @@ static void test_lookup_request_round_trip(void)
 
     uint8_t buf[8192];
     size_t encoded = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.92f, 5, buf, sizeof buf, &encoded),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.92f, 5, 0, buf, sizeof buf, &encoded),
              ANTS_OK);
     CHECK(encoded > 4096); /* embedding alone is 4096 bytes */
     CHECK(encoded < sizeof buf);
@@ -833,7 +834,9 @@ static void test_lookup_request_round_trip(void)
     float out_emb[ANTS_EMBED_DIM];
     float out_thr = 0.0f;
     uint32_t out_topk = 0xFFFFFFFFu;
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, encoded, out_emb, &out_thr, &out_topk),
+    uint32_t out_radius = 0xFFFFFFFFu;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(
+                 buf, encoded, out_emb, &out_thr, &out_topk, &out_radius),
              ANTS_OK);
 
     for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
@@ -841,6 +844,7 @@ static void test_lookup_request_round_trip(void)
     }
     CHECK(out_thr == 0.92f);
     CHECK(out_topk == 5u);
+    CHECK(out_radius == 0u);
 }
 
 static void test_lookup_request_top_k_zero(void)
@@ -851,16 +855,19 @@ static void test_lookup_request_top_k_zero(void)
 
     uint8_t buf[8192];
     size_t encoded = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 0, buf, sizeof buf, &encoded),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 0, 0, buf, sizeof buf, &encoded),
              ANTS_OK);
 
     float out_emb[ANTS_EMBED_DIM];
     float out_thr = 1.0f;
     uint32_t out_topk = 42;
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, encoded, out_emb, &out_thr, &out_topk),
+    uint32_t out_radius = 42;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(
+                 buf, encoded, out_emb, &out_thr, &out_topk, &out_radius),
              ANTS_OK);
     CHECK(out_thr == 0.5f);
     CHECK(out_topk == 0u);
+    CHECK(out_radius == 0u);
 }
 
 static void test_lookup_request_buffer_too_small(void)
@@ -871,8 +878,9 @@ static void test_lookup_request_buffer_too_small(void)
     /* 100 bytes can't hold the embedding alone. */
     uint8_t small[100];
     size_t encoded = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, small, sizeof small, &encoded),
-             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, 0, small, sizeof small, &encoded),
+        ANTS_ERROR_BUFFER_TOO_SMALL);
 }
 
 static void test_lookup_request_null_args(void)
@@ -880,23 +888,35 @@ static void test_lookup_request_null_args(void)
     float emb[ANTS_EMBED_DIM] = {0};
     uint8_t buf[8192];
     size_t encoded = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(NULL, 0.9f, 1, buf, sizeof buf, &encoded),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(NULL, 0.9f, 1, 0, buf, sizeof buf, &encoded),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, NULL, sizeof buf, &encoded),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, 0, NULL, sizeof buf, &encoded),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, buf, sizeof buf, NULL),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 1, 0, buf, sizeof buf, NULL),
              ANTS_ERROR_INVALID_ARG);
+    /* radius > MAX rejects on encode. */
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_encode(
+            emb, 0.9f, 1, ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS + 1u, buf, sizeof buf, &encoded),
+        ANTS_ERROR_INVALID_ARG);
 
     float out_emb[ANTS_EMBED_DIM];
     float out_thr = 0.0f;
     uint32_t out_topk = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(NULL, 1, out_emb, &out_thr, &out_topk),
+    uint32_t out_radius = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(
+                 NULL, 1, out_emb, &out_thr, &out_topk, &out_radius),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, NULL, &out_thr, &out_topk),
-             ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, NULL, &out_topk),
-             ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, &out_thr, NULL),
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_decode(buf, 1, NULL, &out_thr, &out_topk, &out_radius),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, NULL, &out_topk, &out_radius),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, &out_thr, NULL, &out_radius),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(buf, 1, out_emb, &out_thr, &out_topk, NULL),
              ANTS_ERROR_INVALID_ARG);
 }
 
@@ -907,14 +927,15 @@ static void test_lookup_request_decode_truncated(void)
 
     uint8_t buf[8192];
     size_t encoded = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 3, buf, sizeof buf, &encoded),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 3, 0, buf, sizeof buf, &encoded),
              ANTS_OK);
 
     float out_emb[ANTS_EMBED_DIM];
     float out_thr = 0.0f;
     uint32_t out_topk = 0;
-    ants_error_t e =
-        ants_semantic_cache_lookup_request_decode(buf, encoded / 2, out_emb, &out_thr, &out_topk);
+    uint32_t out_radius = 0;
+    ants_error_t e = ants_semantic_cache_lookup_request_decode(
+        buf, encoded / 2, out_emb, &out_thr, &out_topk, &out_radius);
     CHECK(e == ANTS_ERROR_MALFORMED || e == ANTS_ERROR_NON_CANONICAL);
 }
 
@@ -1068,16 +1089,27 @@ static void test_get_topk_null_args(void)
     float emb_buf[2 * ANTS_EMBED_DIM];
     size_t out_n = 0;
 
-    CHECK_EQ(ants_semantic_cache_get_topk(NULL, emb, 0.9f, 5, matches, emb_buf, 2, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(NULL, emb, 0.9f, 5, 0, matches, emb_buf, 2, &out_n),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, NULL, 0.9f, 5, matches, emb_buf, 2, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, NULL, 0.9f, 5, 0, matches, emb_buf, 2, &out_n),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, matches, emb_buf, 2, NULL),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, 0, matches, emb_buf, 2, NULL),
              ANTS_ERROR_INVALID_ARG);
     /* cap > 0 with NULL output buffers rejects. */
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, NULL, emb_buf, 2, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, 0, NULL, emb_buf, 2, &out_n),
              ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, matches, NULL, 2, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 5, 0, matches, NULL, 2, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    /* radius > MAX rejects too. */
+    CHECK_EQ(ants_semantic_cache_get_topk(&c,
+                                          emb,
+                                          0.9f,
+                                          5,
+                                          ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS + 1u,
+                                          matches,
+                                          emb_buf,
+                                          2,
+                                          &out_n),
              ANTS_ERROR_INVALID_ARG);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
@@ -1090,7 +1122,7 @@ static void test_get_topk_rejects_uninitialised(void)
     ants_semantic_cache_lookup_match_t matches[1];
     float emb_buf[ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, 0, matches, emb_buf, 1, &out_n),
              ANTS_ERROR_INVALID_ARG);
 }
 
@@ -1105,7 +1137,7 @@ static void test_get_topk_returns_not_found_on_empty(void)
     ants_semantic_cache_lookup_match_t matches[1];
     float emb_buf[ANTS_EMBED_DIM];
     size_t out_n = 99;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, 0, matches, emb_buf, 1, &out_n),
              ANTS_ERROR_NOT_FOUND);
     CHECK(out_n == 0);
 
@@ -1135,7 +1167,8 @@ static void test_get_topk_returns_sorted_desc(void)
     ants_semantic_cache_lookup_match_t matches[2];
     float emb_buf[2 * ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, base, 0.5f, 2, matches, emb_buf, 2, &out_n), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, base, 0.5f, 2, 0, matches, emb_buf, 2, &out_n),
+             ANTS_OK);
 
     /* First match is always BASE — whether near lands in the same
      * LSH cell or not. */
@@ -1175,7 +1208,8 @@ static void test_get_topk_respects_top_k_cap(void)
     ants_semantic_cache_lookup_match_t matches[5];
     float emb_buf[5 * ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, matches, emb_buf, 5, &out_n), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, 0, matches, emb_buf, 5, &out_n),
+             ANTS_OK);
     CHECK(out_n == 2);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
@@ -1199,7 +1233,8 @@ static void test_get_topk_top_k_zero_unbounded(void)
     ants_semantic_cache_lookup_match_t matches[3];
     float emb_buf[3 * ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 0, matches, emb_buf, 3, &out_n), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 0, 0, matches, emb_buf, 3, &out_n),
+             ANTS_OK);
     CHECK(out_n == 3);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
@@ -1224,9 +1259,459 @@ static void test_get_topk_buffer_too_small(void)
     ants_semantic_cache_lookup_match_t matches[2];
     float emb_buf[2 * ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 4, matches, emb_buf, 2, &out_n),
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 4, 0, matches, emb_buf, 2, &out_n),
              ANTS_ERROR_BUFFER_TOO_SMALL);
     CHECK(out_n == 4);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+/* -- Hamming-neighbour expansion (step 8) ----------------------------------
+ *
+ * Validate that ants_semantic_cache_get_topk admits entries whose
+ * shard_key is within `hamming_radius` bit-flips of the query embedding's
+ * shard_key (the spec's near-neighbour widening from RFC-0002 §Lookup).
+ *
+ * Building entries at controlled Hamming distances from a target query
+ * is awkward: a random embedding's shard_key is binomial(64, 0.5), so
+ * distances 0/1/2/3 are exceptionally rare. We instead generate a pool
+ * of near-embeddings around a base via small-noise perturbations (which
+ * empirically land at small Hamming distances), classify each by its
+ * actual distance, and use that classification as the test's ground
+ * truth. The query is the base embedding itself.
+ */
+
+#define HAMMING_POOL_SIZE 32u
+
+typedef struct {
+    float emb[ANTS_EMBED_DIM];
+    ants_semantic_cache_shard_key_t key;
+    int hamming_dist;
+    uint8_t tag;
+} hamming_pool_entry_t;
+
+static void build_hamming_pool(const float base[ANTS_EMBED_DIM],
+                               ants_semantic_cache_shard_key_t base_key,
+                               hamming_pool_entry_t pool[HAMMING_POOL_SIZE])
+{
+    /* Two noise scales: 0.005 → many distance-0/1 entries, 0.05 → more
+     * distance-3+ entries. Mixing the two gives a varied distribution
+     * over distances 0..~8. */
+    for (uint32_t i = 0; i < HAMMING_POOL_SIZE; i++) {
+        float noise_scale = (i < HAMMING_POOL_SIZE / 2) ? 0.005f : 0.05f;
+        make_near_embedding(base, 10000u + i, noise_scale, pool[i].emb);
+        CHECK_EQ(ants_semantic_cache_shard_key(pool[i].emb, &pool[i].key), ANTS_OK);
+        pool[i].hamming_dist = hamming64((uint64_t)base_key, (uint64_t)pool[i].key);
+        pool[i].tag = (uint8_t)i;
+    }
+}
+
+static size_t count_pool_within_radius(const hamming_pool_entry_t pool[HAMMING_POOL_SIZE],
+                                       int radius)
+{
+    size_t count = 0;
+    for (uint32_t i = 0; i < HAMMING_POOL_SIZE; i++) {
+        if (pool[i].hamming_dist <= radius) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void test_get_topk_hamming_zero_matches_exact_shard_only(void)
+{
+    /* Same as the pre-step-8 behaviour: radius=0 restricts to entries
+     * with shard_key exactly equal to the query's shard_key. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    make_random_embedding(20000, base);
+    ants_semantic_cache_shard_key_t base_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &base_key), ANTS_OK);
+
+    hamming_pool_entry_t pool[HAMMING_POOL_SIZE];
+    build_hamming_pool(base, base_key, pool);
+    for (uint32_t i = 0; i < HAMMING_POOL_SIZE; i++) {
+        CHECK_EQ(ants_semantic_cache_put(&c, pool[i].emb, &pool[i].tag, 1), ANTS_OK);
+    }
+
+    size_t expected_r0 = count_pool_within_radius(pool, 0);
+
+    ants_semantic_cache_lookup_match_t matches[HAMMING_POOL_SIZE];
+    float emb_buf[HAMMING_POOL_SIZE * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    ants_error_t err = ants_semantic_cache_get_topk(
+        &c, base, -1.0f, 0u, 0u, matches, emb_buf, HAMMING_POOL_SIZE, &out_n);
+    if (expected_r0 == 0) {
+        CHECK_EQ(err, ANTS_ERROR_NOT_FOUND);
+    } else {
+        CHECK_EQ(err, ANTS_OK);
+        CHECK(out_n == expected_r0);
+    }
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_hamming_radius_widens_envelope(void)
+{
+    /* For radius 0..MAX_HAMMING_RADIUS the candidate set is exactly the
+     * set of pool entries whose shard_key is within that distance from
+     * the query. We assert the count and that the returned tags are
+     * exactly the expected subset. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    make_random_embedding(20001, base);
+    ants_semantic_cache_shard_key_t base_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &base_key), ANTS_OK);
+
+    hamming_pool_entry_t pool[HAMMING_POOL_SIZE];
+    build_hamming_pool(base, base_key, pool);
+    for (uint32_t i = 0; i < HAMMING_POOL_SIZE; i++) {
+        CHECK_EQ(ants_semantic_cache_put(&c, pool[i].emb, &pool[i].tag, 1), ANTS_OK);
+    }
+
+    ants_semantic_cache_lookup_match_t matches[HAMMING_POOL_SIZE];
+    float emb_buf[HAMMING_POOL_SIZE * ANTS_EMBED_DIM];
+
+    for (uint32_t radius = 0; radius <= ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS; radius++) {
+        size_t expected = count_pool_within_radius(pool, (int)radius);
+
+        size_t out_n = 0;
+        ants_error_t err = ants_semantic_cache_get_topk(
+            &c, base, -1.0f, 0u, radius, matches, emb_buf, HAMMING_POOL_SIZE, &out_n);
+        if (expected == 0) {
+            CHECK_EQ(err, ANTS_ERROR_NOT_FOUND);
+            continue;
+        }
+        CHECK_EQ(err, ANTS_OK);
+        CHECK(out_n == expected);
+
+        /* Verify every returned match is within the radius AND that the
+         * returned set is exactly the expected pool subset. The pool
+         * tags are unique (0..POOL_SIZE-1) so a presence bitmap is
+         * trivial. */
+        uint8_t seen[HAMMING_POOL_SIZE] = {0};
+        for (size_t i = 0; i < out_n; i++) {
+            CHECK(matches[i].entry.response_len == 1);
+            uint8_t tag = matches[i].entry.response[0];
+            CHECK(tag < HAMMING_POOL_SIZE);
+            CHECK(seen[tag] == 0); /* no duplicates */
+            seen[tag] = 1;
+            CHECK(pool[tag].hamming_dist <= (int)radius);
+        }
+        /* Every pool entry within radius must appear. */
+        for (uint32_t j = 0; j < HAMMING_POOL_SIZE; j++) {
+            if (pool[j].hamming_dist <= (int)radius) {
+                CHECK(seen[j] == 1);
+            }
+        }
+    }
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_hamming_excludes_entries_beyond_radius(void)
+{
+    /* Stronger negative assertion: an entry whose shard_key is strictly
+     * outside the radius MUST NOT appear in the result, even at the
+     * lowest possible threshold (-1.0). */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    make_random_embedding(20002, base);
+    ants_semantic_cache_shard_key_t base_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &base_key), ANTS_OK);
+
+    /* A second random embedding produces a key at Hamming ≈ 32 from
+     * the base — well outside MAX_HAMMING_RADIUS. */
+    float far_emb[ANTS_EMBED_DIM];
+    make_random_embedding(99999, far_emb);
+    ants_semantic_cache_shard_key_t far_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(far_emb, &far_key), ANTS_OK);
+    int far_dist = hamming64((uint64_t)base_key, (uint64_t)far_key);
+    /* Two independent random unit vectors produce keys at distance ~32
+     * with vanishing probability of being ≤ 3. Skip the (extremely
+     * improbable) collision case. */
+    if (far_dist <= (int)ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
+        CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+        return;
+    }
+
+    uint8_t far_tag = 0xFF;
+    CHECK_EQ(ants_semantic_cache_put(&c, far_emb, &far_tag, 1), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t matches[4];
+    float emb_buf[4 * ANTS_EMBED_DIM];
+
+    for (uint32_t radius = 0; radius <= ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS; radius++) {
+        size_t out_n = 0;
+        ants_error_t err =
+            ants_semantic_cache_get_topk(&c, base, -1.0f, 0u, radius, matches, emb_buf, 4, &out_n);
+        /* The only stored entry is at distance far_dist > radius so the
+         * envelope must be empty. */
+        CHECK_EQ(err, ANTS_ERROR_NOT_FOUND);
+        CHECK(out_n == 0);
+    }
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_get_topk_hamming_ranks_by_similarity_across_shards(void)
+{
+    /* When the candidate set spans multiple shards, ranking is by
+     * cosine similarity, NOT by Hamming distance. A high-similarity
+     * entry from a neighbour shard outranks a low-similarity entry on
+     * the exact query shard. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    make_random_embedding(20003, base);
+    ants_semantic_cache_shard_key_t base_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &base_key), ANTS_OK);
+
+    /* Find a NEIGHBOUR (Hamming 1..MAX) embedding via brute force over
+     * small-noise variants. */
+    float neighbour[ANTS_EMBED_DIM];
+    int neighbour_dist = -1;
+    for (uint32_t i = 0; i < 200u; i++) {
+        make_near_embedding(base, 30000u + i, 0.05f, neighbour);
+        ants_semantic_cache_shard_key_t k = 0;
+        CHECK_EQ(ants_semantic_cache_shard_key(neighbour, &k), ANTS_OK);
+        int d = hamming64((uint64_t)base_key, (uint64_t)k);
+        if (d >= 1 && d <= (int)ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
+            neighbour_dist = d;
+            break;
+        }
+    }
+    /* If the brute force didn't find one, the test is inconclusive on
+     * this seed — skip rather than fail. */
+    if (neighbour_dist < 1) {
+        CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+        return;
+    }
+
+    /* Sanity: neighbour is highly similar to base (cosine ≈ 0.998 at
+     * 0.05 noise). */
+    double sim_neighbour = 0.0;
+    for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
+        sim_neighbour += (double)base[i] * (double)neighbour[i];
+    }
+    CHECK(sim_neighbour > 0.99);
+
+    /* Distract: an exact-shard entry that is orthogonal-ish in cosine
+     * space. Construct it by re-using base but flipping every value's
+     * sign on a subset of dimensions — same projection signs (so same
+     * shard key) until we re-check. Easier: pick another small-noise
+     * variant that lands on the SAME shard. */
+    float same_shard_entry[ANTS_EMBED_DIM];
+    int found_same_shard = 0;
+    for (uint32_t i = 0; i < 200u; i++) {
+        make_near_embedding(base, 40000u + i, 0.005f, same_shard_entry);
+        ants_semantic_cache_shard_key_t k = 0;
+        CHECK_EQ(ants_semantic_cache_shard_key(same_shard_entry, &k), ANTS_OK);
+        if (k == base_key) {
+            found_same_shard = 1;
+            break;
+        }
+    }
+    if (!found_same_shard) {
+        CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+        return;
+    }
+    /* same_shard_entry will have cosine ≈ 0.99995 with base — very
+     * close, but at 0.005 noise vs 0.05 noise for neighbour, it is
+     * MORE similar. So the ranking puts same_shard_entry first.
+     * We just verify both are present in the radius>=neighbour_dist
+     * result. */
+
+    uint8_t tag_neighbour = 1;
+    uint8_t tag_same = 2;
+    CHECK_EQ(ants_semantic_cache_put(&c, neighbour, &tag_neighbour, 1), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_put(&c, same_shard_entry, &tag_same, 1), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t matches[2];
+    float emb_buf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(
+                 &c, base, 0.5f, 0u, (uint32_t)neighbour_dist, matches, emb_buf, 2, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 2);
+
+    /* Both tags present; order by similarity desc (same_shard ≥ neighbour). */
+    CHECK(matches[0].similarity >= matches[1].similarity);
+    uint8_t first = matches[0].entry.response[0];
+    uint8_t second = matches[1].entry.response[0];
+    CHECK((first == tag_same && second == tag_neighbour) ||
+          (first == tag_neighbour && second == tag_same));
+
+    /* At radius 0 only the same_shard entry shows. */
+    out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, base, 0.5f, 0u, 0u, matches, emb_buf, 2, &out_n),
+             ANTS_OK);
+    CHECK(out_n == 1);
+    CHECK(matches[0].entry.response[0] == tag_same);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_lookup_request_round_trip_with_hamming_radius(void)
+{
+    /* All radii in [0, MAX_HAMMING_RADIUS] round-trip through encode/
+     * decode without loss. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(20100, emb);
+
+    uint8_t buf[8192];
+    for (uint32_t radius = 0; radius <= ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS; radius++) {
+        size_t encoded = 0;
+        CHECK_EQ(ants_semantic_cache_lookup_request_encode(
+                     emb, 0.92f, 5, radius, buf, sizeof buf, &encoded),
+                 ANTS_OK);
+
+        float out_emb[ANTS_EMBED_DIM];
+        float out_thr = 0.0f;
+        uint32_t out_topk = 0;
+        uint32_t out_radius = 0xFFFFFFFFu;
+        CHECK_EQ(ants_semantic_cache_lookup_request_decode(
+                     buf, encoded, out_emb, &out_thr, &out_topk, &out_radius),
+                 ANTS_OK);
+        CHECK(out_radius == radius);
+    }
+}
+
+static void test_lookup_request_rejects_wire_radius_above_max(void)
+{
+    /* A wire payload that declares hamming_radius > MAX must be
+     * rejected at decode with NON_CANONICAL — the spec pins the
+     * range and accepts no higher values. We can't reach this via
+     * the public encoder (which rejects radius > MAX up-front), so
+     * craft the CBOR bytes by hand using ants_cbor primitives. */
+    ants_cbor_enc_t enc;
+    uint8_t buf[8192];
+    CHECK_EQ(ants_cbor_enc_init(&enc, buf, sizeof buf), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 4), ANTS_OK);
+    /* key 1: embedding bytes(4096) */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(20200, emb);
+    uint8_t emb_le[ANTS_EMBED_DIM * 4u];
+    for (uint32_t i = 0; i < (uint32_t)ANTS_EMBED_DIM; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, &emb[i], sizeof bits);
+        emb_le[i * 4u + 0u] = (uint8_t)(bits & 0xFFu);
+        emb_le[i * 4u + 1u] = (uint8_t)((bits >> 8) & 0xFFu);
+        emb_le[i * 4u + 2u] = (uint8_t)((bits >> 16) & 0xFFu);
+        emb_le[i * 4u + 3u] = (uint8_t)((bits >> 24) & 0xFFu);
+    }
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, emb_le, sizeof emb_le), ANTS_OK);
+    /* key 2: threshold bytes(4) */
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    uint8_t thr_le[4] = {0};
+    {
+        float thr = 0.5f;
+        uint32_t bits = 0;
+        memcpy(&bits, &thr, sizeof bits);
+        thr_le[0] = (uint8_t)(bits & 0xFFu);
+        thr_le[1] = (uint8_t)((bits >> 8) & 0xFFu);
+        thr_le[2] = (uint8_t)((bits >> 16) & 0xFFu);
+        thr_le[3] = (uint8_t)((bits >> 24) & 0xFFu);
+    }
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, thr_le, sizeof thr_le), ANTS_OK);
+    /* key 3: top_k */
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
+    /* key 4: hamming_radius = MAX + 1 (out of range) */
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 4), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS + 1u), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+    size_t enc_size = ants_cbor_enc_size(&enc);
+
+    float out_emb[ANTS_EMBED_DIM];
+    float out_thr = 0.0f;
+    uint32_t out_topk = 0;
+    uint32_t out_radius = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_request_decode(
+                 buf, enc_size, out_emb, &out_thr, &out_topk, &out_radius),
+             ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_handle_inbound_lookup_propagates_hamming_radius(void)
+{
+    /* A request encoded with radius=N must, on the receiving side,
+     * cause get_topk to admit entries from neighbour shards within N. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t cfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &cfg), ANTS_OK);
+
+    float base[ANTS_EMBED_DIM];
+    make_random_embedding(20300, base);
+    ants_semantic_cache_shard_key_t base_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(base, &base_key), ANTS_OK);
+
+    /* Brute-force find a neighbour at 1..MAX from base. */
+    float neighbour[ANTS_EMBED_DIM];
+    int neighbour_dist = -1;
+    for (uint32_t i = 0; i < 200u; i++) {
+        make_near_embedding(base, 50000u + i, 0.05f, neighbour);
+        ants_semantic_cache_shard_key_t k = 0;
+        CHECK_EQ(ants_semantic_cache_shard_key(neighbour, &k), ANTS_OK);
+        int d = hamming64((uint64_t)base_key, (uint64_t)k);
+        if (d >= 1 && d <= (int)ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
+            neighbour_dist = d;
+            break;
+        }
+    }
+    if (neighbour_dist < 1) {
+        CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+        return;
+    }
+
+    uint8_t neighbour_tag = 0x42;
+    CHECK_EQ(ants_semantic_cache_put(&c, neighbour, &neighbour_tag, 1), ANTS_OK);
+
+    uint8_t req[8192];
+    size_t req_len = 0;
+    uint8_t resp[65536];
+    size_t resp_len = 0;
+
+    /* radius=0: neighbour is not on the exact shard → empty response. */
+    CHECK_EQ(
+        ants_semantic_cache_lookup_request_encode(base, 0.5f, 5u, 0u, req, sizeof req, &req_len),
+        ANTS_OK);
+    CHECK_EQ(
+        ants_semantic_cache_handle_inbound_lookup(&c, req, req_len, resp, sizeof resp, &resp_len),
+        ANTS_OK);
+    ants_semantic_cache_lookup_match_t parsed_matches[5];
+    float parsed_embs[5 * ANTS_EMBED_DIM];
+    size_t parsed_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(
+                 resp, resp_len, parsed_matches, parsed_embs, 5, &parsed_n),
+             ANTS_OK);
+    CHECK(parsed_n == 0);
+
+    /* radius=neighbour_dist: neighbour is in-envelope → 1 match. */
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(
+                 base, 0.5f, 5u, (uint32_t)neighbour_dist, req, sizeof req, &req_len),
+             ANTS_OK);
+    CHECK_EQ(
+        ants_semantic_cache_handle_inbound_lookup(&c, req, req_len, resp, sizeof resp, &resp_len),
+        ANTS_OK);
+    parsed_n = 0;
+    CHECK_EQ(ants_semantic_cache_lookup_response_decode(
+                 resp, resp_len, parsed_matches, parsed_embs, 5, &parsed_n),
+             ANTS_OK);
+    CHECK(parsed_n == 1);
+    CHECK(parsed_matches[0].entry.response_len == 1);
+    CHECK(parsed_matches[0].entry.response[0] == neighbour_tag);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
@@ -1252,7 +1737,8 @@ static void test_put_record_round_trip(void)
     ants_semantic_cache_lookup_match_t matches[1];
     float emb_buf[ANTS_EMBED_DIM];
     size_t out_n = 0;
-    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, matches, emb_buf, 1, &out_n), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.9f, 1, 0, matches, emb_buf, 1, &out_n),
+             ANTS_OK);
     CHECK(out_n == 1);
     const ants_semantic_cache_entry_t *out_e = &matches[0].entry;
 
@@ -1349,7 +1835,7 @@ static void test_handle_inbound_lookup_round_trip(void)
 
     uint8_t req[8192];
     size_t req_len = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, req, sizeof req, &req_len),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, 0, req, sizeof req, &req_len),
              ANTS_OK);
 
     uint8_t resp[16384];
@@ -1387,7 +1873,7 @@ static void test_handle_inbound_lookup_empty_cache(void)
     make_random_embedding(12300, emb);
     uint8_t req[8192];
     size_t req_len = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, req, sizeof req, &req_len),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.9f, 5, 0, req, sizeof req, &req_len),
              ANTS_OK);
 
     uint8_t resp[256];
@@ -1418,7 +1904,7 @@ static void test_handle_inbound_lookup_buffer_too_small(void)
 
     uint8_t req[8192];
     size_t req_len = 0;
-    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 5, req, sizeof req, &req_len),
+    CHECK_EQ(ants_semantic_cache_lookup_request_encode(emb, 0.5f, 5, 0, req, sizeof req, &req_len),
              ANTS_OK);
 
     uint8_t small[100];
@@ -1529,6 +2015,13 @@ int main(void)
     test_get_topk_respects_top_k_cap();
     test_get_topk_top_k_zero_unbounded();
     test_get_topk_buffer_too_small();
+    test_get_topk_hamming_zero_matches_exact_shard_only();
+    test_get_topk_hamming_radius_widens_envelope();
+    test_get_topk_hamming_excludes_entries_beyond_radius();
+    test_get_topk_hamming_ranks_by_similarity_across_shards();
+    test_lookup_request_round_trip_with_hamming_radius();
+    test_lookup_request_rejects_wire_radius_above_max();
+    test_handle_inbound_lookup_propagates_hamming_radius();
     test_put_record_round_trip();
     test_put_record_null_args();
     test_handle_inbound_entry_round_trip();

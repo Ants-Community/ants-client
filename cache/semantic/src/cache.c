@@ -623,13 +623,14 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
 /* ------------------------------------------------------------------------ */
 /* Top-K lookup                                                             */
 /*                                                                          */
-/* Linear scan filtered by shard_key, collect every entry above the         */
-/* threshold into a stack-resident candidate array (capped at               */
-/* TOPK_MAX_CANDIDATES for safety), insertion-sort by similarity desc,      */
-/* then emit min(top_k, cap_matches, n_candidates) matches into the         */
-/* caller buffers. *out_n is always set to min(top_k, n_candidates) —      */
-/* i.e. the size the caller would need to receive every eligible match —   */
-/* so BUFFER_TOO_SMALL can drive a retry with a bigger buffer.              */
+/* Linear scan filtered by Hamming distance from the query shard_key       */
+/* (radius 0 = exact shard, radius up to MAX_HAMMING_RADIUS widens the     */
+/* envelope), collect every entry above the threshold into a stack-        */
+/* resident candidate array (capped at TOPK_MAX_CANDIDATES for safety),    */
+/* insertion-sort by similarity desc, then emit min(top_k, cap_matches,    */
+/* n_candidates) matches into the caller buffers. *out_n is always set    */
+/* to min(top_k, n_candidates) — i.e. the size the caller would need to   */
+/* receive every eligible match — so BUFFER_TOO_SMALL can drive a retry. */
 /* ------------------------------------------------------------------------ */
 
 #define TOPK_MAX_CANDIDATES 256u
@@ -639,10 +640,27 @@ typedef struct {
     double similarity;
 } topk_candidate_t;
 
+/* popcount for a 64-bit shard key. Brian Kernighan iteration so the
+ * result is independent of any compiler builtin and bit-exact on every
+ * conformant C99 host. For the tight inner-loop scan the body runs at
+ * most 64 times per entry; in practice the average is far lower because
+ * candidate shards within MAX_HAMMING_RADIUS have at most 3 set bits in
+ * the XOR. */
+static unsigned shard_key_popcount(uint64_t x)
+{
+    unsigned count = 0;
+    while (x != 0) {
+        x &= x - 1u;
+        count++;
+    }
+    return count;
+}
+
 ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
                                           const float embedding[ANTS_EMBED_DIM],
                                           float similarity_threshold,
                                           uint32_t top_k,
+                                          uint32_t hamming_radius,
                                           ants_semantic_cache_lookup_match_t *out_matches,
                                           float *out_embeddings,
                                           size_t cap_matches,
@@ -652,6 +670,9 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         return ANTS_ERROR_INVALID_ARG;
     }
     if (cap_matches > 0 && (out_matches == NULL || out_embeddings == NULL)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (hamming_radius > ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_semantic_cache_state *state =
@@ -667,11 +688,14 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         return err;
     }
 
-    /* Collect eligible candidates. */
+    /* Collect eligible candidates. An entry is eligible when its
+     * shard_key is within `hamming_radius` bit-flips of the query key
+     * AND its cosine similarity is at least the threshold. */
     topk_candidate_t cands[TOPK_MAX_CANDIDATES];
     size_t n_cands = 0;
     for (size_t i = 0; i < state->n_entries; i++) {
-        if (state->entries[i].shard_key != key) {
+        unsigned dist = shard_key_popcount(state->entries[i].shard_key ^ key);
+        if (dist > hamming_radius) {
             continue;
         }
         double sim = cosine_l2_normalised(state->entries[i].embedding, embedding);
@@ -867,8 +891,9 @@ ants_error_t ants_semantic_cache_handle_inbound_lookup(ants_semantic_cache_t *ca
     float query_emb[ANTS_EMBED_DIM];
     float threshold = 0.0f;
     uint32_t top_k = 0;
-    ants_error_t err =
-        ants_semantic_cache_lookup_request_decode(req_cbor, req_len, query_emb, &threshold, &top_k);
+    uint32_t hamming_radius = 0;
+    ants_error_t err = ants_semantic_cache_lookup_request_decode(
+        req_cbor, req_len, query_emb, &threshold, &top_k, &hamming_radius);
     if (err != ANTS_OK) {
         return err;
     }
@@ -892,6 +917,7 @@ ants_error_t ants_semantic_cache_handle_inbound_lookup(ants_semantic_cache_t *ca
                                        query_emb,
                                        threshold,
                                        effective_k,
+                                       hamming_radius,
                                        matches,
                                        match_embs,
                                        (size_t)HANDLE_LOOKUP_SERVER_CAP,

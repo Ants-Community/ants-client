@@ -408,24 +408,30 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
 /* ------------------------------------------------------------------------ */
 /* Lookup request wire format (RFC-0002 §The lookup protocol)               */
 /*                                                                          */
-/* CBOR map with integer keys 1..3 in canonical order:                      */
-/*   1: embedding   bytes(4096)   raw LE floats                             */
-/*   2: threshold   bytes(4)      raw LE float                              */
-/*   3: top_k       uint          0 = unbounded                             */
+/* CBOR map with integer keys 1..4 in canonical order:                      */
+/*   1: embedding        bytes(4096)   raw LE floats                        */
+/*   2: threshold        bytes(4)      raw LE float                         */
+/*   3: top_k            uint          0 = unbounded                        */
+/*   4: hamming_radius   uint          0..MAX_HAMMING_RADIUS (3)            */
 /* ------------------------------------------------------------------------ */
 
-#define LR_KEY_EMBEDDING 1u
-#define LR_KEY_THRESHOLD 2u
-#define LR_KEY_TOP_K     3u
+#define LR_KEY_EMBEDDING      1u
+#define LR_KEY_THRESHOLD      2u
+#define LR_KEY_TOP_K          3u
+#define LR_KEY_HAMMING_RADIUS 4u
 
 ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANTS_EMBED_DIM],
                                                        float similarity_threshold,
                                                        uint32_t top_k,
+                                                       uint32_t hamming_radius,
                                                        uint8_t *buf,
                                                        size_t out_cap,
                                                        size_t *out_len)
 {
     if (embedding == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (hamming_radius > ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
         return ANTS_ERROR_INVALID_ARG;
     }
 
@@ -441,7 +447,7 @@ ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANT
         return err;
     }
 
-    err = ants_cbor_enc_map(&enc, 3);
+    err = ants_cbor_enc_map(&enc, 4);
     if (err != ANTS_OK) {
         return err;
     }
@@ -473,6 +479,15 @@ ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANT
         return err;
     }
 
+    err = ants_cbor_enc_uint(&enc, LR_KEY_HAMMING_RADIUS);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_uint(&enc, (uint64_t)hamming_radius);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
     err = ants_cbor_enc_finalise(&enc);
     if (err != ANTS_OK) {
         return err;
@@ -486,13 +501,16 @@ ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
                                                        size_t len,
                                                        float embedding_out[ANTS_EMBED_DIM],
                                                        float *out_threshold,
-                                                       uint32_t *out_top_k)
+                                                       uint32_t *out_top_k,
+                                                       uint32_t *out_hamming_radius)
 {
-    if (buf == NULL || embedding_out == NULL || out_threshold == NULL || out_top_k == NULL) {
+    if (buf == NULL || embedding_out == NULL || out_threshold == NULL || out_top_k == NULL ||
+        out_hamming_radius == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
     *out_threshold = 0.0f;
     *out_top_k = 0;
+    *out_hamming_radius = 0;
 
     ants_cbor_dec_t dec;
     ants_error_t err = ants_cbor_dec_init(&dec, buf, len);
@@ -505,11 +523,11 @@ ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
     if (err != ANTS_OK) {
         return err;
     }
-    if (n_kv != 3) {
+    if (n_kv != 4) {
         return ANTS_ERROR_MALFORMED;
     }
 
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < 4; i++) {
         uint64_t key = 0;
         err = ants_cbor_dec_uint(&dec, &key);
         if (err != ANTS_OK) {
@@ -555,6 +573,17 @@ ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
                 return ANTS_ERROR_NON_CANONICAL;
             }
             *out_top_k = (uint32_t)uval;
+            break;
+
+        case LR_KEY_HAMMING_RADIUS:
+            err = ants_cbor_dec_uint(&dec, &uval);
+            if (err != ANTS_OK) {
+                return err;
+            }
+            if (uval > (uint64_t)ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS) {
+                return ANTS_ERROR_NON_CANONICAL;
+            }
+            *out_hamming_radius = (uint32_t)uval;
             break;
 
         default:
