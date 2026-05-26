@@ -59,6 +59,15 @@ extern "C" {
  * §Write: "replicated to N (typically 3-5) shard-holders". */
 #define ANTS_SEMANTIC_CACHE_DEFAULT_REPLICATION 3u
 
+/* Maximum Hamming radius accepted on lookup requests + local top-K
+ * scans. RFC-0002 §The lookup protocol bounds the neighbour expansion
+ * at 3 bits — three flips give C(64,0)+C(64,1)+C(64,2)+C(64,3) =
+ * ~43k addressable shard keys, an envelope wide enough for high-recall
+ * semantic search and tight enough that the upper-bound DHT query
+ * fan-out stays bounded. Requests / scans with radius > 3 are
+ * rejected with ANTS_ERROR_INVALID_ARG. */
+#define ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS 3u
+
 /* The 64-bit shard key derived from an embedding. Matches the
  * `ants_dht_shard_key_t` typedef in network/dht so the two layers
  * speak the same wire type; we re-declare here so callers don't
@@ -196,20 +205,27 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
 /* Lookup request wire format (RFC-0002 §The lookup protocol)               */
 /*                                                                          */
 /* The consumer's client computes the embedding of its prompt, computes    */
-/* the shard key, queries the DHT for the responsible peers, and sends     */
-/* this request to each candidate in parallel. The receiving peer searches */
-/* its local shard for entries with cosine similarity ≥ threshold and      */
-/* returns up to top_k matches (response wire format lands in step 6).    */
+/* the shard key, queries the DHT for the responsible peers + the          */
+/* Hamming-radius neighbour shards, and sends this request to each         */
+/* candidate in parallel. The receiving peer searches its local shard      */
+/* (and any neighbour-shard entries it happens to hold) for entries with   */
+/* cosine similarity ≥ threshold and returns up to top_k matches.          */
 /*                                                                          */
-/* Wire format (CBOR map with ascending integer keys 1..3):                */
+/* Wire format (CBOR map with ascending integer keys 1..4):                */
 /*   1 : embedding         bytes(4096)    raw IEEE-754 LE floats           */
 /*   2 : threshold         bytes(4)       raw IEEE-754 LE float            */
 /*   3 : top_k             uint           0 = unbounded                    */
+/*   4 : hamming_radius    uint           0..MAX_HAMMING_RADIUS (3)        */
 /*                                                                          */
 /* Threshold + embedding use raw byte representation (not CBOR float       */
 /* native encoding) for the same canonical-numerics rationale as the       */
 /* cache entry record: CBOR's half/single/double "shortest form" choice is */
 /* ambiguous, and the protocol pins the binary footprint instead.          */
+/*                                                                          */
+/* The hamming_radius field lets a consumer trade recall for fan-out: 0   */
+/* searches only the exact shard, 1 includes the 64 single-bit-flip        */
+/* neighbours, 2 adds ~2k two-flip neighbours, 3 adds ~43k three-flip      */
+/* neighbours. Radius > 3 is rejected on encode + decode.                 */
 /* ------------------------------------------------------------------------ */
 
 /*
@@ -220,15 +236,21 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
  * top_k:               max entries the responder should return; 0 means
  *                       the responder picks (typically all matches above
  *                       threshold up to a server-side cap)
+ * hamming_radius:      0..ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS; the
+ *                       receiver expands its scan to every entry whose
+ *                       shard_key is within this Hamming distance of the
+ *                       query's shard_key. 0 = exact-shard only.
  *
  * Returns:
  *   ANTS_OK                       — *out_len bytes written;
- *   ANTS_ERROR_INVALID_ARG        — NULL args;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args or
+ *                                   hamming_radius > MAX_HAMMING_RADIUS;
  *   ANTS_ERROR_BUFFER_TOO_SMALL   — out_cap < required.
  */
 ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANTS_EMBED_DIM],
                                                        float similarity_threshold,
                                                        uint32_t top_k,
+                                                       uint32_t hamming_radius,
                                                        uint8_t *buf,
                                                        size_t out_cap,
                                                        size_t *out_len);
@@ -238,7 +260,8 @@ ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANT
  *
  * embedding_out: caller buffer for ANTS_EMBED_DIM floats; decoder
  *                unpacks the wire's 4096 LE bytes into it.
- * out_threshold / out_top_k: populated from the decoded fields.
+ * out_threshold / out_top_k / out_hamming_radius: populated from the
+ *                decoded fields.
  *
  * Returns:
  *   ANTS_OK             — fields populated;
@@ -246,13 +269,15 @@ ants_error_t ants_semantic_cache_lookup_request_encode(const float embedding[ANT
  *   ANTS_ERROR_MALFORMED   — CBOR parse error, missing required key,
  *                            wrong type, or trailing bytes;
  *   ANTS_ERROR_NON_CANONICAL — wrong byte length on a fixed-length
- *                              field or non-canonical key order.
+ *                              field, non-canonical key order, or
+ *                              hamming_radius > MAX_HAMMING_RADIUS.
  */
 ants_error_t ants_semantic_cache_lookup_request_decode(const uint8_t *buf,
                                                        size_t len,
                                                        float embedding_out[ANTS_EMBED_DIM],
                                                        float *out_threshold,
-                                                       uint32_t *out_top_k);
+                                                       uint32_t *out_top_k,
+                                                       uint32_t *out_hamming_radius);
 
 /* ------------------------------------------------------------------------ */
 /* Lookup response wire format (RFC-0002 §The lookup protocol)              */
@@ -465,10 +490,15 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
                                      float *out_similarity);
 
 /*
- * Look up the top-K matching entries in the local shard above
- * similarity_threshold, sorted descending by cosine similarity.
+ * Look up the top-K matching entries above similarity_threshold,
+ * sorted descending by cosine similarity. The candidate set is every
+ * entry whose shard_key is within `hamming_radius` bit-flips of the
+ * query embedding's shard_key — radius 0 restricts to the exact shard
+ * (the step 7a behaviour); radius 1/2/3 widens the search to ~64,
+ * ~2k, ~43k addressable shards.
  *
  * top_k:           0 = unbounded (caller buffer is the only cap)
+ * hamming_radius:  0..ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS
  * out_matches:     caller buffer for at most cap_matches entries
  * out_embeddings:  contiguous buffer of cap_matches × ANTS_EMBED_DIM
  *                  floats; each match.entry.embedding points into
@@ -487,10 +517,11 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
  *
  * Returns:
  *   ANTS_OK                     — *out_n matches written;
- *   ANTS_ERROR_NOT_FOUND        — no entries in the local shard
- *                                 above threshold;
+ *   ANTS_ERROR_NOT_FOUND        — no entries within the hamming
+ *                                 envelope above threshold;
  *   ANTS_ERROR_INVALID_ARG      — NULL args; cap_matches > 0 with
  *                                 NULL out_matches or out_embeddings;
+ *                                 hamming_radius > MAX_HAMMING_RADIUS;
  *   ANTS_ERROR_BUFFER_TOO_SMALL — caller buffers held fewer entries
  *                                 than min(top_k, n_eligible);
  *                                 *out_n holds the cap actually used.
@@ -499,6 +530,7 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
                                           const float embedding[ANTS_EMBED_DIM],
                                           float similarity_threshold,
                                           uint32_t top_k,
+                                          uint32_t hamming_radius,
                                           ants_semantic_cache_lookup_match_t *out_matches,
                                           float *out_embeddings,
                                           size_t cap_matches,
