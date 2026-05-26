@@ -36,6 +36,7 @@
 #include "ants_cbor.h"
 #include "ants_semantic_cache.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -119,16 +120,20 @@ static ants_error_t entry_validate(const ants_semantic_cache_entry_t *entry)
     return ANTS_OK;
 }
 
-/* Emit one cache-entry record as a nested CBOR map(10) onto an already-
- * open encoder. Used both by the public entry_encode (top-level map)
- * and by the lookup response encoder (nested per-match map). Caller
- * has already validated `entry`. */
-static ants_error_t entry_emit(ants_cbor_enc_t *enc, const ants_semantic_cache_entry_t *entry)
+/* Emit one cache-entry record as a nested CBOR map onto an already-
+ * open encoder. Used by:
+ *   - the public entry_encode (top-level map, include_signature=true);
+ *   - the lookup response encoder (nested per-match map, true);
+ *   - cache_entry_emit_signing_payload (false → emits map(9) without
+ *     the signature field, i.e. the canonical bytes a producer signs).
+ * Caller has already validated `entry`. */
+static ants_error_t
+entry_emit(ants_cbor_enc_t *enc, const ants_semantic_cache_entry_t *entry, bool include_signature)
 {
     uint8_t emb_le[EMBEDDING_WIRE_LEN];
     floats_to_le_bytes(entry->embedding, emb_le);
 
-    ants_error_t err = ants_cbor_enc_map(enc, 10);
+    ants_error_t err = ants_cbor_enc_map(enc, include_signature ? 10 : 9);
     if (err != ANTS_OK) {
         return err;
     }
@@ -195,10 +200,12 @@ static ants_error_t entry_emit(ants_cbor_enc_t *enc, const ants_semantic_cache_e
         return err;
     }
 
-    EMIT_KEY(KEY_SIGNATURE);
-    err = ants_cbor_enc_bytes(enc, entry->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
-    if (err != ANTS_OK) {
-        return err;
+    if (include_signature) {
+        EMIT_KEY(KEY_SIGNATURE);
+        err = ants_cbor_enc_bytes(enc, entry->signature, ANTS_SEMANTIC_CACHE_SIG_LEN);
+        if (err != ANTS_OK) {
+            return err;
+        }
     }
 
 #undef EMIT_KEY
@@ -369,7 +376,7 @@ ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t 
     if (err != ANTS_OK) {
         return err;
     }
-    err = entry_emit(&enc, entry);
+    err = entry_emit(&enc, entry, true);
     if (err != ANTS_OK) {
         return err;
     }
@@ -402,6 +409,54 @@ ants_error_t ants_semantic_cache_entry_decode(const uint8_t *buf,
     if (!ants_cbor_dec_eof(&dec)) {
         return ANTS_ERROR_MALFORMED;
     }
+    return ANTS_OK;
+}
+
+/* Emit the canonical signing payload — CBOR map(9) covering fields
+ * 1..9 of the cache entry, in ascending key order. This is the exact
+ * byte sequence the producer signs with their Ed25519 private key
+ * (per RFC-0002 §The cache entry); receivers re-emit it via this
+ * helper and pass the resulting bytes to ants_ed25519_verify against
+ * entry.producer / entry.signature.
+ *
+ * Module-scope (not in the public header): used by cache.c's
+ * handle_inbound_entry. Caller supplies a buffer at least as large as
+ * the full entry's CBOR encoding (the signing payload is always
+ * smaller — it drops the 67-byte signature field). The matching
+ * forward declaration lives in cache.c (extern); we repeat the
+ * prototype here to silence -Wmissing-prototypes. */
+ants_error_t cache_entry_emit_signing_payload(const ants_semantic_cache_entry_t *entry,
+                                              uint8_t *buf,
+                                              size_t out_cap,
+                                              size_t *out_len);
+
+ants_error_t cache_entry_emit_signing_payload(const ants_semantic_cache_entry_t *entry,
+                                              uint8_t *buf,
+                                              size_t out_cap,
+                                              size_t *out_len)
+{
+    if (entry == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    ants_error_t err = entry_validate(entry);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    ants_cbor_enc_t enc;
+    err = ants_cbor_enc_init(&enc, buf, out_cap);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = entry_emit(&enc, entry, false /* include_signature */);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_cbor_enc_finalise(&enc);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
     return ANTS_OK;
 }
 
@@ -669,7 +724,7 @@ ants_semantic_cache_lookup_response_encode(const ants_semantic_cache_lookup_matc
         if (err != ANTS_OK) {
             return err;
         }
-        err = entry_emit(&enc, &matches[i].entry);
+        err = entry_emit(&enc, &matches[i].entry, true);
         if (err != ANTS_OK) {
             return err;
         }
