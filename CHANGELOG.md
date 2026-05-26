@@ -13,6 +13,70 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) — Ed25519 producer-signature verify · 2026-05-26
+
+**The cache no longer admits unsigned (or tampered) entries.** The
+long-standing TODO in `handle_inbound_entry` is closed: every inbound
+cache-entry record is now verified against the producer's Ed25519
+public key before the record touches the local shard, per RFC-0002
+§The cache entry. An invalid or missing signature returns
+`MALFORMED`; the entry is never `put_record`'d.
+
+**PR #67 — Ed25519 producer-signature verify** (+223/-18):
+
+- `entry_emit` in `cache_wire.c` gains an `include_signature` flag.
+  Public `entry_encode` and `lookup_response_encode` continue to emit
+  the canonical `map(10)` (the on-wire record); the new signing path
+  emits `map(9)` over fields 1..9 only — the exact byte sequence the
+  producer signs.
+- New module-private helper `cache_entry_emit_signing_payload(entry,
+  buf, cap, *out_len)` — not in the public header; forward-declared
+  via `extern` in `cache.c`. Caller passes a buffer at least as large
+  as the full record's CBOR (the signing payload is always smaller —
+  it drops the 67-byte signature field), so `cbor_len` is a safe
+  upper bound for the allocation in `handle_inbound_entry`. The
+  helper is also re-used by the test fixture to construct properly-
+  signed records.
+- `handle_inbound_entry` malloc's a `cbor_len`-byte scratch, emits
+  the signing payload, runs `ants_ed25519_verify(producer, payload,
+  signature)`, frees the scratch. On verify failure the
+  `MALFORMED` (or other) error from the crypto routine is returned
+  verbatim and the record is never admitted.
+
+**Test fixtures**:
+- New `fill_signed_test_entry(e, emb, response, resp_model, priv)` —
+  builds a record whose `producer` matches `pub(priv)` and whose
+  `signature` is the actual Ed25519 signature over the canonical
+  signing payload. Used by every test that drives
+  `handle_inbound_entry`.
+- New `make_test_priv(priv, seed_byte)` — deterministic 32-byte
+  private keys for reproducible tests.
+
+**3 tests** (1 updated, 2 new):
+- `test_handle_inbound_entry_round_trip` updated to use the signed
+  fixture (would otherwise fail under the new gate because the
+  pre-existing `fill_test_entry` produces a stub `0xD0..0xDF`
+  signature).
+- `test_handle_inbound_entry_rejects_tampered_signature` — flip one
+  bit of `entry.signature` → `MALFORMED`, no entry persisted.
+- `test_handle_inbound_entry_rejects_wrong_producer_pubkey` — sign
+  with private key A but set `producer = pub(B)` → `MALFORMED`.
+  Defends against a relayer who tries to attribute someone else's
+  signed payload to themselves by substituting the `producer` field
+  alone.
+- `test_handle_inbound_entry_malformed` unchanged: garbage bytes
+  fail the CBOR decode before reaching the verify path, the
+  pre-existing assertion still holds.
+
+**Component #10 status**: server-side admission is now signature-
+gated. The remaining cache work is the cross-peer client side —
+DHT-routed publish (step 7b) and DHT-routed query (step 7c) — plus
+quality signals + decay (step 9). Step 8 (Hamming-neighbour
+expansion) and Ed25519 verify together close every server-side gap
+that doesn't depend on the DHT and transport.
+
+CI matrix (7 jobs): first-push green.
+
 ### cache: Component #10 (semantic cache) step 8 — Hamming-neighbour expansion · 2026-05-26
 
 **The lookup envelope widens past the exact shard.** `get_topk` and
