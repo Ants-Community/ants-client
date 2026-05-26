@@ -13,6 +13,82 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 8 — Hamming-neighbour expansion · 2026-05-26
+
+**The lookup envelope widens past the exact shard.** `get_topk` and
+the lookup request wire format gain a `hamming_radius` parameter
+(0..3); the candidate set is now every entry whose `shard_key` is
+within `radius` bit-flips of the query embedding's `shard_key`, per
+RFC-0002 §The lookup protocol's near-neighbour widening. `radius = 0`
+preserves step 7a's exact-shard semantics bit-for-bit.
+
+**PR #65 — step 8: Hamming-neighbour expansion** (+649/-69):
+
+- Filter is `popcount(entry.shard_key ^ query_key) ≤ radius`.
+  Implemented as a Brian Kernighan iteration in `shard_key_popcount`
+  to avoid relying on a compiler builtin and stay bit-exact across
+  hosts; the typical XOR has at most 3 set bits, so the cost in the
+  inner scan loop is negligible.
+- New protocol-pinned constant
+  `ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS = 3`: three flips give
+  `C(64,0)+C(64,1)+C(64,2)+C(64,3) ≈ 43k` addressable shards, an
+  envelope wide enough for high-recall semantic search and tight
+  enough that the upper-bound DHT fan-out stays bounded.
+  Out-of-range values are rejected `INVALID_ARG` on the API entry
+  points (`get_topk`, `lookup_request_encode`) and `NON_CANONICAL`
+  on the wire (`lookup_request_decode`).
+- **Wire format** grows CBOR key `4: hamming_radius uint` in
+  canonical ascending order. `handle_inbound_lookup` decodes the
+  new field and threads it through to `get_topk`. The server-side
+  `HANDLE_LOOKUP_SERVER_CAP = 15` still bounds the response size;
+  the radius widens the candidate pool, not the emitted match
+  count.
+- **7 new tests**:
+  - `test_get_topk_hamming_zero_matches_exact_shard_only` —
+    `radius = 0` preserves step-7a exact-shard semantics.
+  - `test_get_topk_hamming_radius_widens_envelope` — for
+    `radius ∈ 0..MAX`, the returned tag-set is exactly the
+    expected pool subset (brute-force ground truth from a
+    near-embedding pool, classified by actual Hamming distance).
+  - `test_get_topk_hamming_excludes_entries_beyond_radius` —
+    a Hamming-~32 entry stays invisible at every allowed
+    radius.
+  - `test_get_topk_hamming_ranks_by_similarity_across_shards`
+    — ranking is by cosine similarity, not by Hamming
+    distance: a high-cos neighbour-shard entry can outrank a
+    lower-cos exact-shard entry.
+  - `test_lookup_request_round_trip_with_hamming_radius` —
+    every legal radius round-trips through the wire format.
+  - `test_lookup_request_rejects_wire_radius_above_max` — a
+    hand-crafted CBOR payload with `radius = MAX + 1` is
+    rejected `NON_CANONICAL` (the public encoder rejects
+    earlier so the wire receiver path is exercised
+    independently).
+  - `test_handle_inbound_lookup_propagates_hamming_radius` —
+    end-to-end: a request with `radius = N` admits a
+    neighbour at Hamming distance `N` on the server's local
+    scan.
+
+**Convention worth preserving**: brute-forcing a Hamming-1/2/3
+neighbour by enumerating small-noise variants is the natural test
+fixture pattern in this regime — two independent random unit
+vectors land at Hamming distance ≈ 32 with overwhelming
+probability, so directly synthesising a near-shard entry is
+impractical. The pool builder + brute-force-find pattern
+(`build_hamming_pool` and the inline loops in
+`*_ranks_by_similarity_across_shards` /
+`*_propagates_hamming_radius`) should be reused for future
+shard-locality tests.
+
+**Component #10 status after step 8**: server-side and local
+top-K both honour the near-neighbour widening; the cache is
+ready for the cross-peer DHT publish (step 7b) and query
+(step 7c). The single remaining server-side gap is the Ed25519
+signature-verify TODO in `handle_inbound_entry` (any well-formed
+record currently admits) — independent of step 8.
+
+CI matrix (7 jobs): first-push green.
+
 ### cache: Component #10 (semantic cache) step 7a — top-K + storage refactor + inbound handlers · 2026-05-25
 
 **Server-side end-to-end ready.** Two consecutive PRs close the
