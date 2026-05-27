@@ -780,6 +780,93 @@ ants_semantic_cache_publish_handle_transport_event(ants_semantic_cache_publish_t
  */
 ants_error_t ants_semantic_cache_publish_destroy(ants_semantic_cache_publish_t *publish);
 
+/* ------------------------------------------------------------------------ */
+/* Server-side stream dispatch (RFC-0002 §Write protocol, §Lookup protocol) */
+/*                                                                          */
+/* The publish + query sides (steps 7b/7c) replicate or fetch records over  */
+/* bidi transport streams. The receiving peer needs to recognise inbound    */
+/* cache streams, accumulate the request, decode it as either an entry      */
+/* write or a lookup query, dispatch to handle_inbound_entry /              */
+/* handle_inbound_lookup, and reply on the same stream.                     */
+/*                                                                          */
+/* The cache_server_t holds an inbound-stream registry parallel to (but     */
+/* independent of) the DHT server's. The caller forwards every transport    */
+/* event to BOTH dispatchers: ants_dht_handle_transport_event runs first,   */
+/* releases its slot silently if peek_type fails (DHT envelopes start with  */
+/* a map of size 2 or 3 with key 0; cache messages don't match), and the    */
+/* cache server's dispatcher then claims the stream by map size — 10 for    */
+/* an entry write (map(9) without signature is only the signing payload     */
+/* form; the on-wire record carries the signature so the top-level map      */
+/* size is 10), 4 for a lookup request.                                     */
+/*                                                                          */
+/* The server emits the lookup response on the same stream with FIN; for    */
+/* entry writes, it sends an empty FIN as ack so the publish-side state    */
+/* machine sees STREAM_FIN and marks the slot ACKED.                        */
+/*                                                                          */
+/* The cache_server_t is caller-allocated; MUST be destroyed BEFORE the     */
+/* underlying transport (server slots reference transport-owned stream     */
+/* pointers that the transport itself cleans up on CONN_CLOSED).           */
+/* ------------------------------------------------------------------------ */
+
+/* Maximum concurrent inbound cache streams a server tracks. Streams      */
+/* opened past this cap are dropped (no slot allocated) and the request    */
+/* never decodes — the sender's publish observes a transport-level close   */
+/* without ACK and counts it as a failed slot. */
+#define ANTS_SEMANTIC_CACHE_SERVER_MAX_INBOUND_STREAMS 16u
+
+/* Per-stream recv buffer cap. The largest legitimate inbound message is  */
+/* an entry write: 4 KiB embedding + producer/signature/prompt-hash (~96  */
+/* bytes) + response text (up to a few KiB) + model strings + scalars.    */
+/* 16 KiB covers realistic protocol traffic with headroom; oversized      */
+/* payloads release the slot silently and the stream is left to the       */
+/* transport's natural close. */
+#define ANTS_SEMANTIC_CACHE_SERVER_INBOUND_RECV_CAP (16u * 1024u)
+
+/* Opaque cache-server context. Sized to fit:
+ *   - magic + cache* + padding
+ *   - inbound_streams[MAX] array (in_use + conn + stream + recv_buf* + lens)
+ * 4 KiB is generous (16 slots × ~64 bytes ≈ 1 KiB; rest is headroom). */
+#define ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE 4096u
+
+typedef struct {
+    union {
+        uint8_t _opaque[ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE];
+        uint64_t _align;
+    };
+} ants_semantic_cache_server_t;
+
+/*
+ * Initialise a cache server bound to `cache`. The server holds a
+ * non-owning pointer to the cache — the cache MUST outlive the server.
+ *
+ * Returns:
+ *   ANTS_OK                — server ready;
+ *   ANTS_ERROR_INVALID_ARG — NULL args.
+ */
+ants_error_t ants_semantic_cache_server_init(ants_semantic_cache_server_t *server,
+                                             ants_semantic_cache_t *cache);
+
+/*
+ * Forward a transport event to the cache server. The server inspects
+ * the event's stream/conn pointers against its inbound registry and
+ * takes no action on foreign events (so it can run in the same event-
+ * dispatch chain as ants_dht_handle_transport_event and any publish
+ * state machines).
+ *
+ * Returns ANTS_OK on success, including no-op cases for foreign events
+ * or zeroed (never-init) ctxs. ANTS_ERROR_INVALID_ARG on NULL args.
+ */
+ants_error_t ants_semantic_cache_server_handle_transport_event(ants_semantic_cache_server_t *server,
+                                                               const ants_transport_event_t *event);
+
+/*
+ * Release all slots + recv buffers held by the server. Idempotent.
+ * MUST be called BEFORE destroying the underlying transport (the
+ * transport's CONN_CLOSED callback would otherwise fire after the
+ * server's slots are gone and attempt to release them again).
+ */
+ants_error_t ants_semantic_cache_server_destroy(ants_semantic_cache_server_t *server);
+
 #ifdef __cplusplus
 }
 #endif

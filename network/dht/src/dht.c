@@ -801,10 +801,23 @@ ants_error_t ants_dht_announce(ants_dht_t *dht, ants_dht_shard_key_t shard_key)
             state->local_announces[i].shard_key = shard_key;
             /* Also record ourselves in the server-side announce set so a
              * GET_PEERS query from a peer who routes us hits an actual
-             * entry rather than the K-closest fallback. */
+             * entry rather than the K-closest fallback. The self-entry's
+             * multiaddr is what other peers will dial when they want to
+             * deliver records to this shard — fill it from the
+             * transport's local listen address so the publish-side dial
+             * path can resolve "responsible peer" → "where to send the
+             * stream". Inbound-announce-from-peers (handle_announce_peer)
+             * still uses an empty multiaddr because the conn's observed
+             * peer_addr is the connect source, not the peer's listen
+             * address; that gap will need an in-protocol multiaddr
+             * exchange to close. */
             ants_dht_peer_t self;
             memset(&self, 0, sizeof self);
             self.peer_id = state->local_peer_id;
+            if (state->transport != NULL) {
+                (void)ants_transport_local_addr(
+                    state->transport, self.multiaddr, sizeof self.multiaddr);
+            }
             (void)ants_dht_server_upsert_announce(state, shard_key, &self, dht_now_us());
             return ANTS_OK;
         }

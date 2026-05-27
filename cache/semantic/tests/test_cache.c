@@ -2356,6 +2356,287 @@ static void test_publish_handle_transport_event_ignores_other_stream(void)
     CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
 }
 
+/* -- End-to-end two-peer publish (step 7b.2) ------------------------------
+ *
+ * Full happy-path of the publish state machine over real QUIC:
+ *   A bootstraps to B, B announces a shard, A constructs a signed
+ *   entry whose LSH shard key matches the announced one, A.publish
+ *   drives lookup → dial → bidi-stream send → B's cache_server decodes
+ *   + Ed25519-verifies + persists the record → B FIN-closes the stream
+ *   as ack → A's completion fires with peers_acked = 1 and B's cache
+ *   reports entries() == 1.
+ *
+ * Exercises:
+ *   - DHT server now silently releases inbound streams whose first
+ *     CBOR bytes don't peek as a DHT envelope (otherwise the stream
+ *     reset would propagate to A as STREAM_RESET and the publish slot
+ *     would mark FAILED).
+ *   - cache_server.c claims those same streams via its parallel
+ *     inbound registry and dispatches to handle_inbound_entry.
+ *   - ants_dht_announce now records the local listen multiaddr in the
+ *     self announce_set entry so the lookup result can be dialed.
+ */
+
+#include "ants_dht.h"
+#include "ants_transport.h"
+
+typedef struct {
+    ants_dht_t *dht;
+    ants_semantic_cache_server_t *cache_server;
+    ants_semantic_cache_publish_t *publish;
+    int conn_ready;
+    int stream_opened;
+} test_e2e_endpoint_t;
+
+static ants_error_t test_e2e_transport_event_fn(const ants_transport_event_t *ev, void *ctx)
+{
+    test_e2e_endpoint_t *e = (test_e2e_endpoint_t *)ctx;
+    if (e->dht) {
+        (void)ants_dht_handle_transport_event(e->dht, ev);
+    }
+    if (e->cache_server) {
+        (void)ants_semantic_cache_server_handle_transport_event(e->cache_server, ev);
+    }
+    if (e->publish) {
+        (void)ants_semantic_cache_publish_handle_transport_event(e->publish, ev);
+    }
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        e->conn_ready++;
+    } else if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
+        e->stream_opened++;
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t test_e2e_dht_event_fn(const ants_dht_event_t *ev, void *ctx)
+{
+    test_e2e_endpoint_t *e = (test_e2e_endpoint_t *)ctx;
+    if (e->publish) {
+        (void)ants_semantic_cache_publish_handle_dht_event(e->publish, ev);
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t test_e2e_real_sign(const uint8_t *transcript,
+                                       size_t transcript_len,
+                                       uint8_t out_sig[ANTS_ED25519_SIG_SIZE],
+                                       void *sign_ctx)
+{
+    const uint8_t *priv = (const uint8_t *)sign_ctx;
+    return ants_ed25519_sign(priv, transcript, transcript_len, out_sig);
+}
+
+static void test_publish_end_to_end_one_peer(void)
+{
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x11, sizeof a_priv);
+    memset(b_priv, 0xEE, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_e2e_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_e2e_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    /* Both transports listen so either side can dial the other. A
+     * publishes; B receives. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_e2e_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_e2e_transport_event_fn;
+    acfg.event_ctx = &a_ep;
+    acfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_e2e_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_e2e_transport_event_fn;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_e2e_dht_event_fn;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_ctx = &b_ep;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    /* Each peer hosts a cache + a cache_server. A doesn't strictly need
+     * a server (it only publishes), but installing it tests the no-op-
+     * on-foreign-stream contract. */
+    ants_semantic_cache_t ca = {{0}};
+    ants_semantic_cache_t cb = {{0}};
+    ants_semantic_cache_config_t ccfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&ca, &ccfg), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_init(&cb, &ccfg), ANTS_OK);
+
+    ants_semantic_cache_server_t srva = {{0}};
+    ants_semantic_cache_server_t srvb = {{0}};
+    CHECK_EQ(ants_semantic_cache_server_init(&srva, &ca), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_init(&srvb, &cb), ANTS_OK);
+    a_ep.cache_server = &srva;
+    b_ep.cache_server = &srvb;
+
+    /* A bootstraps to B. After CONN_READY, A's routing table contains B
+     * (with multiaddr=baddr), and a self-FIND_NODE round-trip completes.
+     * B's routing table is left empty — B doesn't bootstrap back. */
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+
+    for (int i = 0; i < 500; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        if (ants_dht_routing_table_size(&da) >= 1) {
+            break;
+        }
+    }
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    /* Build the entry and compute its shard_key. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(98001, emb);
+    ants_semantic_cache_entry_t entry;
+    fill_signed_test_entry(&entry, emb, "the cached response", "test-model-v1", a_priv);
+
+    ants_semantic_cache_shard_key_t shard_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(emb, &shard_key), ANTS_OK);
+
+    /* B announces the shard for itself (sets self.multiaddr = baddr via
+     * the dht_announce patch in this same PR), so A's lookup resolves
+     * the responsible peer to B with a dialable address. */
+    CHECK_EQ(ants_dht_announce(&db, shard_key), ANTS_OK);
+
+    /* Drive the publish state machine to completion. */
+    ants_semantic_cache_publish_t publish = {{0}};
+    test_publish_recorder_t rec = {0};
+    a_ep.publish = &publish;
+    CHECK_EQ(ants_semantic_cache_publish_init(&publish,
+                                              &da,
+                                              &ta,
+                                              &entry,
+                                              1 /* replication = single peer */,
+                                              test_publish_complete_fn,
+                                              &rec),
+             ANTS_OK);
+
+    for (int i = 0; i < 1000; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        (void)ants_semantic_cache_publish_tick(&publish);
+        if (rec.fired) {
+            break;
+        }
+    }
+
+    CHECK(rec.fired);
+    CHECK_EQ(rec.status, ANTS_OK);
+    CHECK(rec.peers_acked == 1);
+    /* B's cache should now hold the entry. */
+    CHECK(ants_semantic_cache_entries(&cb) == 1);
+
+    /* Teardown order: transport first so its CONN_CLOSED callbacks fan
+     * out to publish + dht + cache_server WHILE all of those are still
+     * alive (publish frees its slot conns/streams from inside its own
+     * CONN_CLOSED handler; the DHT frees bootstrap-conn heap from inside
+     * its CONN_CLOSED handler too). Then drop publish, then the rest. */
+    a_ep.publish = NULL;
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&publish), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srva), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srvb), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_destroy(&ca), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_destroy(&cb), ANTS_OK);
+}
+
+/* -- cache_server contract tests (step 7b.2) ------------------------------
+ *
+ * NULL-arg validation + zero-ctx safety mirror the cache_publish unit
+ * tests. The full transport-level E2E lives in the test above; these
+ * pin the server's defensive surface. */
+
+static void test_cache_server_null_args(void)
+{
+    ants_semantic_cache_t cache = {{0}};
+    ants_semantic_cache_server_t srv = {{0}};
+    ants_transport_event_t ev = {0};
+
+    CHECK_EQ(ants_semantic_cache_server_init(NULL, &cache), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_server_init(&srv, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_server_handle_transport_event(NULL, &ev), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_server_handle_transport_event(&srv, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_server_destroy(NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_cache_server_safe_on_zero_ctx(void)
+{
+    ants_semantic_cache_server_t srv = {{0}};
+    ants_transport_event_t ev = {0};
+    /* Without init the magic check fails — handle_transport_event must
+     * no-op rather than dereference the cache pointer. */
+    CHECK_EQ(ants_semantic_cache_server_handle_transport_event(&srv, &ev), ANTS_OK);
+    /* Destroy is idempotent on a never-init'd ctx. */
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srv), ANTS_OK);
+}
+
+static void test_cache_server_ignores_foreign_streams(void)
+{
+    /* Events whose conn/stream don't match any slot we've opened must be
+     * a no-op so the server can run inside a fan-out chain with the DHT
+     * server + publish handlers without one stealing events from another. */
+    ants_semantic_cache_t cache = {{0}};
+    ants_semantic_cache_config_t ccfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&cache, &ccfg), ANTS_OK);
+
+    ants_semantic_cache_server_t srv = {{0}};
+    CHECK_EQ(ants_semantic_cache_server_init(&srv, &cache), ANTS_OK);
+
+    ants_transport_conn_t alien_conn = {{0}};
+    ants_transport_stream_t alien_stream = {{0}};
+    ants_transport_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
+    ev.conn = &alien_conn;
+    ev.stream = &alien_stream;
+    CHECK_EQ(ants_semantic_cache_server_handle_transport_event(&srv, &ev), ANTS_OK);
+    CHECK(ants_semantic_cache_entries(&cache) == 0);
+
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srv), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_destroy(&cache), ANTS_OK);
+}
+
 int main(void)
 {
     test_protocol_constants();
@@ -2432,6 +2713,11 @@ int main(void)
     test_publish_no_peers_completes_with_peer_unreachable();
     test_publish_handle_dht_event_ignores_other_lookup();
     test_publish_handle_transport_event_ignores_other_stream();
+
+    test_cache_server_null_args();
+    test_cache_server_safe_on_zero_ctx();
+    test_cache_server_ignores_foreign_streams();
+    test_publish_end_to_end_one_peer();
 
     if (failures > 0) {
         fprintf(stderr, "test_cache: %d failure(s)\n", failures);
