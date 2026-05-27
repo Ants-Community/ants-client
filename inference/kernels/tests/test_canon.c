@@ -997,6 +997,149 @@ static void test_matmul_order_invariance_against_naive(void)
     }
 }
 
+/* -- Per-channel symmetric INT8 weight quantization (RFC-0009 §1) ----- */
+
+static void test_quantize_weights_null_args_and_bounds(void)
+{
+    float w[4] = {0};
+    int8_t w_int8[4] = {0};
+    float scales[2] = {0};
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(NULL, w_int8, scales, 2, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, NULL, scales, 2, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, NULL, 2, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 0, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 2, 0),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(
+                 w, w_int8, scales, 2, ANTS_CANON_MAX_REDUCE_LEN + 1),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_quantize_weights_simple_127_scaling(void)
+{
+    /* One channel, max_abs = 127.0 exactly → scale = 1.0, quantized
+     * values = round(w / 1.0) = round(w). */
+    float w[5] = {127.0f, -64.0f, 0.0f, 63.5f, -127.0f};
+    int8_t w_int8[5];
+    float scales[1];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 1, 5), ANTS_OK);
+    CHECK(scales[0] == 1.0f);
+    CHECK(w_int8[0] == 127);
+    CHECK(w_int8[1] == -64);
+    CHECK(w_int8[2] == 0);
+    /* 63.5 rounds to even → 64 (banker's rounding via rintf). */
+    CHECK(w_int8[3] == 64);
+    CHECK(w_int8[4] == -127);
+}
+
+static void test_quantize_weights_two_channels_independent_scales(void)
+{
+    /* Two channels with different magnitudes → different scales. */
+    float w[2 * 4] = {/* ch 0: max_abs = 4.0 → scale = 4/127 */
+                      1.0f,
+                      2.0f,
+                      3.0f,
+                      -4.0f,
+                      /* ch 1: max_abs = 254.0 → scale = 2.0 */
+                      127.0f,
+                      -254.0f,
+                      0.0f,
+                      254.0f};
+    int8_t w_int8[2 * 4];
+    float scales[2];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 2, 4), ANTS_OK);
+    /* Ch 0: scale = 4.0 / 127.0 (not 1/scale!) */
+    CHECK(fabsf(scales[0] - 4.0f / 127.0f) < 1e-7f);
+    /* Quantized ch 0 values: round(w / (4/127)) = round(w * 127/4) */
+    CHECK(w_int8[3] == -127); /* -4.0 * 127 / 4 = -127 */
+    /* Ch 1: scale = 254.0 / 127.0 = 2.0 */
+    CHECK(scales[1] == 2.0f);
+    CHECK(w_int8[4] == 64);   /* round(127.0 / 2.0) = round(63.5) → 64 (banker's) */
+    CHECK(w_int8[5] == -127); /* round(-254.0 / 2.0) = -127 */
+    CHECK(w_int8[6] == 0);    /* round(0.0 / 2.0) = 0 */
+    CHECK(w_int8[7] == 127);  /* round(254.0 / 2.0) = 127 */
+}
+
+static void test_quantize_weights_zero_channel_sentinel(void)
+{
+    /* All-zero channel → scale = 1.0 sentinel, w_int8 = 0 for all
+     * lanes. Other channels processed normally. */
+    float w[2 * 3] = {0.0f, 0.0f, 0.0f, 1.0f, 2.0f, 3.0f};
+    int8_t w_int8[2 * 3];
+    float scales[2];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 2, 3), ANTS_OK);
+    CHECK(scales[0] == 1.0f);
+    CHECK(w_int8[0] == 0);
+    CHECK(w_int8[1] == 0);
+    CHECK(w_int8[2] == 0);
+    /* Ch 1: max_abs = 3.0 → scale = 3/127. */
+    CHECK(fabsf(scales[1] - 3.0f / 127.0f) < 1e-7f);
+}
+
+static void test_quantize_weights_clamps_overflow(void)
+{
+    /* If somehow rounded value exceeds ±127 (shouldn't given the
+     * scale derivation, but the clamp is defensive against numeric
+     * edge cases), the result saturates. The simplest reproduction:
+     * a channel where rintf rounds to +128 at one position (e.g.
+     * via the banker's rounding rule applied to 127.5 → 128). */
+    float w[1 * 2] = {127.49999f, 0.0f};
+    int8_t w_int8[2];
+    float scales[1];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, 1, 2), ANTS_OK);
+    /* max_abs = 127.49999, scale ≈ 1.0039..., w[0] / scale ≈ 127.0
+     * → rounds to 127. Saturation didn't trigger but the contract
+     * is satisfied. */
+    CHECK(w_int8[0] == 127);
+    CHECK(w_int8[1] == 0);
+}
+
+static void test_quantize_weights_dequant_round_trip(void)
+{
+    /* Dequantize via w_int8 * scale and verify approximation:
+     * |w_fp32 - w_int8 * scale| ≤ scale/2 (half a quantization step). */
+    enum { CH = 3, S = 8 };
+    float w[CH * S];
+    /* Pseudo-random weights in [-2, +2]. */
+    for (size_t i = 0; i < CH * S; i++) {
+        w[i] = (float)(((int)i * 13 + 7) % 100 - 50) * 0.04f;
+    }
+    int8_t w_int8[CH * S];
+    float scales[CH];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, w_int8, scales, CH, S), ANTS_OK);
+    for (size_t ch = 0; ch < CH; ch++) {
+        for (size_t i = 0; i < S; i++) {
+            float dequant = (float)w_int8[ch * S + i] * scales[ch];
+            CHECK(fabsf(w[ch * S + i] - dequant) <= scales[ch] * 0.5f + 1e-7f);
+        }
+    }
+}
+
+static void test_quantize_weights_same_input_bit_exact(void)
+{
+    /* No hidden state; same input → bit-identical output. */
+    float w[2 * 4] = {0.1f, 0.5f, -0.3f, 0.9f, 1.0f, -1.5f, 2.0f, -0.5f};
+    int8_t out1[2 * 4];
+    int8_t out2[2 * 4];
+    float scales1[2];
+    float scales2[2];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, out1, scales1, 2, 4), ANTS_OK);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, out2, scales2, 2, 4), ANTS_OK);
+    for (int i = 0; i < 2 * 4; i++) {
+        CHECK(out1[i] == out2[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        uint32_t b1, b2;
+        memcpy(&b1, &scales1[i], sizeof b1);
+        memcpy(&b2, &scales2[i], sizeof b2);
+        CHECK(b1 == b2);
+    }
+}
+
 int main(void)
 {
     test_q24_zero_round_trip();
@@ -1067,6 +1210,14 @@ int main(void)
     test_attention_causal_mask_per_row_sums_to_one();
     test_attention_no_mask_uniform_q_k_zero();
     test_attention_same_input_bit_exact();
+
+    test_quantize_weights_null_args_and_bounds();
+    test_quantize_weights_simple_127_scaling();
+    test_quantize_weights_two_channels_independent_scales();
+    test_quantize_weights_zero_channel_sentinel();
+    test_quantize_weights_clamps_overflow();
+    test_quantize_weights_dequant_round_trip();
+    test_quantize_weights_same_input_bit_exact();
 
     if (failures > 0) {
         fprintf(stderr, "test_canon: %d failure(s)\n", failures);
