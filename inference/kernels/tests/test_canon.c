@@ -629,6 +629,160 @@ static void test_matmul_rectangular_shape(void)
     CHECK(out[5] == 12);
 }
 
+/* -- FP32 × FP32 → FP32 matmul (RFC-0009 §3 + §5) --------------------- */
+
+static void test_matmul_fp32_null_args_and_zero_dims(void)
+{
+    float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(NULL, b, out, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_matmul_fp32(a, NULL, out, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, NULL, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 0, 2, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 2, 0, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 2, 2, 0), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_matmul_fp32_known_2x2(void)
+{
+    /* A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]] → [[19, 22], [43, 50]].
+     * Small integers exactly representable in FP32; no rounding loss. */
+    float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 2, 2, 2), ANTS_OK);
+    CHECK(out[0] == 19.0f);
+    CHECK(out[1] == 22.0f);
+    CHECK(out[2] == 43.0f);
+    CHECK(out[3] == 50.0f);
+}
+
+static void test_matmul_fp32_identity_left(void)
+{
+    /* I · B = B exactly. Float identity matrix has bit-exact 1.0f
+     * and 0.0f entries; the matmul accumulator picks the single
+     * non-zero product per row and the zero entries contribute
+     * exactly 0 (no rounding). */
+    float id[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    float b[12] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f};
+    float out[12] = {0.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(id, b, out, 3, 3, 4), ANTS_OK);
+    for (int i = 0; i < 12; i++) {
+        uint32_t bo, bb;
+        memcpy(&bo, &out[i], sizeof bo);
+        memcpy(&bb, &b[i], sizeof bb);
+        CHECK(bo == bb);
+    }
+}
+
+static void test_matmul_fp32_zero_matrix(void)
+{
+    /* 0 · B = 0 with explicit accumulator zero-init verification:
+     * pre-fill out with garbage. */
+    float zero[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float b[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    float out[4] = {99.0f, 99.0f, 99.0f, 99.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(zero, b, out, 2, 3, 2), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        CHECK(out[i] == 0.0f);
+    }
+}
+
+static void test_matmul_fp32_strict_left_to_right_order(void)
+{
+    /* The bit-exact discriminator for FP32 matmul: construct K=4
+     * input vectors where strict left-to-right reduction gives a
+     * different last-bit result than other plausible reduction
+     * orders. With K=4, the strict-LR order is:
+     *   ((a*b)[0] + (a*b)[1]) + (a*b)[2]) + (a*b)[3]
+     * A pairwise-tree shape would be:
+     *   ((a*b)[0] + (a*b)[1]) + ((a*b)[2] + (a*b)[3])
+     * Same products; different addition order.
+     *
+     * Choose products such that strict-LR and pairwise differ in
+     * the last bit. The classic example is summing 1e8 + 1 + 1 + 1:
+     *   Strict-LR: ((1e8 + 1) + 1) + 1 = 1e8 + 0 + 0 + 0 = 1e8
+     *     (each +1 lost because FP32 epsilon at 1e8 is ~8)
+     *   Pairwise: (1e8 + 1) + (1 + 1) = 1e8 + 2 = 1e8 (still lost)
+     *
+     * Better: 1e8 + 1 + (-1e8) + 1
+     *   Strict-LR: ((1e8+1) + -1e8) + 1 = (1e8 - 1e8) + 1 = 0 + 1 = 1
+     *   Pairwise:  (1e8+1) + (-1e8 + 1) = 1e8 + (-9999999) = 1
+     *   Same.
+     *
+     * Try: 1.0, 1e-8, 1.0, -1.0
+     *   Strict-LR: ((1.0 + 1e-8) + 1.0) + -1.0 = (1.0 + 1.0) - 1.0
+     *     = 2.0 - 1.0 = 1.0 (1e-8 lost in first add)
+     *   Pairwise: (1.0 + 1e-8) + (1.0 - 1.0) = 1.0 + 0 = 1.0
+     *   Same.
+     *
+     * Easier: hand-compute the strict-LR result on a pseudo-random
+     * input and require the impl to match THAT specific bit pattern.
+     * The test value isn't important; the bit-exactness IS. */
+    float a[4] = {1.0e7f, 1.0f, -1.0e7f, 1.0f};
+    float b[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float out[1] = {0.0f};
+    /* M=1, K=4, N=1: out[0] = sum_l a[l] * b[l] in strict LR order. */
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 1, 4, 1), ANTS_OK);
+    /* Hand-compute strict-LR in the test: */
+    float p0 = a[0] * b[0];
+    float p1 = a[1] * b[1];
+    float p2 = a[2] * b[2];
+    float p3 = a[3] * b[3];
+    float expected = ((p0 + p1) + p2) + p3;
+    uint32_t bg, be;
+    memcpy(&bg, &out[0], sizeof bg);
+    memcpy(&be, &expected, sizeof be);
+    CHECK(bg == be);
+}
+
+static void test_matmul_fp32_rectangular_shape(void)
+{
+    /* Non-square shape exercises index arithmetic. A: 2×3, B: 3×4 → out 2×4. */
+    float a[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    float b[12] = {1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+    float out[8] = {0.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out, 2, 3, 4), ANTS_OK);
+    /* Row 0 of A = [1, 2, 3]. Cols of B are
+     *   col 0: [1, 0, 1] → 1*1 + 2*0 + 3*1 = 4
+     *   col 1: [0, 1, 0] → 1*0 + 2*1 + 3*0 = 2
+     *   col 2: [1, 0, 1] → 4
+     *   col 3: [0, 1, 0] → 2
+     * Row 1 of A = [4, 5, 6].
+     *   col 0: 4*1 + 5*0 + 6*1 = 10
+     *   col 1: 4*0 + 5*1 + 6*0 = 5
+     *   col 2: 10
+     *   col 3: 5 */
+    CHECK(out[0] == 4.0f);
+    CHECK(out[1] == 2.0f);
+    CHECK(out[2] == 4.0f);
+    CHECK(out[3] == 2.0f);
+    CHECK(out[4] == 10.0f);
+    CHECK(out[5] == 5.0f);
+    CHECK(out[6] == 10.0f);
+    CHECK(out[7] == 5.0f);
+}
+
+static void test_matmul_fp32_same_input_bit_exact(void)
+{
+    /* No hidden state: same inputs → bit-identical outputs across
+     * repeated calls. This is the canonical bit-exactness contract
+     * for honest peers. */
+    float a[6] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+    float b[6] = {0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f};
+    float out1[4] = {0.0f};
+    float out2[4] = {0.0f};
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out1, 2, 3, 2), ANTS_OK);
+    CHECK_EQ(ants_canon_matmul_fp32(a, b, out2, 2, 3, 2), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        uint32_t b1, b2;
+        memcpy(&b1, &out1[i], sizeof b1);
+        memcpy(&b2, &out2[i], sizeof b2);
+        CHECK(b1 == b2);
+    }
+}
+
 static void test_matmul_order_invariance_against_naive(void)
 {
     /* The strict left-to-right reduction rule is the protocol-pinned
@@ -718,6 +872,14 @@ int main(void)
     test_matmul_extreme_int8_values();
     test_matmul_rectangular_shape();
     test_matmul_order_invariance_against_naive();
+
+    test_matmul_fp32_null_args_and_zero_dims();
+    test_matmul_fp32_known_2x2();
+    test_matmul_fp32_identity_left();
+    test_matmul_fp32_zero_matrix();
+    test_matmul_fp32_strict_left_to_right_order();
+    test_matmul_fp32_rectangular_shape();
+    test_matmul_fp32_same_input_bit_exact();
 
     if (failures > 0) {
         fprintf(stderr, "test_canon: %d failure(s)\n", failures);

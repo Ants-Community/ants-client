@@ -31,6 +31,7 @@
  *   - Left-biased max + sum reductions: implemented (§2.1 step 2 + §3)
  *   - Per-token scale (full §2.1 recipe): implemented
  *   - INT8 × INT8 → INT32 matmul: implemented (§3)
+ *   - FP32 × FP32 → FP32 matmul (strict left-to-right): implemented (§3 + §5)
  *   - Softmax with stable subtract-max + divide: implemented (§3)
  *   - Attention (Q·K^T scaled + softmax + ·V): future PR
  *   - GPTQ / AWQ quantization (§1): future PR
@@ -301,6 +302,40 @@ ants_error_t ants_canon_per_token_scale(const float *activations, size_t n, floa
  */
 ants_error_t
 ants_canon_matmul_i8(const int8_t *a, const int8_t *b, int32_t *out, size_t m, size_t k, size_t n);
+
+/*
+ * Canonical FP32 × FP32 → FP32 GEMM per RFC-0009 §3 + §5:
+ *   - Row-major iteration order for the output matrix.
+ *   - Inner-product summation in a strict left-to-right reduction
+ *     over the inner (K) dimension. NO tiling-induced reordering,
+ *     NO horizontal-SIMD reordering that violates left-to-right.
+ *
+ * Used by §5 unembedding (FP32 hidden-state → vocab logits projection)
+ * and as a building block for the FP32 fallback inference path
+ * referenced in §"The FP16 fallback".
+ *
+ * FP32 addition is NOT associative, so the reduction order matters
+ * bit-exactly. Two honest implementations that reduce in different
+ * orders (e.g. a SIMD horizontal-add tree vs strict left-to-right)
+ * will produce different last-bit results — the canonical recipe
+ * pins left-to-right so byte-identical output is reproducible.
+ *
+ * Shapes (row-major):
+ *   a:   [m × k]   FP32
+ *   b:   [k × n]   FP32
+ *   out: [m × n]   FP32
+ *
+ * No overflow analogue to the INT8 case: FP32 saturates to ±∞ for
+ * extreme magnitudes, which propagates through softmax + downstream
+ * matmuls deterministically. Callers concerned about overflow should
+ * either scale inputs or expect ±∞ in their output.
+ *
+ * Returns:
+ *   ANTS_OK                — out populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args or zero-sized dim.
+ */
+ants_error_t
+ants_canon_matmul_fp32(const float *a, const float *b, float *out, size_t m, size_t k, size_t n);
 
 #ifdef __cplusplus
 }

@@ -488,3 +488,46 @@ ants_canon_matmul_i8(const int8_t *a, const int8_t *b, int32_t *out, size_t m, s
     }
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* FP32 × FP32 → FP32 matmul (RFC-0009 §3 + §5)                             */
+/* ------------------------------------------------------------------------ */
+
+/* Same loop skeleton as the INT8 variant but with FP32 multiply +
+ * FP32 add. The crucial difference from INT8: FP32 addition is NOT
+ * associative, so the strict left-to-right inner reduction is part
+ * of the bit-exact contract. A SIMD implementation that uses lane-
+ * parallel partial sums + horizontal reduce will produce
+ * different last-bit results than this scalar reference and so MUST
+ * follow the same reduction order (a strict left-to-right scalar
+ * fallback OR a left-biased tree like reduce_sum, which the spec
+ * pins uniformly in §"The reference kernel library").
+ *
+ * The reference implementation here uses strict left-to-right rather
+ * than a tree because it matches the per-output-cell loop structure
+ * exactly. SIMD parity proofs against this reference must verify
+ * either: (a) the SIMD path also computes strict left-to-right per
+ * cell (slow but parity-clear), or (b) the spec is extended to bless
+ * a specific tree shape for FP32 matmul; in either case the test
+ * vectors against cpu_scalar.c are the source of truth. */
+ants_error_t
+ants_canon_matmul_fp32(const float *a, const float *b, float *out, size_t m, size_t k, size_t n)
+{
+    if (a == NULL || b == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (m == 0 || k == 0 || n == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < m; i++) {
+        for (size_t j = 0; j < n; j++) {
+            float acc = 0.0f;
+            for (size_t l = 0; l < k; l++) {
+                acc += a[i * k + l] * b[l * n + j];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    return ANTS_OK;
+}
