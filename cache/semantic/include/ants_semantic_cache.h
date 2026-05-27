@@ -167,13 +167,20 @@ typedef struct {
  * Serialise a cache-entry record into a buffer using canonical CBOR
  * (RFC-0008 §3 deterministic encoding, integer map keys 1..10).
  *
+ * `buf` MUST be non-NULL and `out_cap` MUST be non-zero. The underlying
+ * CBOR encoder does NOT support probe-mode (NULL/0 → INVALID_ARG); to
+ * size-probe a record, pass a generously-sized buffer and retry with
+ * `realloc(buf, *out_len)` on `BUFFER_TOO_SMALL` (cache_publish.c uses
+ * this pattern with an 8 KiB starting cap).
+ *
  * Returns:
  *   ANTS_OK                       — *out_len bytes written to buf;
- *   ANTS_ERROR_INVALID_ARG        — NULL args, NULL embedding, NULL
+ *   ANTS_ERROR_INVALID_ARG        — NULL args (including NULL buf or
+ *                                   zero out_cap), NULL embedding, NULL
  *                                   response with non-zero len, etc.;
  *   ANTS_ERROR_BUFFER_TOO_SMALL   — out_cap insufficient; *out_len set
- *                                   to required size (probe call:
- *                                   buf=NULL, out_cap=0).
+ *                                   to required size, caller may retry
+ *                                   with a bigger buffer.
  */
 ants_error_t ants_semantic_cache_entry_encode(const ants_semantic_cache_entry_t *entry,
                                               uint8_t *buf,
