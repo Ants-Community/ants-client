@@ -30,7 +30,7 @@
  *   - q24 ↔ FP32 conversion: implemented (§5)
  *   - Left-biased max reduction: implemented (§2.1 step 2)
  *   - Per-token scale (full §2.1 recipe): implemented
- *   - INT8 × INT8 → INT32 matmul (§3): stub
+ *   - INT8 × INT8 → INT32 matmul: implemented (§3)
  *   - Softmax + attention (§3): stub
  *   - GPTQ / AWQ quantization (§1): stub
  *
@@ -212,20 +212,22 @@ ants_error_t ants_canon_per_token_scale(const float *activations, size_t n, floa
 /*
  * Canonical INT8 × INT8 → INT32 GEMM per RFC-0009 §3:
  *   - Row-major iteration order for the output matrix.
- *   - Inner-product summation in a strictly left-to-right reduction
+ *   - Inner-product summation in a strict left-to-right reduction
  *     over the inner (K) dimension. NO tiling-induced reordering.
  *
  * Shapes (row-major):
- *   a:   [M × K]   INT8
- *   b:   [K × N]   INT8
- *   out: [M × N]   INT32
+ *   a:   [m × k]   INT8
+ *   b:   [k × n]   INT8
+ *   out: [m × n]   INT32
  *
- * Status: STUB. Lands in a follow-up PR.
+ * Accumulator is int32_t. Per-product range is [-127·127, +127·127];
+ * INT32_MAX / 127² ≈ 133150 → K up to that value is overflow-safe.
+ * No realistic transformer K dimension exceeds this; callers passing
+ * larger K are responsible for verifying overflow safety.
  *
  * Returns:
- *   ANTS_OK                    — out populated (when implemented);
- *   ANTS_ERROR_INVALID_ARG     — NULL args, zero-sized dim;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold stage.
+ *   ANTS_OK                — out populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args or zero-sized dim.
  */
 ants_error_t
 ants_canon_matmul_i8(const int8_t *a, const int8_t *b, int32_t *out, size_t m, size_t k, size_t n);

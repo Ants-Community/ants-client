@@ -276,20 +276,70 @@ ants_error_t ants_canon_per_token_scale(const float *activations, size_t n, floa
 }
 
 /* ------------------------------------------------------------------------ */
-/* INT8 × INT8 → INT32 matmul — STUB (RFC-0009 §3)                          */
+/* INT8 × INT8 → INT32 matmul (RFC-0009 §3)                                 */
 /* ------------------------------------------------------------------------ */
 
+/* Per RFC-0009 §3 the canonical matmul pins:
+ *   - Row-major iteration order for the output matrix.
+ *   - Inner-product summation in a strict left-to-right reduction
+ *     over the inner dimension. NO tiling-induced reordering.
+ *
+ * Shapes (row-major):
+ *   a:   m × k        int8_t,  index (i, l)  →  a[i*k + l]
+ *   b:   k × n        int8_t,  index (l, j)  →  b[l*n + j]
+ *   out: m × n        int32_t, index (i, j)  →  out[i*n + j]
+ *
+ * Accumulator is int32_t. Per-product range is [-127·127, +127·127]
+ * = [-16129, +16129]. INT32_MAX / 16129 ≈ 133150, so K up to that
+ * value is overflow-safe; larger K is protocol-pinned out by the
+ * fact that no realistic transformer K exceeds this. Caller
+ * responsibility: don't pass K beyond the safe range.
+ *
+ * The loop is the simplest possible nest with the canonical ordering:
+ *
+ *   for i in 0..m:              (output row)
+ *       for j in 0..n:          (output column)
+ *           acc = 0
+ *           for l in 0..k:      (inner dimension — STRICTLY LEFT-TO-RIGHT)
+ *               acc += a[i*k + l] * b[l*n + j]
+ *           out[i*n + j] = acc
+ *
+ * The inner reduction is a sequential sum of integer products, which
+ * is associative and commutative on INT32 (modulo the overflow caveat
+ * above). The ordering rule survives the trivial bit-exactness check
+ * since integer addition has no rounding; the ORDER constraint is
+ * spec-pinned for forward-compatibility with the FP32 unembedding
+ * reduction (§3 also covers fp32_unembed) and for SIMD parity:
+ * future AVX2 / NEON implementations that use per-lane partial sums
+ * before a horizontal reduce produce a bit-identical INT32 result
+ * here because integer addition is exact, BUT the same discipline
+ * applied to fp32_unembed wouldn't, so the spec pins the ordering
+ * uniformly. */
 ants_error_t
 ants_canon_matmul_i8(const int8_t *a, const int8_t *b, int32_t *out, size_t m, size_t k, size_t n)
 {
-    /* NULL / zero-dim validation is meaningful even at stub stage —
-     * lets the test scaffold pin the contract. */
     if (a == NULL || b == NULL || out == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
     if (m == 0 || k == 0 || n == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    /* Implementation lands in a follow-up PR. */
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    for (size_t i = 0; i < m; i++) {
+        for (size_t j = 0; j < n; j++) {
+            int32_t acc = 0;
+            for (size_t l = 0; l < k; l++) {
+                /* Cast the int8 multiplicands to int32 BEFORE multiplying
+                 * so the product is computed in 32-bit arithmetic. A
+                 * naive `(int32_t)(a[..] * b[..])` would compute the
+                 * multiply in `int` (typically int32) on most targets
+                 * but is technically UB on a 16-bit `int` target. The
+                 * explicit cast is portable C99. */
+                int32_t prod = (int32_t)a[i * k + l] * (int32_t)b[l * n + j];
+                acc += prod;
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    return ANTS_OK;
 }

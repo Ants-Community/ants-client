@@ -264,24 +264,147 @@ static void test_per_token_scale_null_args(void)
     CHECK_EQ(ants_canon_per_token_scale(v, 0, &scale), ANTS_ERROR_INVALID_ARG);
 }
 
-/* -- matmul stub contract --------------------------------------------- */
+/* -- INT8 × INT8 → INT32 matmul (RFC-0009 §3) ------------------------ */
 
-static void test_matmul_stub_contract(void)
+static void test_matmul_null_args_and_zero_dims(void)
 {
-    /* The stub returns NOT_IMPLEMENTED on a valid call; rejects NULL
-     * args + zero dims with INVALID_ARG. Pins the contract so the
-     * real implementation in a follow-up PR can be diffed against
-     * the stub. */
     int8_t a[2 * 2] = {1, 2, 3, 4};
     int8_t b[2 * 2] = {5, 6, 7, 8};
     int32_t out[2 * 2] = {0};
-    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 2, 2), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_canon_matmul_i8(NULL, b, out, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_canon_matmul_i8(a, NULL, out, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_canon_matmul_i8(a, b, NULL, 2, 2, 2), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_canon_matmul_i8(a, b, out, 0, 2, 2), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 0, 2), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 2, 0), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_matmul_known_2x2(void)
+{
+    /* A = [[1, 2],     B = [[5, 6],     A·B = [[1·5+2·7, 1·6+2·8],
+     *      [3, 4]]          [7, 8]]            [3·5+4·7, 3·6+4·8]]
+     *                                     = [[19, 22],
+     *                                        [43, 50]] */
+    int8_t a[2 * 2] = {1, 2, 3, 4};
+    int8_t b[2 * 2] = {5, 6, 7, 8};
+    int32_t out[2 * 2] = {0};
+    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 2, 2), ANTS_OK);
+    CHECK(out[0] == 19);
+    CHECK(out[1] == 22);
+    CHECK(out[2] == 43);
+    CHECK(out[3] == 50);
+}
+
+static void test_matmul_identity_left(void)
+{
+    /* I_3 · B = B. Identity on the left preserves B exactly. */
+    int8_t id[3 * 3] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    int8_t b[3 * 4] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    int32_t out[3 * 4] = {0};
+    CHECK_EQ(ants_canon_matmul_i8(id, b, out, 3, 3, 4), ANTS_OK);
+    for (int i = 0; i < 12; i++) {
+        CHECK(out[i] == (int32_t)b[i]);
+    }
+}
+
+static void test_matmul_zero_matrix(void)
+{
+    /* 0·B = 0. Verifies the accumulator initialises cleanly across
+     * every output cell. */
+    int8_t a[2 * 3] = {0, 0, 0, 0, 0, 0};
+    int8_t b[3 * 2] = {1, 2, 3, 4, 5, 6};
+    int32_t out[2 * 2];
+    /* Pre-fill out with garbage so the test verifies zero-init. */
+    out[0] = 99;
+    out[1] = 99;
+    out[2] = 99;
+    out[3] = 99;
+    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 3, 2), ANTS_OK);
+    CHECK(out[0] == 0);
+    CHECK(out[1] == 0);
+    CHECK(out[2] == 0);
+    CHECK(out[3] == 0);
+}
+
+static void test_matmul_negative_values(void)
+{
+    /* Mixed-sign multiplication. A = [-1, 2], B = [3, -4]^T → -1·3 + 2·-4 = -11. */
+    int8_t a[1 * 2] = {-1, 2};
+    int8_t b[2 * 1] = {3, -4};
+    int32_t out[1 * 1] = {99};
+    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 1, 2, 1), ANTS_OK);
+    CHECK(out[0] == -11);
+}
+
+static void test_matmul_extreme_int8_values(void)
+{
+    /* Per-product range is [-127·127, +127·127]; accumulator is
+     * int32_t. A single -127 × -127 = +16129; +127 × +127 = +16129.
+     * Sum two of each = +64516. */
+    int8_t a[1 * 4] = {127, 127, -127, -127};
+    int8_t b[4 * 1] = {127, 127, -127, -127};
+    int32_t out[1 * 1] = {0};
+    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 1, 4, 1), ANTS_OK);
+    CHECK(out[0] == 127 * 127 + 127 * 127 + (-127) * (-127) + (-127) * (-127));
+    CHECK(out[0] == 64516);
+}
+
+static void test_matmul_rectangular_shape(void)
+{
+    /* Non-square: A is 2×4, B is 4×3, output is 2×3. Verifies the
+     * row-major index arithmetic (i*k+l for A, l*n+j for B,
+     * i*n+j for out) is correct for non-square dims. */
+    int8_t a[2 * 4] = {1, 2, 3, 4, 5, 6, 7, 8};
+    int8_t b[4 * 3] = {1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0};
+    int32_t out[2 * 3] = {0};
+    CHECK_EQ(ants_canon_matmul_i8(a, b, out, 2, 4, 3), ANTS_OK);
+    /* out[0,0] = 1·1 + 2·0 + 3·1 + 4·0 = 4
+     * out[0,1] = 1·0 + 2·1 + 3·0 + 4·1 = 6
+     * out[0,2] = 1·1 + 2·0 + 3·1 + 4·0 = 4
+     * out[1,0] = 5·1 + 6·0 + 7·1 + 8·0 = 12
+     * out[1,1] = 5·0 + 6·1 + 7·0 + 8·1 = 14
+     * out[1,2] = 5·1 + 6·0 + 7·1 + 8·0 = 12 */
+    CHECK(out[0] == 4);
+    CHECK(out[1] == 6);
+    CHECK(out[2] == 4);
+    CHECK(out[3] == 12);
+    CHECK(out[4] == 14);
+    CHECK(out[5] == 12);
+}
+
+static void test_matmul_order_invariance_against_naive(void)
+{
+    /* The strict left-to-right reduction rule is the protocol-pinned
+     * order. For integer arithmetic the result is associative-
+     * invariant (no rounding), so we can verify the impl against a
+     * naive in-place double-loop computation that reduces in the
+     * same order. This test exists to catch the obvious off-by-one
+     * indexing error that flips an iteration boundary. */
+    enum { M = 4, K = 7, N = 5 };
+    int8_t a[M * K];
+    int8_t b[K * N];
+    for (int i = 0; i < M * K; i++) {
+        a[i] = (int8_t)((i * 13 + 7) % 127 - 63);
+    }
+    for (int i = 0; i < K * N; i++) {
+        b[i] = (int8_t)((i * 17 + 11) % 127 - 63);
+    }
+    int32_t got[M * N];
+    int32_t expected[M * N];
+    CHECK_EQ(ants_canon_matmul_i8(a, b, got, M, K, N), ANTS_OK);
+    /* Reference reduction in the same canonical order. */
+    for (size_t i = 0; i < M; i++) {
+        for (size_t j = 0; j < N; j++) {
+            int32_t acc = 0;
+            for (size_t l = 0; l < K; l++) {
+                acc += (int32_t)a[i * K + l] * (int32_t)b[l * N + j];
+            }
+            expected[i * N + j] = acc;
+        }
+    }
+    for (int i = 0; i < M * N; i++) {
+        CHECK(got[i] == expected[i]);
+    }
 }
 
 int main(void)
@@ -311,7 +434,14 @@ int main(void)
     test_per_token_scale_divide_not_reciprocal();
     test_per_token_scale_null_args();
 
-    test_matmul_stub_contract();
+    test_matmul_null_args_and_zero_dims();
+    test_matmul_known_2x2();
+    test_matmul_identity_left();
+    test_matmul_zero_matrix();
+    test_matmul_negative_values();
+    test_matmul_extreme_int8_values();
+    test_matmul_rectangular_shape();
+    test_matmul_order_invariance_against_naive();
 
     if (failures > 0) {
         fprintf(stderr, "test_canon: %d failure(s)\n", failures);
