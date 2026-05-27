@@ -34,7 +34,10 @@
  *   - FP32 × FP32 → FP32 matmul (strict left-to-right): implemented (§3 + §5)
  *   - Softmax with stable subtract-max + divide: implemented (§3)
  *   - Full scaled-dot-product attention (Q·K^T + softmax + ·V): implemented (§3)
- *   - GPTQ / AWQ quantization (§1): future PR
+ *   - Per-channel symmetric INT8 weight quantization (§1, AbsMax variant
+ *     without group-size-128 + without GPTQ Hessian optimization): implemented
+ *   - Group-size-128 quantization (§1 full canonical): future PR
+ *   - GPTQ Hessian-optimized scales: future PR (calibration-driven)
  *   - SIMD parity (AVX2/AVX-512/NEON/SVE): future PRs
  *
  * API model: caller-allocated buffers, no internal allocation, no
@@ -389,6 +392,59 @@ ants_error_t ants_canon_attention_fp32(const float *q,
                                        bool causal_mask,
                                        float *scratch,
                                        size_t scratch_cap);
+
+/* ------------------------------------------------------------------------ */
+/* Per-channel symmetric INT8 weight quantization (RFC-0009 §1)             */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Quantize FP32 weights to INT8 with per-channel symmetric scaling.
+ *
+ * The full canonical recipe per RFC-0009 §1 is "INT8-GPTQ-128":
+ *  (a) per-channel symmetric scaling — one or more scales per output channel;
+ *  (b) group size 128 — each channel divided into groups of 128 weights,
+ *      each group with its own scale;
+ *  (c) GPTQ Hessian-based optimisation — scales tuned per row using
+ *      a Hessian-based optimisation against calibration data.
+ *
+ * This entry point implements (a) only — one scale per channel, computed
+ * via AbsMax (max(|w|) / 127.0) over the full channel. (b) and (c) are
+ * future PRs. The output FORMAT (INT8 weights + FP32 scales) is
+ * forward-compatible: a future caller can run AbsMax for fast
+ * deployment or full GPTQ-128 for canonical-recipe conformance, and
+ * both produce the same downstream tensor layout.
+ *
+ * Per channel ch:
+ *   max_abs = left-biased-tree-max(|w[ch, 0..channel_size-1]|)
+ *   if max_abs == 0:
+ *     scales[ch] = 1.0f                              (zero-channel sentinel)
+ *     w_int8[ch, i] = 0 for all i
+ *   else:
+ *     scales[ch] = max_abs / 127.0f                  (single FP32 divide
+ *                                                     per §2.1 discipline)
+ *     w_int8[ch, i] = clamp(rintf(w[ch, i] / scales[ch]), -127, +127)
+ *
+ * Dequantization: w_fp32 ≈ w_int8 * scales[ch].
+ *
+ * Shapes (row-major):
+ *   w:       [n_channels × channel_size]   FP32
+ *   w_int8:  [n_channels × channel_size]   INT8 (output)
+ *   scales:  [n_channels]                  FP32 (output)
+ *
+ * channel_size MUST be ≤ ANTS_CANON_MAX_REDUCE_LEN (the reduce_max
+ * scratch limit). Future PRs may relax this once a group-size-128
+ * variant lands.
+ *
+ * Returns:
+ *   ANTS_OK                — quantization complete;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, zero-sized dim, or
+ *                            channel_size > MAX_REDUCE_LEN.
+ */
+ants_error_t ants_canon_quantize_weights_symmetric_per_channel(const float *w,
+                                                               int8_t *w_int8,
+                                                               float *scales,
+                                                               size_t n_channels,
+                                                               size_t channel_size);
 
 #ifdef __cplusplus
 }

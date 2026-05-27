@@ -610,3 +610,87 @@ ants_error_t ants_canon_attention_fp32(const float *q,
      * Reuse matmul_fp32 — same loop discipline. */
     return ants_canon_matmul_fp32(scratch, v, out, n_tokens, n_tokens, d_head);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Per-channel symmetric INT8 weight quantization (RFC-0009 §1)             */
+/* ------------------------------------------------------------------------ */
+
+/* Quantize one FP32 value to INT8 using the given scale.
+ * Returns clamp(rintf(value / scale), -127, +127). */
+static int8_t quantize_one_i8(float value, float scale)
+{
+    float q = rintf(value / scale);
+    if (q >= 127.0f) {
+        return (int8_t)127;
+    }
+    if (q <= -127.0f) {
+        return (int8_t)-127;
+    }
+    return (int8_t)q;
+}
+
+ants_error_t ants_canon_quantize_weights_symmetric_per_channel(const float *w,
+                                                               int8_t *w_int8,
+                                                               float *scales,
+                                                               size_t n_channels,
+                                                               size_t channel_size)
+{
+    if (w == NULL || w_int8 == NULL || scales == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_channels == 0 || channel_size == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (channel_size > ANTS_CANON_MAX_REDUCE_LEN) {
+        /* The per-channel max reduction shares the same scratch
+         * budget as reduce_max/per_token_scale. A group-size-128
+         * variant in a future PR will bypass this cap by reducing
+         * 128 elements at a time. */
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Per-channel scratch reused across channels (cheaper than
+     * allocating a fresh ANTS_CANON_MAX_REDUCE_LEN buffer per
+     * channel). Holds the abs-value pass then the reduction tree. */
+    float scratch[ANTS_CANON_MAX_REDUCE_LEN * 2u];
+    size_t d_pad = next_pow2_size(channel_size);
+    float neg_inf = bits_to_f32(ANTS_CANON_NEG_INF_BITS);
+
+    for (size_t ch = 0; ch < n_channels; ch++) {
+        const float *row = &w[ch * channel_size];
+
+        /* Step 1: abs-value pass into scratch, then pad with -∞. */
+        for (size_t i = 0; i < channel_size; i++) {
+            scratch[i] = fabsf(row[i]);
+        }
+        for (size_t i = channel_size; i < d_pad; i++) {
+            scratch[i] = neg_inf;
+        }
+        /* Step 2: left-biased tree max. */
+        reduce_max_tree_in_place(scratch, d_pad);
+        float max_abs = scratch[0];
+
+        /* Step 3: zero-channel sentinel — scale=1.0f and the int8
+         * weights are all zero, which dequantize to all-zero FP32
+         * (consistent with the input). */
+        if (max_abs == 0.0f) {
+            scales[ch] = 1.0f;
+            for (size_t i = 0; i < channel_size; i++) {
+                w_int8[ch * channel_size + i] = 0;
+            }
+            continue;
+        }
+
+        /* Step 4: single FP32 divide (NOT precomputed reciprocal,
+         * per §2.1 discipline). */
+        float scale = max_abs / (float)ANTS_CANON_INT8_SCALE_DENOM;
+        scales[ch] = scale;
+
+        /* Step 5: per-element quantize via the same recipe. */
+        for (size_t i = 0; i < channel_size; i++) {
+            w_int8[ch * channel_size + i] = quantize_one_i8(row[i], scale);
+        }
+    }
+
+    return ANTS_OK;
+}
