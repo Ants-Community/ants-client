@@ -764,6 +764,185 @@ static void test_matmul_fp32_rectangular_shape(void)
     CHECK(out[7] == 5.0f);
 }
 
+/* -- Scaled-dot-product attention (RFC-0009 §3) ---------------------- */
+
+static void test_attention_null_args_and_bounds(void)
+{
+    float q[4] = {0};
+    float k[4] = {0};
+    float v[4] = {0};
+    float out[4] = {0};
+    float scratch[4];
+    CHECK_EQ(ants_canon_attention_fp32(NULL, k, v, out, 2, 2, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_attention_fp32(q, NULL, v, out, 2, 2, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_attention_fp32(q, k, NULL, out, 2, 2, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, NULL, 2, 2, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, 0, 2, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, 2, 0, false, scratch, 4),
+             ANTS_ERROR_INVALID_ARG);
+    /* scratch_cap < n_tokens² (need 4, give 3) */
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, 2, 2, false, scratch, 3),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_attention_singleton_token(void)
+{
+    /* n_tokens=1: softmax of a single value is 1.0; out = V. */
+    float q[2] = {0.5f, 0.7f};
+    float k[2] = {0.3f, 0.9f};
+    float v[2] = {1.5f, 2.5f};
+    float out[2] = {0};
+    float scratch[1];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, 1, 2, false, scratch, 1), ANTS_OK);
+    CHECK(out[0] == 1.5f);
+    CHECK(out[1] == 2.5f);
+}
+
+static void test_attention_softmax_sums_to_one_per_row(void)
+{
+    /* After softmax, each row sums to ~1 (within FP32 precision).
+     * The output therefore has weights that mix V's rows; sanity
+     * check: every output row is within the convex hull of V rows
+     * (i.e., every component is bounded by min/max of that component
+     * across V rows). */
+    enum { N = 4, D = 3 };
+    float q[N * D] = {
+        0.1f,
+        0.2f,
+        0.3f, /* row 0 */
+        0.4f,
+        0.5f,
+        0.6f, /* row 1 */
+        0.7f,
+        0.8f,
+        0.9f, /* row 2 */
+        1.0f,
+        1.1f,
+        1.2f /* row 3 */
+    };
+    float k[N * D];
+    for (int i = 0; i < N * D; i++) {
+        k[i] = q[i]; /* K = Q for self-attention sanity */
+    }
+    float v[N * D] = {
+        1.0f,
+        2.0f,
+        3.0f, /* row 0 */
+        4.0f,
+        5.0f,
+        6.0f, /* row 1 */
+        7.0f,
+        8.0f,
+        9.0f, /* row 2 */
+        2.0f,
+        3.0f,
+        4.0f /* row 3 — overlaps row 0..1 in value range */
+    };
+    float out[N * D] = {0};
+    float scratch[N * N];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, N, D, false, scratch, N * N), ANTS_OK);
+
+    /* Per-component bounds across V rows: min=1, max=9. Every output
+     * component must lie inside [1.0, 9.0]. */
+    for (int i = 0; i < N * D; i++) {
+        CHECK(out[i] >= 1.0f - 1e-5f);
+        CHECK(out[i] <= 9.0f + 1e-5f);
+    }
+}
+
+static void test_attention_causal_mask_row_zero_attends_only_self(void)
+{
+    /* With causal mask: position 0 can only attend to position 0.
+     * Regardless of K_{1..N-1}, out[0] = V[0]. */
+    enum { N = 3, D = 2 };
+    float q[N * D] = {1.0f, 0.5f, 0.3f, 0.8f, 0.6f, 0.4f};
+    /* Make K_1 and K_2 have huge scores to ensure WITHOUT the mask,
+     * row 0 would attend to them. With the mask, those entries
+     * become -inf and exp(-inf) = 0 cleanly. */
+    float k[N * D] = {1.0f, 0.5f, 100.0f, 100.0f, 100.0f, 100.0f};
+    float v[N * D] = {1.0f, 1.0f, 9.0f, 9.0f, 9.0f, 9.0f};
+    float out[N * D] = {0};
+    float scratch[N * N];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, N, D, true, scratch, N * N), ANTS_OK);
+    /* Row 0 attends only to V[0] = (1, 1). */
+    CHECK(fabsf(out[0] - 1.0f) < 1e-5f);
+    CHECK(fabsf(out[1] - 1.0f) < 1e-5f);
+}
+
+static void test_attention_causal_mask_per_row_sums_to_one(void)
+{
+    /* With causal mask: row i has (i+1) unmasked entries; the
+     * softmax over those should sum to 1. Verify by tracing through
+     * a small example. We use V = identity-like so we can check each
+     * row's output magnitude. */
+    enum { N = 4, D = 2 };
+    /* Q, K such that scores[i, j] = constant for valid (i, j) so
+     * uniform attention over valid entries: 1/(i+1) on V[0..i]. */
+    float q[N * D] = {0};
+    float k[N * D] = {0};
+    /* V is identity-like: each row's first component holds the
+     * row's index encoded as a value (0, 1, 2, 3). */
+    float v[N * D] = {0.0f, 0.0f, 1.0f, 1.0f, 2.0f, 2.0f, 3.0f, 3.0f};
+    float out[N * D] = {0};
+    float scratch[N * N];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, N, D, true, scratch, N * N), ANTS_OK);
+    /* With Q=K=0, all unmasked scores are 0, softmax → uniform over
+     * unmasked entries. Row i has (i+1) valid entries.
+     *   Row 0: attends V[0] = (0, 0) → out (0, 0)
+     *   Row 1: 1/2 V[0] + 1/2 V[1] = (0.5, 0.5)
+     *   Row 2: 1/3 V[0] + 1/3 V[1] + 1/3 V[2] = (1, 1)
+     *   Row 3: 1/4 (V[0] + V[1] + V[2] + V[3]) = (1.5, 1.5)
+     */
+    float expected[N * D] = {0.0f, 0.0f, 0.5f, 0.5f, 1.0f, 1.0f, 1.5f, 1.5f};
+    for (int i = 0; i < N * D; i++) {
+        CHECK(fabsf(out[i] - expected[i]) < 1e-5f);
+    }
+}
+
+static void test_attention_no_mask_uniform_q_k_zero(void)
+{
+    /* Without mask: Q=K=0 means uniform attention over all N tokens
+     * regardless of position. Each output is the mean of V rows. */
+    enum { N = 3, D = 2 };
+    float q[N * D] = {0};
+    float k[N * D] = {0};
+    float v[N * D] = {1.0f, 2.0f, 4.0f, 5.0f, 7.0f, 8.0f};
+    float out[N * D] = {0};
+    float scratch[N * N];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out, N, D, false, scratch, N * N), ANTS_OK);
+    /* Mean of column 0: (1+4+7)/3 = 4. Mean of column 1: (2+5+8)/3 = 5. */
+    for (int i = 0; i < N; i++) {
+        CHECK(fabsf(out[i * D + 0] - 4.0f) < 1e-5f);
+        CHECK(fabsf(out[i * D + 1] - 5.0f) < 1e-5f);
+    }
+}
+
+static void test_attention_same_input_bit_exact(void)
+{
+    /* No hidden state: same inputs → bit-identical outputs.
+     * Canonical bit-exactness contract. */
+    enum { N = 3, D = 2 };
+    float q[N * D] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+    float k[N * D] = {0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f};
+    float v[N * D] = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
+    float out_a[N * D] = {0};
+    float out_b[N * D] = {0};
+    float scratch[N * N];
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out_a, N, D, false, scratch, N * N), ANTS_OK);
+    CHECK_EQ(ants_canon_attention_fp32(q, k, v, out_b, N, D, false, scratch, N * N), ANTS_OK);
+    for (int i = 0; i < N * D; i++) {
+        uint32_t a, b;
+        memcpy(&a, &out_a[i], sizeof a);
+        memcpy(&b, &out_b[i], sizeof b);
+        CHECK(a == b);
+    }
+}
+
 static void test_matmul_fp32_same_input_bit_exact(void)
 {
     /* No hidden state: same inputs → bit-identical outputs across
@@ -880,6 +1059,14 @@ int main(void)
     test_matmul_fp32_strict_left_to_right_order();
     test_matmul_fp32_rectangular_shape();
     test_matmul_fp32_same_input_bit_exact();
+
+    test_attention_null_args_and_bounds();
+    test_attention_singleton_token();
+    test_attention_softmax_sums_to_one_per_row();
+    test_attention_causal_mask_row_zero_attends_only_self();
+    test_attention_causal_mask_per_row_sums_to_one();
+    test_attention_no_mask_uniform_q_k_zero();
+    test_attention_same_input_bit_exact();
 
     if (failures > 0) {
         fprintf(stderr, "test_canon: %d failure(s)\n", failures);
