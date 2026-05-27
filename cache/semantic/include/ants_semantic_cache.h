@@ -70,6 +70,40 @@ extern "C" {
  * rejected with ANTS_ERROR_INVALID_ARG. */
 #define ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS 3u
 
+/* Decay horizons per RFC-0002 §Quality, decay, and invalidation. Each
+ * validity class maps to a useful-lifetime horizon in seconds; lookup
+ * scoring downweights entries proportionally to age via the recency
+ * factor, and after EVICTION_MULTIPLIER × horizon the entry is
+ * excluded from lookup results entirely (still_valid = false).
+ * Perennial entries never expire. Values from RFC-0002's reference
+ * implementation appendix; changing them is a protocol break. */
+#define ANTS_SEMANTIC_CACHE_HORIZON_EPHEMERAL_SEC 300ull      /* 5 minutes */
+#define ANTS_SEMANTIC_CACHE_HORIZON_WEEKS_SEC     1200000ull  /* ~14 days */
+#define ANTS_SEMANTIC_CACHE_HORIZON_MONTHS_SEC    7000000ull  /* ~81 days */
+#define ANTS_SEMANTIC_CACHE_HORIZON_YEARS_SEC     60000000ull /* ~1.9 years */
+#define ANTS_SEMANTIC_CACHE_EVICTION_MULTIPLIER   4u
+
+/* Composite lookup-score parameters per RFC-0002 §Quality:
+ *   score = similarity · signal_ratio · recency
+ *   signal_ratio = (positive_count + 1) / (negative_count + 1)
+ *   recency = max(RECENCY_FLOOR, 1.0 - age_sec / RECENCY_DECAY_SEC)
+ * The wire-level match.similarity field carries raw cosine
+ * similarity (what the threshold filters against); the composite
+ * score is local-ranking only. */
+#define ANTS_SEMANTIC_CACHE_RECENCY_DECAY_SEC 31500000ull /* 1 year */
+#define ANTS_SEMANTIC_CACHE_RECENCY_FLOOR     0.1f
+
+/* Number of independent challenges (re-execution with attestation
+ * that yields a substantively different response) needed to
+ * invalidate a cache entry per RFC-0002 §Quality. Each challenge
+ * advances the entry's challenge_count; on reaching this threshold
+ * the entry is marked invalidated and excluded from every future
+ * lookup. The producer's reputation downweighting on invalidation
+ * is cross-component work (Component #9) and not implemented in
+ * v0.x — the local invalidation gate alone closes the cache-side
+ * mechanism. */
+#define ANTS_SEMANTIC_CACHE_CHALLENGE_INVALIDATION_THRESHOLD 3u
+
 /* The 64-bit shard key derived from an embedding. Matches the
  * `ants_dht_shard_key_t` typedef in network/dht so the two layers
  * speak the same wire type; we re-declare here so callers don't
@@ -385,6 +419,15 @@ typedef union {
 /* Configuration                                                            */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Optional clock override for deterministic decay testing. Returns the
+ * current time in seconds since the Unix epoch (matching the resolution
+ * of `ants_semantic_cache_entry_t.created`). NULL on the config falls
+ * back to `time(NULL)`. Tests drive deterministic ages by closing over
+ * a mutable counter via `ctx`.
+ */
+typedef uint64_t (*ants_semantic_cache_clock_sec_fn_t)(void *ctx);
+
 typedef struct {
     /* Maximum entries retained per shard before LRU eviction kicks in.
      * 0 = unbounded (subject to total_max). */
@@ -394,6 +437,13 @@ typedef struct {
      * When both per_shard_max and total_max are 0 the cache grows
      * without bound until ants_semantic_cache_destroy. */
     size_t total_max;
+
+    /* Optional clock override. NULL = default to time(NULL). Used by
+     * the decay scoring path (get_topk) and recorded onto entries at
+     * challenge time. Tests pass a callback so they can drive entries
+     * past their horizon deterministically without sleeping. */
+    ants_semantic_cache_clock_sec_fn_t clock_sec_fn;
+    void *clock_ctx;
 } ants_semantic_cache_config_t;
 
 /* ------------------------------------------------------------------------ */
@@ -500,11 +550,22 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
 
 /*
  * Look up the top-K matching entries above similarity_threshold,
- * sorted descending by cosine similarity. The candidate set is every
- * entry whose shard_key is within `hamming_radius` bit-flips of the
- * query embedding's shard_key — radius 0 restricts to the exact shard
- * (the step 7a behaviour); radius 1/2/3 widens the search to ~64,
- * ~2k, ~43k addressable shards.
+ * sorted descending by composite score (RFC-0002 §Quality):
+ *   score = cosine_similarity · signal_ratio · recency
+ *   signal_ratio = (positive_count + 1) / (negative_count + 1)
+ *   recency = max(RECENCY_FLOOR, 1.0 - age_sec / RECENCY_DECAY_SEC)
+ * Entries past 4× their validity_class horizon are excluded entirely
+ * (still_valid = false); invalidated entries (challenge_count ≥
+ * INVALIDATION_THRESHOLD) are also excluded. The wire-level
+ * match.similarity field carries raw cosine similarity (what the
+ * caller-side threshold filters against); the composite score is
+ * for local ranking only.
+ *
+ * The candidate set is every entry whose shard_key is within
+ * `hamming_radius` bit-flips of the query embedding's shard_key —
+ * radius 0 restricts to the exact shard (the step 7a behaviour);
+ * radius 1/2/3 widens the search to ~64, ~2k, ~43k addressable
+ * shards.
  *
  * top_k:           0 = unbounded (caller buffer is the only cap)
  * hamming_radius:  0..ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS
@@ -639,6 +700,78 @@ size_t ants_semantic_cache_entries(const ants_semantic_cache_t *cache);
  *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold stage.
  */
 ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache);
+
+/* ------------------------------------------------------------------------ */
+/* Quality signals + challenge invalidation (RFC-0002 §Quality, decay)      */
+/*                                                                          */
+/* Each shard-holder locally tracks per-entry signals:                      */
+/*   - positive_count: feedback that the entry served well                  */
+/*   - negative_count: feedback that the entry served poorly                */
+/*   - challenge_count: independent re-executions whose result              */
+/*     substantively differed from the cached one (per RFC-0002 §Quality   */
+/*     §Explicit invalidation by challenge)                                 */
+/*                                                                          */
+/* The cache uses these locally to bias `get_topk` ranking:                 */
+/*   composite_score = sim · (positive+1)/(negative+1) · recency           */
+/* The wire-level `match.similarity` carries raw cosine similarity (what   */
+/* the threshold filters against); the composite score is local-ranking   */
+/* only.                                                                    */
+/*                                                                          */
+/* On reaching ANTS_SEMANTIC_CACHE_CHALLENGE_INVALIDATION_THRESHOLD = 3     */
+/* challenges, the entry is marked invalidated and excluded from every    */
+/* future lookup. The producer's reputation downweighting on invalidation  */
+/* is cross-component work (Component #9) and is NOT implemented in v0.x — */
+/* the local invalidation gate alone closes the cache-side mechanism.      */
+/*                                                                          */
+/* Signals are NOT on the wire format. Each peer accumulates its own       */
+/* view; the network's quality emerges from the aggregate of locally-      */
+/* resolved decisions over time per RFC-0002.                              */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Record a positive quality signal for the entry identified by
+ * (prompt_hash, producer). Increments the entry's positive_count;
+ * saturates at UINT32_MAX (no wrap-around).
+ *
+ * Returns:
+ *   ANTS_OK                — entry found, count incremented;
+ *   ANTS_ERROR_INVALID_ARG — NULL ctx or NULL key args, or
+ *                            uninitialised cache;
+ *   ANTS_ERROR_NOT_FOUND   — no entry matches (prompt_hash, producer).
+ */
+ants_error_t
+ants_semantic_cache_record_positive(ants_semantic_cache_t *cache,
+                                    const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                    const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN]);
+
+/*
+ * Record a negative quality signal for (prompt_hash, producer).
+ * Increments negative_count; saturates at UINT32_MAX. Same error
+ * semantics as _record_positive.
+ */
+ants_error_t
+ants_semantic_cache_record_negative(ants_semantic_cache_t *cache,
+                                    const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                    const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN]);
+
+/*
+ * Record a challenge against (prompt_hash, producer). Increments
+ * challenge_count and stamps last_challenged_sec with the cache's
+ * current clock. On reaching
+ * ANTS_SEMANTIC_CACHE_CHALLENGE_INVALIDATION_THRESHOLD, the entry is
+ * marked invalidated and will be excluded from every future
+ * `get_topk` result. The entry's heap allocations remain until LRU
+ * eviction or _clear — invalidation is a soft-delete in v0.x.
+ *
+ * Returns:
+ *   ANTS_OK                — challenge recorded;
+ *   ANTS_ERROR_INVALID_ARG — NULL args / uninitialised cache;
+ *   ANTS_ERROR_NOT_FOUND   — no matching entry.
+ */
+ants_error_t
+ants_semantic_cache_record_challenge(ants_semantic_cache_t *cache,
+                                     const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                     const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN]);
 
 /* ------------------------------------------------------------------------ */
 /* Client-side publish (RFC-0002 §The write protocol — DHT-routed)          */

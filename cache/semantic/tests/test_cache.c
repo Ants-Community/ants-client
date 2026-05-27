@@ -38,6 +38,7 @@ extern ants_error_t cache_entry_emit_signing_payload(const ants_semantic_cache_e
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -660,7 +661,12 @@ static void fill_test_entry(ants_semantic_cache_entry_t *e,
     for (uint32_t i = 0; i < ANTS_SEMANTIC_CACHE_PEER_ID_LEN; i++) {
         e->producer[i] = (uint8_t)(0xB0u + (i & 0x0Fu));
     }
-    e->created = 1717000000ull;
+    /* Use the current wall clock for `created` so step 9's decay
+     * scoring sees the entry as fresh under the default clock
+     * (time(NULL)). Wire round-trip tests assert round-trip equality
+     * rather than against a hard-coded constant — that's a more robust
+     * preservation check anyway. */
+    e->created = (uint64_t)time(NULL);
     e->validity_class = ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS;
     static const uint8_t att[] = {0xC0, 0xDE, 0xCA, 0xFE};
     e->attestation = att;
@@ -741,7 +747,7 @@ static void test_entry_wire_round_trip(void)
     CHECK(out_e.response_model_len == strlen("llama-3.3-70b-instruct"));
     CHECK(memcmp(out_e.response_model, "llama-3.3-70b-instruct", out_e.response_model_len) == 0);
     CHECK(memcmp(out_e.producer, in_e.producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0);
-    CHECK(out_e.created == 1717000000ull);
+    CHECK(out_e.created == in_e.created);
     CHECK(out_e.validity_class == ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS);
     CHECK(out_e.attestation_len == in_e.attestation_len);
     CHECK(memcmp(out_e.attestation, in_e.attestation, out_e.attestation_len) == 0);
@@ -1800,7 +1806,7 @@ static void test_put_record_round_trip(void)
     CHECK(out_e->response_model_len == strlen("bge-m3-canonical"));
     CHECK(memcmp(out_e->response_model, "bge-m3-canonical", out_e->response_model_len) == 0);
     CHECK(memcmp(out_e->producer, in_e.producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0);
-    CHECK(out_e->created == 1717000000ull);
+    CHECK(out_e->created == in_e.created);
     CHECK(out_e->validity_class == ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS);
     CHECK(out_e->attestation_len == in_e.attestation_len);
     CHECK(memcmp(out_e->attestation, in_e.attestation, out_e->attestation_len) == 0);
@@ -2076,6 +2082,337 @@ static void test_clear_removes_entries(void)
     CHECK_EQ(ants_semantic_cache_put(&c, emb, w, sizeof w - 1), ANTS_OK);
     CHECK_EQ(ants_semantic_cache_get(&c, emb, 0.9f, out, sizeof out, &out_len, &sim), ANTS_OK);
     CHECK(memcmp(out, "again", 5) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+/* -- Quality signals, decay, challenge invalidation (step 9) --------------
+ *
+ * RFC-0002 §Quality: an entry's effective lookup rank is the composite
+ * of cosine similarity, signal_ratio = (positive+1)/(negative+1), and
+ * a recency factor. Entries past 4 × validity-class horizon are
+ * excluded entirely. After K=3 challenges an entry is invalidated
+ * permanently.
+ *
+ * These tests drive deterministic ages via a controllable test clock
+ * (config->clock_sec_fn closes over a mutable counter), so the proofs
+ * don't rely on wall-clock sleeps. */
+
+typedef struct {
+    uint64_t now_sec;
+} test_clock_ctx_t;
+
+static uint64_t test_clock_sec_fn(void *ctx)
+{
+    return ((test_clock_ctx_t *)ctx)->now_sec;
+}
+
+/* Build a controlled-clock cache for the step 9 tests. Caller advances
+ * `clk->now_sec` to drive entries past their horizons. */
+static void init_clocked_cache(ants_semantic_cache_t *cache, test_clock_ctx_t *clk)
+{
+    ants_semantic_cache_config_t ccfg;
+    memset(&ccfg, 0, sizeof ccfg);
+    ccfg.clock_sec_fn = test_clock_sec_fn;
+    ccfg.clock_ctx = clk;
+    CHECK_EQ(ants_semantic_cache_init(cache, &ccfg), ANTS_OK);
+}
+
+/* Populate a signed entry whose `created` is `now_sec` and whose
+ * `validity_class` is `vc`. The signature is computed correctly so
+ * handle_inbound_entry would also accept the record. Returns the
+ * test private key as out-param so the test can reuse the same
+ * (prompt_hash, producer) key for record_positive / record_challenge. */
+static void make_quality_entry(ants_semantic_cache_entry_t *out_entry,
+                               const float *emb,
+                               const char *response,
+                               uint64_t created_sec,
+                               ants_semantic_cache_validity_t vc,
+                               uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE],
+                               uint8_t seed_byte)
+{
+    make_test_priv(priv, seed_byte);
+    fill_signed_test_entry(out_entry, emb, response, "test-model", priv);
+    /* Override fill_signed_test_entry's defaults for created/vc and
+     * re-sign — the signature is over fields 1..9 which include
+     * created + validity_class. */
+    out_entry->created = created_sec;
+    out_entry->validity_class = vc;
+    uint8_t payload[16384];
+    size_t payload_len = 0;
+    CHECK_EQ(cache_entry_emit_signing_payload(out_entry, payload, sizeof payload, &payload_len),
+             ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(priv, payload, payload_len, out_entry->signature), ANTS_OK);
+}
+
+static void test_decay_excludes_past_eviction_horizon(void)
+{
+    /* An entry past 4 × horizon must not appear in get_topk results.
+     * MONTHS horizon = 7e6 s; 4× = 2.8e7 s. We start at t0, insert,
+     * then advance the test clock past 4 × horizon and confirm
+     * NOT_FOUND. A query just before that boundary should still hit. */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91001, emb);
+    ants_semantic_cache_entry_t e;
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e, emb, "monthly answer", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS, priv, 0x91);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e), ANTS_OK);
+
+    /* Just before 4 × horizon: still valid. */
+    clk.now_sec += 4ull * ANTS_SEMANTIC_CACHE_HORIZON_MONTHS_SEC - 1ull;
+    ants_semantic_cache_lookup_match_t m[1];
+    float embuf[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+
+    /* Past 4 × horizon: still_valid = false → NOT_FOUND. */
+    clk.now_sec += 2ull;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n),
+             ANTS_ERROR_NOT_FOUND);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_decay_perennial_never_expires(void)
+{
+    /* A PERENNIAL entry should remain valid arbitrarily far into the
+     * future; horizon = UINT64_MAX in validity_horizon_sec. */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91002, emb);
+    ants_semantic_cache_entry_t e;
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e, emb, "constants", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv, 0x92);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e), ANTS_OK);
+
+    /* Jump 100 years forward (3.15e9 s). PERENNIAL still served. */
+    clk.now_sec += 100ull * 31500000ull;
+    ants_semantic_cache_lookup_match_t m[1];
+    float embuf[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_recency_downweights_older_in_ranking(void)
+{
+    /* Two entries with the SAME embedding and the SAME response (so
+     * same cosine sim); the older one should rank below the fresher
+     * one because recency = max(FLOOR, 1 - age / DECAY) shrinks with
+     * age. (Same shard => both in candidate set with hamming=0.) */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91003, emb);
+
+    /* Older entry: PERENNIAL so age doesn't disqualify it; older
+     * means smaller recency factor. */
+    ants_semantic_cache_entry_t e_old;
+    uint8_t priv_old[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_old, emb, "OLDER", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_old, 0x93);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_old), ANTS_OK);
+
+    /* Advance 6 months (~1.5e7 s) of wall-clock between the two
+     * inserts. */
+    clk.now_sec += 15000000ull;
+    ants_semantic_cache_entry_t e_new;
+    uint8_t priv_new[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_new, emb, "NEWER", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_new, 0x94);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_new), ANTS_OK);
+
+    /* Query now — newer entry should rank first by composite score. */
+    ants_semantic_cache_lookup_match_t m[2];
+    float embuf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, 0, m, embuf, 2, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+    CHECK(m[0].entry.response_len == strlen("NEWER"));
+    CHECK(memcmp(m[0].entry.response, "NEWER", m[0].entry.response_len) == 0);
+    CHECK(m[1].entry.response_len == strlen("OLDER"));
+    CHECK(memcmp(m[1].entry.response, "OLDER", m[1].entry.response_len) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_positive_signal_raises_rank(void)
+{
+    /* Two PERENNIAL entries inserted at the same instant with the
+     * same embedding + similarity. Without signals they tie; with
+     * positive feedback for entry B, B's signal_ratio = (1+1)/(0+1)
+     * = 2.0 beats A's 1.0 in the composite score. */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91004, emb);
+
+    ants_semantic_cache_entry_t e_a;
+    uint8_t priv_a[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_a, emb, "A_NEUTRAL", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_a, 0x95);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_a), ANTS_OK);
+
+    ants_semantic_cache_entry_t e_b;
+    uint8_t priv_b[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_b, emb, "B_LIKED", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_b, 0x96);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_b), ANTS_OK);
+
+    /* Two positive signals for B → ratio = 3/1 = 3 vs A's 1. */
+    CHECK_EQ(ants_semantic_cache_record_positive(&c, e_b.prompt_hash, e_b.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_record_positive(&c, e_b.prompt_hash, e_b.producer), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t m[2];
+    float embuf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, 0, m, embuf, 2, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+    CHECK(memcmp(m[0].entry.response, "B_LIKED", m[0].entry.response_len) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_negative_signal_lowers_rank(void)
+{
+    /* Mirror of test_positive_signal_raises_rank: negative signals on
+     * A should make A rank below B. */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91005, emb);
+
+    ants_semantic_cache_entry_t e_a;
+    uint8_t priv_a[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_a, emb, "A_DISLIKED", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_a, 0x97);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_a), ANTS_OK);
+
+    ants_semantic_cache_entry_t e_b;
+    uint8_t priv_b[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e_b, emb, "B_NEUTRAL", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv_b, 0x98);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e_b), ANTS_OK);
+
+    /* Three negative signals for A → ratio = 1/4 = 0.25 vs B's 1.0. */
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, e_a.prompt_hash, e_a.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, e_a.prompt_hash, e_a.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, e_a.prompt_hash, e_a.producer), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t m[2];
+    float embuf[2 * ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 2, 0, m, embuf, 2, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+    CHECK(memcmp(m[0].entry.response, "B_NEUTRAL", m[0].entry.response_len) == 0);
+    CHECK(memcmp(m[1].entry.response, "A_DISLIKED", m[1].entry.response_len) == 0);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_record_quality_null_args(void)
+{
+    /* NULL state, NULL prompt_hash, NULL producer all → INVALID_ARG.
+     * Same shape for all three record_* entry points. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t ccfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &ccfg), ANTS_OK);
+    uint8_t ph[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN] = {0};
+    uint8_t pk[ANTS_SEMANTIC_CACHE_PEER_ID_LEN] = {0};
+
+    CHECK_EQ(ants_semantic_cache_record_positive(NULL, ph, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_positive(&c, NULL, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_positive(&c, ph, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_negative(NULL, ph, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, NULL, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, ph, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_challenge(NULL, ph, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, NULL, pk), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, ph, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* Uninitialised cache (zeroed magic) → INVALID_ARG too. */
+    ants_semantic_cache_t zeroed = {{0}};
+    CHECK_EQ(ants_semantic_cache_record_positive(&zeroed, ph, pk), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_record_quality_not_found(void)
+{
+    /* No matching (prompt_hash, producer) → NOT_FOUND. */
+    ants_semantic_cache_t c = {{0}};
+    ants_semantic_cache_config_t ccfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&c, &ccfg), ANTS_OK);
+
+    uint8_t ph[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN];
+    uint8_t pk[ANTS_SEMANTIC_CACHE_PEER_ID_LEN];
+    memset(ph, 0xAA, sizeof ph);
+    memset(pk, 0xBB, sizeof pk);
+
+    CHECK_EQ(ants_semantic_cache_record_positive(&c, ph, pk), ANTS_ERROR_NOT_FOUND);
+    CHECK_EQ(ants_semantic_cache_record_negative(&c, ph, pk), ANTS_ERROR_NOT_FOUND);
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, ph, pk), ANTS_ERROR_NOT_FOUND);
+
+    CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
+}
+
+static void test_challenge_invalidates_at_threshold(void)
+{
+    /* K=3 challenges should mark the entry invalidated. Before the
+     * third challenge: still served. After: excluded from get_topk. */
+    test_clock_ctx_t clk = {.now_sec = 1700000000ull};
+    ants_semantic_cache_t c = {{0}};
+    init_clocked_cache(&c, &clk);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(91006, emb);
+    ants_semantic_cache_entry_t e;
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_quality_entry(
+        &e, emb, "challenged", clk.now_sec, ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL, priv, 0x99);
+    CHECK_EQ(ants_semantic_cache_put_record(&c, &e), ANTS_OK);
+
+    ants_semantic_cache_lookup_match_t m[1];
+    float embuf[ANTS_EMBED_DIM];
+    size_t out_n = 0;
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+
+    /* First two challenges: count rises but entry still served. */
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, e.prompt_hash, e.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, e.prompt_hash, e.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+
+    /* Third challenge crosses the threshold → invalidated → NOT_FOUND. */
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, e.prompt_hash, e.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n),
+             ANTS_ERROR_NOT_FOUND);
+
+    /* Additional challenges past the threshold are still accepted
+     * (count saturates at UINT32_MAX) but the invalidated flag stays
+     * set; observation: still NOT_FOUND. */
+    CHECK_EQ(ants_semantic_cache_record_challenge(&c, e.prompt_hash, e.producer), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_get_topk(&c, emb, 0.5f, 1, 0, m, embuf, 1, &out_n),
+             ANTS_ERROR_NOT_FOUND);
 
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
@@ -3337,6 +3674,15 @@ int main(void)
     test_cache_server_safe_on_zero_ctx();
     test_cache_server_ignores_foreign_streams();
     test_publish_end_to_end_one_peer();
+
+    test_decay_excludes_past_eviction_horizon();
+    test_decay_perennial_never_expires();
+    test_recency_downweights_older_in_ranking();
+    test_positive_signal_raises_rank();
+    test_negative_signal_lowers_rank();
+    test_record_quality_null_args();
+    test_record_quality_not_found();
+    test_challenge_invalidates_at_threshold();
 
     test_query_null_args();
     test_query_invalid_bounds();
