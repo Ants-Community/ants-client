@@ -13,6 +13,146 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 7c — client-side query state machine · 2026-05-27
+
+**The cache learns to ask the network.** Step 7c lands
+`ants_semantic_cache_query_*`: the consumer-side state machine that
+takes a query embedding + threshold + top_k + hamming_radius, finds
+the responsible shard-holders via an `ants_dht_lookup`, fans the
+lookup_request out to them in parallel, decodes each response, and
+aggregates matches across peers into the caller's buffers. Mirror
+of step 7b's publish state machine — same phases, same per-slot
+heap discipline, same teardown convention.
+
+**PR #74 — client-side query state machine** (~1.6k lines):
+
+State machine phases (mirror cache_publish):
+- **LOOKUP** — `_query_init` derives `shard_key` from the query
+  embedding via `ants_semantic_cache_shard_key`, encodes the
+  `lookup_request` CBOR once (reused across all slots, freed at
+  `_destroy`), then issues `ants_dht_lookup(shard_key)`. The caller-
+  forwarded `_handle_dht_event` consumes `LOOKUP_COMPLETE` /
+  `LOOKUP_TIMEOUT` and populates per-slot peer descriptors capped at
+  `fanout` (default 3 via `ANTS_SEMANTIC_CACHE_QUERY_DEFAULT_FANOUT`,
+  max 8 via `ANTS_SEMANTIC_CACHE_QUERY_MAX_FANOUT`).
+- **DELIVER** — `_query_tick` dials each slot; on `CONN_READY` the
+  caller-forwarded `_handle_transport_event` opens a bidi stream and
+  sends the pre-encoded request with `fin=true`. The slot then
+  accumulates the peer's response on `STREAM_READABLE` into a lazy-
+  allocated 96 KiB recv_buf (covers the upper envelope of
+  `HANDLE_LOOKUP_SERVER_CAP = 15` matches × ~5 KiB each), and decodes
+  on `STREAM_FIN`. The decode uses the existing
+  `ants_semantic_cache_lookup_response_decode`'s probe path (NULL
+  buffers + `cap=0` → `BUFFER_TOO_SMALL` with `*out_n` = wire count)
+  so per-slot heaps for `decoded_matches` + `decoded_embeddings` are
+  sized to the actual response, not the worst case.
+- **DONE** — completion fires exactly once. On success, aggregation
+  collects all decoded matches across slots, dedupes by
+  `(producer, prompt_hash)` keeping the higher-similarity occurrence,
+  insertion-sorts descending by similarity (N ≤ MAX_FANOUT ×
+  QUERY_PEER_RESPONSE_CAP = 120 so O(N²) is trivial), caps at
+  `min(top_k, cap_matches)`, copies each chosen match into the
+  caller's `out_matches`, deep-copies the embedding into the caller's
+  `out_embeddings`, and re-points `out_matches[i].entry.embedding`
+  to the caller-owned slot.
+
+Public surface added to `ants_semantic_cache.h`:
+- `ANTS_SEMANTIC_CACHE_QUERY_MAX_FANOUT = 8` (matches publish's
+  MAX_REPLICATION so a single transport+dht hosts both with the same
+  upper envelope)
+- `ANTS_SEMANTIC_CACHE_QUERY_DEFAULT_FANOUT = 3`
+- `ANTS_SEMANTIC_CACHE_QUERY_CTX_SIZE = 32 KiB` (fits the embedded
+  16 KiB `ants_dht_lookup_t` + per-slot bookkeeping)
+- `ants_semantic_cache_query_t` opaque ctx (magic-tagged `0x53435152
+  "SCQR"` — same discriminator pattern as ANTS, ANTC, ANSE, CNCS,
+  SCPB, SCSV)
+- `ants_semantic_cache_query_complete_fn_t(status, peers_responded,
+  n_matches, ctx)`
+- `_query_init` / `_tick` / `_handle_dht_event` /
+  `_handle_transport_event` / `_destroy`
+
+Status semantics on completion:
+- `ANTS_OK` — at least one peer responded with a decodable response.
+  `n_matches` MAY be 0 (legitimate miss-above-threshold result —
+  caller distinguishes from "no peers responded" via the status).
+- `ANTS_ERROR_PEER_UNREACHABLE` — DHT returned no peers OR every
+  peer failed (dial / handshake / stream reset / decode error).
+
+Memory lifetime contract documented in both header and impl:
+- `out_matches[i].entry.embedding` points into the caller-owned
+  `out_embeddings` buffer (deep-copied during aggregation) — safe
+  past `_destroy`.
+- All other pointer fields (`response`, `embedding_model`,
+  `response_model`, `attestation`) **alias into query-owned `recv_buf`
+  bytes** and become invalid after `_destroy`. Caller MUST finish
+  reading aggregated matches before calling `_destroy`.
+- Teardown order: `transport_destroy → query_destroy` (same
+  convention as publish, `dht.bootstrap_entries[]`, and
+  `dht.pending_dials[]`).
+
+**7 new tests** in `test_cache.c`:
+- `test_query_null_args` — every NULL arg → INVALID_ARG; tick /
+  handle_* / destroy reject NULL state arg.
+- `test_query_invalid_bounds` — `cap_matches == 0`, `hamming_radius
+  > MAX_HAMMING_RADIUS`, `fanout > MAX_FANOUT` all rejected;
+  `fanout == 0` falls back to `DEFAULT_FANOUT` (accepted).
+- `test_query_destroy_safe_on_zero_ctx` — `_destroy/_tick/_handle_*`
+  no-op on zeroed (never-initialised) ctx.
+- `test_query_no_peers_completes_with_peer_unreachable` — empty DHT
+  routing table → `LOOKUP_COMPLETE` with `peer_count = 0` fires
+  synchronously on first `dht_tick`; the query observes 0
+  candidates, fires `PEER_UNREACHABLE` from inside
+  `handle_dht_event`, callback invoked once, idempotent on second
+  tick.
+- `test_query_handle_dht_event_ignores_other_lookup` — synthetic
+  `LOOKUP_COMPLETE` with foreign `lookup` pointer is silent no-op.
+- `test_query_handle_transport_event_ignores_other_stream` —
+  foreign `conn`/`stream` is silent no-op.
+- `test_query_end_to_end_one_peer` — full happy-path over real QUIC:
+  A bootstraps to B, B `put_record`s a signed entry + announces the
+  shard, A.query drives lookup → dial → bidi-stream send → B's
+  cache_server decodes the lookup_request → runs get_topk → encodes
+  + sends response → A's query decodes + aggregates + completion
+  fires with `peers_responded = 1`, `n_matches = 1`, `similarity >
+  0.99`, `producer == b_pub`, response payload matches what B
+  stored. Verifies the embedding deep-copy contract
+  (`out_matches[0].entry.embedding == &out_embeddings[0]`).
+
+`test_e2e_endpoint_t` extended with a `query` field; the transport
++ DHT event_fns fan out to it alongside the existing publish hook.
+
+**Quirks worth preserving**:
+- **Response decode uses probe-mode** via the existing
+  `lookup_response_decode(buf, len, NULL, NULL, 0, &n)` → returns
+  `BUFFER_TOO_SMALL` with `*out_n` set to the wire's actual match
+  count (or `ANTS_OK` if the response carries zero matches).
+  Allocate per-slot decoded heaps to that exact size, then re-decode.
+  This sidesteps the over-allocate-for-worst-case waste; the cost
+  is two passes over the same recv_buf, which is fine.
+- **`recv_buf` outlives `decoded_matches`/`decoded_embeddings`**:
+  the aliased pointer fields in the aggregated `out_matches`
+  (response, embedding_model, etc.) reference recv_buf bytes
+  directly. `_destroy` frees both heaps together; `CONN_CLOSED`
+  inside `_handle_transport_event` frees the per-slot `conn` +
+  `stream` heaps but leaves `recv_buf` + decoded heaps alive so
+  the caller's aliased pointers stay valid until they ask us to
+  tear down.
+- **Aggregation dedupes on `(producer, prompt_hash)`**: the same
+  entry replicated to multiple shard-holders will be returned by
+  more than one peer. Dedup by these 64 bytes (32 + 32) keeps the
+  higher-similarity occurrence; in practice both peers see the
+  same similarity for the same query+entry, but the dedup is
+  robust under future quality-signal regrading too.
+
+**Component #10 status**: cross-peer cache write+query path is now
+end-to-end functional. Server-side admission is signature-gated and
+Hamming-aware (step 8 + Ed25519 verify); client-side publish
+state machine + E2E test (step 7b + 7b.2); client-side query state
+machine + E2E test (this PR, step 7c). Remaining cache work: **step
+9** (quality signals + decay by validity class), plus the carry-over
+`transport_conn_peer_addr` `NOT_IMPLEMENTED` (small; closes the
+inbound-announce multiaddr propagation gap).
+
 ### cache: Component #10 (semantic cache) step 7b.2 — server-side dispatch + E2E publish · 2026-05-27
 
 **The cache learns to read from the network.** Step 7b shipped the
