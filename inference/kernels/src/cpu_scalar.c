@@ -226,6 +226,151 @@ ants_error_t ants_canon_reduce_max_into(const float *values,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Left-biased sum reduction (RFC-0009 §3)                                  */
+/* ------------------------------------------------------------------------ */
+
+/* Run the left-biased binary-tree sum on a power-of-two-padded `m`
+ * array in-place. After return, m[0] holds the result; the rest is
+ * indeterminate. Parallel to reduce_max_tree_in_place but using
+ * `+` instead of `fmaxf`. FP32 addition is NOT associative, so the
+ * tree shape — left-to-right pairs at each level — is the protocol
+ * commitment. */
+static void reduce_sum_tree_in_place(float *m, size_t d_pad)
+{
+    while (d_pad > 1) {
+        size_t half = d_pad >> 1;
+        for (size_t i = 0; i < half; i++) {
+            m[i] = m[2 * i] + m[2 * i + 1];
+        }
+        d_pad = half;
+    }
+}
+
+ants_error_t ants_canon_reduce_sum(const float *values, size_t n, float *out_result)
+{
+    if (out_result == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n == 0) {
+        /* Reducing the empty set under + returns 0 (additive identity). */
+        *out_result = 0.0f;
+        return ANTS_OK;
+    }
+    if (values == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n > ANTS_CANON_MAX_REDUCE_LEN) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    float scratch[ANTS_CANON_MAX_REDUCE_LEN * 2u];
+    size_t d_pad = next_pow2_size(n);
+    memcpy(scratch, values, n * sizeof(float));
+    /* Pad with 0.0f (additive identity) — never perturbs the sum. */
+    for (size_t i = n; i < d_pad; i++) {
+        scratch[i] = 0.0f;
+    }
+    reduce_sum_tree_in_place(scratch, d_pad);
+    *out_result = scratch[0];
+    return ANTS_OK;
+}
+
+ants_error_t ants_canon_reduce_sum_into(const float *values,
+                                        size_t n,
+                                        float *scratch,
+                                        size_t scratch_cap,
+                                        float *out_result)
+{
+    if (out_result == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n == 0) {
+        *out_result = 0.0f;
+        return ANTS_OK;
+    }
+    if (values == NULL || scratch == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    size_t d_pad = next_pow2_size(n);
+    if (scratch_cap < d_pad) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memcpy(scratch, values, n * sizeof(float));
+    for (size_t i = n; i < d_pad; i++) {
+        scratch[i] = 0.0f;
+    }
+    reduce_sum_tree_in_place(scratch, d_pad);
+    *out_result = scratch[0];
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Softmax with numerical stability (RFC-0009 §3 attention)                 */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_canon_softmax(const float *in, float *out, size_t n)
+{
+    if (in == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n > ANTS_CANON_MAX_REDUCE_LEN) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Step 1: find the max via the left-biased tree. The reference
+     * helper is `reduce_max_tree_in_place`; we inline a copy here
+     * rather than call the public entry point so the softmax stays
+     * a single allocation. */
+    float scratch[ANTS_CANON_MAX_REDUCE_LEN * 2u];
+    size_t d_pad = next_pow2_size(n);
+    memcpy(scratch, in, n * sizeof(float));
+    float neg_inf = bits_to_f32(ANTS_CANON_NEG_INF_BITS);
+    for (size_t i = n; i < d_pad; i++) {
+        scratch[i] = neg_inf;
+    }
+    reduce_max_tree_in_place(scratch, d_pad);
+    float max_val = scratch[0];
+
+    /* Step 2: compute exp(in_i - max) into `out`. Reading `in` AFTER
+     * the scratch has been mutated is safe because we made a copy in
+     * step 1. Writing to `out` may alias `in`, which is allowed by
+     * the contract — every read of `in[i]` happens before we touch
+     * `out[i]`. */
+    for (size_t i = 0; i < n; i++) {
+        out[i] = expf(in[i] - max_val);
+    }
+
+    /* Step 3: left-biased tree sum of the exp values. Reuse the
+     * scratch buffer; copy `out` into it then run the sum tree. */
+    memcpy(scratch, out, n * sizeof(float));
+    for (size_t i = n; i < d_pad; i++) {
+        scratch[i] = 0.0f;
+    }
+    reduce_sum_tree_in_place(scratch, d_pad);
+    float sum_val = scratch[0];
+
+    /* Step 4: divide each lane by the sum. The all-zero pathological
+     * case (every exp underflowed to 0 because every input was
+     * extreme-negative) emits a zero output deterministically rather
+     * than risk NaN/Inf propagation from divide-by-zero. */
+    if (sum_val == 0.0f) {
+        for (size_t i = 0; i < n; i++) {
+            out[i] = 0.0f;
+        }
+        return ANTS_OK;
+    }
+    for (size_t i = 0; i < n; i++) {
+        /* Single FP32 divide per lane — NOT a precomputed reciprocal,
+         * same §2.1 discipline. */
+        out[i] = out[i] / sum_val;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Per-token INT8 quantization scale (RFC-0009 §2.1)                        */
 /* ------------------------------------------------------------------------ */
 

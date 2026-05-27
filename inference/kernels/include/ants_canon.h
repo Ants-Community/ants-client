@@ -28,11 +28,12 @@
  *
  * Status (scaffold + first kernels):
  *   - q24 ↔ FP32 conversion: implemented (§5)
- *   - Left-biased max reduction: implemented (§2.1 step 2)
+ *   - Left-biased max + sum reductions: implemented (§2.1 step 2 + §3)
  *   - Per-token scale (full §2.1 recipe): implemented
  *   - INT8 × INT8 → INT32 matmul: implemented (§3)
- *   - Softmax + attention (§3): stub
- *   - GPTQ / AWQ quantization (§1): stub
+ *   - Softmax with stable subtract-max + divide: implemented (§3)
+ *   - Attention (Q·K^T scaled + softmax + ·V): future PR
+ *   - GPTQ / AWQ quantization (§1): future PR
  *
  * API model: caller-allocated buffers, no internal allocation, no
  * threads, no hidden global state. Every entry point is pure
@@ -179,6 +180,75 @@ ants_error_t ants_canon_reduce_max_into(const float *values,
                                         float *scratch,
                                         size_t scratch_cap,
                                         float *out_result);
+
+/* ------------------------------------------------------------------------ */
+/* Left-biased sum reduction (RFC-0009 §3, parallel to §2.1 step 2)         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Reduce a vector to its sum via the left-biased binary tree, mirror
+ * of `ants_canon_reduce_max` but padding with 0.0f (additive identity)
+ * instead of -∞. FP32 summation is NOT associative, so the order
+ * matters even for honest implementations — the canonical recipe
+ * pins the tree shape so two implementations on different hardware
+ * produce byte-identical output for the same input.
+ *
+ * The recipe:
+ *   1. Pad to d_pad = next_pow2(n) with 0.0f.
+ *   2. For each level 0..log2(d_pad)−1:
+ *          m[i] ← m[2i] + m[2i+1]    for i = 0..d_pad/2^{level+1} − 1
+ *   3. Return m[0].
+ *
+ * `n == 0` returns 0.0f.
+ *
+ * Used by the softmax recipe (RFC-0009 §3 attention) to sum the
+ * exponentiated values before the final divide.
+ *
+ * Returns:
+ *   ANTS_OK                — *out_result set;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, or n > MAX_REDUCE_LEN
+ *                            (use _into for larger inputs).
+ */
+ants_error_t ants_canon_reduce_sum(const float *values, size_t n, float *out_result);
+
+/*
+ * Caller-buffer variant. `scratch` MUST hold at least `next_pow2(n)`
+ * floats; left in indeterminate state on return.
+ */
+ants_error_t ants_canon_reduce_sum_into(const float *values,
+                                        size_t n,
+                                        float *scratch,
+                                        size_t scratch_cap,
+                                        float *out_result);
+
+/* ------------------------------------------------------------------------ */
+/* Softmax with numerical stability (RFC-0009 §3 attention)                 */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Compute the softmax of an FP32 vector with the fixed numerical-
+ * stability subtraction per RFC-0009 §3:
+ *
+ *   1. m = max(in[0..n−1])           (left-biased tree max per §2.1)
+ *   2. e_i = expf(in_i − m)          (per-element FP32)
+ *   3. s = sum(e_0..e_{n−1})         (left-biased tree sum)
+ *   4. out_i = e_i / s               (single FP32 divide per lane,
+ *                                     NOT a precomputed reciprocal —
+ *                                     same §2.1 discipline)
+ *
+ * Pathological s == 0 (all inputs −∞ or extreme negatives whose exp
+ * underflows to 0): out is set to all zeros and ANTS_OK is returned.
+ * This is the deterministic recipe; callers that want a uniform-
+ * distribution fallback can detect zero sum from the output.
+ *
+ * `in` and `out` MAY alias (in-place softmax is supported). Internal
+ * scratch holds the exp results during the sum reduction.
+ *
+ * Returns:
+ *   ANTS_OK                — out populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, n == 0, or n > MAX_REDUCE_LEN.
+ */
+ants_error_t ants_canon_softmax(const float *in, float *out, size_t n);
 
 /* ------------------------------------------------------------------------ */
 /* Per-token INT8 quantization scale (RFC-0009 §2.1 — full recipe)          */
