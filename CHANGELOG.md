@@ -13,6 +13,158 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 9 — quality signals + decay + challenge invalidation · 2026-05-27
+
+**The cache learns to forget.** Step 9 lands the three mechanisms
+RFC-0002 §Quality, decay, and invalidation calls for: implicit decay
+by validity class, composite lookup scoring (similarity ·
+signal_ratio · recency), and explicit challenge-based invalidation
+at K=3. Component #10's cache-side surface is now end-to-end
+functional; only the cross-layer `transport_conn_peer_addr`
+carry-over remains.
+
+**PR #76 — step 9** (+728/-14):
+
+Implicit decay by validity class:
+- Each entry's `validity_class` maps to a useful-lifetime horizon
+  in seconds (RFC reference-impl values): EPHEMERAL=300 (5 min),
+  WEEKS=1.2M (~14 d), MONTHS=7M (~81 d), YEARS=60M (~1.9 y),
+  PERENNIAL=∞. Beyond `EVICTION_MULTIPLIER (4) × horizon`, the
+  entry is excluded from `get_topk` results entirely (`still_valid
+  = false`). Constants exposed in the public header so external
+  callers can introspect the schedule.
+
+Composite lookup scoring:
+- `get_topk` candidate filter now includes `still_valid` (not
+  invalidated AND age < 4 × horizon).
+- Sort uses composite score:
+  ```
+  score = cosine_sim · (positive_count + 1) / (negative_count + 1)
+                     · max(0.1, 1.0 - age_sec / 31500000)
+  ```
+  Laplace-smoothed signal ratio (so an entry with no feedback still
+  ranks at 1.0); recency floor at 0.1 so very old entries don't
+  zero-out completely.
+- Wire-level `match.similarity` still carries raw cosine — composite
+  is local-ranking only (otherwise we'd leak local-feedback signal
+  to the network).
+- `ants_semantic_cache_get` (single-result path) also applies the
+  `still_valid` filter so its exclusion behaviour matches `get_topk`.
+
+Explicit challenge invalidation:
+- New public APIs:
+  ```
+  ants_semantic_cache_record_positive(cache, prompt_hash, producer)
+  ants_semantic_cache_record_negative(cache, prompt_hash, producer)
+  ants_semantic_cache_record_challenge(cache, prompt_hash, producer)
+  ```
+- Identify entries by `(prompt_hash[32], producer[32])`. Each
+  counter saturates at `UINT32_MAX`. `NOT_FOUND` returned if no
+  matching entry.
+- `_record_challenge` stamps `last_challenged_sec` with the cache's
+  current clock and marks the entry `invalidated` once
+  `challenge_count` reaches
+  `ANTS_SEMANTIC_CACHE_CHALLENGE_INVALIDATION_THRESHOLD = 3`.
+  Invalidated entries are excluded from every future lookup —
+  hard soft-delete; heap allocations remain until LRU eviction or
+  `_clear`.
+- Producer reputation downweighting on invalidation is cross-
+  component work pending Component #9 (identity & reputation
+  service) and explicitly NOT implemented in v0.x. The local
+  invalidation gate alone closes the cache-side mechanism.
+
+Clock abstraction:
+- New typedef + config fields:
+  ```
+  typedef uint64_t (*ants_semantic_cache_clock_sec_fn_t)(void *ctx);
+  config.clock_sec_fn  (NULL → time(NULL))
+  config.clock_ctx
+  ```
+- Mirrored to state on init. Tests drive deterministic ages via a
+  controlled-counter clock; production gets `time(NULL)` for free
+  by passing `{0}` config (backward-compatible).
+- `ants_semantic_cache_put` now stamps `created` with the cache's
+  current clock (previously zero from the memset, which would have
+  put EPHEMERAL entries 50+ years in the past against `time(NULL)`).
+  EPHEMERAL stays the default class for the convenience API;
+  callers wanting a longer horizon should use `put_record` with an
+  explicit class.
+
+Storage extension (local-only, NOT on the wire):
+- `cache_entry_t` gains `positive_count`, `negative_count`,
+  `challenge_count`, `last_challenged_sec`, `invalidated`. The
+  network's quality emerges from the aggregate of locally-resolved
+  decisions over time per RFC-0002 — quality signals are NEVER
+  propagated on the wire.
+
+**8 new tests** in `test_cache.c`:
+- `test_decay_excludes_past_eviction_horizon` — entry just before
+  4 × MONTHS horizon: served; one second past: NOT_FOUND.
+- `test_decay_perennial_never_expires` — PERENNIAL entry still
+  served after 100 simulated years.
+- `test_recency_downweights_older_in_ranking` — two identical
+  PERENNIAL entries inserted 6 months apart; newer ranks first
+  purely from the recency factor (signal_ratio identical, sim
+  identical).
+- `test_positive_signal_raises_rank` — two PERENNIAL entries at
+  the same similarity; two positive signals on one push it to
+  rank 0.
+- `test_negative_signal_lowers_rank` — mirror: three negative
+  signals on one drop it to rank 1.
+- `test_record_quality_null_args` — every NULL arg →
+  `INVALID_ARG`; uninitialised cache also rejected.
+- `test_record_quality_not_found` — no matching record → `NOT_FOUND`
+  for all three `record_*` entry points.
+- `test_challenge_invalidates_at_threshold` — entry served after
+  1 + 2 challenges; vanishes after the third; further challenges
+  accepted but state stays invalidated (saturating count).
+
+**Test helper changes (one-line per file)**:
+- `fill_test_entry` now stamps `created = (uint64_t)time(NULL)` so
+  the default-clock decay path treats fresh test entries as fresh
+  (previously hardcoded to `1717000000ull` which is ~2 years past
+  by 2026-05-27 — outside 4 × MONTHS horizon).
+- The two wire round-trip tests that asserted `out_e.created ==
+  1717000000ull` now assert `out_e.created == in_e.created` —
+  round-trip equality is a more robust preservation check anyway
+  and the magic constant has no special meaning.
+
+**Conventions worth preserving (step 9)**:
+- **Wire format is NOT extended** by step 9 — quality state is
+  strictly local-shard-holder perspective. A future cross-peer
+  signal aggregation would need a new wire-level protocol; the
+  current design deliberately keeps "what makes an entry good" a
+  decentralised local decision.
+- **Composite vs raw similarity**: the wire `match.similarity`
+  field carries raw cosine because that's what the caller-side
+  threshold filters against; the composite is for ranking only.
+  Don't leak signal_ratio into the wire — that exports local
+  feedback in a way the protocol doesn't yet specify.
+- **PERENNIAL=∞ via UINT64_MAX horizon**: `entry_still_valid`
+  returns true unconditionally for PERENNIAL via the
+  `horizon == UINT64_MAX` early-exit, avoiding the `4 × ∞`
+  overflow concern entirely.
+- **CHALLENGE_INVALIDATION_THRESHOLD is constant-time, not state**:
+  once `challenge_count >= THRESHOLD`, the entry is invalidated
+  regardless of when the threshold was first crossed. Further
+  challenges are accepted as no-ops (the count saturates at
+  UINT32_MAX).
+- **`ants_semantic_cache_put` stamping `created`**: a previously
+  silent change of behaviour. Before step 9, `put` produced
+  entries with `created=0` (Unix epoch). With decay live, those
+  entries would be ~57 years past their EPHEMERAL horizon → never
+  served. Stamping `created` at put time fixes the convenience
+  API without breaking `put_record` (which preserves the caller's
+  `created`).
+
+**Component #10 status after step 9**: cache-side surface is
+**fully complete** end-to-end. Cross-peer write+query path works;
+server-side admission is signature-gated + Hamming-aware + decay-
+aware + signal-aware + challenge-aware. Remaining v0.x cache work:
+only the carry-over `ants_transport_conn_peer_addr`
+`NOT_IMPLEMENTED` (small; closes inbound-announce multiaddr gap).
+Reputation downweighting on invalidation waits on Component #9.
+
 ### cache: Component #10 (semantic cache) step 7c — client-side query state machine · 2026-05-27
 
 **The cache learns to ask the network.** Step 7c lands
