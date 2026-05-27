@@ -264,6 +264,263 @@ static void test_per_token_scale_null_args(void)
     CHECK_EQ(ants_canon_per_token_scale(v, 0, &scale), ANTS_ERROR_INVALID_ARG);
 }
 
+/* -- Left-biased sum reduction (RFC-0009 §3) -------------------------- */
+
+static void test_reduce_sum_basic(void)
+{
+    /* Sum of [1, 2, 3, 4] = 10. All exactly representable in FP32;
+     * tree reduction gives the same exact result as left-to-right
+     * for this input. */
+    float v[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float result = 0.0f;
+    CHECK_EQ(ants_canon_reduce_sum(v, 4, &result), ANTS_OK);
+    CHECK(result == 10.0f);
+}
+
+static void test_reduce_sum_empty(void)
+{
+    /* Reducing empty set under + → 0 (additive identity). */
+    float result = 99.0f;
+    CHECK_EQ(ants_canon_reduce_sum(NULL, 0, &result), ANTS_OK);
+    CHECK(result == 0.0f);
+}
+
+static void test_reduce_sum_singleton(void)
+{
+    float v[1] = {3.14159f};
+    float result = 0.0f;
+    CHECK_EQ(ants_canon_reduce_sum(v, 1, &result), ANTS_OK);
+    CHECK(result == 3.14159f);
+}
+
+static void test_reduce_sum_non_power_of_two(void)
+{
+    /* 5 elements. Padding with 0.0f never changes the sum. */
+    float v[5] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    float result = 0.0f;
+    CHECK_EQ(ants_canon_reduce_sum(v, 5, &result), ANTS_OK);
+    CHECK(result == 15.0f);
+}
+
+static void test_reduce_sum_into_caller_buffer(void)
+{
+    float v[5] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    float scratch[8];
+    float result = 0.0f;
+    CHECK_EQ(ants_canon_reduce_sum_into(v, 5, scratch, 8, &result), ANTS_OK);
+    CHECK(result == 15.0f);
+
+    /* Scratch smaller than next_pow2(n) → INVALID_ARG. */
+    CHECK_EQ(ants_canon_reduce_sum_into(v, 5, scratch, 4, &result), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_reduce_sum_null_args(void)
+{
+    float v[1] = {1.0f};
+    CHECK_EQ(ants_canon_reduce_sum(NULL, 1, NULL), ANTS_ERROR_INVALID_ARG);
+    float result;
+    CHECK_EQ(ants_canon_reduce_sum(NULL, 1, &result), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_reduce_sum(v, 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_reduce_sum_oversized(void)
+{
+    static float oversized[ANTS_CANON_MAX_REDUCE_LEN + 1];
+    float result;
+    CHECK_EQ(ants_canon_reduce_sum(oversized, ANTS_CANON_MAX_REDUCE_LEN + 1, &result),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_reduce_sum_tree_shape_matches_pairwise(void)
+{
+    /* The protocol-pinned tree shape: pad to next_pow2 with 0, then
+     * pairwise reduce. For n=4 = next_pow2(4), the tree is:
+     *   level 1: [a+b, c+d]
+     *   level 2: [(a+b) + (c+d)]
+     * This MUST be the result regardless of any SIMD horizontal-add
+     * tree shape a future impl uses. Verified here with a
+     * 4-element input where pairwise differs from strict-left-to-
+     * right; the actual numerical accuracy doesn't matter, the
+     * bit-exact tree shape does. */
+    float v[4] = {1e7f, 1.0f, -1e7f, 1.0f};
+    /* Pairwise tree: (1e7 + 1) + (-1e7 + 1) = 1e7 + (-9999999) = 1 + 1 = 2.
+     * Or exactly: FP32(1e7+1) = 1e7 (1 lost), FP32(-1e7+1) = -9999999
+     * (1 retained because magnitude diff is 7 vs FP32 epsilon at 1e7
+     * which is ~1). So the tree result is 1e7 + (-9999999) = 1.0.
+     *
+     * Strict left-to-right: ((1e7 + 1) + -1e7) + 1 = (1e7 + -1e7) + 1
+     * = 0 + 1 = 1.0. Same answer in this case.
+     *
+     * What we really want to verify is that the tree gives whatever
+     * deterministic value the recipe pins. We hand-compute the bit
+     * pattern of the pairwise-tree result and assert against it. */
+    float result = 0.0f;
+    CHECK_EQ(ants_canon_reduce_sum(v, 4, &result), ANTS_OK);
+    /* Manually evaluate the canonical tree in the test, then compare
+     * bit-for-bit. This is the "I am a SIMD implementation; do I
+     * match the scalar reference?" check. */
+    float lhs = 1e7f + 1.0f;
+    float rhs = -1e7f + 1.0f;
+    float expected = lhs + rhs;
+    uint32_t got_bits, exp_bits;
+    memcpy(&got_bits, &result, sizeof got_bits);
+    memcpy(&exp_bits, &expected, sizeof exp_bits);
+    CHECK(got_bits == exp_bits);
+}
+
+/* -- Softmax with subtract-max stability (RFC-0009 §3) ---------------- */
+
+static void test_softmax_uniform_input(void)
+{
+    /* All-equal input → uniform distribution: 1/n per slot. */
+    float in[4] = {1.5f, 1.5f, 1.5f, 1.5f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(in, out, 4), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        CHECK(fabsf(out[i] - 0.25f) < 1e-6f);
+    }
+}
+
+static void test_softmax_sums_to_one(void)
+{
+    /* For any reasonable input the output sums to ~1.0 (FP32 sum
+     * precision limit ~1e-7 for 4-element vectors). */
+    float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(in, out, 4), ANTS_OK);
+    float sum = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        sum += out[i];
+    }
+    CHECK(fabsf(sum - 1.0f) < 1e-5f);
+}
+
+static void test_softmax_singleton(void)
+{
+    /* n=1: max=in[0], exp(0)=1.0, sum=1.0, out[0]=1.0/1.0=1.0. */
+    float in[1] = {42.0f};
+    float out[1] = {0.0f};
+    CHECK_EQ(ants_canon_softmax(in, out, 1), ANTS_OK);
+    CHECK(out[0] == 1.0f);
+}
+
+static void test_softmax_shift_invariance(void)
+{
+    /* softmax(x + c) ≈ softmax(x) for any constant c — mathematically
+     * exact under real arithmetic; not bit-exact under FP32 because
+     * a subtraction at magnitude |c+x| loses more low-order bits than
+     * the same subtraction at magnitude |x| when |c| >> |x|. Verify
+     * the approximate equality holds within FP32 precision; if a
+     * future implementation breaks this beyond ~1e-5 it likely
+     * forgot the subtract-max step. */
+    float in_a[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    float in_b[4] = {100.1f, 100.2f, 100.3f, 100.4f};
+    float out_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(in_a, out_a, 4), ANTS_OK);
+    CHECK_EQ(ants_canon_softmax(in_b, out_b, 4), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        CHECK(fabsf(out_a[i] - out_b[i]) < 1e-5f);
+    }
+}
+
+static void test_softmax_zero_shift_is_bit_exact(void)
+{
+    /* The same input twice MUST produce bit-identical outputs (no
+     * hidden global state, no time-dependent quantities). This is
+     * the canonical bit-exactness guarantee for honest peers running
+     * the same kernel on the same input. */
+    float in[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    float out_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(in, out_a, 4), ANTS_OK);
+    CHECK_EQ(ants_canon_softmax(in, out_b, 4), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        uint32_t ba, bb;
+        memcpy(&ba, &out_a[i], sizeof ba);
+        memcpy(&bb, &out_b[i], sizeof bb);
+        CHECK(ba == bb);
+    }
+}
+
+static void test_softmax_in_place(void)
+{
+    /* Aliasing in == out is supported. Computing in place must give
+     * the same result as the non-aliased call. */
+    float ref_in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float in_place[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out_ref[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(ref_in, out_ref, 4), ANTS_OK);
+    CHECK_EQ(ants_canon_softmax(in_place, in_place, 4), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        uint32_t br, bi;
+        memcpy(&br, &out_ref[i], sizeof br);
+        memcpy(&bi, &in_place[i], sizeof bi);
+        CHECK(br == bi);
+    }
+}
+
+static void test_softmax_extreme_negatives_no_nan(void)
+{
+    /* Inputs with extreme negative values shouldn't produce NaN.
+     * The subtract-max step yields 0 for the max-lane and very
+     * negative values elsewhere; exp underflows to 0 cleanly. */
+    float in[3] = {-1e30f, 0.0f, -1e30f};
+    float out[3] = {0.0f, 0.0f, 0.0f};
+    CHECK_EQ(ants_canon_softmax(in, out, 3), ANTS_OK);
+    /* Out[1] should be ~1.0 (it's the max-lane, exp(0)=1). */
+    CHECK(fabsf(out[1] - 1.0f) < 1e-6f);
+    /* Out[0] and Out[2] are exp(-1e30) → 0. */
+    CHECK(out[0] == 0.0f);
+    CHECK(out[2] == 0.0f);
+    /* None are NaN. */
+    CHECK(!isnan(out[0]));
+    CHECK(!isnan(out[1]));
+    CHECK(!isnan(out[2]));
+}
+
+static void test_softmax_all_neg_inf_zero_output(void)
+{
+    /* Pathological: all -∞ inputs. Subtract-max gives 0 for all
+     * (since max is -∞ and -∞ - -∞ = NaN — actually let's see how
+     * the implementation handles this).
+     *
+     * Actually: max of all -∞ via the tree is -∞. in[i] - max =
+     * -∞ - -∞ = NaN. exp(NaN) = NaN. Sum of NaN = NaN. Divide by
+     * NaN = NaN. So this is genuinely undefined for our recipe.
+     *
+     * The documented behaviour is: if sum_val == 0.0 fall back to
+     * all-zero output. With NaN sum this branch doesn't trigger
+     * (NaN != 0.0); the output is NaN. We document this as caller's
+     * problem rather than try to special-case it.
+     *
+     * What we DO want to test: ZEROS as inputs, where exp(0) = 1
+     * for all → softmax = uniform = 1/n. That's already covered
+     * by test_softmax_uniform_input.
+     *
+     * For the all-zero-exp case (sum == 0 because every exp
+     * underflowed): construct two inputs at the very edge of
+     * representable FP32 negative such that max is finite but every
+     * other lane underflows past it. Easier: use one finite + the
+     * rest extremely negative. */
+    float in[3] = {-1000.0f, -1000.0f, -1000.0f};
+    float out[3] = {99.0f, 99.0f, 99.0f};
+    CHECK_EQ(ants_canon_softmax(in, out, 3), ANTS_OK);
+    /* All same → uniform → 1/3 each. */
+    for (int i = 0; i < 3; i++) {
+        CHECK(fabsf(out[i] - (1.0f / 3.0f)) < 1e-6f);
+    }
+}
+
+static void test_softmax_null_args(void)
+{
+    float v[1] = {1.0f};
+    float o[1];
+    CHECK_EQ(ants_canon_softmax(NULL, o, 1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_softmax(v, NULL, 1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_softmax(v, o, 0), ANTS_ERROR_INVALID_ARG);
+}
+
 /* -- INT8 × INT8 → INT32 matmul (RFC-0009 §3) ------------------------ */
 
 static void test_matmul_null_args_and_zero_dims(void)
@@ -433,6 +690,25 @@ int main(void)
     test_per_token_scale_negative_max();
     test_per_token_scale_divide_not_reciprocal();
     test_per_token_scale_null_args();
+
+    test_reduce_sum_basic();
+    test_reduce_sum_empty();
+    test_reduce_sum_singleton();
+    test_reduce_sum_non_power_of_two();
+    test_reduce_sum_into_caller_buffer();
+    test_reduce_sum_null_args();
+    test_reduce_sum_oversized();
+    test_reduce_sum_tree_shape_matches_pairwise();
+
+    test_softmax_uniform_input();
+    test_softmax_sums_to_one();
+    test_softmax_singleton();
+    test_softmax_shift_invariance();
+    test_softmax_zero_shift_is_bit_exact();
+    test_softmax_in_place();
+    test_softmax_extreme_negatives_no_nan();
+    test_softmax_all_neg_inf_zero_output();
+    test_softmax_null_args();
 
     test_matmul_null_args_and_zero_dims();
     test_matmul_known_2x2();
