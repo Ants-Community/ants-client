@@ -33,7 +33,9 @@
 #define ANTS_SEMANTIC_CACHE_H
 
 #include "ants_common.h"
+#include "ants_dht.h"
 #include "ants_embed.h"
+#include "ants_transport.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -630,6 +632,146 @@ size_t ants_semantic_cache_entries(const ants_semantic_cache_t *cache);
  *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold stage.
  */
 ants_error_t ants_semantic_cache_clear(ants_semantic_cache_t *cache);
+
+/* ------------------------------------------------------------------------ */
+/* Client-side publish (RFC-0002 §The write protocol — DHT-routed)          */
+/*                                                                          */
+/* A producer-signed cache entry is replicated to N shard-holders selected   */
+/* via a DHT lookup on the entry's shard_key. The publish API drives the    */
+/* full pipeline:                                                            */
+/*                                                                            */
+/*   1. Derive shard_key from entry.embedding (LSH);                        */
+/*   2. Issue ants_dht_lookup(shard_key) to find responsible peers;         */
+/*   3. For each of the top-N peers, dial via transport and open a bidi    */
+/*      stream;                                                              */
+/*   4. Send the CBOR-encoded entry on each stream with FIN;                */
+/*   5. Each peer's ants_semantic_cache_handle_inbound_entry decodes +      */
+/*      Ed25519-verifies + persists; clean stream-close from the peer      */
+/*      is treated as ack;                                                   */
+/*   6. Once every slot is acked-or-failed, the completion callback fires. */
+/*                                                                            */
+/* The publish_t is caller-allocated and MUST remain valid until either    */
+/* the completion callback fires or the caller calls _destroy(). The       */
+/* caller is responsible for forwarding DHT + transport events to the      */
+/* publish state machine via _handle_dht_event and                          */
+/* _handle_transport_event, alongside their forwarding to ants_dht and    */
+/* their own logic (the singleton-event-fn pattern documented in           */
+/* ants_dht.h). Calls with non-publish events are cheap no-ops.            */
+/* ------------------------------------------------------------------------ */
+
+/* Maximum replication factor accepted by _publish_init. Beyond this the
+ * DHT lookup result tail is ignored even if the caller requested more. */
+#define ANTS_SEMANTIC_CACHE_PUBLISH_MAX_REPLICATION 8u
+
+/* Opaque publish context. Sized to fit:
+ *   - 16 KiB embedded ants_dht_lookup_t
+ *   - 8 slots × (ants_dht_peer_t + scalars + heap-ptr bookkeeping)
+ *   - Bookkeeping (magic, status, callback, heap-pointers for entry CBOR)
+ * Headroom is conservative; the .c file pins the exact bound via the
+ * compile-time-assertion idiom shared with the rest of the codebase. */
+#define ANTS_SEMANTIC_CACHE_PUBLISH_CTX_SIZE 32768
+
+typedef union {
+    uint8_t _opaque[ANTS_SEMANTIC_CACHE_PUBLISH_CTX_SIZE];
+    uint64_t _align;
+} ants_semantic_cache_publish_t;
+
+/*
+ * Completion callback. Invoked exactly once, from inside _tick or one of
+ * the _handle_* event hooks, on the same thread that drove the state
+ * machine forward. After this fires the publish_t is logically done; the
+ * caller may safely _destroy it (and reuse the buffer) at any point.
+ *
+ * status:
+ *   ANTS_OK                       — peers_acked ≥ 1; at least one peer
+ *                                   acknowledged receipt of the entry;
+ *   ANTS_ERROR_PEER_UNREACHABLE   — DHT lookup returned no peers, or
+ *                                   every peer failed (dial / handshake /
+ *                                   stream reset / connection drop);
+ *   ANTS_ERROR_*                  — internal failure (entry encode,
+ *                                   shard-key derivation, heap exhaustion).
+ *
+ * peers_acked: number of peers that received the entry cleanly (FIN
+ * observed on the bidi stream). May be 0 < peers_acked < replication
+ * when partial publish succeeds.
+ */
+typedef void (*ants_semantic_cache_publish_complete_fn_t)(ants_error_t status,
+                                                          uint32_t peers_acked,
+                                                          void *user_ctx);
+
+/*
+ * Initialise + start a publish. The entry is encoded to CBOR internally;
+ * the caller may free the source entry buffers immediately on return.
+ * The publish state machine begins by issuing a DHT lookup on the
+ * entry's shard_key.
+ *
+ * replication_factor: 0 means "use the default
+ *   (ANTS_SEMANTIC_CACHE_DEFAULT_REPLICATION)". Values >
+ *   ANTS_SEMANTIC_CACHE_PUBLISH_MAX_REPLICATION are rejected.
+ *
+ * Returns:
+ *   ANTS_OK                       — publish queued; completion fires later;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args, NULL embedding, bad
+ *                                   replication factor, or invalid entry
+ *                                   fields (same validation as
+ *                                   _entry_encode);
+ *   ANTS_ERROR_MALFORMED          — entry encode failed (malloc or
+ *                                   internal CBOR error);
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — too many concurrent lookups in the
+ *                                   underlying dht for a new one to start.
+ */
+ants_error_t ants_semantic_cache_publish_init(ants_semantic_cache_publish_t *publish,
+                                              ants_dht_t *dht,
+                                              ants_transport_t *transport,
+                                              const ants_semantic_cache_entry_t *entry,
+                                              uint32_t replication_factor,
+                                              ants_semantic_cache_publish_complete_fn_t complete_fn,
+                                              void *complete_ctx);
+
+/*
+ * Drive the publish state machine forward. Should be invoked from the
+ * same loop that ticks the transport + dht. The publish issues dial
+ * requests from this entry point (event-driven transitions, like
+ * STREAM_FIN, are handled from _handle_transport_event).
+ *
+ * Returns ANTS_OK on success, including the case where the publish is
+ * already completed (in which case _tick is a no-op).
+ */
+ants_error_t ants_semantic_cache_publish_tick(ants_semantic_cache_publish_t *publish);
+
+/*
+ * Forward a DHT event to the publish state machine. The publish
+ * consumes LOOKUP_COMPLETE / LOOKUP_TIMEOUT events whose `lookup`
+ * pointer matches its internal lookup handle; all other events are
+ * ignored. Safe to call from inside the caller's dht event_fn.
+ */
+ants_error_t ants_semantic_cache_publish_handle_dht_event(ants_semantic_cache_publish_t *publish,
+                                                          const ants_dht_event_t *event);
+
+/*
+ * Forward a transport event to the publish state machine. The publish
+ * consumes events whose `conn` or `stream` pointer matches one of its
+ * heap-owned per-slot handles; all other events are ignored. Safe to
+ * call from inside the caller's transport event_fn.
+ */
+ants_error_t
+ants_semantic_cache_publish_handle_transport_event(ants_semantic_cache_publish_t *publish,
+                                                   const ants_transport_event_t *event);
+
+/*
+ * Cancel + free a publish. Cancels any in-flight DHT lookup, closes
+ * any in-flight streams + connections, frees the encoded entry CBOR.
+ * Idempotent: safe on a zeroed (never-initialised) ctx or on a
+ * completed publish.
+ *
+ * No completion callback fires from _destroy — the caller has already
+ * elected to stop waiting.
+ *
+ * MUST NOT be called from inside the publish's own completion callback
+ * or from inside an event-forwarding entry point (defer to the next
+ * tick).
+ */
+ants_error_t ants_semantic_cache_publish_destroy(ants_semantic_cache_publish_t *publish);
 
 #ifdef __cplusplus
 }

@@ -2080,6 +2080,282 @@ static void test_clear_removes_entries(void)
     CHECK_EQ(ants_semantic_cache_destroy(&c), ANTS_OK);
 }
 
+/* -- Client-side publish (step 7b) ----------------------------------------
+ *
+ * Unit tests for the ants_semantic_cache_publish_* state machine. We
+ * exercise: NULL-arg validation, replication-factor bounds, destroy
+ * safety on a zeroed ctx, the LOOKUP → DELIVER → completion (PEER_
+ * UNREACHABLE) path on an empty DHT, and the cross-publish event
+ * isolation guarantees (events for some other publish's lookup or
+ * some other stream are ignored).
+ *
+ * End-to-end transport-level tests (entry actually crosses the wire
+ * and gets persisted by a peer's cache) are deferred to step 7b.2,
+ * which lands the server-side stream-dispatch glue + the dht_server
+ * tolerance change needed to multiplex DHT + cache traffic on a
+ * single conn. */
+
+typedef struct {
+    bool fired;
+    ants_error_t status;
+    uint32_t peers_acked;
+} test_publish_recorder_t;
+
+static void test_publish_complete_fn(ants_error_t status, uint32_t peers_acked, void *ctx)
+{
+    test_publish_recorder_t *r = (test_publish_recorder_t *)ctx;
+    r->fired = true;
+    r->status = status;
+    r->peers_acked = peers_acked;
+}
+
+typedef struct {
+    ants_semantic_cache_publish_t *publish;
+    int dht_events_seen;
+} test_publish_dht_ctx_t;
+
+static ants_error_t test_publish_dht_event_fn(const ants_dht_event_t *ev, void *ctx)
+{
+    test_publish_dht_ctx_t *c = (test_publish_dht_ctx_t *)ctx;
+    c->dht_events_seen++;
+    if (c->publish) {
+        (void)ants_semantic_cache_publish_handle_dht_event(c->publish, ev);
+    }
+    return ANTS_OK;
+}
+
+static void test_publish_null_args(void)
+{
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dummy_d = {{0}};
+    ants_semantic_cache_publish_t p = {{0}};
+    ants_semantic_cache_entry_t e;
+    memset(&e, 0, sizeof e);
+    test_publish_recorder_t rec = {0};
+
+    CHECK_EQ(ants_semantic_cache_publish_init(
+                 NULL, &dummy_d, &dummy_t, &e, 3, test_publish_complete_fn, &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_semantic_cache_publish_init(&p, NULL, &dummy_t, &e, 3, test_publish_complete_fn, &rec),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_semantic_cache_publish_init(&p, &dummy_d, NULL, &e, 3, test_publish_complete_fn, &rec),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_init(
+                 &p, &dummy_d, &dummy_t, NULL, 3, test_publish_complete_fn, &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_init(&p, &dummy_d, &dummy_t, &e, 3, NULL, &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_semantic_cache_publish_tick(NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_destroy(NULL), ANTS_ERROR_INVALID_ARG);
+
+    ants_dht_event_t dht_ev = {0};
+    ants_transport_event_t tev = {0};
+    CHECK_EQ(ants_semantic_cache_publish_handle_dht_event(NULL, &dht_ev), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_handle_dht_event(&p, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_handle_transport_event(NULL, &tev),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_publish_handle_transport_event(&p, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_publish_invalid_replication_factor(void)
+{
+    /* A non-zero replication_factor above MAX is rejected; 0 falls back to
+     * the default and is accepted. The init must succeed with the default
+     * but we don't need a real network — just verify the bounds-check. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_publish_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_publish_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8001, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x21);
+    ants_semantic_cache_entry_t e;
+    fill_signed_test_entry(&e, emb, "x", "m", priv);
+
+    ants_semantic_cache_publish_t p = {{0}};
+    test_publish_recorder_t rec = {0};
+    CHECK_EQ(ants_semantic_cache_publish_init(&p,
+                                              &dht,
+                                              &dummy_t,
+                                              &e,
+                                              ANTS_SEMANTIC_CACHE_PUBLISH_MAX_REPLICATION + 1,
+                                              test_publish_complete_fn,
+                                              &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Default (0 → ANTS_SEMANTIC_CACHE_DEFAULT_REPLICATION) is accepted. */
+    CHECK_EQ(
+        ants_semantic_cache_publish_init(&p, &dht, &dummy_t, &e, 0, test_publish_complete_fn, &rec),
+        ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&p), ANTS_OK);
+
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_publish_destroy_safe_on_zero_ctx(void)
+{
+    /* Destroy is a no-op on a never-initialised (zeroed) publish_t. */
+    ants_semantic_cache_publish_t p = {{0}};
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&p), ANTS_OK);
+
+    /* Tick / handle_dht_event / handle_transport_event are also no-ops
+     * on a zeroed ctx (no magic → silently ignore). They must NOT
+     * return INVALID_ARG just because magic is absent — that's reserved
+     * for NULL ptrs. */
+    CHECK_EQ(ants_semantic_cache_publish_tick(&p), ANTS_OK);
+    ants_dht_event_t dev = {0};
+    CHECK_EQ(ants_semantic_cache_publish_handle_dht_event(&p, &dev), ANTS_OK);
+    ants_transport_event_t tev = {0};
+    CHECK_EQ(ants_semantic_cache_publish_handle_transport_event(&p, &tev), ANTS_OK);
+}
+
+static void test_publish_no_peers_completes_with_peer_unreachable(void)
+{
+    /* Empty routing table → ants_dht_lookup fires LOOKUP_COMPLETE with
+     * peer_count = 0 on the very first dht_tick. The publish state
+     * machine receives the event via the DHT event_fn forward, observes
+     * 0 candidate slots, and the completion callback fires synchronously
+     * from inside handle_dht_event with ANTS_ERROR_PEER_UNREACHABLE +
+     * peers_acked = 0. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_publish_dht_ctx_t dht_ctx = {0};
+
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_publish_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(9001, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x44);
+    ants_semantic_cache_entry_t e;
+    fill_signed_test_entry(&e, emb, "no-peers response", "test-model", priv);
+
+    ants_semantic_cache_publish_t publish = {{0}};
+    test_publish_recorder_t rec = {0};
+    dht_ctx.publish = &publish;
+    CHECK_EQ(ants_semantic_cache_publish_init(
+                 &publish, &dht, &dummy_t, &e, 3, test_publish_complete_fn, &rec),
+             ANTS_OK);
+
+    (void)ants_dht_tick(&dht);
+
+    CHECK(rec.fired);
+    CHECK_EQ(rec.status, ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK(rec.peers_acked == 0);
+
+    /* Second tick is a no-op (completion fired exactly once). */
+    rec.fired = false;
+    (void)ants_dht_tick(&dht);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&publish), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_publish_handle_dht_event_ignores_other_lookup(void)
+{
+    /* A LOOKUP_COMPLETE event whose `lookup` pointer is NOT our internal
+     * lookup must be a no-op. The completion does not fire and the
+     * state machine remains in LOOKUP phase. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_publish_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_publish_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(9002, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x55);
+    ants_semantic_cache_entry_t e;
+    fill_signed_test_entry(&e, emb, "x", "m", priv);
+
+    ants_semantic_cache_publish_t publish = {{0}};
+    test_publish_recorder_t rec = {0};
+    /* Note: we do NOT wire dht_ctx.publish — we manually feed a
+     * synthetic event below. The DHT's own lookup event still fires on
+     * tick; we just want to assert the manual non-matching event is
+     * ignored before that. */
+    CHECK_EQ(ants_semantic_cache_publish_init(
+                 &publish, &dht, &dummy_t, &e, 3, test_publish_complete_fn, &rec),
+             ANTS_OK);
+
+    /* Synthetic event with a foreign lookup pointer. */
+    ants_dht_lookup_t alien_lookup = {{0}};
+    ants_dht_event_t alien_ev;
+    memset(&alien_ev, 0, sizeof alien_ev);
+    alien_ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
+    alien_ev.lookup = &alien_lookup;
+    alien_ev.peers = NULL;
+    alien_ev.peer_count = 0;
+    CHECK_EQ(ants_semantic_cache_publish_handle_dht_event(&publish, &alien_ev), ANTS_OK);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&publish), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_publish_handle_transport_event_ignores_other_stream(void)
+{
+    /* A transport event whose conn/stream pointers belong to no slot of
+     * ours must be a no-op (no state mutation, no completion). */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_publish_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_publish_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(9003, emb);
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    make_test_priv(priv, 0x66);
+    ants_semantic_cache_entry_t e;
+    fill_signed_test_entry(&e, emb, "x", "m", priv);
+
+    ants_semantic_cache_publish_t publish = {{0}};
+    test_publish_recorder_t rec = {0};
+    CHECK_EQ(ants_semantic_cache_publish_init(
+                 &publish, &dht, &dummy_t, &e, 3, test_publish_complete_fn, &rec),
+             ANTS_OK);
+
+    /* Synthetic transport event with a foreign conn pointer. */
+    ants_transport_conn_t alien_conn = {{0}};
+    ants_transport_stream_t alien_stream = {{0}};
+    ants_transport_event_t alien_ev;
+    memset(&alien_ev, 0, sizeof alien_ev);
+    alien_ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
+    alien_ev.conn = &alien_conn;
+    alien_ev.stream = &alien_stream;
+    CHECK_EQ(ants_semantic_cache_publish_handle_transport_event(&publish, &alien_ev), ANTS_OK);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_publish_destroy(&publish), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
 int main(void)
 {
     test_protocol_constants();
@@ -2149,6 +2425,13 @@ int main(void)
     test_handle_inbound_lookup_buffer_too_small();
     test_handle_inbound_lookup_malformed_request();
     test_clear_removes_entries();
+
+    test_publish_null_args();
+    test_publish_invalid_replication_factor();
+    test_publish_destroy_safe_on_zero_ctx();
+    test_publish_no_peers_completes_with_peer_unreachable();
+    test_publish_handle_dht_event_ignores_other_lookup();
+    test_publish_handle_transport_event_ignores_other_stream();
 
     if (failures > 0) {
         fprintf(stderr, "test_cache: %d failure(s)\n", failures);
