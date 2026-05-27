@@ -531,3 +531,82 @@ ants_canon_matmul_fp32(const float *a, const float *b, float *out, size_t m, siz
     }
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Scaled-dot-product attention (RFC-0009 §3)                               */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_canon_attention_fp32(const float *q,
+                                       const float *k,
+                                       const float *v,
+                                       float *out,
+                                       size_t n_tokens,
+                                       size_t d_head,
+                                       bool causal_mask,
+                                       float *scratch,
+                                       size_t scratch_cap)
+{
+    if (q == NULL || k == NULL || v == NULL || out == NULL || scratch == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_tokens == 0 || d_head == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (scratch_cap < n_tokens * n_tokens) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_tokens > ANTS_CANON_MAX_REDUCE_LEN) {
+        /* The per-row softmax uses the public ants_canon_softmax
+         * entry point with the internal MAX_REDUCE_LEN scratch.
+         * n_tokens larger than that needs a softmax-into variant
+         * which we don't expose yet. Reject; a future PR can land
+         * a softmax_into and a scratch-driven attention path. */
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Step 1: scores[i, j] = sum_d Q[i, d] * K[j, d], strict L-to-R.
+     * This is Q · K^T, computed in place without an explicit
+     * transpose by indexing K as [j, d] instead of [d, j]. */
+    float sqrt_d = sqrtf((float)d_head);
+    for (size_t i = 0; i < n_tokens; i++) {
+        for (size_t j = 0; j < n_tokens; j++) {
+            float acc = 0.0f;
+            for (size_t d = 0; d < d_head; d++) {
+                acc += q[i * d_head + d] * k[j * d_head + d];
+            }
+            /* Step 2: scale by 1/sqrt(d_head). Single FP32 divide per
+             * the §2.1 discipline — NOT a precomputed reciprocal. */
+            scratch[i * n_tokens + j] = acc / sqrt_d;
+        }
+    }
+
+    /* Step 3: causal mask. Position i can attend to j ∈ [0, i]; the
+     * upper triangle (j > i) is set to -∞ so it contributes 0 to the
+     * softmax via exp(-∞) = 0. Skipped when causal_mask = false
+     * (encoder / cross-attention). */
+    if (causal_mask) {
+        float neg_inf = bits_to_f32(ANTS_CANON_NEG_INF_BITS);
+        for (size_t i = 0; i < n_tokens; i++) {
+            for (size_t j = i + 1; j < n_tokens; j++) {
+                scratch[i * n_tokens + j] = neg_inf;
+            }
+        }
+    }
+
+    /* Step 4: softmax per row in place. The public ants_canon_softmax
+     * supports in-place aliasing (in == out). Each call reads the
+     * row from scratch and writes back to the same row. */
+    for (size_t i = 0; i < n_tokens; i++) {
+        float *row = &scratch[i * n_tokens];
+        ants_error_t err = ants_canon_softmax(row, row, n_tokens);
+        if (err != ANTS_OK) {
+            return err;
+        }
+    }
+
+    /* Step 5: out[i, d] = sum_j probs[i, j] * V[j, d], strict L-to-R.
+     * This is a standard FP32 matmul shape: probs is [n_tokens ×
+     * n_tokens], V is [n_tokens × d_head], out is [n_tokens × d_head].
+     * Reuse matmul_fp32 — same loop discipline. */
+    return ants_canon_matmul_fp32(scratch, v, out, n_tokens, n_tokens, d_head);
+}

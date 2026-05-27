@@ -26,15 +26,16 @@
  *   - RFC-0009 §5   FP32 unembedding + q24 fixed-point representation
  *   - RFC-0009 §5.1 q24 collision + birthday-attack bounds
  *
- * Status (scaffold + first kernels):
+ * Status:
  *   - q24 ↔ FP32 conversion: implemented (§5)
  *   - Left-biased max + sum reductions: implemented (§2.1 step 2 + §3)
  *   - Per-token scale (full §2.1 recipe): implemented
  *   - INT8 × INT8 → INT32 matmul: implemented (§3)
  *   - FP32 × FP32 → FP32 matmul (strict left-to-right): implemented (§3 + §5)
  *   - Softmax with stable subtract-max + divide: implemented (§3)
- *   - Attention (Q·K^T scaled + softmax + ·V): future PR
+ *   - Full scaled-dot-product attention (Q·K^T + softmax + ·V): implemented (§3)
  *   - GPTQ / AWQ quantization (§1): future PR
+ *   - SIMD parity (AVX2/AVX-512/NEON/SVE): future PRs
  *
  * API model: caller-allocated buffers, no internal allocation, no
  * threads, no hidden global state. Every entry point is pure
@@ -48,6 +49,7 @@
 
 #include "ants_common.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -336,6 +338,57 @@ ants_canon_matmul_i8(const int8_t *a, const int8_t *b, int32_t *out, size_t m, s
  */
 ants_error_t
 ants_canon_matmul_fp32(const float *a, const float *b, float *out, size_t m, size_t k, size_t n);
+
+/* ------------------------------------------------------------------------ */
+/* Scaled-dot-product attention (RFC-0009 §3)                               */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Canonical FP32 scaled-dot-product attention per RFC-0009 §3:
+ *
+ *   scores[i, j] = sum_d Q[i, d] * K[j, d]               (strict L-to-R)
+ *   scores[i, j] /= sqrtf((float)d_head)                 (single FP32 div)
+ *   if causal_mask and j > i: scores[i, j] = -inf        (causal)
+ *   probs[i, :] = softmax(scores[i, :])                  (§3 stable recipe)
+ *   out[i, d] = sum_j probs[i, j] * V[j, d]              (strict L-to-R)
+ *
+ * Shapes (row-major, single attention head):
+ *   q:   [n_tokens × d_head]    FP32
+ *   k:   [n_tokens × d_head]    FP32
+ *   v:   [n_tokens × d_head]    FP32
+ *   out: [n_tokens × d_head]    FP32
+ *
+ * The `causal_mask` boolean enables autoregressive masking — set to
+ * true for decoder self-attention, false for encoder / cross-
+ * attention. Masked entries become 0.0f in the softmax output via the
+ * subtract-max trick (max is finite from the non-masked entries; the
+ * masked -inf produces exp(-inf) = 0 cleanly).
+ *
+ * `scratch` MUST hold at least `n_tokens × n_tokens` floats — the
+ * intermediate attention-scores buffer. The contract decouples
+ * attention's memory budget from the public ctx size (which has to
+ * stay small enough to stack-allocate). For n_tokens = 1024 this is
+ * 4 MiB; for n_tokens = 8192, 256 MiB. Callers manage the heap.
+ *
+ * `q`, `k`, `v`, `out` MAY alias each other if the caller knows the
+ * read-before-write ordering is safe — but the reference impl does
+ * NOT verify this and may behave unpredictably if (out == q) etc.
+ * Recommended: distinct buffers.
+ *
+ * Returns:
+ *   ANTS_OK                — out populated;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, zero-sized dim, or scratch_cap
+ *                            < n_tokens * n_tokens.
+ */
+ants_error_t ants_canon_attention_fp32(const float *q,
+                                       const float *k,
+                                       const float *v,
+                                       float *out,
+                                       size_t n_tokens,
+                                       size_t d_head,
+                                       bool causal_mask,
+                                       float *scratch,
+                                       size_t scratch_cap);
 
 #ifdef __cplusplus
 }
