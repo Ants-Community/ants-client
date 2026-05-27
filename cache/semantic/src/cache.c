@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* M_PI is gated behind _BSD_SOURCE / _XOPEN_SOURCE on some libcs.
  * Always define our own to keep the project's strict C99 + no-extensions
@@ -95,6 +96,16 @@ typedef struct {
     uint8_t *attestation;
     size_t attestation_len;
     uint8_t signature[ANTS_SEMANTIC_CACHE_SIG_LEN];
+
+    /* Local-only quality state (NOT on the wire). RFC-0002 §Quality.
+     * Each shard-holder accumulates its own view; the network's
+     * quality emerges from the aggregate of locally-resolved decisions
+     * across peers. */
+    uint32_t positive_count;
+    uint32_t negative_count;
+    uint32_t challenge_count;
+    uint64_t last_challenged_sec; /* 0 = never challenged */
+    bool invalidated;             /* hard-skip in get_topk once true */
 } cache_entry_t;
 
 struct ants_semantic_cache_state {
@@ -114,6 +125,12 @@ struct ants_semantic_cache_state {
     /* Monotonic counter; advanced on every put + on every get hit.
      * Used by step 3 to identify the eviction candidate. */
     uint64_t lru_counter;
+
+    /* Clock override for step 9 decay scoring. NULL = default to
+     * time(NULL). Mirrored from config; ctx is opaque and passed
+     * verbatim. */
+    ants_semantic_cache_clock_sec_fn_t clock_sec_fn;
+    void *clock_ctx;
 };
 
 typedef char ants_semantic_cache_state_size_check[(sizeof(struct ants_semantic_cache_state) <=
@@ -350,6 +367,109 @@ static void enforce_caps_on_insert(struct ants_semantic_cache_state *state,
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Step 9: clock, decay scoring, and quality signals                        */
+/* ------------------------------------------------------------------------ */
+
+/* Resolve the cache's current clock to Unix seconds. Tests override via
+ * config->clock_sec_fn so decay aging is deterministic; production uses
+ * time(NULL). The return value type matches entry->created (uint64_t
+ * seconds) so age arithmetic is one subtraction. */
+static uint64_t cache_now_sec(const struct ants_semantic_cache_state *state)
+{
+    if (state->clock_sec_fn != NULL) {
+        return state->clock_sec_fn(state->clock_ctx);
+    }
+    return (uint64_t)time(NULL);
+}
+
+/* Map a validity class to its useful-lifetime horizon in seconds per
+ * RFC-0002 §Quality. PERENNIAL returns UINT64_MAX so still_valid
+ * always succeeds. An out-of-range class (shouldn't happen — encoder
+ * validates 0..4 at insert time) returns 0 so still_valid rejects. */
+static uint64_t validity_horizon_sec(ants_semantic_cache_validity_t v)
+{
+    switch (v) {
+    case ANTS_SEMANTIC_CACHE_VALIDITY_EPHEMERAL:
+        return ANTS_SEMANTIC_CACHE_HORIZON_EPHEMERAL_SEC;
+    case ANTS_SEMANTIC_CACHE_VALIDITY_WEEKS:
+        return ANTS_SEMANTIC_CACHE_HORIZON_WEEKS_SEC;
+    case ANTS_SEMANTIC_CACHE_VALIDITY_MONTHS:
+        return ANTS_SEMANTIC_CACHE_HORIZON_MONTHS_SEC;
+    case ANTS_SEMANTIC_CACHE_VALIDITY_YEARS:
+        return ANTS_SEMANTIC_CACHE_HORIZON_YEARS_SEC;
+    case ANTS_SEMANTIC_CACHE_VALIDITY_PERENNIAL:
+        return UINT64_MAX;
+    default:
+        return 0;
+    }
+}
+
+/* RFC-0002 §Quality "still_valid" predicate: invalidated entries are
+ * always rejected; otherwise age < EVICTION_MULTIPLIER × horizon. The
+ * PERENNIAL case is handled implicitly via horizon = UINT64_MAX. */
+static bool entry_still_valid(const cache_entry_t *e, uint64_t now_sec)
+{
+    if (e->invalidated) {
+        return false;
+    }
+    uint64_t horizon = validity_horizon_sec(e->validity_class);
+    if (horizon == UINT64_MAX) {
+        return true; /* perennial */
+    }
+    if (horizon == 0) {
+        return false; /* malformed class */
+    }
+    uint64_t age_sec = (now_sec >= e->created) ? (now_sec - e->created) : 0;
+    /* EVICTION_MULTIPLIER × horizon — guard the multiply against an
+     * unlikely overflow with a saturating ceiling. EPHEMERAL=300 ×
+     * 4 = 1200 << UINT64_MAX so overflow only matters when someone
+     * later adds a TBD validity class with absurd horizon. */
+    uint64_t cap;
+    if (horizon > UINT64_MAX / ANTS_SEMANTIC_CACHE_EVICTION_MULTIPLIER) {
+        cap = UINT64_MAX;
+    } else {
+        cap = horizon * (uint64_t)ANTS_SEMANTIC_CACHE_EVICTION_MULTIPLIER;
+    }
+    return age_sec < cap;
+}
+
+/* Composite ranking score per RFC-0002 §Quality:
+ *   score = sim · (positive+1)/(negative+1) · max(FLOOR, 1 - age/DECAY)
+ * sim is passed in (already computed by the caller's dot product).
+ * Both positive+1 and negative+1 are guarded against 0 → ratio = 1.0
+ * when both counts are 0 (the default for a fresh entry). */
+static double compute_score(const cache_entry_t *e, double sim, uint64_t now_sec)
+{
+    double signal_ratio = ((double)e->positive_count + 1.0) / ((double)e->negative_count + 1.0);
+    uint64_t age_sec = (now_sec >= e->created) ? (now_sec - e->created) : 0;
+    double recency = 1.0 - (double)age_sec / (double)ANTS_SEMANTIC_CACHE_RECENCY_DECAY_SEC;
+    if (recency < (double)ANTS_SEMANTIC_CACHE_RECENCY_FLOOR) {
+        recency = (double)ANTS_SEMANTIC_CACHE_RECENCY_FLOOR;
+    }
+    return sim * signal_ratio * recency;
+}
+
+/* Locate an entry by (prompt_hash, producer). Linear scan over the
+ * entries array — fine in v0.x since per-peer caches are bounded by
+ * total_max and prompt_hash+producer is an unindexed key. A future
+ * regime can add a secondary hash-table index when call volume on
+ * signal recording justifies it. Returns NULL if no match. */
+static cache_entry_t *
+find_entry_by_record_key(struct ants_semantic_cache_state *state,
+                         const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                         const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN])
+{
+    for (size_t i = 0; i < state->n_entries; i++) {
+        cache_entry_t *e = &state->entries[i];
+        if (memcmp(e->prompt_hash, prompt_hash, ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN) == 0 &&
+            memcmp(e->producer, producer, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
 ants_error_t ants_semantic_cache_init(ants_semantic_cache_t *cache,
                                       const ants_semantic_cache_config_t *config)
 {
@@ -370,6 +490,8 @@ ants_error_t ants_semantic_cache_init(ants_semantic_cache_t *cache,
     state->per_shard_max = config->per_shard_max;
     state->total_max = config->total_max;
     state->lru_counter = 0;
+    state->clock_sec_fn = config->clock_sec_fn;
+    state->clock_ctx = config->clock_ctx;
     state->magic = ANTS_SEMANTIC_CACHE_STATE_MAGIC;
     return ANTS_OK;
 }
@@ -539,6 +661,17 @@ ants_error_t ants_semantic_cache_put(ants_semantic_cache_t *cache,
     e.response_len = value_len;
     e.response_model = "";
     e.response_model_len = 0;
+    /* Step 9: stamp `created` with the cache's current clock so the
+     * decay path treats freshly-put entries as fresh. EPHEMERAL is
+     * still the right default class — the convenience API doesn't know
+     * the producer's intent on horizon. PERENNIAL would be safer for
+     * "I never want this evicted by age" callers, but those should use
+     * put_record with an explicit validity_class anyway. */
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic == ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        e.created = cache_now_sec(state);
+    }
     e.validity_class = ANTS_SEMANTIC_CACHE_VALIDITY_EPHEMERAL;
     /* prompt_hash, producer, signature default to zero per memset. */
     return ants_semantic_cache_put_record(cache, &e);
@@ -589,8 +722,14 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
     size_t best_idx = 0;
     bool best_found = false;
     double best_sim = -2.0; /* below the [-1, 1] cosine range */
+    /* Snapshot the clock once so all candidates share the same
+     * still_valid reference time (matches the get_topk pattern). */
+    uint64_t now_sec = cache_now_sec(state);
     for (size_t i = 0; i < state->n_entries; i++) {
         if (state->entries[i].shard_key != key) {
+            continue;
+        }
+        if (!entry_still_valid(&state->entries[i], now_sec)) {
             continue;
         }
         double sim = cosine_l2_normalised(state->entries[i].embedding, embedding);
@@ -638,6 +777,11 @@ ants_error_t ants_semantic_cache_get(ants_semantic_cache_t *cache,
 typedef struct {
     size_t entry_idx;
     double similarity;
+    /* Step 9: composite score used for ranking (RFC-0002 §Quality).
+     * Raw `similarity` is still emitted on the wire because that's
+     * what the caller-side threshold filters against; the composite
+     * is local-only. */
+    double score;
 } topk_candidate_t;
 
 /* popcount for a 64-bit shard key. Brian Kernighan iteration so the
@@ -688,12 +832,23 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         return err;
     }
 
-    /* Collect eligible candidates. An entry is eligible when its
-     * shard_key is within `hamming_radius` bit-flips of the query key
-     * AND its cosine similarity is at least the threshold. */
+    /* Step 9: snapshot the cache's current clock once per call so all
+     * candidates score against the same reference time. */
+    uint64_t now_sec = cache_now_sec(state);
+
+    /* Collect eligible candidates. An entry is eligible when:
+     *   - it is still_valid (not invalidated AND age < 4 × horizon);
+     *   - its shard_key is within `hamming_radius` bit-flips of the
+     *     query key;
+     *   - its cosine similarity is at least the threshold.
+     * The composite ranking score (similarity · signal_ratio · recency)
+     * is recorded alongside; the sort below uses it. */
     topk_candidate_t cands[TOPK_MAX_CANDIDATES];
     size_t n_cands = 0;
     for (size_t i = 0; i < state->n_entries; i++) {
+        if (!entry_still_valid(&state->entries[i], now_sec)) {
+            continue;
+        }
         unsigned dist = shard_key_popcount(state->entries[i].shard_key ^ key);
         if (dist > hamming_radius) {
             continue;
@@ -710,6 +865,7 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         }
         cands[n_cands].entry_idx = i;
         cands[n_cands].similarity = sim;
+        cands[n_cands].score = compute_score(&state->entries[i], sim, now_sec);
         n_cands++;
     }
 
@@ -717,12 +873,14 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
         return ANTS_ERROR_NOT_FOUND;
     }
 
-    /* Insertion-sort desc by similarity. n_cands is bounded by
-     * TOPK_MAX_CANDIDATES so O(n²) is fine. */
+    /* Insertion-sort desc by composite score (similarity · signal_ratio
+     * · recency). n_cands is bounded by TOPK_MAX_CANDIDATES so O(n²) is
+     * fine. Stable on equal scores — preserves the cache's storage
+     * order. */
     for (size_t i = 1; i < n_cands; i++) {
         topk_candidate_t pivot = cands[i];
         size_t j = i;
-        while (j > 0 && cands[j - 1].similarity < pivot.similarity) {
+        while (j > 0 && cands[j - 1].score < pivot.score) {
             cands[j] = cands[j - 1];
             j--;
         }
@@ -972,4 +1130,81 @@ ants_error_t ants_semantic_cache_handle_inbound_lookup(ants_semantic_cache_t *ca
         matches, n_matches, resp_buf, resp_cap, out_resp_len);
     free(match_embs);
     return err;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Quality signals + challenge invalidation (step 9)                        */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t
+ants_semantic_cache_record_positive(ants_semantic_cache_t *cache,
+                                    const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                    const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN])
+{
+    if (cache == NULL || prompt_hash == NULL || producer == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    cache_entry_t *e = find_entry_by_record_key(state, prompt_hash, producer);
+    if (e == NULL) {
+        return ANTS_ERROR_NOT_FOUND;
+    }
+    if (e->positive_count < UINT32_MAX) {
+        e->positive_count++;
+    }
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_semantic_cache_record_negative(ants_semantic_cache_t *cache,
+                                    const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                    const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN])
+{
+    if (cache == NULL || prompt_hash == NULL || producer == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    cache_entry_t *e = find_entry_by_record_key(state, prompt_hash, producer);
+    if (e == NULL) {
+        return ANTS_ERROR_NOT_FOUND;
+    }
+    if (e->negative_count < UINT32_MAX) {
+        e->negative_count++;
+    }
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_semantic_cache_record_challenge(ants_semantic_cache_t *cache,
+                                     const uint8_t prompt_hash[ANTS_SEMANTIC_CACHE_PROMPT_HASH_LEN],
+                                     const uint8_t producer[ANTS_SEMANTIC_CACHE_PEER_ID_LEN])
+{
+    if (cache == NULL || prompt_hash == NULL || producer == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_semantic_cache_state *state =
+        (struct ants_semantic_cache_state *)(void *)cache->_opaque;
+    if (state->magic != ANTS_SEMANTIC_CACHE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    cache_entry_t *e = find_entry_by_record_key(state, prompt_hash, producer);
+    if (e == NULL) {
+        return ANTS_ERROR_NOT_FOUND;
+    }
+    if (e->challenge_count < UINT32_MAX) {
+        e->challenge_count++;
+    }
+    e->last_challenged_sec = cache_now_sec(state);
+    if (e->challenge_count >= ANTS_SEMANTIC_CACHE_CHALLENGE_INVALIDATION_THRESHOLD) {
+        e->invalidated = true;
+    }
+    return ANTS_OK;
 }
