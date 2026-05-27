@@ -13,6 +13,136 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 7b.2 — server-side dispatch + E2E publish · 2026-05-27
+
+**The cache learns to read from the network.** Step 7b shipped the
+publish state machine but stopped short of an end-to-end test because
+two ingredients were missing: a server-side dispatcher that picks up
+inbound cache streams without colliding with the DHT server, and a way
+for the publish-side DHT lookup to resolve a responsible peer to a
+dialable address. Step 7b.2 closes both, plus the E2E test that ties
+the whole publish → server pipeline together over real QUIC.
+
+**PR #72 — server-side dispatch + E2E publish** (+741/-11):
+
+Three pieces, one PR:
+
+1. **`dht_server.process_fin` tolerance**: the DHT server still
+   eagerly claims every `STREAM_OPENED` on every inbound conn, but
+   no longer RESETs the stream when the inbound bytes either don't
+   peek as a DHT envelope OR exceed the 4 KiB DHT recv cap. Both
+   cases are now silent slot release. The RESET-on-peek-failure was
+   the proximate blocker: it propagated to A.publish's send-side as
+   `STREAM_RESET`, killing the entry delivery before B's cache_server
+   could see the FIN. RESETs are still issued for the cases where
+   peek confirms a DHT envelope but the message is malformed (genuine
+   protocol violations).
+
+2. **New module `cache/semantic/src/cache_server.{h,c}`** (~330 LoC
+   impl + ~95 LoC public API): sibling dispatcher to `dht_server.c`.
+   Public surface:
+   - `ANTS_SEMANTIC_CACHE_SERVER_MAX_INBOUND_STREAMS = 16`
+   - `ANTS_SEMANTIC_CACHE_SERVER_INBOUND_RECV_CAP = 16 KiB`
+     (covers ~5 KiB entries with margin; oversized payloads release
+     silently)
+   - `ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE = 4 KiB`
+   - `ants_semantic_cache_server_t` opaque ctx (magic-tagged
+     `0x53435356 "SCSV"`)
+   - `_init(server, cache)`, `_handle_transport_event(server, event)`,
+     `_destroy(server)`
+
+   Slot lifecycle mirrors `dht_server.c`: alloc on `STREAM_OPENED`
+   (peer-initiated), lazy-malloc `recv_buf` on first `STREAM_READABLE`,
+   process + free on `STREAM_FIN`, force-free on `STREAM_RESET` and
+   `CONN_CLOSED`. `_handle_transport_event` returns `ANTS_OK` for
+   foreign streams so the server can run inside a fan-out chain with
+   `ants_dht_handle_transport_event` + any publish state machines
+   without one stealing events from another.
+
+   Discrimination on `STREAM_FIN`: peek the top-level CBOR map size
+   without consuming the inner fields.
+   - `map(10)` → entry write (on-wire record includes the signature
+     field; `map(9)` is the *signing payload* form only). Calls
+     `handle_inbound_entry` (decode + Ed25519 verify + put_record).
+     On success, FIN-only sentinel send signals ACK to the
+     publish-side state machine. On any decode/verify error, RESET.
+   - `map(4)` → lookup request. Calls `handle_inbound_lookup`,
+     encodes the response into a 96 KiB heap buffer, sends with FIN.
+   - any other size → silent release (probably a DHT envelope,
+     `map(2)` or `map(3)`).
+
+   The server holds a non-owning back-pointer to the cache. The cache
+   MUST outlive the server, and the server MUST be destroyed before
+   the underlying transport — same convention as the bootstrap-conn
+   lifetime in `dht.c`. Otherwise the transport's `CONN_CLOSED`
+   callback fan-out references slot pointers after `recv_buf` is
+   reclaimed.
+
+3. **`ants_dht_announce` multiaddr fill**: the self announce_set
+   entry now records the local listen multiaddr via
+   `ants_transport_local_addr(state->transport, ...)`. Previously
+   left empty, which made the publish's DHT lookup return a peer
+   with no dialable address — the K-closest fallback inside
+   `handle_get_peers` would have worked, but only if B's routing
+   table contained itself, which it doesn't (peers don't self-route).
+   Inbound-announce-from-peers (`handle_announce_peer`) still uses an
+   empty multiaddr because the conn's observed peer_addr is the
+   connect source, not the peer's listen address. Closing that gap
+   needs an in-protocol multiaddr field on ANNOUNCE_PEER_REQ; out of
+   scope for 7b.2.
+
+**4 new tests** in `test_cache.c`:
+- `test_cache_server_null_args` — NULL validation on every entry.
+- `test_cache_server_safe_on_zero_ctx` — magic check on never-init
+  ctx; both `_handle_transport_event` and `_destroy` are no-ops.
+- `test_cache_server_ignores_foreign_streams` — events with
+  conn/stream not matching any of our slots are no-ops; cache
+  unchanged. Validates the fan-out-friendly contract.
+- `test_publish_end_to_end_one_peer` — full happy-path over real
+  QUIC. A bootstraps to B; B announces a shard whose key matches the
+  LSH of A's signed entry; A.publish drives lookup → dial → bidi
+  stream send → B's cache_server decodes + Ed25519-verifies +
+  persists the record → B FIN-closes the stream → A's completion
+  fires with `peers_acked = 1` and `B.cache.entries() == 1`.
+
+**Conventions worth preserving (step 7b.2)**:
+- **Wire-discriminator pattern for sibling dispatchers on the same
+  event chain**: each dispatcher eagerly claims `STREAM_OPENED`,
+  accumulates bytes independently, and on `STREAM_FIN` peeks the
+  top-level CBOR shape to decide whether to process or release
+  silently. RESET only when the peek succeeds AND the bytes are
+  *our* protocol but malformed — never when we can't prove the
+  stream is ours. This lets cache + DHT + future subsystems share
+  a single conn without coordination.
+- **Magic-uint32 at offset 0** for `cache_server_state`:
+  `0x53435356` ("SCSV"). Discriminates a fully-init server from a
+  zeroed (never-init) ctx for `_handle_transport_event` /
+  `_destroy` safety. Same pattern: `ANTS`, `ANTC`, `ANSE`, `CNCS`,
+  `SCPB`, now `SCSV`.
+- **Entry CBOR is `map(10)` on the wire, `map(9)` as signing
+  payload**: easy thing to get wrong (first attempt of this PR
+  checked `map(9)` and silently dropped every entry). Future cache
+  server work that re-uses this discriminator should reference both
+  numbers in comments next to the constants.
+- **`ants_transport_conn_peer_addr` is still NOT_IMPLEMENTED**:
+  fixing it requires capturing `peer_addr` in
+  `struct ants_transport_conn_state` at both inbound-bootstrap
+  (around line 1078 of `transport.c`) and outbound-dial (around
+  line 1457) sites. Once that lands, `handle_announce_peer` can
+  fill the announcer's multiaddr too — closing the inbound-side
+  half of the multiaddr propagation gap.
+
+CI matrix (7 jobs): all green first push.
+
+**Component #10 status**: publish pipeline is now end-to-end
+functional. Two peers can ship signed entries to each other over the
+network with proper signature verification and Hamming-aware
+server-side scoring. Remaining cache work: **step 7c** (client-side
+query — DHT lookup + parallel lookup-request streams + aggregate),
+**step 9** (quality signals + decay by validity class), and the
+inbound-announce multiaddr gap (waiting on `transport_conn_peer_addr`
+or an in-protocol multiaddr field).
+
 ### cache: Component #10 (semantic cache) step 7b — client-side publish state machine · 2026-05-27
 
 **The cache learns to write to the network.** Step 7b lands
