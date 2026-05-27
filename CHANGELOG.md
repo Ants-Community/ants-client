@@ -13,6 +13,120 @@ the spec repo's
 
 ## Unreleased
 
+### cache: Component #10 (semantic cache) step 7b — client-side publish state machine · 2026-05-27
+
+**The cache learns to write to the network.** Step 7b lands
+`ants_semantic_cache_publish_*`: the producer-side state machine that
+takes a signed cache-entry and replicates it to N shard-holders
+selected via an `ants_dht_lookup` on the entry's LSH shard_key. This
+is the first time the cache layer drives DHT + transport directly;
+the existing `handle_inbound_entry` (server side) was already wired
+in step 7a.2 but invoked only by tests passing raw bytes — step 7b
+gives it a network-side counterpart.
+
+**PR #69 — client-side publish state machine** (+921/-3):
+
+State machine phases:
+- **LOOKUP** — `_publish_init` issues an `ants_dht_lookup(shard_key)`
+  where the shard_key is derived from `entry.embedding` via
+  `ants_semantic_cache_shard_key`. The caller-forwarded
+  `_handle_dht_event` consumes `LOOKUP_COMPLETE` / `LOOKUP_TIMEOUT`
+  whose `lookup` pointer matches the publish's internal handle, and
+  populates per-slot peer descriptors capped at the
+  replication_factor (default 3, max
+  `ANTS_SEMANTIC_CACHE_PUBLISH_MAX_REPLICATION = 8`).
+- **DELIVER** — `_publish_tick` dials each slot via
+  `ants_transport_dial`; on `CONN_READY` the caller-forwarded
+  `_handle_transport_event` opens a bidi stream and sends the
+  pre-encoded entry CBOR with `fin=true`. The slot then waits on the
+  peer's `STREAM_FIN` as the implicit ack (per RFC-0002's "the peer
+  closes the stream after `handle_inbound_entry` succeeds"
+  convention).
+- **DONE** — completion fires exactly once, either with
+  `(ANTS_OK, peers_acked)` if at least one slot reached `SLOT_ACKED`,
+  or with `(ANTS_ERROR_PEER_UNREACHABLE, 0)` if every slot failed
+  (dial / handshake / stream reset / connection drop) or the lookup
+  returned zero peers.
+
+Public surface added to `ants_semantic_cache.h`:
+- `ANTS_SEMANTIC_CACHE_PUBLISH_MAX_REPLICATION = 8`
+- `ANTS_SEMANTIC_CACHE_PUBLISH_CTX_SIZE = 32 KiB` (fits the embedded
+  16 KiB `ants_dht_lookup_t` + per-slot bookkeeping + heap pointers)
+- `ants_semantic_cache_publish_t` opaque ctx (magic-tagged `0x53435042
+  "SCPB"`)
+- `ants_semantic_cache_publish_complete_fn_t(status, peers_acked, ctx)`
+- `_publish_init` / `_tick` / `_handle_dht_event` /
+  `_handle_transport_event` / `_destroy`
+
+Per-slot `conn` (8 KiB heap each) + `stream` (1 KiB heap each) are
+allocated by us, kept alive for the full publish duration, and freed
+during `_destroy` (which also issues `ants_transport_peer_disconnect`
+to clean up server-side state when the transport is still alive).
+Caller MUST destroy the publish BEFORE destroying the underlying
+transport — same convention dht.c uses for `bootstrap_entries[]` and
+`pending_dials[]` (otherwise the transport's CONN_CLOSED callback
+may reference a freed slot buffer).
+
+`ants_semantic_cache` library now `PUBLIC`-links `ants_dht` +
+`ants_transport`. The header was previously self-contained (just
+`ants_common` + `ants_embed`); the new dependency is the price of
+folding network-side write protocol into the cache surface.
+
+**Scope deferral**: end-to-end transport-level test (entry actually
+crosses the wire, peer's `handle_inbound_entry` persists, A.publish
+completes with `peers_acked = 1`) is deferred to **step 7b.2**. That
+PR also needs to (a) fix `dht_server.process_fin`'s RESET-on-non-DHT
+behaviour so DHT and cache streams can coexist on a single conn,
+and (b) add a cache server-side `_handle_transport_event` that
+picks up inbound entry streams without colliding with the DHT
+server dispatcher. This PR keeps scope to the client-side state
+machine and validates it via unit tests that exercise every
+transition path without relying on a real handshake.
+
+**6 new tests** in `test_cache.c`:
+- `test_publish_null_args` — NULL validation on every entry point.
+- `test_publish_invalid_replication_factor` — `> MAX` rejected;
+  `0 → DEFAULT (3)` accepted.
+- `test_publish_destroy_safe_on_zero_ctx` — `_destroy`, `_tick`,
+  `_handle_*` are no-ops on a zeroed (never-initialised) ctx, so
+  pre-allocated arrays of publish slots are safe to tick over.
+- `test_publish_no_peers_completes_with_peer_unreachable` — empty
+  DHT routing table → `LOOKUP_COMPLETE` with `peer_count = 0` fires
+  synchronously on first `dht_tick`; the publish observes 0
+  candidates, fires `PEER_UNREACHABLE` from inside `handle_dht_event`,
+  and the completion callback is invoked once.
+- `test_publish_handle_dht_event_ignores_other_lookup` — synthetic
+  `LOOKUP_COMPLETE` with a foreign `lookup` pointer is a no-op;
+  completion does not fire.
+- `test_publish_handle_transport_event_ignores_other_stream` —
+  synthetic transport event with foreign `conn`/`stream` pointers
+  is a no-op; no state mutation, no completion.
+
+**Quirks worth preserving**:
+- `ants_semantic_cache_entry_encode` does NOT support probe-mode
+  (`buf=NULL, cap=0 → INVALID_ARG`); the header's doc-comment claiming
+  otherwise is stale and tracked for fix. `publish_init` handles this
+  by `malloc`-ing a generous 8 KiB starting buffer and reallocating
+  with the returned required size on `BUFFER_TOO_SMALL`.
+- `state_of()` casts via `void *` to silence `-Wcast-align` under
+  AppleClang; the `_align` field of the opaque union guarantees
+  `uint64_t` alignment for the underlying buffer.
+- `_handle_dht_event` returns `ANTS_OK` (not `INVALID_ARG`) for events
+  whose `lookup` pointer doesn't match — necessary so the same DHT
+  event_fn can fan out to multiple publishes (or to a publish + a
+  separate DHT consumer like a lookup) without one publish suppressing
+  the others.
+
+**Component #10 status**: server-side admission is signature-gated
+and Hamming-aware; client-side publish state machine is in place but
+not yet wired into a working two-peer scenario (that's 7b.2).
+Remaining cache work: 7b.2 server-side dispatch + DHT fix + E2E test;
+7c client-side query (DHT-routed lookup + parallel requests + aggregate);
+step 9 quality signals + decay by validity class.
+
+CI matrix (7 jobs): 6/7 first push, 1 macOS Debug `transport_basic`
+flake unrelated to this PR (re-run green).
+
 ### cache: Component #10 (semantic cache) — Ed25519 producer-signature verify · 2026-05-26
 
 **The cache no longer admits unsigned (or tampered) entries.** The
