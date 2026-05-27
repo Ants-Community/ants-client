@@ -368,15 +368,20 @@ static void process_fin(ants_dht_t *dht, struct ants_dht_inbound_stream *slot)
 {
     struct ants_dht_state *state = dht_get_state(dht);
     if (slot->recv_buf == NULL || slot->recv_len == 0) {
-        /* Empty request — reset rather than respond. */
-        (void)ants_transport_stream_reset(slot->stream, 1 /* malformed */);
+        /* Empty request — could be a peer-initiated stream that another
+         * subsystem (e.g. cache_server) is meant to handle. Release the
+         * slot silently rather than reset; sibling dispatchers running
+         * after us on the same event chain still get their chance. */
         inbound_release(slot);
         return;
     }
     ants_dht_msg_type_t type;
     ants_error_t err = ants_dht_wire_peek_type(slot->recv_buf, slot->recv_len, &type);
     if (err != ANTS_OK) {
-        (void)ants_transport_stream_reset(slot->stream, 1);
+        /* Doesn't look like a DHT envelope — silent release so a sibling
+         * dispatcher (cache_server, future subsystems) can claim the
+         * stream. Reset would propagate to the requester as STREAM_RESET
+         * and abort a perfectly valid non-DHT stream. */
         inbound_release(slot);
         return;
     }
@@ -397,8 +402,9 @@ static void process_fin(ants_dht_t *dht, struct ants_dht_inbound_stream *slot)
         err = handle_announce_peer(state, slot, resp_buf, sizeof resp_buf, &resp_len);
         break;
     default:
-        /* Response types or unknown — clients shouldn't send those to
-         * a server stream. Reset rather than respond. */
+        /* peek_type confirmed it's a DHT envelope but the type is a
+         * response — clients shouldn't open a server stream with that.
+         * It IS our protocol but malformed, so reset is correct here. */
         (void)ants_transport_stream_reset(slot->stream, 1);
         inbound_release(slot);
         return;
@@ -445,10 +451,9 @@ ants_error_t ants_dht_server_handle_event(ants_dht_t *dht, const ants_transport_
         struct ants_dht_inbound_stream *slot = inbound_find_by_stream(state, event->stream);
         if (slot == NULL) {
             slot = inbound_alloc(state, event->conn, event->stream, &event->peer_id);
-            if (slot == NULL) {
-                /* Registry full — reset the stream. */
-                (void)ants_transport_stream_reset(event->stream, 3 /* overload */);
-            }
+            /* Registry full → no-op; a sibling dispatcher (cache_server,
+             * etc.) may still take the stream. Reset would close a
+             * stream we can't prove is ours. */
         }
         return ANTS_OK;
     }
@@ -475,7 +480,10 @@ ants_error_t ants_dht_server_handle_event(ants_dht_t *dht, const ants_transport_
             slot->recv_len = 0;
         }
         if (event->payload_len > slot->recv_cap - slot->recv_len) {
-            (void)ants_transport_stream_reset(slot->stream, 4 /* too big */);
+            /* Overflows the DHT-side recv cap — but a sibling dispatcher
+             * (cache_server etc.) may still want the stream, and big
+             * payloads are the cache's normal case (4 KiB embeddings).
+             * Silent release so we stop accumulating; no reset. */
             inbound_release(slot);
             break;
         }
