@@ -10,6 +10,7 @@
 
 add_library(ants_semantic_cache STATIC
     src/cache.c
+    src/cache_publish.c
     src/cache_wire.c
 )
 
@@ -20,13 +21,17 @@ target_include_directories(ants_semantic_cache
 )
 
 # ants_strerror lives in ants_cbor for now (same transitional placement
-# the other components use). ants_embed for ANTS_EMBED_DIM. ants_crypto
-# (BLAKE3) is PRIVATE — used internally to derive the LSH projection
-# matrix from a fixed seed label; not exposed in our public API.
+# the other components use). ants_embed for ANTS_EMBED_DIM. ants_dht +
+# ants_transport are required PUBLIC by the publish API (step 7b) — the
+# header exposes ants_dht_t * / ants_transport_t * + their event
+# typedefs. ants_crypto (BLAKE3) is PRIVATE — used internally to derive
+# the LSH projection matrix from a fixed seed label; not exposed.
 target_link_libraries(ants_semantic_cache
     PUBLIC
         ants_cbor
+        ants_dht
         ants_embed
+        ants_transport
     PRIVATE
         ants_crypto
 )
