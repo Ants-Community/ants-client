@@ -781,6 +781,191 @@ ants_semantic_cache_publish_handle_transport_event(ants_semantic_cache_publish_t
 ants_error_t ants_semantic_cache_publish_destroy(ants_semantic_cache_publish_t *publish);
 
 /* ------------------------------------------------------------------------ */
+/* Client-side query (RFC-0002 §The lookup protocol — DHT-routed)           */
+/*                                                                          */
+/* A consumer with an embedding asks the network for entries with cosine    */
+/* similarity ≥ threshold. The query API drives the full pipeline:          */
+/*                                                                          */
+/*   1. Derive shard_key from the query embedding (LSH);                    */
+/*   2. Issue ants_dht_lookup(shard_key) to find responsible peers;         */
+/*   3. For each of the top-N (fanout) peers, dial via transport, open a    */
+/*      bidi stream, and send a CBOR-encoded lookup_request with FIN;       */
+/*   4. Each peer's cache_server runs handle_inbound_lookup and returns a   */
+/*      lookup_response (up to HANDLE_LOOKUP_SERVER_CAP=15 matches) with    */
+/*      FIN;                                                                */
+/*   5. Accumulate per-slot recv buffers, decode each response, aggregate   */
+/*      across all peers (dedup by producer+prompt_hash, sort desc by       */
+/*      similarity, cap at min(cap_matches, top_k));                        */
+/*   6. Copy aggregated matches into the caller's out_matches buffer        */
+/*      (entry.embedding floats deep-copied into out_embeddings; other      */
+/*      pointer fields alias into per-slot recv buffers that stay alive     */
+/*      until _destroy()); fire the completion callback with the count.    */
+/*                                                                          */
+/* Memory lifetime: out_matches[i].entry.embedding points into the caller-  */
+/* owned out_embeddings buffer (safe past _destroy). All other pointer     */
+/* fields (response, embedding_model, response_model, attestation) ALIAS    */
+/* into query-owned recv buffers and BECOME INVALID after _destroy. The     */
+/* caller MUST finish reading aggregated matches before calling _destroy.   */
+/*                                                                          */
+/* The query_t is caller-allocated; MUST be destroyed BEFORE the underlying */
+/* transport — same convention as publish, dht bootstrap_entries, and       */
+/* dht pending_dials. */
+/* ------------------------------------------------------------------------ */
+
+/* Maximum query fanout. Bounds the DHT lookup tail and the per-query heap */
+/* footprint. 8 matches publish's MAX_REPLICATION; the two layers use      */
+/* the same upper envelope so a single transport+dht can host both. */
+#define ANTS_SEMANTIC_CACHE_QUERY_MAX_FANOUT 8u
+
+/* Default query fanout when caller passes 0. Mirrors the write-protocol    */
+/* default replication factor — three shard-holders is the typical lookup   */
+/* breadth too. */
+#define ANTS_SEMANTIC_CACHE_QUERY_DEFAULT_FANOUT 3u
+
+/* Opaque query context. Sized to fit:
+ *   - 16 KiB embedded ants_dht_lookup_t
+ *   - 8 slots × (ants_dht_peer_t + scalars + heap-ptr bookkeeping)
+ *   - Bookkeeping (magic, phase, callback, heap-pointers for request CBOR
+ *     and caller-buffer aliases)
+ * Headroom is conservative; the .c file pins the exact bound via the
+ * compile-time-assertion idiom shared with the rest of the codebase. */
+#define ANTS_SEMANTIC_CACHE_QUERY_CTX_SIZE 32768
+
+typedef union {
+    uint8_t _opaque[ANTS_SEMANTIC_CACHE_QUERY_CTX_SIZE];
+    uint64_t _align;
+} ants_semantic_cache_query_t;
+
+/*
+ * Completion callback. Invoked exactly once, from inside _tick or one of
+ * the _handle_* event hooks, on the same thread that drove the state
+ * machine forward. After this fires the caller's out_matches buffer holds
+ * the aggregated result (first n_matches entries valid). The query_t is
+ * logically done; the caller may safely _destroy it (and reuse the buffer)
+ * at any point AFTER reading out_matches.
+ *
+ * status:
+ *   ANTS_OK                       — at least one peer responded; out_matches
+ *                                   holds n_matches aggregated entries
+ *                                   (n_matches MAY be 0 if peers responded
+ *                                   with empty match lists — that is a
+ *                                   legitimate "cache miss above threshold"
+ *                                   result, not a failure);
+ *   ANTS_ERROR_PEER_UNREACHABLE   — DHT lookup returned no peers, or every
+ *                                   peer failed (dial / handshake / stream
+ *                                   reset / connection drop / decode error);
+ *   ANTS_ERROR_*                  — internal failure (request encode,
+ *                                   shard-key derivation, heap exhaustion).
+ *
+ * peers_responded: number of peers that returned a decodable response
+ * (regardless of how many matches each one had). May be 0 < responded <
+ * fanout when partial query succeeds.
+ *
+ * n_matches: number of entries written into out_matches (0 ≤ n_matches ≤
+ * min(cap_matches, top_k>0?top_k:∞)).
+ */
+typedef void (*ants_semantic_cache_query_complete_fn_t)(ants_error_t status,
+                                                        uint32_t peers_responded,
+                                                        size_t n_matches,
+                                                        void *user_ctx);
+
+/*
+ * Initialise + start a query.
+ *
+ * The query takes the consumer's embedding, derives the LSH shard_key,
+ * issues a DHT lookup, and fans the encoded lookup_request out to the
+ * top `fanout` peers in parallel. Each peer responds with up to
+ * HANDLE_LOOKUP_SERVER_CAP matches; the query aggregates across peers and
+ * writes the top-K into the caller's buffers before firing complete_fn.
+ *
+ * embedding:           ANTS_EMBED_DIM L2-normalised float32 values
+ * similarity_threshold: minimum cosine similarity for a match (forwarded
+ *                       to each peer in the lookup_request)
+ * top_k:               0 = unbounded (cap_matches is the only limit);
+ *                       otherwise the aggregator returns at most top_k
+ * hamming_radius:      0..ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS (3)
+ * fanout:              0 = use ANTS_SEMANTIC_CACHE_QUERY_DEFAULT_FANOUT;
+ *                       > MAX_FANOUT rejected
+ * out_matches:         caller buffer for at most cap_matches matches
+ * out_embeddings:      contiguous buffer of cap_matches × ANTS_EMBED_DIM
+ *                       floats; each match.entry.embedding points into
+ *                       out_embeddings[i * ANTS_EMBED_DIM] after completion
+ * cap_matches:         capacity of both caller buffers (MUST be > 0)
+ *
+ * Returns:
+ *   ANTS_OK                       — query queued; completion fires later;
+ *   ANTS_ERROR_INVALID_ARG        — NULL args, NULL embedding, cap_matches
+ *                                   == 0, fanout > MAX_FANOUT,
+ *                                   hamming_radius > MAX_HAMMING_RADIUS;
+ *   ANTS_ERROR_MALFORMED          — request encode failed (heap exhaustion
+ *                                   or internal CBOR error);
+ *   ANTS_ERROR_BUFFER_TOO_SMALL   — too many concurrent lookups in the
+ *                                   underlying dht for a new one to start.
+ */
+ants_error_t ants_semantic_cache_query_init(ants_semantic_cache_query_t *query,
+                                            ants_dht_t *dht,
+                                            ants_transport_t *transport,
+                                            const float embedding[ANTS_EMBED_DIM],
+                                            float similarity_threshold,
+                                            uint32_t top_k,
+                                            uint32_t hamming_radius,
+                                            uint32_t fanout,
+                                            ants_semantic_cache_lookup_match_t *out_matches,
+                                            float *out_embeddings,
+                                            size_t cap_matches,
+                                            ants_semantic_cache_query_complete_fn_t complete_fn,
+                                            void *complete_ctx);
+
+/*
+ * Drive the query state machine forward. Should be invoked from the same
+ * loop that ticks the transport + dht. Issues dial requests after the
+ * DHT lookup completes; event-driven transitions (CONN_READY, STREAM_FIN,
+ * etc.) are handled from _handle_transport_event.
+ *
+ * Returns ANTS_OK on success, including no-op cases for already-completed
+ * queries or zeroed ctxs.
+ */
+ants_error_t ants_semantic_cache_query_tick(ants_semantic_cache_query_t *query);
+
+/*
+ * Forward a DHT event to the query state machine. The query consumes
+ * LOOKUP_COMPLETE / LOOKUP_TIMEOUT events whose `lookup` pointer matches
+ * its internal lookup handle; all other events are ignored. Safe to call
+ * from inside the caller's dht event_fn.
+ */
+ants_error_t ants_semantic_cache_query_handle_dht_event(ants_semantic_cache_query_t *query,
+                                                        const ants_dht_event_t *event);
+
+/*
+ * Forward a transport event to the query state machine. The query
+ * consumes events whose `conn` or `stream` pointer matches one of its
+ * heap-owned per-slot handles; all other events are ignored. Safe to
+ * call from inside the caller's transport event_fn.
+ */
+ants_error_t ants_semantic_cache_query_handle_transport_event(ants_semantic_cache_query_t *query,
+                                                              const ants_transport_event_t *event);
+
+/*
+ * Cancel + free a query. Cancels any in-flight DHT lookup, closes any
+ * in-flight streams + connections, frees the encoded request CBOR + all
+ * per-slot recv/decoded heaps. Idempotent: safe on a zeroed (never-
+ * initialised) ctx or on a completed query.
+ *
+ * After _destroy fires the caller's out_matches aliased pointer fields
+ * (response, embedding_model, response_model, attestation) BECOME
+ * INVALID — only entry.embedding (which points into the caller-owned
+ * out_embeddings) remains usable. Read the matches BEFORE _destroy.
+ *
+ * No completion callback fires from _destroy — the caller has already
+ * elected to stop waiting.
+ *
+ * MUST NOT be called from inside the query's own completion callback
+ * or from inside an event-forwarding entry point (defer to the next
+ * tick).
+ */
+ants_error_t ants_semantic_cache_query_destroy(ants_semantic_cache_query_t *query);
+
+/* ------------------------------------------------------------------------ */
 /* Server-side stream dispatch (RFC-0002 §Write protocol, §Lookup protocol) */
 /*                                                                          */
 /* The publish + query sides (steps 7b/7c) replicate or fetch records over  */

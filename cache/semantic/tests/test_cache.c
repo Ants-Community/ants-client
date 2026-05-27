@@ -2384,6 +2384,7 @@ typedef struct {
     ants_dht_t *dht;
     ants_semantic_cache_server_t *cache_server;
     ants_semantic_cache_publish_t *publish;
+    ants_semantic_cache_query_t *query;
     int conn_ready;
     int stream_opened;
 } test_e2e_endpoint_t;
@@ -2400,6 +2401,9 @@ static ants_error_t test_e2e_transport_event_fn(const ants_transport_event_t *ev
     if (e->publish) {
         (void)ants_semantic_cache_publish_handle_transport_event(e->publish, ev);
     }
+    if (e->query) {
+        (void)ants_semantic_cache_query_handle_transport_event(e->query, ev);
+    }
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         e->conn_ready++;
     } else if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
@@ -2413,6 +2417,9 @@ static ants_error_t test_e2e_dht_event_fn(const ants_dht_event_t *ev, void *ctx)
     test_e2e_endpoint_t *e = (test_e2e_endpoint_t *)ctx;
     if (e->publish) {
         (void)ants_semantic_cache_publish_handle_dht_event(e->publish, ev);
+    }
+    if (e->query) {
+        (void)ants_semantic_cache_query_handle_dht_event(e->query, ev);
     }
     return ANTS_OK;
 }
@@ -2637,6 +2644,618 @@ static void test_cache_server_ignores_foreign_streams(void)
     CHECK_EQ(ants_semantic_cache_destroy(&cache), ANTS_OK);
 }
 
+/* -- cache_query unit tests (step 7c) -------------------------------------
+ *
+ * Mirror the cache_publish unit tests. NULL-arg validation, bounds-check
+ * on fanout / hamming_radius / cap_matches, zero-ctx safety, and the
+ * empty-routing-table shortcut that completes synchronously with
+ * PEER_UNREACHABLE from inside the DHT event_fn.
+ *
+ * The full-network E2E test (test_query_end_to_end_one_peer) lives after
+ * these unit checks and exercises the dial → request → response → decode
+ * → aggregate → completion pipeline over real QUIC. */
+
+typedef struct {
+    bool fired;
+    ants_error_t status;
+    uint32_t peers_responded;
+    size_t n_matches;
+} test_query_recorder_t;
+
+static void
+test_query_complete_fn(ants_error_t status, uint32_t peers_responded, size_t n_matches, void *ctx)
+{
+    test_query_recorder_t *r = (test_query_recorder_t *)ctx;
+    r->fired = true;
+    r->status = status;
+    r->peers_responded = peers_responded;
+    r->n_matches = n_matches;
+}
+
+typedef struct {
+    ants_semantic_cache_query_t *query;
+    int dht_events_seen;
+} test_query_dht_ctx_t;
+
+static ants_error_t test_query_dht_event_fn(const ants_dht_event_t *ev, void *ctx)
+{
+    test_query_dht_ctx_t *c = (test_query_dht_ctx_t *)ctx;
+    c->dht_events_seen++;
+    if (c->query) {
+        (void)ants_semantic_cache_query_handle_dht_event(c->query, ev);
+    }
+    return ANTS_OK;
+}
+
+static void test_query_null_args(void)
+{
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dummy_d = {{0}};
+    ants_semantic_cache_query_t q = {{0}};
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8801, emb);
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+    test_query_recorder_t rec = {0};
+
+    /* Every NULL pointer arg is INVALID_ARG. */
+    CHECK_EQ(ants_semantic_cache_query_init(NULL,
+                                            &dummy_d,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            NULL,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dummy_d,
+                                            NULL,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dummy_d,
+                                            &dummy_t,
+                                            NULL,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dummy_d,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            NULL,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dummy_d,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            NULL,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dummy_d,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            NULL,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Tick / handle_* / destroy reject NULL state arg. */
+    CHECK_EQ(ants_semantic_cache_query_tick(NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_destroy(NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_handle_dht_event(NULL, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_semantic_cache_query_handle_transport_event(NULL, NULL), ANTS_ERROR_INVALID_ARG);
+    ants_dht_event_t dev = {0};
+    CHECK_EQ(ants_semantic_cache_query_handle_dht_event(&q, NULL), ANTS_ERROR_INVALID_ARG);
+    (void)dev;
+    CHECK_EQ(ants_semantic_cache_query_handle_transport_event(&q, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_query_invalid_bounds(void)
+{
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_query_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_query_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8802, emb);
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+    ants_semantic_cache_query_t q = {{0}};
+    test_query_recorder_t rec = {0};
+
+    /* cap_matches == 0 is rejected. */
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            1,
+                                            out_matches,
+                                            out_embeddings,
+                                            0,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* hamming_radius > MAX is rejected. */
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            ANTS_SEMANTIC_CACHE_MAX_HAMMING_RADIUS + 1,
+                                            1,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* fanout > MAX_FANOUT is rejected. */
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            ANTS_SEMANTIC_CACHE_QUERY_MAX_FANOUT + 1,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* fanout == 0 falls back to the default — accepted. */
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            0,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_query_destroy(&q), ANTS_OK);
+
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_query_destroy_safe_on_zero_ctx(void)
+{
+    /* Destroy + tick + handle_* are no-ops on a never-initialised query. */
+    ants_semantic_cache_query_t q = {{0}};
+    CHECK_EQ(ants_semantic_cache_query_destroy(&q), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_query_tick(&q), ANTS_OK);
+    ants_dht_event_t dev = {0};
+    CHECK_EQ(ants_semantic_cache_query_handle_dht_event(&q, &dev), ANTS_OK);
+    ants_transport_event_t tev = {0};
+    CHECK_EQ(ants_semantic_cache_query_handle_transport_event(&q, &tev), ANTS_OK);
+}
+
+static void test_query_no_peers_completes_with_peer_unreachable(void)
+{
+    /* Empty routing table → ants_dht_lookup fires LOOKUP_COMPLETE with 0
+     * peers on the first dht_tick. The query state machine sees 0
+     * candidates, transitions to DELIVER with slot_count = 0, and the
+     * maybe_complete check fires PEER_UNREACHABLE synchronously. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_query_dht_ctx_t dht_ctx = {0};
+
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_query_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8803, emb);
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+
+    ants_semantic_cache_query_t q = {{0}};
+    test_query_recorder_t rec = {0};
+    dht_ctx.query = &q;
+
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            3,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_OK);
+
+    (void)ants_dht_tick(&dht);
+
+    CHECK(rec.fired);
+    CHECK_EQ(rec.status, ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK(rec.peers_responded == 0);
+    CHECK(rec.n_matches == 0);
+
+    /* Idempotency: a second tick does not re-fire. */
+    rec.fired = false;
+    (void)ants_dht_tick(&dht);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_query_destroy(&q), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_query_handle_dht_event_ignores_other_lookup(void)
+{
+    /* A LOOKUP_COMPLETE event whose `lookup` pointer is NOT our internal
+     * lookup must be a silent no-op. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_query_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_query_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8804, emb);
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+
+    ants_semantic_cache_query_t q = {{0}};
+    test_query_recorder_t rec = {0};
+    /* Intentionally NOT wiring dht_ctx.query — synthetic event below. */
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            3,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_OK);
+
+    ants_dht_lookup_t alien_lookup = {{0}};
+    ants_dht_event_t alien_ev;
+    memset(&alien_ev, 0, sizeof alien_ev);
+    alien_ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
+    alien_ev.lookup = &alien_lookup;
+    alien_ev.peers = NULL;
+    alien_ev.peer_count = 0;
+    CHECK_EQ(ants_semantic_cache_query_handle_dht_event(&q, &alien_ev), ANTS_OK);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_query_destroy(&q), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+static void test_query_handle_transport_event_ignores_other_stream(void)
+{
+    /* Transport events whose conn/stream don't match any slot of ours
+     * must be silent no-ops. */
+    ants_transport_t dummy_t = {{0}};
+    ants_dht_t dht = {{0}};
+    test_query_dht_ctx_t dht_ctx = {0};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &dummy_t;
+    dcfg.event_fn = test_query_dht_event_fn;
+    dcfg.event_ctx = &dht_ctx;
+    CHECK_EQ(ants_dht_init(&dht, &dcfg), ANTS_OK);
+
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(8805, emb);
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+
+    ants_semantic_cache_query_t q = {{0}};
+    test_query_recorder_t rec = {0};
+    CHECK_EQ(ants_semantic_cache_query_init(&q,
+                                            &dht,
+                                            &dummy_t,
+                                            emb,
+                                            0.9f,
+                                            10,
+                                            0,
+                                            3,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_OK);
+
+    ants_transport_conn_t alien_conn = {{0}};
+    ants_transport_stream_t alien_stream = {{0}};
+    ants_transport_event_t alien_ev;
+    memset(&alien_ev, 0, sizeof alien_ev);
+    alien_ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
+    alien_ev.conn = &alien_conn;
+    alien_ev.stream = &alien_stream;
+    CHECK_EQ(ants_semantic_cache_query_handle_transport_event(&q, &alien_ev), ANTS_OK);
+    CHECK(!rec.fired);
+
+    CHECK_EQ(ants_semantic_cache_query_destroy(&q), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dht), ANTS_OK);
+}
+
+/* -- End-to-end two-peer query (step 7c) ----------------------------------
+ *
+ * Full happy-path of the query state machine over real QUIC:
+ *   A bootstraps to B, B announces a shard + put_records a signed entry
+ *   for that shard, A.query drives lookup → dial → bidi-stream send →
+ *   B's cache_server decodes the lookup_request → runs get_topk →
+ *   encodes the lookup_response → FIN-closes the stream → A's query
+ *   decodes the response, aggregates, fires completion with n_matches=1.
+ *
+ * Exercises:
+ *   - DHT server tolerance for non-DHT inbound streams (cache request
+ *     map(4) is not a DHT envelope; DHT silently releases its slot).
+ *   - cache_server.c lookup-request dispatch (map(4) → handle_inbound_
+ *     lookup → response encode → stream_send + FIN).
+ *   - cache_query.c response accumulator + decode + aggregation.
+ *   - Aliased pointer fields surviving across the slot's recv_buf
+ *     lifetime (read before _destroy).
+ */
+static void test_query_end_to_end_one_peer(void)
+{
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x22, sizeof a_priv);
+    memset(b_priv, 0xDD, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_e2e_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_e2e_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_e2e_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_e2e_transport_event_fn;
+    acfg.event_ctx = &a_ep;
+    acfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_e2e_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_e2e_transport_event_fn;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_e2e_dht_event_fn;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_ctx = &b_ep;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_semantic_cache_t ca = {{0}};
+    ants_semantic_cache_t cb = {{0}};
+    ants_semantic_cache_config_t ccfg = {0};
+    CHECK_EQ(ants_semantic_cache_init(&ca, &ccfg), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_init(&cb, &ccfg), ANTS_OK);
+
+    ants_semantic_cache_server_t srva = {{0}};
+    ants_semantic_cache_server_t srvb = {{0}};
+    CHECK_EQ(ants_semantic_cache_server_init(&srva, &ca), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_init(&srvb, &cb), ANTS_OK);
+    a_ep.cache_server = &srva;
+    b_ep.cache_server = &srvb;
+
+    /* A bootstraps to B (A's routing table will contain B with
+     * multiaddr=baddr after CONN_READY + self-FIND_NODE). */
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+
+    for (int i = 0; i < 500; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        if (ants_dht_routing_table_size(&da) >= 1) {
+            break;
+        }
+    }
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    /* Construct the entry that B will hold + the matching query
+     * embedding. We use the same embedding for both — similarity 1.0,
+     * well above the 0.9 threshold. */
+    float emb[ANTS_EMBED_DIM];
+    make_random_embedding(98777, emb);
+    ants_semantic_cache_entry_t entry;
+    fill_signed_test_entry(&entry, emb, "the cached response for query", "test-model-v1", b_priv);
+
+    /* B stores the record locally + announces the shard so A's lookup
+     * resolves to B. */
+    CHECK_EQ(ants_semantic_cache_put_record(&cb, &entry), ANTS_OK);
+    ants_semantic_cache_shard_key_t shard_key = 0;
+    CHECK_EQ(ants_semantic_cache_shard_key(emb, &shard_key), ANTS_OK);
+    CHECK_EQ(ants_dht_announce(&db, shard_key), ANTS_OK);
+
+    /* Drive the query state machine to completion. */
+    ants_semantic_cache_query_t query = {{0}};
+    test_query_recorder_t rec = {0};
+    ants_semantic_cache_lookup_match_t out_matches[4];
+    float out_embeddings[4 * ANTS_EMBED_DIM];
+    memset(out_matches, 0, sizeof out_matches);
+    memset(out_embeddings, 0, sizeof out_embeddings);
+    a_ep.query = &query;
+    CHECK_EQ(ants_semantic_cache_query_init(&query,
+                                            &da,
+                                            &ta,
+                                            emb,
+                                            0.9f /* threshold */,
+                                            10 /* top_k */,
+                                            0 /* hamming_radius */,
+                                            1 /* fanout = single peer */,
+                                            out_matches,
+                                            out_embeddings,
+                                            4,
+                                            test_query_complete_fn,
+                                            &rec),
+             ANTS_OK);
+
+    for (int i = 0; i < 1000; i++) {
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        (void)ants_semantic_cache_query_tick(&query);
+        if (rec.fired) {
+            break;
+        }
+    }
+
+    CHECK(rec.fired);
+    CHECK_EQ(rec.status, ANTS_OK);
+    CHECK(rec.peers_responded == 1);
+    CHECK(rec.n_matches == 1);
+
+    /* Inspect the aggregated match: similarity ≈ 1.0 (same embedding
+     * each side), producer == b_pub, response payload matches what B
+     * stored. The response bytes alias into the query's slot recv_buf
+     * which is still alive (we haven't destroyed yet). */
+    CHECK(out_matches[0].similarity > 0.99f);
+    CHECK(memcmp(out_matches[0].entry.producer, b_pub, ANTS_SEMANTIC_CACHE_PEER_ID_LEN) == 0);
+    CHECK(out_matches[0].entry.response_len == strlen("the cached response for query"));
+    CHECK(memcmp(out_matches[0].entry.response,
+                 "the cached response for query",
+                 out_matches[0].entry.response_len) == 0);
+    /* The embedding was deep-copied into the caller-owned out_embeddings
+     * slot 0 and the entry pointer was re-pointed there. */
+    CHECK(out_matches[0].entry.embedding == &out_embeddings[0]);
+
+    /* Teardown order: transport first (so its CONN_CLOSED callbacks fan
+     * out to query + dht + cache_server while all are alive), then drop
+     * query (frees the slot's recv_buf — aliased pointers in out_matches
+     * become invalid past this point), then rest. */
+    a_ep.query = NULL;
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_query_destroy(&query), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srva), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_server_destroy(&srvb), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_destroy(&ca), ANTS_OK);
+    CHECK_EQ(ants_semantic_cache_destroy(&cb), ANTS_OK);
+}
+
 int main(void)
 {
     test_protocol_constants();
@@ -2718,6 +3337,14 @@ int main(void)
     test_cache_server_safe_on_zero_ctx();
     test_cache_server_ignores_foreign_streams();
     test_publish_end_to_end_one_peer();
+
+    test_query_null_args();
+    test_query_invalid_bounds();
+    test_query_destroy_safe_on_zero_ctx();
+    test_query_no_peers_completes_with_peer_unreachable();
+    test_query_handle_dht_event_ignores_other_lookup();
+    test_query_handle_transport_event_ignores_other_stream();
+    test_query_end_to_end_one_peer();
 
     if (failures > 0) {
         fprintf(stderr, "test_cache: %d failure(s)\n", failures);

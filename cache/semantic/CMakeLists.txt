@@ -11,6 +11,7 @@
 add_library(ants_semantic_cache STATIC
     src/cache.c
     src/cache_publish.c
+    src/cache_query.c
     src/cache_server.c
     src/cache_wire.c
 )
