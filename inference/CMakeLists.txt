@@ -9,4 +9,4 @@
 add_subdirectory(kernels)
 
 # Component #13 — Inference orchestration  (4 EM)
-# add_subdirectory(orchestration)
+add_subdirectory(orchestration)
