@@ -3,7 +3,7 @@
 Inference orchestration. Inference layer.
 **On the critical path.**
 
-**Status:** pending claim.
+**Status:** scaffold landed (BDFL interim primary; claim still open). Full API surface + opaque ctx + protocol constants in `include/ants_inference.h`; every entry point stubbed (argument validation + `ANTS_ERROR_NOT_IMPLEMENTED`). Per-surface implementation lands in subsequent PRs: commit-at-send (leaf/Merkle hashing, commit encode/decode/sign) → anti-grinding challenge derivation → betting e-process (init/update + discrepancy scoring) → serving runtime + audit capstone.
 **Effort:** 4 EM.
 **Spec:** [RFC-0003 v0.2](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0003-verification.md), [RFC-0009 v0.5](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0009-canonical-numerics.md).
 **Dependencies:** `inference/kernels`, `cache/embedding`, `cache/semantic`, `reputation/crdt`, `reputation/identity`.
