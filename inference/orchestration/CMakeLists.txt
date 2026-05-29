@@ -3,11 +3,11 @@
 # Spec: RFC-0003 v0.2 + RFC-0009 v0.5.
 # Effort: 4 EM.
 #
-# Status: scaffold. The full public API surface (ants_inference.h) is laid
-# down with every entry point stubbed — argument validation runs, then the
-# function returns ANTS_ERROR_NOT_IMPLEMENTED. Per-surface implementation
-# PRs replace the stub bodies in turn:
-#   1. commit-at-send       (leaf/Merkle hashing, commit encode/decode/sign)
+# Status: surface 1 implemented. The full public API surface
+# (ants_inference.h) is laid down; the commit-at-send surface has a real
+# implementation, the other three still validate arguments and return
+# ANTS_ERROR_NOT_IMPLEMENTED until their PRs land:
+#   1. commit-at-send       (leaf/Merkle hashing, commit encode/decode/sign) — DONE
 #   2. challenge derivation (the three beacon-bound PRF derivations)
 #   3. betting e-process    (init/update + discrepancy scoring)
 #   4. serving runtime      (init/destroy/serve + the audit capstone)
@@ -30,14 +30,19 @@ target_include_directories(ants_inference
 target_link_libraries(ants_inference
     PUBLIC
         ants_canon
+    PRIVATE
+        ants_crypto
+        ants_cbor
 )
 
 # ants_crypto (#1) — BLAKE3 leaf/Merkle hashing and Ed25519 commit signing —
-# becomes a PRIVATE dependency once the commit-at-send implementation PR
-# lands. Not linked yet: the scaffold stubs reference no crypto symbols, and
-# (per the kernels component's precedent with ggml) we don't link what we
-# don't yet use. libm follows the same rule — added with the e-process /
-# discrepancy softmax implementation, guarded the usual NOT MSVC AND NOT APPLE.
+# and ants_cbor (#2) — the canonical commit encode/decode — are PRIVATE
+# dependencies of the commit-at-send surface: orchestration.c calls their
+# symbols directly, so they are linked explicitly rather than leaned on
+# transitively (ants_canon already brings ants_cbor PUBLIC, but we link what
+# we use). libm still follows the don't-link-what-you-don't-use rule — it
+# joins with the e-process / discrepancy softmax implementation, guarded the
+# usual NOT MSVC AND NOT APPLE.
 
 target_compile_features(ants_inference PUBLIC c_std_99)
 
@@ -45,6 +50,12 @@ target_compile_features(ants_inference PUBLIC c_std_99)
 
 if(BUILD_TESTING)
     add_executable(test_orchestration tests/test_orchestration.c)
-    target_link_libraries(test_orchestration PRIVATE ants_inference)
+    # ants_crypto is a PRIVATE dep of ants_inference, so it is NOT re-exported
+    # to the test; the commit-at-send tests recompute BLAKE3 leaf/node hashes
+    # and Ed25519 signatures independently, so the test links it directly.
+    # ants_cbor (for ants_cbor_is_canonical) arrives transitively through
+    # ants_canon's PUBLIC link — the same path that already supplies
+    # ants_strerror and the q24 types — so linking it again here is redundant.
+    target_link_libraries(test_orchestration PRIVATE ants_inference ants_crypto)
     add_test(NAME orchestration_basic COMMAND test_orchestration)
 endif()

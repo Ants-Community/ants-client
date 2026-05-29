@@ -55,11 +55,13 @@
  * caller-owns-state discipline established by foundation/, network/,
  * cache/, and inference/kernels/.
  *
- * Status (this PR — scaffold): every entry point is declared with its
- * full contract but returns ANTS_ERROR_NOT_IMPLEMENTED (or, for the
- * pure predicates, leaves outputs untouched and returns NOT_IMPLEMENTED)
- * until the per-surface implementation PRs land. The header is the
- * reviewable API-design artifact; the contract tests pin the shapes.
+ * Status: surface 1 (commit-at-send) is implemented — leaf hashing,
+ * Merkle root/prove/verify, the canonical CBOR commit codec, and Ed25519
+ * sign/verify over that encoding. Surfaces 2–4 (challenge derivation, the
+ * betting e-process, the serving runtime) are declared with their full
+ * contracts but still return ANTS_ERROR_NOT_IMPLEMENTED until their
+ * implementation PRs land. The tests pin both the live behavior and the
+ * pending-stub contracts.
  */
 
 #ifndef ANTS_INFERENCE_H
@@ -244,6 +246,12 @@ typedef struct {
     uint8_t tier;
 } ants_inference_commit_t;
 
+/* Upper bound on the canonical CBOR encoding of a commit. The encoding is a
+ * 10-pair map (five 32-byte strings + five integers ≤ u64); the worst-case
+ * length is ~211 bytes. 256 leaves headroom and lets sign/verify stage the
+ * encoding on a fixed stack buffer with no allocation. */
+#define ANTS_INFERENCE_COMMIT_ENCODED_MAX 256
+
 /*
  * Hash one per-position leaf: leaf = BLAKE3(0x00 ‖ dist_bytes ‖ LE64(position)).
  *
@@ -254,8 +262,7 @@ typedef struct {
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL dist_bytes/out_leaf or zero dist_len;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL dist_bytes/out_leaf or zero dist_len.
  */
 ants_error_t ants_inference_leaf_hash(const uint8_t *dist_bytes,
                                       size_t dist_len,
@@ -268,8 +275,7 @@ ants_error_t ants_inference_leaf_hash(const uint8_t *dist_bytes,
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL leaves/out_root or n_leaves == 0;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL leaves/out_root, n_leaves == 0, or n_leaves too large.
  */
 ants_error_t ants_inference_merkle_root(const uint8_t (*leaves)[ANTS_INFERENCE_MERKLE_LEAF_SIZE],
                                         size_t n_leaves,
@@ -287,8 +293,7 @@ ants_error_t ants_inference_merkle_root(const uint8_t (*leaves)[ANTS_INFERENCE_M
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG — NULL pointers, n_leaves == 0, or index >= n_leaves;
- *   ANTS_ERROR_BUFFER_TOO_SMALL — out_path_cap too small for the proof;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — out_path_cap too small for the proof.
  */
 ants_error_t ants_inference_merkle_prove(const uint8_t (*leaves)[ANTS_INFERENCE_MERKLE_LEAF_SIZE],
                                          size_t n_leaves,
@@ -309,8 +314,7 @@ ants_error_t ants_inference_merkle_prove(const uint8_t (*leaves)[ANTS_INFERENCE_
  * Returns:
  *   ANTS_OK — verification ran; consult *out_ok for the result;
  *   ANTS_ERROR_INVALID_ARG — NULL pointers, n_leaves == 0, index >= n_leaves,
- *     or path_len inconsistent with the tree shape;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *     or path_len inconsistent with the tree shape.
  */
 ants_error_t ants_inference_merkle_verify(const uint8_t leaf[ANTS_INFERENCE_MERKLE_LEAF_SIZE],
                                           size_t index,
@@ -333,8 +337,7 @@ ants_error_t ants_inference_merkle_verify(const uint8_t leaf[ANTS_INFERENCE_MERK
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG — NULL pointers;
- *   ANTS_ERROR_BUFFER_TOO_SMALL — out_cap too small;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — out_cap too small.
  */
 ants_error_t ants_inference_commit_encode(const ants_inference_commit_t *commit,
                                           uint8_t *out,
@@ -343,17 +346,19 @@ ants_error_t ants_inference_commit_encode(const ants_inference_commit_t *commit,
 
 /*
  * Decode a canonical commit encoding produced by
- * `ants_inference_commit_encode`. Rejects non-canonical encodings
- * (out-of-order keys, indefinite lengths, trailing bytes) with
- * ANTS_ERROR_NON_CANONICAL — the audit path must not accept ambiguous
- * commits.
+ * `ants_inference_commit_encode`. The strict codec rejects anything the
+ * audit path must not treat as an unambiguous commit: a §4.2.1 violation
+ * (out-of-order map keys, non-shortest-form integers) surfaces as
+ * ANTS_ERROR_NON_CANONICAL; a structural problem (not a 10-pair map, a
+ * field of the wrong type or length, an out-of-range integer, indefinite
+ * lengths, or trailing bytes after the map) surfaces as
+ * ANTS_ERROR_MALFORMED.
  *
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG — NULL pointers or zero in_len;
- *   ANTS_ERROR_MALFORMED — not valid CBOR / structurally wrong;
- *   ANTS_ERROR_NON_CANONICAL — valid CBOR but not canonical;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_MALFORMED — not valid CBOR / structurally wrong / trailing bytes;
+ *   ANTS_ERROR_NON_CANONICAL — valid CBOR but violates canonical form.
  */
 ants_error_t
 ants_inference_commit_decode(const uint8_t *in, size_t in_len, ants_inference_commit_t *out);
@@ -365,8 +370,7 @@ ants_inference_commit_decode(const uint8_t *in, size_t in_len, ants_inference_co
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers.
  */
 ants_error_t ants_inference_commit_sign(const ants_inference_commit_t *commit,
                                         const uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE],
@@ -379,8 +383,7 @@ ants_error_t ants_inference_commit_sign(const ants_inference_commit_t *commit,
  *
  * Returns:
  *   ANTS_OK — verification ran; consult *out_ok;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers.
  */
 ants_error_t ants_inference_commit_verify_sig(const ants_inference_commit_t *commit,
                                               const uint8_t pub[ANTS_INFERENCE_PUBKEY_SIZE],
