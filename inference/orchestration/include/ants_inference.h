@@ -401,16 +401,32 @@ ants_error_t ants_inference_commit_verify_sig(const ants_inference_commit_t *com
 /* ======================================================================== */
 
 /*
- * Decide whether this answer is audited:
- *   audited  ⇔  PRF(beacon ‖ root ‖ "sel")  <  audit_threshold
- * where the PRF output is interpreted as a 64-bit big-endian integer and
- * `audit_threshold` is the commit's floor(p · 2^64). The verdict is
- * written to `*out_audited`.
+ * Shared keystream (all three derivations). The PRF is BLAKE3 over
+ *   seed = beacon ‖ root ‖ tag   (tag = the context string with no
+ * terminator: "sel" / "pos" / "aud", three bytes each). BLAKE3 here exposes
+ * a 32-byte digest and no XOF, so an arbitrarily long keystream is built in
+ * counter mode and read as 64-bit big-endian words:
+ *   block(i)  = BLAKE3( seed ‖ LE64(i) ),   i = 0, 1, 2, …
+ *   keystream = block(0) ‖ block(1) ‖ …
+ *   W_k       = bytes [8k, 8k+8) of the keystream, big-endian.
+ * Big-endian word reads match the "interpret the PRF output as a big-endian
+ * integer" convention already used by audit_threshold. This pins the mixing
+ * the scaffold left open, for byte-for-byte agreement with independent
+ * implementations — DRAFT pending RFC-0003 / RFC-0008 formalization.
+ */
+
+/*
+ * Decide whether this answer is audited, from the "sel" keystream:
+ *   audited  ⇔  W_0  <  audit_threshold
+ * where W_0 is the first 64-bit big-endian keystream word and
+ * `audit_threshold` is the commit's floor(p · 2^64) — so the answer is
+ * audited with probability ≈ p. A threshold of 0 never audits; the maximum
+ * threshold audits every outcome except the single W_0 == UINT64_MAX. The
+ * verdict is written to `*out_audited`.
  *
  * Returns:
  *   ANTS_OK — decision computed; consult *out_audited;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers.
  */
 ants_error_t
 ants_inference_challenge_is_audited(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
@@ -419,20 +435,25 @@ ants_inference_challenge_is_audited(const uint8_t beacon[ANTS_INFERENCE_BEACON_S
                                     bool *out_audited);
 
 /*
- * Derive the strided position set S to open: `m` distinct positions in
- * [0, length) expanded deterministically from PRF(beacon ‖ root ‖ "pos").
- * Striding (rather than independent draws) spreads the sample across the
- * answer so a producer cannot cheaply localize fraud to unsampled spans.
+ * Derive the position set S to open from the "pos" keystream. When
+ * m >= length the entire answer is opened (positions 0 .. length-1);
+ * otherwise the m positions are a stratified ("strided") sample of
+ * [0, length): the range is split into m contiguous buckets and one position
+ * is drawn per bucket. Stratifying spreads the sample evenly so a producer
+ * cannot localize fraud to an unsampled span; the per-bucket jitter comes
+ * from the keystream. Because the buckets are disjoint, the positions are
+ * distinct and returned in strictly ascending order.
  *
- * Writes up to `cap` positions into `out_positions` and the count to
- * `*out_count`. When m > length, the whole answer is opened (count =
- * length).
+ *   M = min(m, length);  bucket j = [⌊jL/M⌋, ⌊(j+1)L/M⌋),  0 ≤ j < M;
+ *   position j = ⌊jL/M⌋ + (W_j mod width_j),  width_j = bucket size ≥ 1.
+ *
+ * Writes min(m, length) positions into `out_positions` and that count to
+ * `*out_count`.
  *
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG — NULL pointers, length == 0, or m == 0;
- *   ANTS_ERROR_BUFFER_TOO_SMALL — cap < min(m, length);
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — cap < min(m, length).
  */
 ants_error_t ants_inference_challenge_positions(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
                                                 const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
@@ -443,16 +464,18 @@ ants_error_t ants_inference_challenge_positions(const uint8_t beacon[ANTS_INFERE
                                                 size_t *out_count);
 
 /*
- * Select the assigned verifier: an index in [0, n_verifiers) drawn from
- * PRF(beacon ‖ root ‖ "aud"). The caller maps this index onto the
- * reputation-weighted verifier set (the weighting lives in the
- * reputation component; this function provides the unbiased draw). The
- * index is written to `*out_index`.
+ * Select the assigned verifier: an unbiased index in [0, n_verifiers) drawn
+ * from the "aud" keystream. Successive 64-bit big-endian words W_0, W_1, …
+ * are taken with rejection sampling — the low (2^64 mod n_verifiers)-wide
+ * non-uniform band is rejected — so every index is equiprobable, with no
+ * modulo bias. The caller maps this index onto the reputation-weighted
+ * verifier set (the weighting lives in the reputation component; this
+ * function provides the unbiased draw). The index is written to
+ * `*out_index`.
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers or n_verifiers == 0;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers or n_verifiers == 0.
  */
 ants_error_t ants_inference_challenge_auditor(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
                                               const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],

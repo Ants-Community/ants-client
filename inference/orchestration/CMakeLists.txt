@@ -3,12 +3,12 @@
 # Spec: RFC-0003 v0.2 + RFC-0009 v0.5.
 # Effort: 4 EM.
 #
-# Status: surface 1 implemented. The full public API surface
-# (ants_inference.h) is laid down; the commit-at-send surface has a real
-# implementation, the other three still validate arguments and return
-# ANTS_ERROR_NOT_IMPLEMENTED until their PRs land:
+# Status: surfaces 1-2 implemented. The full public API surface
+# (ants_inference.h) is laid down; the commit-at-send and challenge-derivation
+# surfaces have real implementations, the other two still validate arguments
+# and return ANTS_ERROR_NOT_IMPLEMENTED until their PRs land:
 #   1. commit-at-send       (leaf/Merkle hashing, commit encode/decode/sign) — DONE
-#   2. challenge derivation (the three beacon-bound PRF derivations)
+#   2. challenge derivation (the three beacon-bound PRF derivations) — DONE
 #   3. betting e-process    (init/update + discrepancy scoring)
 #   4. serving runtime      (init/destroy/serve + the audit capstone)
 

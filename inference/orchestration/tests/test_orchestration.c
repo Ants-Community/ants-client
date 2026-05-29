@@ -17,9 +17,17 @@
  *     standalone encode-then-Ed25519-sign), and verify_sig rejects tampered
  *     commits, signatures, and wrong public keys.
  *
- * Surfaces 2–4 (challenge derivation, e-process, serving runtime) are still
- * stubs: their tests pin the API shape, argument validation, and the
- * ANTS_ERROR_NOT_IMPLEMENTED return until their implementing PRs land.
+ * Surface 2 (anti-grinding challenge derivation) is implemented, so its three
+ * entry points are cross-checked against an independent recompute of the
+ * pinned PRF keystream (block(i) = BLAKE3(beacon ‖ root ‖ tag ‖ LE64(i)), read
+ * as big-endian words): is_audited against the exact W_0 < threshold boundary;
+ * positions against a stratified-stride reference (distinct, ascending,
+ * in-range, whole-answer when m >= length); auditor against a replay of the
+ * unbiased rejection sampling (in range, n == 1, deterministic, well-spread).
+ *
+ * Surfaces 3–4 (e-process, serving runtime) are still stubs: their tests pin
+ * the API shape, argument validation, and the ANTS_ERROR_NOT_IMPLEMENTED
+ * return until their implementing PRs land.
  *
  * The remaining checks pin protocol constants, distinct PRF tags, e-process
  * default ranges, and the opaque-context size.
@@ -589,28 +597,153 @@ static void test_commit_verify_sig_contract(void)
 
 /* -- 2. anti-grinding challenge derivation ---------------------------- */
 
+/* Independent recompute of keystream word W_k, mirroring nothing in the
+ * library's streaming reader: hash block(k/4) = BLAKE3(beacon ‖ root ‖ tag ‖
+ * LE64(k/4)) one-shot via streaming, then read word (k%4) big-endian. */
+static uint64_t t_prf_word(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
+                           const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
+                           const char *tag,
+                           uint64_t k)
+{
+    uint64_t block_i = k / 4;
+    int word_in = (int)(k % 4);
+    uint8_t le[8];
+    uint8_t block[32];
+    ants_blake3_ctx_t h;
+    uint64_t w = 0;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        le[i] = (uint8_t)(block_i >> (8 * i));
+    }
+    CHECK_EQ(ants_blake3_init(&h), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, beacon, ANTS_INFERENCE_BEACON_SIZE), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, root, ANTS_INFERENCE_MERKLE_ROOT_SIZE), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, (const uint8_t *)tag, strlen(tag)), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, le, sizeof le), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&h, block), ANTS_OK);
+
+    for (i = 0; i < 8; i++) {
+        w = (w << 8) | block[word_in * 8 + i];
+    }
+    return w;
+}
+
+/* Replay the unbiased rejection sampling independently of the library. */
+static uint64_t t_expected_auditor(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
+                                   const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
+                                   uint64_t n)
+{
+    uint64_t reject_below = ((uint64_t)0 - n) % n;
+    uint64_t k;
+    for (k = 0;; k++) {
+        uint64_t w = t_prf_word(beacon, root, ANTS_INFERENCE_PRF_CONTEXT_AUD, k);
+        if (w >= reject_below) {
+            return w % n;
+        }
+    }
+}
+
+/* Run challenge_positions for one (m, length) and check it against the
+ * independent stratified-stride reference: count, exact per-bucket value,
+ * in-range, strictly ascending (hence distinct). */
+static void check_positions_case(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
+                                 const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
+                                 uint32_t m,
+                                 uint32_t length)
+{
+    uint64_t got[128];
+    size_t count = 999;
+    uint32_t M = (m < length) ? m : length;
+    uint32_t j;
+
+    CHECK(M <= 128);
+    CHECK_EQ(ants_inference_challenge_positions(beacon, root, m, length, got, 128, &count),
+             ANTS_OK);
+    CHECK(count == (size_t)M);
+
+    for (j = 0; j < M; j++) {
+        uint64_t lo = ((uint64_t)j * length) / M;
+        uint64_t hi = (((uint64_t)j + 1u) * length) / M;
+        uint64_t expect;
+        if (m >= length) {
+            expect = j; /* whole answer opened, no keystream draw */
+        } else {
+            uint64_t w = t_prf_word(beacon, root, ANTS_INFERENCE_PRF_CONTEXT_POS, j);
+            expect = lo + (w % (hi - lo));
+        }
+        CHECK(got[j] == expect);
+        CHECK(got[j] < length);
+        if (j > 0) {
+            CHECK(got[j] > got[j - 1]);
+        }
+    }
+}
+
 static void test_challenge_is_audited_contract(void)
 {
-    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE] = {0};
-    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE] = {0};
-    bool audited = false;
+    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE];
+    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
+    bool a1 = false, a2 = false;
+    uint64_t w0, w0b;
+    int i;
 
-    CHECK_EQ(ants_inference_challenge_is_audited(NULL, root, 0, &audited), ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_inference_challenge_is_audited(beacon, NULL, 0, &audited),
-             ANTS_ERROR_INVALID_ARG);
+    for (i = 0; i < 32; i++) {
+        beacon[i] = (uint8_t)(0x10 + i);
+        root[i] = (uint8_t)(0xC0 + i);
+    }
+
+    /* argument validation (permanent) */
+    CHECK_EQ(ants_inference_challenge_is_audited(NULL, root, 0, &a1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, NULL, 0, &a1), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, 0, NULL), ANTS_ERROR_INVALID_ARG);
 
-    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, (uint64_t)1 << 63, &audited),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+    w0 = t_prf_word(beacon, root, ANTS_INFERENCE_PRF_CONTEXT_SEL, 0);
+    CHECK(w0 != UINT64_MAX); /* keeps the boundary cases below well-defined */
+
+    /* threshold 0 never audits */
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, 0, &a1), ANTS_OK);
+    CHECK(!a1);
+
+    /* exact "< threshold" semantics, against the independently recomputed W_0 */
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, w0, &a1), ANTS_OK);
+    CHECK(!a1); /* W_0 < W_0 is false */
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, w0 + 1u, &a1), ANTS_OK);
+    CHECK(a1); /* W_0 < W_0 + 1 is true */
+
+    /* maximum threshold audits (W_0 < UINT64_MAX) */
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, UINT64_MAX, &a1), ANTS_OK);
+    CHECK(a1);
+
+    /* determinism */
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, w0 + 1u, &a2), ANTS_OK);
+    CHECK(a2 == a1);
+
+    /* root binding: a flipped root yields a different W_0 and the decision
+     * tracks it at its own boundary */
+    root[0] ^= 0x01;
+    w0b = t_prf_word(beacon, root, ANTS_INFERENCE_PRF_CONTEXT_SEL, 0);
+    CHECK(w0b != w0);
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, w0b, &a1), ANTS_OK);
+    CHECK(!a1);
+    CHECK_EQ(ants_inference_challenge_is_audited(beacon, root, w0b + 1u, &a1), ANTS_OK);
+    CHECK(a1);
 }
 
 static void test_challenge_positions_contract(void)
 {
-    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE] = {0};
-    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE] = {0};
+    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE];
+    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
     uint64_t positions[8] = {0};
     size_t count = 0;
+    int i;
 
+    for (i = 0; i < 32; i++) {
+        beacon[i] = (uint8_t)(0x21 + i);
+        root[i] = (uint8_t)(0x90 + i);
+    }
+
+    /* argument validation (permanent) */
     CHECK_EQ(ants_inference_challenge_positions(NULL, root, 4, 64, positions, 8, &count),
              ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_challenge_positions(beacon, NULL, 4, 64, positions, 8, &count),
@@ -624,24 +757,80 @@ static void test_challenge_positions_contract(void)
     CHECK_EQ(ants_inference_challenge_positions(beacon, root, 4, 64, positions, 8, NULL),
              ANTS_ERROR_INVALID_ARG);
 
-    CHECK_EQ(ants_inference_challenge_positions(beacon, root, 4, 64, positions, 8, &count),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+    /* BUFFER_TOO_SMALL: cap < min(m, length) */
+    CHECK_EQ(ants_inference_challenge_positions(beacon, root, 4, 64, positions, 3, &count),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK_EQ(ants_inference_challenge_positions(beacon, root, 100, 8, positions, 7, &count),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    /* cap exactly == min(m, length) succeeds */
+    CHECK_EQ(ants_inference_challenge_positions(beacon, root, 4, 64, positions, 4, &count),
+             ANTS_OK);
+    CHECK(count == 4);
+
+    /* behavioral + independent stratified cross-check over several shapes */
+    check_positions_case(beacon, root, 4, 64);
+    check_positions_case(beacon, root, 5, 64);
+    check_positions_case(beacon, root, 1, 64);  /* single bucket = whole range */
+    check_positions_case(beacon, root, 3, 5);   /* uneven bucket widths */
+    check_positions_case(beacon, root, 8, 8);   /* m == length: whole answer */
+    check_positions_case(beacon, root, 100, 8); /* m > length: whole answer */
+    check_positions_case(beacon, root, 7, 7);
+    check_positions_case(beacon, root, 64, 64);
 }
 
 static void test_challenge_auditor_contract(void)
 {
-    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE] = {0};
-    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE] = {0};
-    uint64_t index = 0;
+    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE];
+    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
+    uint64_t index = 0, index2 = 0;
+    const uint64_t ns[] = {1, 2, 3, 7, 100, 1000, ((uint64_t)1 << 32) + 1, ((uint64_t)1 << 63) + 1};
+    size_t t;
+    int i;
 
+    for (i = 0; i < 32; i++) {
+        beacon[i] = (uint8_t)(0x33 + i);
+        root[i] = (uint8_t)(0x77 + i);
+    }
+
+    /* argument validation (permanent) */
     CHECK_EQ(ants_inference_challenge_auditor(NULL, root, 10, &index), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_challenge_auditor(beacon, NULL, 10, &index), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 0, &index),
              ANTS_ERROR_INVALID_ARG); /* n_verifiers == 0 */
     CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 10, NULL), ANTS_ERROR_INVALID_ARG);
 
-    CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 10, &index),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+    /* n == 1 always yields 0 */
+    CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 1, &index), ANTS_OK);
+    CHECK(index == 0);
+
+    /* in range + cross-check against an independent rejection-sampling replay */
+    for (t = 0; t < sizeof ns / sizeof ns[0]; t++) {
+        CHECK_EQ(ants_inference_challenge_auditor(beacon, root, ns[t], &index), ANTS_OK);
+        CHECK(index < ns[t]);
+        CHECK(index == t_expected_auditor(beacon, root, ns[t]));
+    }
+
+    /* determinism */
+    CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 1000, &index), ANTS_OK);
+    CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 1000, &index2), ANTS_OK);
+    CHECK(index == index2);
+
+    /* well-spread: varying the root over n == 2 produces both 0 and 1 (guards
+     * against a stuck/degenerate draw the exact cross-check could share) */
+    {
+        int seen0 = 0, seen1 = 0;
+        for (i = 0; i < 64; i++) {
+            root[0] = (uint8_t)i;
+            CHECK_EQ(ants_inference_challenge_auditor(beacon, root, 2, &index), ANTS_OK);
+            if (index == 0) {
+                seen0 = 1;
+            }
+            if (index == 1) {
+                seen1 = 1;
+            }
+        }
+        CHECK(seen0 && seen1);
+    }
 }
 
 /* -- 3. the betting e-process ----------------------------------------- */
