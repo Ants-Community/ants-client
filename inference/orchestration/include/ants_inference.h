@@ -533,13 +533,14 @@ typedef struct {
 /*
  * Initialize an e-process. `alpha`, `mu0`, `lambda_cap` configure the test
  * (the ANTS_INFERENCE_DEFAULT_* values are the protocol defaults). Capital
- * starts at 1.0, n at 0.
+ * starts at 1.0 and n at 0; mu_hat / var_hat start at a single
+ * pseudo-observation prior (mean 1/2, variance 1/4) so the first bet is
+ * well-defined and var_hat stays > 0 thereafter.
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL ep, or out-of-range parameters
- *     (alpha ∉ (0,1), mu0 ∉ [0,1), lambda_cap < 0);
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL ep, or out-of-range / NaN parameters
+ *     (alpha ∉ (0,1), mu0 ∉ [0,1), lambda_cap < 0).
  */
 ants_error_t ants_inference_eprocess_init(ants_inference_eprocess_t *ep,
                                           double alpha,
@@ -547,40 +548,48 @@ ants_error_t ants_inference_eprocess_init(ants_inference_eprocess_t *ep,
                                           double lambda_cap);
 
 /*
- * Fold one discrepancy score `score` ∈ [0, 1] into the e-process: set the
- * predictable bet λ from the current running statistics, multiply the
- * capital by (1 + λ·(score − μ0)), then update the running mean/variance.
- * The post-update verdict is written to `*out_verdict`.
+ * Fold one discrepancy score `score` ∈ [0, 1] into the e-process, then write
+ * the post-update verdict to `*out_verdict`. The recipe (pinned here; the
+ * spec leaves the plug-in details open):
+ *   1. predictable bet  λ = clip((μ̂ − μ0) / v̂, 0, lambda_cap), from the
+ *      running mean μ̂ and variance v̂ of the scores seen *before* this one
+ *      (so λ never depends on `score`); v̂ > 0 by the init prior → safe divide.
+ *   2. capital          M ← M · (1 + λ·(score − μ0)).
+ *   3. statistics       fold `score` into μ̂, v̂ by Welford, with the init
+ *      prior as a pseudo-observation (pseudo-count n+1 → n+2).
+ * The verdict is FRAUD iff M ≥ 1/α (terminal — Ville's inequality then bounds
+ * the honest false-accusation probability by α), else CONTINUE.
  *
  * Once FRAUD is returned the process is terminal; further updates are a
  * caller error (the audit loop should stop).
  *
  * Returns:
  *   ANTS_OK — score folded; consult *out_verdict;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers or score ∉ [0, 1];
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers or score ∉ [0, 1] (or NaN).
  */
 ants_error_t ants_inference_eprocess_update(ants_inference_eprocess_t *ep,
                                             double score,
                                             ants_inference_verdict_t *out_verdict);
 
 /*
- * Compute the per-position discrepancy score X ∈ [0, 1] between a
- * reference distribution `p_ref` and a committed distribution
- * `q_committed`, both as canonical q24 logit vectors of length `vocab`.
- * The score feeds `ants_inference_eprocess_update`.
+ * Compute the per-position discrepancy score X ∈ [0, 1] between a reference
+ * distribution `p_ref` and a committed distribution `q_committed`, both as
+ * canonical q24 logit vectors of length `vocab`. The score feeds
+ * `ants_inference_eprocess_update`.
  *
- * The exact metric (e.g. total-variation distance after a canonical
- * softmax, or an L1 distance on probabilities) is NOT yet frozen by the
- * spec; it must be pinned in a future RFC-0003 / RFC-0009 revision so all
- * verifiers compute identical scores. This declaration fixes the
- * signature and the [0, 1] range contract; the implementation PR will
- * carry the chosen, spec-ratified recipe.
+ * Metric (DRAFT, pending a spec-ratified recipe in a future RFC-0003 /
+ * RFC-0009 revision): the total-variation distance between the softmaxes of
+ * the two logit vectors, X = 1/2 · Σ_i |P_i − Q_i| ∈ [0, 1]. It is computed
+ * streaming in `double` (max, sum-of-exp, then the |·| accumulation), so no
+ * vocab-sized buffer is needed — the canonical softmax kernel caps below a
+ * real vocab. The score is bit-reproducible given identical inputs on one
+ * platform; cross-platform bit-exactness of the transcendental (exp) step is
+ * the open canonical-numerics item a future RFC must pin so every verifier
+ * agrees to the last bit.
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers or vocab == 0;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers or vocab == 0.
  */
 ants_error_t ants_inference_discrepancy(const ants_canon_q24_t *p_ref,
                                         const ants_canon_q24_t *q_committed,

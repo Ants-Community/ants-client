@@ -25,9 +25,15 @@
  * in-range, whole-answer when m >= length); auditor against a replay of the
  * unbiased rejection sampling (in range, n == 1, deterministic, well-spread).
  *
- * Surfaces 3–4 (e-process, serving runtime) are still stubs: their tests pin
- * the API shape, argument validation, and the ANTS_ERROR_NOT_IMPLEMENTED
- * return until their implementing PRs land.
+ * Surface 3 (the betting e-process) is implemented: eprocess_init/update are
+ * cross-checked step-by-step against an independent replay of the documented
+ * recipe, with behavioral checks (capital fixed at 1 when score == mu0, FRAUD
+ * within a known step bound on max-discrepancy scores, CONTINUE while honest);
+ * discrepancy is checked for identity == 0, symmetry, range, near-disjoint ≈ 1,
+ * and a closed-form two-element value.
+ *
+ * Surface 4 (the serving runtime) is still a stub: its tests pin the API shape,
+ * argument validation, and the ANTS_ERROR_NOT_IMPLEMENTED return until its PR.
  *
  * The remaining checks pin protocol constants, distinct PRF tags, e-process
  * default ranges, and the opaque-context size.
@@ -38,6 +44,7 @@
 #include "ants_crypto.h"
 #include "ants_inference.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -835,54 +842,160 @@ static void test_challenge_auditor_contract(void)
 
 /* -- 3. the betting e-process ----------------------------------------- */
 
+/* Relative+absolute tolerance, robust to a 1-ULP cross-TU FP-contraction
+ * difference between the library and the replay below. */
+static int approx(double a, double b)
+{
+    double d = a - b;
+    double m = (a < 0.0) ? -a : a;
+    double mb = (b < 0.0) ? -b : b;
+    if (d < 0.0) {
+        d = -d;
+    }
+    if (mb > m) {
+        m = mb;
+    }
+    return d <= 1e-9 * (1.0 + m);
+}
+
+/* Independent replay of the documented e-process recipe, to cross-check the
+ * library's running state step by step. */
+typedef struct {
+    double alpha, mu0, lambda_cap, capital, mu_hat, var_hat;
+    uint64_t n;
+} t_ep_t;
+
+static void t_ep_init(t_ep_t *e, double alpha, double mu0, double cap)
+{
+    e->alpha = alpha;
+    e->mu0 = mu0;
+    e->lambda_cap = cap;
+    e->capital = 1.0;
+    e->mu_hat = 0.5;
+    e->var_hat = 0.25;
+    e->n = 0;
+}
+
+static void t_ep_update(t_ep_t *e, double x)
+{
+    double lam = (e->mu_hat - e->mu0) / e->var_hat;
+    double k, m2, knew, d;
+    if (lam < 0.0) {
+        lam = 0.0;
+    }
+    if (lam > e->lambda_cap) {
+        lam = e->lambda_cap;
+    }
+    e->capital *= 1.0 + lam * (x - e->mu0);
+    k = (double)(e->n + 1);
+    m2 = e->var_hat * k;
+    knew = k + 1.0;
+    d = x - e->mu_hat;
+    e->mu_hat += d / knew;
+    m2 += d * (x - e->mu_hat);
+    e->var_hat = m2 / knew;
+    e->n += 1;
+}
+
 static void test_eprocess_init_contract(void)
 {
     ants_inference_eprocess_t ep;
 
+    /* argument validation (permanent) */
     CHECK_EQ(ants_inference_eprocess_init(NULL,
                                           ANTS_INFERENCE_DEFAULT_ALPHA,
                                           ANTS_INFERENCE_DEFAULT_MU0,
                                           ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
              ANTS_ERROR_INVALID_ARG);
-    /* alpha must be in (0, 1). */
-    CHECK_EQ(ants_inference_eprocess_init(
-                 &ep, 0.0, ANTS_INFERENCE_DEFAULT_MU0, ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
-             ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_inference_eprocess_init(
-                 &ep, 1.0, ANTS_INFERENCE_DEFAULT_MU0, ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
-             ANTS_ERROR_INVALID_ARG);
-    /* mu0 must be in [0, 1). */
-    CHECK_EQ(ants_inference_eprocess_init(
-                 &ep, ANTS_INFERENCE_DEFAULT_ALPHA, -0.1, ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
-             ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_inference_eprocess_init(
-                 &ep, ANTS_INFERENCE_DEFAULT_ALPHA, 1.0, ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
-             ANTS_ERROR_INVALID_ARG);
-    /* lambda_cap must be >= 0. */
-    CHECK_EQ(ants_inference_eprocess_init(
-                 &ep, ANTS_INFERENCE_DEFAULT_ALPHA, ANTS_INFERENCE_DEFAULT_MU0, -1.0),
-             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.0, 0.05, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 1.0, 0.05, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 1.5, 0.05, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.05, -0.1, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.05, 1.0, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.05, 0.05, -1.0), ANTS_ERROR_INVALID_ARG);
+    /* NaN parameters are rejected */
+    CHECK_EQ(ants_inference_eprocess_init(&ep, NAN, 0.05, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.05, NAN, 1.0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 0.05, 0.05, NAN), ANTS_ERROR_INVALID_ARG);
 
+    /* valid init records the config and seeds the prior state */
     CHECK_EQ(ants_inference_eprocess_init(&ep,
                                           ANTS_INFERENCE_DEFAULT_ALPHA,
                                           ANTS_INFERENCE_DEFAULT_MU0,
                                           ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+             ANTS_OK);
+    CHECK(ep.alpha == ANTS_INFERENCE_DEFAULT_ALPHA);
+    CHECK(ep.mu0 == ANTS_INFERENCE_DEFAULT_MU0);
+    CHECK(ep.lambda_cap == ANTS_INFERENCE_DEFAULT_LAMBDA_CAP);
+    CHECK(ep.capital == 1.0);
+    CHECK(ep.mu_hat == 0.5);
+    CHECK(ep.var_hat == 0.25);
+    CHECK(ep.n == 0);
 }
 
 static void test_eprocess_update_contract(void)
 {
     ants_inference_eprocess_t ep;
-    ants_inference_verdict_t verdict = ANTS_INFERENCE_VERDICT_CONTINUE;
-    memset(&ep, 0, sizeof ep);
+    ants_inference_verdict_t v = ANTS_INFERENCE_VERDICT_CONTINUE;
+    t_ep_t ref;
+    int i;
 
-    CHECK_EQ(ants_inference_eprocess_update(NULL, 0.5, &verdict), ANTS_ERROR_INVALID_ARG);
+    /* argument validation (permanent) */
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 1e-6, 0.05, 1.0), ANTS_OK);
+    CHECK_EQ(ants_inference_eprocess_update(NULL, 0.5, &v), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_eprocess_update(&ep, 0.5, NULL), ANTS_ERROR_INVALID_ARG);
-    /* score must be in [0, 1]. */
-    CHECK_EQ(ants_inference_eprocess_update(&ep, -0.1, &verdict), ANTS_ERROR_INVALID_ARG);
-    CHECK_EQ(ants_inference_eprocess_update(&ep, 1.1, &verdict), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_update(&ep, -0.1, &v), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_update(&ep, 1.1, &v), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_eprocess_update(&ep, NAN, &v), ANTS_ERROR_INVALID_ARG);
 
-    CHECK_EQ(ants_inference_eprocess_update(&ep, 0.5, &verdict), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* step-by-step state match against the independent recipe replay */
+    {
+        const double xs[] = {0.9, 0.1, 0.5, 1.0, 0.0, 0.7, 0.3, 0.95, 0.2, 0.6};
+        size_t t;
+        CHECK_EQ(ants_inference_eprocess_init(&ep, 1e-6, 0.05, 1.0), ANTS_OK);
+        t_ep_init(&ref, 1e-6, 0.05, 1.0);
+        for (t = 0; t < sizeof xs / sizeof xs[0]; t++) {
+            CHECK_EQ(ants_inference_eprocess_update(&ep, xs[t], &v), ANTS_OK);
+            t_ep_update(&ref, xs[t]);
+            CHECK(approx(ep.capital, ref.capital));
+            CHECK(approx(ep.mu_hat, ref.mu_hat));
+            CHECK(approx(ep.var_hat, ref.var_hat));
+            CHECK(ep.n == ref.n);
+            CHECK(v == ANTS_INFERENCE_VERDICT_CONTINUE); /* capital stays < 1/alpha */
+        }
+    }
+
+    /* honest producer: score == mu0 leaves capital exactly 1.0 -> never FRAUD */
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 1e-6, 0.05, 1.0), ANTS_OK);
+    for (i = 0; i < 100; i++) {
+        CHECK_EQ(ants_inference_eprocess_update(&ep, 0.05, &v), ANTS_OK);
+        CHECK(v == ANTS_INFERENCE_VERDICT_CONTINUE);
+    }
+    CHECK(ep.capital == 1.0);
+
+    /* scores below mu0 only shrink capital -> still CONTINUE */
+    CHECK_EQ(ants_inference_eprocess_init(&ep, 1e-6, 0.05, 1.0), ANTS_OK);
+    for (i = 0; i < 50; i++) {
+        CHECK_EQ(ants_inference_eprocess_update(&ep, 0.0, &v), ANTS_OK);
+        CHECK(v == ANTS_INFERENCE_VERDICT_CONTINUE);
+    }
+    CHECK(ep.capital <= 1.0);
+
+    /* fraud: a stream of max-discrepancy scores drives capital past 1/alpha */
+    {
+        int fraud_step = -1;
+        CHECK_EQ(ants_inference_eprocess_init(&ep, 1e-6, 0.05, 1.0), ANTS_OK);
+        for (i = 0; i < 100; i++) {
+            CHECK_EQ(ants_inference_eprocess_update(&ep, 1.0, &v), ANTS_OK);
+            if (v == ANTS_INFERENCE_VERDICT_FRAUD) {
+                fraud_step = i;
+                break;
+            }
+        }
+        CHECK(fraud_step >= 0); /* FRAUD is reached */
+        CHECK(fraud_step < 40); /* and well within the ~21-step growth bound */
+        CHECK(ep.capital >= 1.0 / ep.alpha);
+    }
 }
 
 static void test_discrepancy_contract(void)
@@ -890,13 +1003,66 @@ static void test_discrepancy_contract(void)
     ants_canon_q24_t p[8] = {0};
     ants_canon_q24_t q[8] = {0};
     double score = -1.0;
+    double score2 = -1.0;
+    int i;
 
+    /* argument validation (permanent) */
     CHECK_EQ(ants_inference_discrepancy(NULL, q, 8, &score), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_discrepancy(p, NULL, 8, &score), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_discrepancy(p, q, 0, &score), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_discrepancy(p, q, 8, NULL), ANTS_ERROR_INVALID_ARG);
 
-    CHECK_EQ(ants_inference_discrepancy(p, q, 8, &score), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* identical distributions -> TV exactly 0 */
+    for (i = 0; i < 8; i++) {
+        p[i] = ants_canon_q24_from_f32((float)(i % 3) - 1.0f);
+        q[i] = p[i];
+    }
+    CHECK_EQ(ants_inference_discrepancy(p, q, 8, &score), ANTS_OK);
+    CHECK(score == 0.0);
+
+    /* symmetry + range over an asymmetric pair */
+    for (i = 0; i < 8; i++) {
+        p[i] = ants_canon_q24_from_f32((float)i * 0.3f);
+        q[i] = ants_canon_q24_from_f32((float)(7 - i) * 0.5f - 1.0f);
+    }
+    CHECK_EQ(ants_inference_discrepancy(p, q, 8, &score), ANTS_OK);
+    CHECK_EQ(ants_inference_discrepancy(q, p, 8, &score2), ANTS_OK);
+    CHECK(score == score2);              /* TV is symmetric */
+    CHECK(score >= 0.0 && score <= 1.0); /* in range */
+    CHECK(score > 0.0);                  /* genuinely different inputs */
+
+    /* near-disjoint support -> TV ~ 1 */
+    {
+        ants_canon_q24_t a[4], b[4];
+        a[0] = ants_canon_q24_from_f32(30.0f);
+        a[1] = ants_canon_q24_from_f32(-30.0f);
+        a[2] = ants_canon_q24_from_f32(-30.0f);
+        a[3] = ants_canon_q24_from_f32(-30.0f);
+        b[0] = ants_canon_q24_from_f32(-30.0f);
+        b[1] = ants_canon_q24_from_f32(30.0f);
+        b[2] = ants_canon_q24_from_f32(-30.0f);
+        b[3] = ants_canon_q24_from_f32(-30.0f);
+        CHECK_EQ(ants_inference_discrepancy(a, b, 4, &score), ANTS_OK);
+        CHECK(score > 0.99);
+    }
+
+    /* closed-form two-element check: p = (0,0) -> (.5,.5); q = (a,0); TV
+     * computed independently from the closed-form softmax */
+    {
+        ants_canon_q24_t pp[2], qq[2];
+        double a, ea, q0, q1, expect;
+        pp[0] = ants_canon_q24_from_f32(0.0f);
+        pp[1] = ants_canon_q24_from_f32(0.0f);
+        qq[0] = ants_canon_q24_from_f32(2.0f);
+        qq[1] = ants_canon_q24_from_f32(0.0f);
+        a = (double)ants_canon_q24_to_f32(qq[0]); /* the dequantized logit */
+        ea = exp(a);
+        q0 = ea / (ea + 1.0);
+        q1 = 1.0 / (ea + 1.0);
+        expect = 0.5 * (fabs(0.5 - q0) + fabs(0.5 - q1));
+        CHECK_EQ(ants_inference_discrepancy(pp, qq, 2, &score), ANTS_OK);
+        CHECK(fabs(score - expect) < 1e-9);
+    }
 }
 
 /* -- 4. the serving runtime ------------------------------------------- */
