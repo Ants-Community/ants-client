@@ -3,13 +3,13 @@
 # Spec: RFC-0003 v0.2 + RFC-0009 v0.5.
 # Effort: 4 EM.
 #
-# Status: surfaces 1-2 implemented. The full public API surface
-# (ants_inference.h) is laid down; the commit-at-send and challenge-derivation
-# surfaces have real implementations, the other two still validate arguments
-# and return ANTS_ERROR_NOT_IMPLEMENTED until their PRs land:
+# Status: surfaces 1-3 implemented. The full public API surface
+# (ants_inference.h) is laid down; the three primitive surfaces have real
+# implementations, the serving runtime still validates arguments and returns
+# ANTS_ERROR_NOT_IMPLEMENTED until its PR lands:
 #   1. commit-at-send       (leaf/Merkle hashing, commit encode/decode/sign) — DONE
 #   2. challenge derivation (the three beacon-bound PRF derivations) — DONE
-#   3. betting e-process    (init/update + discrepancy scoring)
+#   3. betting e-process    (init/update + discrepancy scoring) — DONE
 #   4. serving runtime      (init/destroy/serve + the audit capstone)
 
 add_library(ants_inference STATIC
@@ -40,9 +40,12 @@ target_link_libraries(ants_inference
 # dependencies of the commit-at-send surface: orchestration.c calls their
 # symbols directly, so they are linked explicitly rather than leaned on
 # transitively (ants_canon already brings ants_cbor PUBLIC, but we link what
-# we use). libm still follows the don't-link-what-you-don't-use rule — it
-# joins with the e-process / discrepancy softmax implementation, guarded the
-# usual NOT MSVC AND NOT APPLE.
+# we use). libm provides the discrepancy softmax's exp(); it is linked the
+# usual way, guarded NOT MSVC AND NOT APPLE — Windows and macOS fold libm into
+# their C runtime, only ELF/glibc needs the explicit -lm.
+if(NOT MSVC AND NOT APPLE)
+    target_link_libraries(ants_inference PRIVATE m)
+endif()
 
 target_compile_features(ants_inference PUBLIC c_std_99)
 

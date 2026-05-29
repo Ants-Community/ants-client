@@ -26,6 +26,7 @@
 #include "ants_cbor.h"
 #include "ants_crypto.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -876,23 +877,66 @@ ants_error_t ants_inference_eprocess_init(ants_inference_eprocess_t *ep,
     if (ep == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    if (!(alpha > 0.0 && alpha < 1.0) || !(mu0 >= 0.0 && mu0 < 1.0) || lambda_cap < 0.0) {
+    /* The !(>=) form also rejects NaN parameters (every comparison is false). */
+    if (!(alpha > 0.0 && alpha < 1.0) || !(mu0 >= 0.0 && mu0 < 1.0) || !(lambda_cap >= 0.0)) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    ep->alpha = alpha;
+    ep->mu0 = mu0;
+    ep->lambda_cap = lambda_cap;
+    ep->capital = 1.0;
+    /* mu_hat / var_hat carry one pseudo-observation prior (mean 1/2, variance
+     * 1/4) so the first bet is well-defined and var_hat stays > 0 thereafter. */
+    ep->mu_hat = 0.5;
+    ep->var_hat = 0.25;
+    ep->n = 0;
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_eprocess_update(ants_inference_eprocess_t *ep,
                                             double score,
                                             ants_inference_verdict_t *out_verdict)
 {
+    double lambda;
+    double k, m2, knew, delta;
+
     if (ep == NULL || out_verdict == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
     if (!(score >= 0.0 && score <= 1.0)) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    /* Predictable bet from the pre-score statistics, so lambda depends only on
+     * X_1..X_n (never on this score): lambda = clip((mu_hat - mu0)/var_hat, 0,
+     * lambda_cap). var_hat > 0 always (the prior), so the divide is safe. */
+    lambda = (ep->mu_hat - ep->mu0) / ep->var_hat;
+    if (lambda < 0.0) {
+        lambda = 0.0;
+    }
+    if (lambda > ep->lambda_cap) {
+        lambda = ep->lambda_cap;
+    }
+
+    /* Capital recursion M_n = prod_j (1 + lambda_j (X_j - mu0)). */
+    ep->capital *= 1.0 + lambda * (score - ep->mu0);
+
+    /* Fold the score into the prior-augmented running mean/variance: Welford,
+     * treating the init prior as a pseudo-observation (pseudo-count). The
+     * struct stores mu_hat and var_hat, so reconstruct the sum of squared
+     * deviations m2 = var_hat * count, update it, and store the new variance. */
+    k = (double)(ep->n + 1); /* prior obs + n scores seen so far */
+    m2 = ep->var_hat * k;
+    knew = k + 1.0;
+    delta = score - ep->mu_hat;
+    ep->mu_hat += delta / knew;
+    m2 += delta * (score - ep->mu_hat);
+    ep->var_hat = m2 / knew;
+    ep->n += 1;
+
+    *out_verdict = (ep->capital >= 1.0 / ep->alpha) ? ANTS_INFERENCE_VERDICT_FRAUD
+                                                    : ANTS_INFERENCE_VERDICT_CONTINUE;
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_discrepancy(const ants_canon_q24_t *p_ref,
@@ -900,10 +944,60 @@ ants_error_t ants_inference_discrepancy(const ants_canon_q24_t *p_ref,
                                         size_t vocab,
                                         double *out_score)
 {
+    double max_p, max_q, sum_p, sum_q, tv;
+    size_t i;
+
     if (p_ref == NULL || q_committed == NULL || vocab == 0 || out_score == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    /* DRAFT metric (pending RFC-0003/RFC-0009 ratification): total-variation
+     * distance between the canonical softmaxes of the two q24 logit vectors,
+     * TV = 1/2 * sum_i |P_i - Q_i|, which lies in [0, 1]. Computed streaming in
+     * double (max pass, sum-of-exp pass, then the |.| accumulation) so no
+     * vocab-sized buffer is needed; the canonical softmax kernel caps at 16384
+     * < a real vocab, hence the local recomputation. exp() is libm; bit-exact
+     * cross-verifier agreement of the transcendental step is the open item the
+     * header documents. */
+    max_p = (double)ants_canon_q24_to_f32(p_ref[0]);
+    max_q = (double)ants_canon_q24_to_f32(q_committed[0]);
+    for (i = 1; i < vocab; i++) {
+        double lp = (double)ants_canon_q24_to_f32(p_ref[i]);
+        double lq = (double)ants_canon_q24_to_f32(q_committed[i]);
+        if (lp > max_p) {
+            max_p = lp;
+        }
+        if (lq > max_q) {
+            max_q = lq;
+        }
+    }
+
+    sum_p = 0.0;
+    sum_q = 0.0;
+    for (i = 0; i < vocab; i++) {
+        sum_p += exp((double)ants_canon_q24_to_f32(p_ref[i]) - max_p);
+        sum_q += exp((double)ants_canon_q24_to_f32(q_committed[i]) - max_q);
+    }
+    /* The arg-max element contributes exp(0) = 1, so both sums are >= 1. */
+
+    tv = 0.0;
+    for (i = 0; i < vocab; i++) {
+        double pi = exp((double)ants_canon_q24_to_f32(p_ref[i]) - max_p) / sum_p;
+        double qi = exp((double)ants_canon_q24_to_f32(q_committed[i]) - max_q) / sum_q;
+        double d = pi - qi;
+        tv += (d < 0.0) ? -d : d;
+    }
+    tv *= 0.5;
+
+    /* TV is in [0, 1] analytically; clamp away any floating-point spill. */
+    if (tv < 0.0) {
+        tv = 0.0;
+    }
+    if (tv > 1.0) {
+        tv = 1.0;
+    }
+    *out_score = tv;
+    return ANTS_OK;
 }
 
 /* ======================================================================== */
