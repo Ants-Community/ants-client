@@ -665,17 +665,119 @@ ants_error_t ants_inference_commit_verify_sig(const ants_inference_commit_t *com
 /* 2. Anti-grinding challenge derivation                                    */
 /* ======================================================================== */
 
+/* ---- internal: the anti-grinding PRF keystream -------------------------- */
+
+/* Read a 64-bit big-endian word. Big-endian matches the "interpret the PRF
+ * output as a big-endian integer" convention the commit's audit_threshold
+ * already uses. */
+static uint64_t read_be64(const uint8_t b[8])
+{
+    return ((uint64_t)b[0] << 56) | ((uint64_t)b[1] << 48) | ((uint64_t)b[2] << 40) |
+           ((uint64_t)b[3] << 32) | ((uint64_t)b[4] << 24) | ((uint64_t)b[5] << 16) |
+           ((uint64_t)b[6] << 8) | (uint64_t)b[7];
+}
+
+/* A counter-mode BLAKE3 keystream over seed = beacon ‖ root ‖ tag. BLAKE3 here
+ * yields a 32-byte digest and no XOF, so an arbitrarily long stream is
+ * block(i) = BLAKE3(seed ‖ LE64(i)), i = 0,1,2,…, read out as 64-bit
+ * big-endian words. DRAFT scheme, pinned for byte-for-byte agreement with
+ * independent implementations pending RFC-0003/RFC-0008 formalization. */
+typedef struct {
+    const uint8_t *beacon;
+    const uint8_t *root;
+    const uint8_t *tag;
+    size_t tag_len;
+    uint8_t block[ANTS_INFERENCE_HASH_SIZE]; /* most recently hashed block */
+    uint64_t next_block;                     /* counter of the next block to hash */
+    int words_left;                          /* unread words in `block` (0..4) */
+} prf_keystream_t;
+
+static void prf_keystream_init(prf_keystream_t *ks,
+                               const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
+                               const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
+                               const char *tag)
+{
+    ks->beacon = beacon;
+    ks->root = root;
+    ks->tag = (const uint8_t *)tag;
+    ks->tag_len = strlen(tag);
+    ks->next_block = 0;
+    ks->words_left = 0;
+}
+
+/* block = BLAKE3(beacon ‖ root ‖ tag ‖ LE64(counter)). */
+static ants_error_t prf_compute_block(prf_keystream_t *ks, uint64_t counter)
+{
+    uint8_t ctr[8];
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    write_le64(ctr, counter);
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, ks->beacon, ANTS_INFERENCE_BEACON_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, ks->root, ANTS_INFERENCE_MERKLE_ROOT_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, ks->tag, ks->tag_len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, ctr, sizeof ctr);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, ks->block);
+}
+
+/* Next 64-bit big-endian keystream word. */
+static ants_error_t prf_next_word(prf_keystream_t *ks, uint64_t *out)
+{
+    ants_error_t rc;
+    int word_idx;
+
+    if (ks->words_left == 0) {
+        rc = prf_compute_block(ks, ks->next_block);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        ks->next_block += 1;
+        ks->words_left = 4;
+    }
+    word_idx = 4 - ks->words_left; /* 0..3 within the current block */
+    *out = read_be64(ks->block + (size_t)word_idx * 8);
+    ks->words_left -= 1;
+    return ANTS_OK;
+}
+
+/* ---- public entry points ------------------------------------------------ */
+
 ants_error_t
 ants_inference_challenge_is_audited(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
                                     const uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE],
                                     uint64_t audit_threshold,
                                     bool *out_audited)
 {
-    (void)audit_threshold;
+    prf_keystream_t ks;
+    uint64_t w0;
+    ants_error_t rc;
+
     if (beacon == NULL || root == NULL || out_audited == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    prf_keystream_init(&ks, beacon, root, ANTS_INFERENCE_PRF_CONTEXT_SEL);
+    rc = prf_next_word(&ks, &w0);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_audited = (w0 < audit_threshold);
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_challenge_positions(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
@@ -686,12 +788,48 @@ ants_error_t ants_inference_challenge_positions(const uint8_t beacon[ANTS_INFERE
                                                 size_t cap,
                                                 size_t *out_count)
 {
-    (void)cap;
+    prf_keystream_t ks;
+    uint32_t count;
+    uint32_t j;
+    ants_error_t rc;
+
     if (beacon == NULL || root == NULL || m == 0 || length == 0 || out_positions == NULL ||
         out_count == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    count = (m < length) ? m : length; /* M = min(m, length) */
+    if (cap < (size_t)count) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    if (m >= length) {
+        /* The whole answer is opened: positions 0 .. length-1, no draw. */
+        for (j = 0; j < length; j++) {
+            out_positions[j] = j;
+        }
+        *out_count = (size_t)length;
+        return ANTS_OK;
+    }
+
+    /* Stratified ("strided") sample: split [0, length) into m contiguous
+     * buckets and draw one position per bucket. Disjoint buckets make the
+     * result distinct and strictly ascending. m < length here, so every
+     * bucket width is >= 1. */
+    prf_keystream_init(&ks, beacon, root, ANTS_INFERENCE_PRF_CONTEXT_POS);
+    for (j = 0; j < m; j++) {
+        uint64_t lo = ((uint64_t)j * (uint64_t)length) / (uint64_t)m;
+        uint64_t hi = (((uint64_t)j + 1u) * (uint64_t)length) / (uint64_t)m;
+        uint64_t width = hi - lo;
+        uint64_t w;
+        rc = prf_next_word(&ks, &w);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        out_positions[j] = lo + (w % width);
+    }
+    *out_count = (size_t)m;
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_challenge_auditor(const uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE],
@@ -699,10 +837,31 @@ ants_error_t ants_inference_challenge_auditor(const uint8_t beacon[ANTS_INFERENC
                                               uint64_t n_verifiers,
                                               uint64_t *out_index)
 {
+    prf_keystream_t ks;
+    uint64_t reject_below;
+    ants_error_t rc;
+
     if (beacon == NULL || root == NULL || n_verifiers == 0 || out_index == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    /* Reject the low (2^64 mod n)-wide band so the accepted range is a whole
+     * multiple of n; then w % n is unbiased. In u64 arithmetic (0 - n) is
+     * 2^64 - n, and (2^64 - n) mod n == 2^64 mod n. */
+    reject_below = ((uint64_t)0 - n_verifiers) % n_verifiers;
+
+    prf_keystream_init(&ks, beacon, root, ANTS_INFERENCE_PRF_CONTEXT_AUD);
+    for (;;) {
+        uint64_t w;
+        rc = prf_next_word(&ks, &w);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (w >= reject_below) {
+            *out_index = w % n_verifiers;
+            return ANTS_OK;
+        }
+    }
 }
 
 /* ======================================================================== */
