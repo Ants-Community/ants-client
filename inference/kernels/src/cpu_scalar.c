@@ -694,3 +694,82 @@ ants_error_t ants_canon_quantize_weights_symmetric_per_channel(const float *w,
 
     return ANTS_OK;
 }
+
+ants_error_t ants_canon_quantize_weights_symmetric_grouped(const float *w,
+                                                           int8_t *w_int8,
+                                                           float *scales,
+                                                           size_t n_channels,
+                                                           size_t channel_size,
+                                                           size_t group_size)
+{
+    if (w == NULL || w_int8 == NULL || scales == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_channels == 0 || channel_size == 0 || group_size == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Each group's absmax reduces over at most group_size elements, so
+     * only group_size is bound by the reduction-tree scratch — NOT the
+     * full channel. This is what lets the grouped path quantize channels
+     * wider than ANTS_CANON_MAX_REDUCE_LEN. */
+    if (group_size > ANTS_CANON_MAX_REDUCE_LEN) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Groups per channel: ceil(channel_size / group_size). The final
+     * group is short (covers the remainder) when channel_size is not a
+     * multiple — no padding, per RFC-0009 §1. */
+    size_t n_groups = (channel_size + group_size - 1u) / group_size;
+
+    /* Scratch reused across groups (holds the abs-value pass then the
+     * reduction tree). Sized as the per-channel path for symmetry. */
+    float scratch[ANTS_CANON_MAX_REDUCE_LEN * 2u];
+    float neg_inf = bits_to_f32(ANTS_CANON_NEG_INF_BITS);
+
+    for (size_t ch = 0; ch < n_channels; ch++) {
+        const float *row = &w[ch * channel_size];
+
+        for (size_t g = 0; g < n_groups; g++) {
+            size_t start = g * group_size;
+            size_t len = group_size;
+            if (start + len > channel_size) {
+                len = channel_size - start; /* short final group */
+            }
+            size_t d_pad = next_pow2_size(len);
+
+            /* Step 1: abs-value pass into scratch, pad with -∞. */
+            for (size_t i = 0; i < len; i++) {
+                scratch[i] = fabsf(row[start + i]);
+            }
+            for (size_t i = len; i < d_pad; i++) {
+                scratch[i] = neg_inf;
+            }
+            /* Step 2: left-biased tree max over the group. */
+            reduce_max_tree_in_place(scratch, d_pad);
+            float max_abs = scratch[0];
+
+            size_t scale_idx = ch * n_groups + g;
+
+            /* Step 3: zero-group sentinel — scale=1.0f, weights all 0. */
+            if (max_abs == 0.0f) {
+                scales[scale_idx] = 1.0f;
+                for (size_t i = 0; i < len; i++) {
+                    w_int8[ch * channel_size + start + i] = 0;
+                }
+                continue;
+            }
+
+            /* Step 4: single FP32 divide (NOT precomputed reciprocal,
+             * per §2.1 discipline). */
+            float scale = max_abs / (float)ANTS_CANON_INT8_SCALE_DENOM;
+            scales[scale_idx] = scale;
+
+            /* Step 5: per-element quantize via the same recipe. */
+            for (size_t i = 0; i < len; i++) {
+                w_int8[ch * channel_size + start + i] = quantize_one_i8(row[start + i], scale);
+            }
+        }
+    }
+
+    return ANTS_OK;
+}

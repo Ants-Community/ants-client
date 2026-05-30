@@ -1140,6 +1140,143 @@ static void test_quantize_weights_same_input_bit_exact(void)
     }
 }
 
+/* -- Group-wise symmetric INT8 weight quantization (RFC-0009 §1) ------ */
+
+static void test_quantize_weights_grouped_basic(void)
+{
+    /* Two groups in one channel, each scaled against ITS OWN absmax —
+     * the small group {3,-1} is not crushed by the large group
+     * {100,25}. Values chosen clear of half-integer ties (round-half-
+     * to-even is already pinned by the per-channel tests; the same
+     * quantize_one_i8 helper backs both paths). */
+    CHECK(ANTS_CANON_QUANT_GROUP_SIZE == 128u);
+
+    float w[4] = {3.0f, -1.0f, 100.0f, 25.0f};
+    int8_t w_int8[4];
+    float scales[2]; /* n_groups = ceil(4/2) = 2 */
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 1, 4, 2), ANTS_OK);
+    /* group 0 {3,-1}: scale = 3/127, independent of group 1. */
+    CHECK(fabsf(scales[0] - 3.0f / 127.0f) < 1e-7f);
+    CHECK(w_int8[0] == 127); /* 3 / (3/127) = 127 (group max) */
+    CHECK(w_int8[1] == -42); /* -1 / (3/127) = -42.33 -> -42 */
+    /* group 1 {100,25}: scale = 100/127. */
+    CHECK(fabsf(scales[1] - 100.0f / 127.0f) < 1e-7f);
+    CHECK(w_int8[2] == 127); /* 100 / (100/127) = 127 (group max) */
+    CHECK(w_int8[3] == 32);  /* 25 / (100/127) = 31.75 -> 32 */
+
+    /* dequant via the per-group scale stays within half a step. */
+    for (size_t i = 0; i < 4; i++) {
+        float scale = scales[i / 2];
+        float dequant = (float)w_int8[i] * scale;
+        CHECK(fabsf(w[i] - dequant) <= scale * 0.5f + 1e-7f);
+    }
+}
+
+static void test_quantize_weights_grouped_equals_per_channel(void)
+{
+    /* Independent cross-check: with group_size >= channel_size there is
+     * exactly one group per channel, so the grouped result MUST be
+     * bit-identical to the per-channel entry point (a different code
+     * path computing the same thing). */
+    float w[3 * 4] = {
+        /* ch0 */ 1.0f,
+        -2.0f,
+        3.0f,
+        -4.0f,
+        /* ch1 */ 0.5f,
+        0.25f,
+        -0.5f,
+        0.125f,
+        /* ch2 */ 10.0f,
+        -20.0f,
+        30.0f,
+        -40.0f,
+    };
+    int8_t q_pc[12], q_g[12];
+    float s_pc[3], s_g[3]; /* n_groups = 1 per channel */
+
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_per_channel(w, q_pc, s_pc, 3, 4), ANTS_OK);
+    /* group_size == channel_size -> one group per channel. */
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, q_g, s_g, 3, 4, 4), ANTS_OK);
+    for (int i = 0; i < 12; i++) {
+        CHECK(q_g[i] == q_pc[i]);
+    }
+    for (int c = 0; c < 3; c++) {
+        uint32_t b_pc, b_g;
+        memcpy(&b_pc, &s_pc[c], sizeof b_pc);
+        memcpy(&b_g, &s_g[c], sizeof b_g);
+        CHECK(b_pc == b_g);
+    }
+
+    /* group_size strictly greater than channel_size also collapses to a
+     * single (short) group covering the whole channel. */
+    int8_t q_big[12];
+    float s_big[3];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, q_big, s_big, 3, 4, 100), ANTS_OK);
+    for (int i = 0; i < 12; i++) {
+        CHECK(q_big[i] == q_pc[i]);
+    }
+}
+
+static void test_quantize_weights_grouped_short_final(void)
+{
+    /* channel_size not a multiple of group_size -> the last group covers
+     * the remainder and gets its own scale. No padding. */
+    float w[5] = {1.0f, -2.0f, 4.0f, -8.0f, 3.0f};
+    int8_t w_int8[5];
+    float scales[3]; /* n_groups = ceil(5/2) = 3: [0,1] [2,3] [4] */
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 1, 5, 2), ANTS_OK);
+    CHECK(fabsf(scales[0] - 2.0f / 127.0f) < 1e-7f); /* {1,-2} absmax 2 */
+    CHECK(fabsf(scales[1] - 8.0f / 127.0f) < 1e-7f); /* {4,-8} absmax 8 */
+    CHECK(fabsf(scales[2] - 3.0f / 127.0f) < 1e-7f); /* {3}   absmax 3 */
+    CHECK(w_int8[4] == 127);                         /* lone short-group element -> group max */
+}
+
+static void test_quantize_weights_grouped_divide_not_reciprocal(void)
+{
+    /* The per-group scale uses a direct FP32 divide. 9.0/127.0 as a
+     * single divide is 0x3D912245u; the precomputed-reciprocal
+     * multiply 9.0 * (1/127) would give 0x3D912244u (off by 1 ULP).
+     * Same discriminator as §2.1, applied per group. */
+    float w[4] = {9.0f, -3.0f, 254.0f, 0.0f};
+    int8_t w_int8[4];
+    float scales[2];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 1, 4, 2), ANTS_OK);
+    uint32_t s0_bits;
+    memcpy(&s0_bits, &scales[0], sizeof s0_bits);
+    CHECK(s0_bits == 0x3D912245u); /* divide, correct */
+    CHECK(s0_bits != 0x3D912244u); /* reciprocal-multiply, wrong */
+    CHECK(w_int8[0] == 127);       /* 9 / (9/127) = 127 */
+    /* group 1 {254,0}: 254/127 = 2.0 exactly; distinct from group 0. */
+    CHECK(scales[1] == 2.0f);
+    CHECK(scales[0] != scales[1]);
+    CHECK(w_int8[2] == 127); /* 254 / 2 = 127 */
+}
+
+static void test_quantize_weights_grouped_null_args_and_bounds(void)
+{
+    float w[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    int8_t w_int8[4];
+    float scales[4];
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(NULL, w_int8, scales, 1, 4, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, NULL, scales, 1, 4, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, NULL, 1, 4, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 0, 4, 2),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 1, 0, 2),
+             ANTS_ERROR_INVALID_ARG);
+    /* group_size == 0 is invalid. */
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(w, w_int8, scales, 1, 4, 0),
+             ANTS_ERROR_INVALID_ARG);
+    /* group_size beyond the reduction-tree cap is invalid. */
+    CHECK_EQ(ants_canon_quantize_weights_symmetric_grouped(
+                 w, w_int8, scales, 1, 4, ANTS_CANON_MAX_REDUCE_LEN + 1),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_q24_zero_round_trip();
@@ -1218,6 +1355,11 @@ int main(void)
     test_quantize_weights_clamps_overflow();
     test_quantize_weights_dequant_round_trip();
     test_quantize_weights_same_input_bit_exact();
+    test_quantize_weights_grouped_basic();
+    test_quantize_weights_grouped_equals_per_channel();
+    test_quantize_weights_grouped_short_final();
+    test_quantize_weights_grouped_divide_not_reciprocal();
+    test_quantize_weights_grouped_null_args_and_bounds();
 
     if (failures > 0) {
         fprintf(stderr, "test_canon: %d failure(s)\n", failures);
