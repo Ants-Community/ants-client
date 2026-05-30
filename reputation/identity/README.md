@@ -41,10 +41,29 @@ primitives the rest of the architecture depends on.
 > section) and the values fixed by b2 before peers compute interoperable
 > tenure.
 
+**Implemented (PR2 — the saturating `T_eff` fork-choice transform,
+RFC-0004 §"The saturating T → T_eff transform"):**
+
+- **`ants_reputation_t_eff(t, t_cap)` = `t_cap · (1 − exp(−t/t_cap))`**,
+  applied to tenure **for fork choice only** (raw `t` stays uncapped for
+  verifier eligibility, bond capacity, persistence). Bounds the
+  *relative* fork-choice weight of an arbitrarily old peer so the founder
+  cohort cannot retain fork-choice dominance forever (long-tail
+  centralisation). The caller sums `T_eff` over a fork's validators
+  (`Σ T_eff`) to compare forks.
+- **Deterministic, no float.** `exp(−t/t_cap)` is computed in pinned q32
+  fixed-point by range reduction `t/t_cap = n + f`: `exp(−1)^n` via the
+  PR1 repeated-multiplication `decay_factor` (base `exp(−1)` pinned in
+  q32), `exp(−f)` for `f ∈ [0,1)` via a pinned 16-term Horner Taylor
+  series; the fraction and final scaling use overflow-safe integer
+  long-division / multiply-shift. The exact method is the canonical
+  recipe — verified monotone (zero inversions over a 10·cap sweep),
+  saturating to `t_cap` without exceeding it, linear for `t ≪ t_cap`, and
+  bit-stable across calls. `T_CAP` (`T_FORK_CHOICE_CAP`, RFC-0008 §7) is
+  a DRAFT placeholder, b2-class like δ/κ.
+
 **Pending (later PRs):**
 
-- **Saturating `T_eff` fork-choice transform** (RFC-0004 §"The saturating
-  T → T_eff transform").
 - **Receipt-bag Merkle tree** + **selective disclosure** (RFC-0004
   §"Selective disclosure of receipts"): inclusion proofs, lower-bound
   property, positive/negative asymmetry.

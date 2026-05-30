@@ -133,6 +133,84 @@ static uint64_t apply_decay(uint64_t value, uint64_t factor_q32)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Saturating T_eff fork-choice transform (RFC-0004 §"T → T_eff")           */
+/* ------------------------------------------------------------------------ */
+
+/* floor(a · 2^32 / d) for a < d, in q32, exact and overflow-safe with no
+ * 128-bit type: 32-iteration binary long division. The invariant rem < d
+ * is preserved every step, and the "double rem mod d" is written so no
+ * intermediate exceeds 2^64 even for d near UINT64_MAX:
+ *   if 2·rem >= d (tested as rem >= d − rem):  rem ← 2·rem − d, bit = 1
+ *   else:                                       rem ← 2·rem,     bit = 0
+ * 2·rem − d is computed as rem − (d − rem) (both operands < 2^64, result
+ * >= 0 and < d); the else branch has 2·rem < d < 2^64. */
+static uint64_t muldiv_q32(uint64_t a, uint64_t d)
+{
+    uint64_t q = 0;
+    uint64_t rem = a; /* invariant: rem < d */
+    int i;
+    for (i = 0; i < 32; i++) {
+        if (rem >= d - rem) {
+            rem = rem - (d - rem); /* 2*rem - d, in [0, d) */
+            q = (q << 1) | 1u;
+        } else {
+            rem = rem + rem; /* 2*rem < d */
+            q = q << 1;
+        }
+    }
+    return q;
+}
+
+/* exp(−f) for f ∈ [0, 1) in q32, via a pinned Horner-form Taylor series
+ * of ANTS_REP_TAYLOR_TERMS terms:
+ *   exp(−f) = 1 − f/1·(1 − f/2·(1 − f/3·( … (1 − f/N) … )))
+ * Each step s ← 1 − (f·s)/k uses the exact q32 fp_mul then an integer
+ * divide by k. For f < 1 the result stays in (1/e, 1], so the subtraction
+ * never underflows. The term count is part of the canonical recipe. */
+static uint64_t taylor_expneg_q32(uint64_t f_q32)
+{
+    uint64_t s = ANTS_REP_FP_ONE;
+    uint64_t k;
+    for (k = ANTS_REP_TAYLOR_TERMS; k >= 1; k--) {
+        uint64_t term = ants_reputation_fp_mul(f_q32, s) / k;
+        s = ANTS_REP_FP_ONE - term;
+    }
+    return s;
+}
+
+/* exp(−t/t_cap) in q32 by range reduction t/t_cap = n + f:
+ *   exp(−(n+f)) = exp(−1)^n · exp(−f).
+ * exp(−1)^n reuses the pinned repeated-multiplication decay_factor (it
+ * short-circuits to 0 after ~61 iterations regardless of how large n is,
+ * so a huge t cannot drive unbounded work); exp(−f) is the Taylor series
+ * above. Requires t_cap > 0 (caller-checked). */
+static uint64_t expneg_ratio_q32(uint64_t t, uint64_t t_cap)
+{
+    uint64_t n = t / t_cap;
+    uint64_t rem = t % t_cap; /* rem < t_cap → safe muldiv input */
+    uint64_t f_q32 = muldiv_q32(rem, t_cap);
+    uint64_t int_part = ants_reputation_decay_factor(ANTS_REP_EXP_NEG1_Q32, n);
+    uint64_t frac_part = taylor_expneg_q32(f_q32);
+    return ants_reputation_fp_mul(int_part, frac_part);
+}
+
+ants_error_t ants_reputation_t_eff(uint64_t t, uint64_t t_cap, uint64_t *out)
+{
+    uint64_t expx, one_minus;
+
+    if (out == NULL || t_cap == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    expx = expneg_ratio_q32(t, t_cap);  /* exp(−t/t_cap) in q32 ∈ [0,1] */
+    one_minus = ANTS_REP_FP_ONE - expx; /* 1 − exp(−t/t_cap)  in q32     */
+    /* t_cap · (1 − exp), saturating; reuses the q32-scale multiply. The
+     * result is <= t_cap because one_minus <= 1.0. */
+    *out = apply_decay(t_cap, one_minus);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Receipt body encode + verify                                             */
 /* ------------------------------------------------------------------------ */
 

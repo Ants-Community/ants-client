@@ -311,6 +311,99 @@ static void test_params_default(void)
     CHECK_EQ(ants_reputation_params_default(NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- saturating T_eff fork-choice transform ------------------------- */
+
+static void test_t_eff_pinned_values(void)
+{
+    /* Regression pin of the fixed-point recipe's exact outputs at cap =
+     * 2e9. These are the canonical bytes: if a future change to the exp
+     * recipe (term count, range-reduction split, the muldiv) shifts any of
+     * them, fork choice would silently diverge across peers — so they are
+     * nailed down. Each is within 1 unit of the true (libm double)
+     * cap·(1 − exp(−t/cap)); the true values, for the record:
+     *   t=2e6  → 1999000.50    t=2e7 → 19900330.83
+     *   t=2e8  → 190325163.64  t=cap → 1264241117.66                     */
+    uint64_t cap = ANTS_REP_T_FORK_CHOICE_CAP; /* 2e9 */
+    uint64_t v;
+
+    CHECK_EQ(ants_reputation_t_eff(0, cap, &v), ANTS_OK);
+    CHECK(v == 0);
+    CHECK_EQ(ants_reputation_t_eff(2000000, cap, &v), ANTS_OK);
+    CHECK(v == 1999000);
+    CHECK_EQ(ants_reputation_t_eff(20000000, cap, &v), ANTS_OK);
+    CHECK(v == 19900331);
+    CHECK_EQ(ants_reputation_t_eff(200000000, cap, &v), ANTS_OK);
+    CHECK(v == 190325163);
+    CHECK_EQ(ants_reputation_t_eff(cap, cap, &v), ANTS_OK);
+    CHECK(v == 1264241117);
+
+    /* Independent algebraic anchor at t == cap: the range reduction gives
+     * n = 1, f = 0 exactly, so the Taylor path contributes exactly 1.0 and
+     * T_eff(cap) = cap · (1 − exp(−1)) with exp(−1) the PINNED q32
+     * constant — reproduced here WITHOUT the impl's muldiv / Taylor loop
+     * (cap·(2^32 − E1) ≈ 5.4e18 fits in u64, so the >>32 is exact). If
+     * this and the pin above ever disagree, the exp(−1) constant or the
+     * f==0 path regressed. */
+    {
+        uint64_t one_minus_e1 = ANTS_REP_FP_ONE - ANTS_REP_EXP_NEG1_Q32;
+        uint64_t at_cap = (cap * one_minus_e1) >> ANTS_REP_FP_BITS;
+        CHECK(at_cap == 1264241117);
+        CHECK_EQ(ants_reputation_t_eff(cap, cap, &v), ANTS_OK);
+        CHECK(v == at_cap);
+    }
+}
+
+static void test_t_eff_properties(void)
+{
+    uint64_t cap = ANTS_REP_T_FORK_CHOICE_CAP;
+    uint64_t v, prev;
+    uint64_t i;
+
+    /* Linear regime: for t ≪ cap, T_eff(t) ≈ t (within ~0.1% at t=cap/1000). */
+    CHECK_EQ(ants_reputation_t_eff(cap / 1000, cap, &v), ANTS_OK);
+    {
+        uint64_t t = cap / 1000;
+        uint64_t diff = (v > t) ? (v - t) : (t - v);
+        CHECK(diff * 1000 <= t); /* |T_eff − t| ≤ 0.1% of t */
+    }
+
+    /* Never exceeds the cap, and saturates toward it. */
+    CHECK_EQ(ants_reputation_t_eff(50 * cap, cap, &v), ANTS_OK);
+    CHECK(v <= cap);
+    CHECK(v >= cap - cap / 1000); /* within 0.1% of cap by 50× */
+    CHECK_EQ(ants_reputation_t_eff(UINT64_MAX, cap, &v), ANTS_OK);
+    CHECK(v <= cap); /* pathological huge t still bounded, no runaway */
+
+    /* Monotone non-decreasing across a sweep (the recipe was checked to
+     * have zero inversions; assert it holds). */
+    prev = 0;
+    for (i = 0; i <= 200; i++) {
+        uint64_t t = i * (cap / 20); /* 0 … 10·cap */
+        CHECK_EQ(ants_reputation_t_eff(t, cap, &v), ANTS_OK);
+        CHECK(v >= prev);
+        prev = v;
+    }
+
+    /* Determinism: same input → same output (no hidden state). */
+    {
+        uint64_t a = 0, b = 0;
+        CHECK_EQ(ants_reputation_t_eff(123456789, cap, &a), ANTS_OK);
+        CHECK_EQ(ants_reputation_t_eff(123456789, cap, &b), ANTS_OK);
+        CHECK(a == b);
+    }
+
+    /* A small cap (edge of the range reduction) still obeys the bound. */
+    CHECK_EQ(ants_reputation_t_eff(5, 1, &v), ANTS_OK);
+    CHECK(v <= 1);
+}
+
+static void test_t_eff_args(void)
+{
+    uint64_t v;
+    CHECK_EQ(ants_reputation_t_eff(100, 0, &v), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_t_eff(100, 2000000000, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -321,6 +414,10 @@ int main(void)
     test_compute_kappa_clips_a_bin();
     test_compute_empty_and_args();
     test_params_default();
+
+    test_t_eff_pinned_values();
+    test_t_eff_properties();
+    test_t_eff_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);
