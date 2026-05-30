@@ -331,7 +331,7 @@ static void test_decode_rejects_trailing_byte(void)
 
 static void test_decode_rejects_wrong_map_size(void)
 {
-    /* The encoder always writes 0xA7 = map(7). A header announcing 6
+    /* The encoder always writes 0xA8 = map(8). A header announcing 6
      * pairs (0xA6) is structurally wrong for this schema. */
     uint8_t buf[8] = {0xA6, 0x01};
     ants_ledger_peer_t got;
@@ -355,22 +355,357 @@ static void test_decode_rejects_non_canonical_int(void)
 static void test_decode_rejects_wrong_field_type(void)
 {
     /* A valid record with the choked value (key 7) rewritten from a bool
-     * to a uint must be rejected: the decoder demands a bool there. We
-     * build a valid record, then find the final two bytes (0x07 key +
-     * 0xF4/0xF5 bool) and corrupt the bool to a uint 0x00. */
+     * to a uint must be rejected: the decoder demands a bool there. With
+     * an empty recent array (key 8 = 0x08 0x80) the tail of the encoding
+     * is: ... 0x07 (key) 0xF5 (true) 0x08 (key) 0x80 (empty array). So
+     * the choked bool sits at buf[n-3]. */
     ants_ledger_peer_t rec = sample_record();
-    rec.choked = true; /* encodes as 0xF5 */
+    rec.choked = true;    /* encodes as 0xF5 */
+    rec.recent_count = 0; /* empty recent => key 8 is `0x08 0x80` */
+    rec.recent_head = 0;
     uint8_t buf[ANTS_LEDGER_RECORD_ENCODED_MAX];
     size_t n = 0;
     CHECK_EQ(ants_ledger_record_encode(&rec, buf, sizeof buf, &n), ANTS_OK);
 
-    /* The last pair is key 7 (0x07) then the bool (0xF5 true / 0xF4
-     * false). Rewrite the trailing bool byte to 0x00 (uint 0). */
-    CHECK(buf[n - 2] == 0x07);
-    CHECK(buf[n - 1] == 0xF5);
-    buf[n - 1] = 0x00; /* now a uint where a bool is required */
+    /* tail: [n-4]=0x07 key, [n-3]=0xF5 bool, [n-2]=0x08 key, [n-1]=0x80 array(0). */
+    CHECK(buf[n - 4] == 0x07);
+    CHECK(buf[n - 3] == 0xF5);
+    CHECK(buf[n - 2] == 0x08);
+    CHECK(buf[n - 1] == 0x80);
+    buf[n - 3] = 0x00; /* choked bool -> uint 0, type mismatch */
     ants_ledger_peer_t got;
     CHECK_EQ(ants_ledger_record_decode(buf, n, &got), ANTS_ERROR_MALFORMED);
+}
+
+/* -- choke/unchoke: generosity window + ring buffer ------------------- */
+
+static void test_generosity_window(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+
+    /* Three receipts at t=100, 1000, 2000. */
+    CHECK_EQ(ants_ledger_record_recv(&rec, 50, 100), ANTS_OK);
+    CHECK_EQ(ants_ledger_record_recv(&rec, 70, 1000), ANTS_OK);
+    CHECK_EQ(ants_ledger_record_recv(&rec, 90, 2000), ANTS_OK);
+    /* record_recv also credits the cumulative total. */
+    CHECK(rec.served_by == 210);
+
+    uint64_t gen = 12345;
+    /* Window 1200 s ending at now=2000 => cutoff 800; only t=1000 and
+     * t=2000 qualify (70+90=160); t=100 is stale. */
+    CHECK_EQ(ants_ledger_generosity(&rec, 2000, 1200, &gen), ANTS_OK);
+    CHECK(gen == 160);
+
+    /* Huge window => everything counts. */
+    CHECK_EQ(ants_ledger_generosity(&rec, 2000, 100000, &gen), ANTS_OK);
+    CHECK(gen == 210);
+
+    /* now <= window => everything in window (no underflow in cutoff). */
+    CHECK_EQ(ants_ledger_generosity(&rec, 500, 1200, &gen), ANTS_OK);
+    CHECK(gen == 210);
+
+    /* Tight window catching only the last receipt. */
+    CHECK_EQ(ants_ledger_generosity(&rec, 2000, 500, &gen), ANTS_OK);
+    CHECK(gen == 90); /* cutoff 1500; only t=2000 */
+}
+
+static void test_generosity_clockless_always_in_window(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+    /* unix_s == 0 samples are always in-window regardless of now. */
+    CHECK_EQ(ants_ledger_record_recv(&rec, 11, 0), ANTS_OK);
+    CHECK_EQ(ants_ledger_record_recv(&rec, 22, 0), ANTS_OK);
+    uint64_t gen = 0;
+    CHECK_EQ(ants_ledger_generosity(&rec, 9999999, 1, &gen), ANTS_OK);
+    CHECK(gen == 33);
+}
+
+static void test_recent_ring_eviction(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+
+    /* Push cap+10 receipts of 1 uNCS each, timestamps increasing so all
+     * land in a huge window. The ring keeps only the last cap; the
+     * windowed generosity therefore tops out at cap, even though the
+     * cumulative served_by counts every one. */
+    uint32_t cap = ANTS_LEDGER_RECENT_SAMPLES;
+    uint32_t total = cap + 10u;
+    for (uint32_t i = 0; i < total; i++) {
+        CHECK_EQ(ants_ledger_record_recv(&rec, 1, 100 + i), ANTS_OK);
+    }
+    CHECK(rec.recent_count == cap);
+    CHECK(rec.served_by == total); /* cumulative is not capped */
+
+    uint64_t gen = 0;
+    CHECK_EQ(ants_ledger_generosity(&rec, 100 + total, 1000000, &gen), ANTS_OK);
+    CHECK(gen == cap); /* only the surviving cap samples count */
+}
+
+static void test_record_recv_overflow_no_sample(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+    rec.served_by = UINT64_MAX;
+    /* Overflow => record unchanged AND no sample pushed. */
+    CHECK_EQ(ants_ledger_record_recv(&rec, 1, 500), ANTS_ERROR_OVERFLOW);
+    CHECK(rec.served_by == UINT64_MAX);
+    CHECK(rec.recent_count == 0);
+}
+
+static void test_record_recv_null(void)
+{
+    CHECK_EQ(ants_ledger_record_recv(NULL, 1, 0), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_generosity_null(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+    uint64_t g;
+    CHECK_EQ(ants_ledger_generosity(NULL, 0, 0, &g), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ledger_generosity(&rec, 0, 0, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+/* -- choke/unchoke: the unchoke round -------------------------------- */
+
+/* Build a record with a given peer-id byte, generosity (one receipt),
+ * and quality. Helper for the ranking tests. */
+static ants_ledger_peer_t make_peer(uint8_t id_byte, uint64_t recv_uncs, uint16_t quality)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    memset(id, id_byte, sizeof id);
+    ants_ledger_peer_t rec;
+    (void)ants_ledger_peer_init(&rec, id, 0);
+    rec.quality_q14k = quality;
+    if (recv_uncs > 0) {
+        (void)ants_ledger_record_recv(&rec, recv_uncs, 1000);
+    }
+    return rec;
+}
+
+static void test_unchoke_ranks_by_generosity(void)
+{
+    /* 4 peers, descending generosity, all quality 1.0. slots=8 =>
+     * optimistic = 8/8 = 1, earned = 7. With only 4 peers everyone is
+     * served, but the choked flags should all clear. */
+    ants_ledger_peer_t recs[4];
+    recs[0] = make_peer(0x01, 100, 10000);
+    recs[1] = make_peer(0x02, 50, 10000);
+    recs[2] = make_peer(0x03, 10, 10000);
+    recs[3] = make_peer(0x04, 0, 10000); /* no generosity */
+    uint64_t scratch[4];
+    CHECK_EQ(ants_ledger_unchoke_round(recs, 4, 2000, 1200, 8, 0, scratch, 4), ANTS_OK);
+    for (int i = 0; i < 4; i++) {
+        CHECK(recs[i].choked == false); /* 4 peers <= 8 slots */
+    }
+}
+
+static void test_unchoke_earned_slots_limited(void)
+{
+    /* 10 peers, generosity 100 down to 10 (distinct), quality 1.0,
+     * slots=8 => optimistic=1, earned=7. The 7 most generous are
+     * earned-unchoked; of the remaining 3, exactly 1 gets the optimistic
+     * slot. So exactly 8 unchoked, 2 choked. */
+    ants_ledger_peer_t recs[10];
+    for (int i = 0; i < 10; i++) {
+        recs[i] = make_peer((uint8_t)(0x10 + i), (uint64_t)(100 - i * 10), 10000);
+    }
+    uint64_t scratch[10];
+    CHECK_EQ(ants_ledger_unchoke_round(recs, 10, 2000, 1200, 8, 0, scratch, 10), ANTS_OK);
+    int unchoked = 0;
+    for (int i = 0; i < 10; i++) {
+        if (!recs[i].choked) {
+            unchoked++;
+        }
+    }
+    CHECK(unchoked == 8); /* 7 earned + 1 optimistic */
+    /* The top-7 by generosity (i = 0..6) must all be unchoked. */
+    for (int i = 0; i < 7; i++) {
+        CHECK(recs[i].choked == false);
+    }
+}
+
+static void test_unchoke_quality_is_multiplier(void)
+{
+    /* Two peers, equal generosity, different quality. The higher-quality
+     * peer must rank above. With slots=1 (=> optimistic=1, earned=0),
+     * ranking alone doesn't unchoke; use slots large enough for 1 earned
+     * by setting slots=8 but only 2 peers: both get served. To isolate
+     * ranking, give 9 filler peers with zero generosity so only the 7
+     * earned slots matter. Simpler: directly compare via a 2-peer set
+     * with slots where earned=1. slots= such that earned=1: with
+     * divisor 8, slots=2 => optimistic=1, earned=1. */
+    ants_ledger_peer_t recs[2];
+    recs[0] = make_peer(0x01, 100, 5000);  /* gen 100, q 0.5 => score 500k */
+    recs[1] = make_peer(0x02, 100, 10000); /* gen 100, q 1.0 => score 1.0M */
+    uint64_t scratch[2];
+    /* slots=2 => optimistic=1, earned=1. The earned slot goes to the
+     * higher score (peer 1); peer 0 then takes the optimistic slot, so
+     * both end unchoked — not useful for isolating rank. Use 3 peers with
+     * a zero-gen decoy so earned=1 and optimistic falls on the decoy. */
+    (void)scratch;
+    ants_ledger_peer_t r3[3];
+    r3[0] = make_peer(0x01, 100, 5000);
+    r3[1] = make_peer(0x02, 100, 10000);
+    r3[2] = make_peer(0x03, 0, 10000); /* decoy, lowest score */
+    uint64_t s3[3];
+    /* slots=2 => earned=1, optimistic=1. earned slot -> peer 1 (highest
+     * score). optimistic among the 2 still-choked (peer 0, peer 2),
+     * rotation 0 picks the first in index order = peer 0. So peer 1 and
+     * peer 0 unchoked, peer 2 choked. The point: peer 1 (higher quality)
+     * is the EARNED one; verify it's unchoked and peer 2 (decoy) choked. */
+    CHECK_EQ(ants_ledger_unchoke_round(r3, 3, 2000, 1200, 2, 0, s3, 3), ANTS_OK);
+    CHECK(r3[1].choked == false); /* highest score earned a slot */
+    CHECK(r3[2].choked == true);  /* decoy not earned, not this rotation */
+}
+
+static void test_unchoke_optimistic_rotation(void)
+{
+    /* 3 zero-generosity peers, slots=2 => earned=1 (but all scores 0, so
+     * the "earned" slot also goes by tie-break peer_id ascending), plus
+     * 1 optimistic. Across rotations the optimistic slot should move. We
+     * check that over rotations 0,1,2 every peer gets unchoked at least
+     * once (porosity). */
+    int ever_unchoked[3] = {0, 0, 0};
+    for (uint64_t rot = 0; rot < 3; rot++) {
+        ants_ledger_peer_t recs[3];
+        recs[0] = make_peer(0x01, 0, 10000);
+        recs[1] = make_peer(0x02, 0, 10000);
+        recs[2] = make_peer(0x03, 0, 10000);
+        uint64_t scratch[3];
+        CHECK_EQ(ants_ledger_unchoke_round(recs, 3, 2000, 1200, 2, rot, scratch, 3), ANTS_OK);
+        for (int i = 0; i < 3; i++) {
+            if (!recs[i].choked) {
+                ever_unchoked[i] = 1;
+            }
+        }
+    }
+    CHECK(ever_unchoked[0] && ever_unchoked[1] && ever_unchoked[2]);
+}
+
+static void test_unchoke_zero_slots_chokes_all(void)
+{
+    ants_ledger_peer_t recs[3];
+    recs[0] = make_peer(0x01, 100, 10000);
+    recs[1] = make_peer(0x02, 50, 10000);
+    recs[2] = make_peer(0x03, 10, 10000);
+    uint64_t scratch[3];
+    CHECK_EQ(ants_ledger_unchoke_round(recs, 3, 2000, 1200, 0, 0, scratch, 3), ANTS_OK);
+    for (int i = 0; i < 3; i++) {
+        CHECK(recs[i].choked == true);
+    }
+}
+
+static void test_unchoke_arg_guards(void)
+{
+    ants_ledger_peer_t recs[2];
+    recs[0] = make_peer(0x01, 1, 10000);
+    recs[1] = make_peer(0x02, 1, 10000);
+    uint64_t scratch[2];
+    /* n_records == 0 is a no-op success even with NULL. */
+    CHECK_EQ(ants_ledger_unchoke_round(NULL, 0, 0, 0, 8, 0, NULL, 0), ANTS_OK);
+    /* NULL records / scratch with n>0 => INVALID_ARG. */
+    CHECK_EQ(ants_ledger_unchoke_round(NULL, 2, 0, 0, 8, 0, scratch, 2), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ledger_unchoke_round(recs, 2, 0, 0, 8, 0, NULL, 2), ANTS_ERROR_INVALID_ARG);
+    /* scratch too short => INVALID_ARG. */
+    CHECK_EQ(ants_ledger_unchoke_round(recs, 2, 0, 0, 8, 0, scratch, 1), ANTS_ERROR_INVALID_ARG);
+}
+
+/* -- choke/unchoke: CBOR round-trip with recent samples -------------- */
+
+static void test_record_round_trip_with_recent(void)
+{
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 1700000000ULL), ANTS_OK);
+    /* A handful of receipts (partial ring). */
+    CHECK_EQ(ants_ledger_record_recv(&rec, 11, 1700000100ULL), ANTS_OK);
+    CHECK_EQ(ants_ledger_record_recv(&rec, 22, 1700000200ULL), ANTS_OK);
+    CHECK_EQ(ants_ledger_record_recv(&rec, 33, 1700000300ULL), ANTS_OK);
+
+    uint8_t buf[ANTS_LEDGER_RECORD_ENCODED_MAX];
+    size_t n = 0;
+    CHECK_EQ(ants_ledger_record_encode(&rec, buf, sizeof buf, &n), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(buf, n), ANTS_OK);
+
+    ants_ledger_peer_t got;
+    CHECK_EQ(ants_ledger_record_decode(buf, n, &got), ANTS_OK);
+    CHECK(got.recent_count == 3);
+    /* Generosity over a huge window must match across the round-trip. */
+    uint64_t g0 = 0, g1 = 0;
+    CHECK_EQ(ants_ledger_generosity(&rec, 1700000400ULL, 1000000, &g0), ANTS_OK);
+    CHECK_EQ(ants_ledger_generosity(&got, 1700000400ULL, 1000000, &g1), ANTS_OK);
+    CHECK(g0 == 66);
+    CHECK(g1 == g0);
+}
+
+static void test_record_round_trip_full_ring(void)
+{
+    /* A full ring (cap samples) must round-trip and stay canonical. */
+    uint8_t id[ANTS_LEDGER_PEER_ID_SIZE];
+    sample_peer_id(id);
+    ants_ledger_peer_t rec;
+    CHECK_EQ(ants_ledger_peer_init(&rec, id, 0), ANTS_OK);
+    uint32_t cap = ANTS_LEDGER_RECENT_SAMPLES;
+    for (uint32_t i = 0; i < cap + 5u; i++) {
+        CHECK_EQ(ants_ledger_record_recv(&rec, i + 1u, 1000 + i), ANTS_OK);
+    }
+    CHECK(rec.recent_count == cap);
+
+    uint8_t buf[ANTS_LEDGER_RECORD_ENCODED_MAX];
+    size_t n = 0;
+    CHECK_EQ(ants_ledger_record_encode(&rec, buf, sizeof buf, &n), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(buf, n), ANTS_OK);
+
+    ants_ledger_peer_t got;
+    CHECK_EQ(ants_ledger_record_decode(buf, n, &got), ANTS_OK);
+    CHECK(got.recent_count == cap);
+    uint64_t g0 = 0, g1 = 0;
+    CHECK_EQ(ants_ledger_generosity(&rec, 2000, 1000000, &g0), ANTS_OK);
+    CHECK_EQ(ants_ledger_generosity(&got, 2000, 1000000, &g1), ANTS_OK);
+    CHECK(g0 == g1);
+}
+
+static void test_decode_rejects_oversized_recent(void)
+{
+    /* A key-8 array claiming more than ANTS_LEDGER_RECENT_SAMPLES entries
+     * must be rejected — it would not fit the ring buffer. Encode a valid
+     * record with an empty recent array (tail = 0x08 0x80 = key 8,
+     * array(0)), then rewrite the array(0) header into array(cap+1). The
+     * decoder checks the announced count against the cap BEFORE reading
+     * any entry, so no entry bytes are needed to trigger the bound. */
+    ants_ledger_peer_t z;
+    uint8_t zid[ANTS_LEDGER_PEER_ID_SIZE] = {0};
+    CHECK_EQ(ants_ledger_peer_init(&z, zid, 0), ANTS_OK);
+    z.quality_q14k = 0;
+    z.choked = false;
+    uint8_t zb[ANTS_LEDGER_RECORD_ENCODED_MAX];
+    size_t zn = 0;
+    CHECK_EQ(ants_ledger_record_encode(&z, zb, sizeof zb, &zn), ANTS_OK);
+
+    /* Empty recent => the encoding ends in `0x08 0x80`. Rewrite the
+     * array(0) byte 0x80 into array(33) = `0x98 0x21` (cap is 32, so 33
+     * is one over). 0x98 = array with a following 1-byte count; 0x21 = 33. */
+    CHECK(zb[zn - 1] == 0x80);
+    zb[zn - 1] = 0x98;
+    zb[zn] = 0x21; /* count = 33 = cap + 1 */
+    ants_ledger_peer_t got;
+    ants_error_t rc = ants_ledger_record_decode(zb, zn + 1, &got);
+    CHECK(rc == ANTS_ERROR_MALFORMED || rc == ANTS_ERROR_NON_CANONICAL);
 }
 
 int main(void)
@@ -395,6 +730,24 @@ int main(void)
     test_decode_rejects_wrong_map_size();
     test_decode_rejects_non_canonical_int();
     test_decode_rejects_wrong_field_type();
+
+    test_generosity_window();
+    test_generosity_clockless_always_in_window();
+    test_recent_ring_eviction();
+    test_record_recv_overflow_no_sample();
+    test_record_recv_null();
+    test_generosity_null();
+
+    test_unchoke_ranks_by_generosity();
+    test_unchoke_earned_slots_limited();
+    test_unchoke_quality_is_multiplier();
+    test_unchoke_optimistic_rotation();
+    test_unchoke_zero_slots_chokes_all();
+    test_unchoke_arg_guards();
+
+    test_record_round_trip_with_recent();
+    test_record_round_trip_full_ring();
+    test_decode_rejects_oversized_recent();
 
     if (failures > 0) {
         fprintf(stderr, "test_ledger: %d failure(s)\n", failures);
