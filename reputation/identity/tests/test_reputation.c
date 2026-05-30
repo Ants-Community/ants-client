@@ -315,11 +315,14 @@ static void test_params_default(void)
 
 static void test_t_eff_pinned_values(void)
 {
-    /* Exact pinned outputs of the fixed-point recipe (cap = 2e9). These
-     * are the canonical bytes: if a future change to the exp recipe (term
-     * count, range-reduction split, the muldiv) shifts any of them, fork
-     * choice would silently diverge across peers — so they are nailed
-     * down. Verified against a double-precision reference offline. */
+    /* Regression pin of the fixed-point recipe's exact outputs at cap =
+     * 2e9. These are the canonical bytes: if a future change to the exp
+     * recipe (term count, range-reduction split, the muldiv) shifts any of
+     * them, fork choice would silently diverge across peers — so they are
+     * nailed down. Each is within 1 unit of the true (libm double)
+     * cap·(1 − exp(−t/cap)); the true values, for the record:
+     *   t=2e6  → 1999000.50    t=2e7 → 19900330.83
+     *   t=2e8  → 190325163.64  t=cap → 1264241117.66                     */
     uint64_t cap = ANTS_REP_T_FORK_CHOICE_CAP; /* 2e9 */
     uint64_t v;
 
@@ -328,12 +331,26 @@ static void test_t_eff_pinned_values(void)
     CHECK_EQ(ants_reputation_t_eff(2000000, cap, &v), ANTS_OK);
     CHECK(v == 1999000);
     CHECK_EQ(ants_reputation_t_eff(20000000, cap, &v), ANTS_OK);
-    CHECK(v == 19900333);
+    CHECK(v == 19900331);
     CHECK_EQ(ants_reputation_t_eff(200000000, cap, &v), ANTS_OK);
-    CHECK(v == 190325687);
-    /* At t == cap, T_eff = cap·(1 − 1/e) = 0.632121·2e9. */
+    CHECK(v == 190325163);
     CHECK_EQ(ants_reputation_t_eff(cap, cap, &v), ANTS_OK);
-    CHECK(v == 1264241734);
+    CHECK(v == 1264241117);
+
+    /* Independent algebraic anchor at t == cap: the range reduction gives
+     * n = 1, f = 0 exactly, so the Taylor path contributes exactly 1.0 and
+     * T_eff(cap) = cap · (1 − exp(−1)) with exp(−1) the PINNED q32
+     * constant — reproduced here WITHOUT the impl's muldiv / Taylor loop
+     * (cap·(2^32 − E1) ≈ 5.4e18 fits in u64, so the >>32 is exact). If
+     * this and the pin above ever disagree, the exp(−1) constant or the
+     * f==0 path regressed. */
+    {
+        uint64_t one_minus_e1 = ANTS_REP_FP_ONE - ANTS_REP_EXP_NEG1_Q32;
+        uint64_t at_cap = (cap * one_minus_e1) >> ANTS_REP_FP_BITS;
+        CHECK(at_cap == 1264241117);
+        CHECK_EQ(ants_reputation_t_eff(cap, cap, &v), ANTS_OK);
+        CHECK(v == at_cap);
+    }
 }
 
 static void test_t_eff_properties(void)
