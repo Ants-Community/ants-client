@@ -1,16 +1,17 @@
 # economy/ledger — Component #14 (local economic ledger).
 #
-# Spec: RFC-0001 v0.3 §"The local ledger"; RFC-0008 v0.5 §6 (NCS as u64
-# micro-NCS) + §1.1 (canonical CBOR).
+# Spec: RFC-0001 v0.3 §"The local ledger" + §"The choke / unchoke
+# algorithm"; RFC-0006 v0.1 (payment terms); RFC-0008 v0.5 §6 (NCS as u64
+# micro-NCS) + §1.1 (canonical CBOR) + §7 (choke constants).
 #
-# Status: PR1 — the accounting core. Per-pair u64 uNCS running totals
-# with overflow-checked credits, on-demand signed net balance, and
-# canonical-CBOR record (de)serialisation. The choke/unchoke loop,
-# optimistic-unchoke slot (RFC-0001), and payment-terms negotiation
-# (RFC-0006) land in subsequent PRs.
+# Status: PR1 accounting core + PR2 choke/unchoke loop + PR3 payment-terms
+# object. ledger.c = the per-pair NCS accounting and the choke/unchoke
+# scheduler; payment.c = the RFC-0006 payment_terms advertisement object
+# and its canonical-CBOR codec.
 
 add_library(ants_ledger STATIC
     src/ledger.c
+    src/payment.c
 )
 
 target_include_directories(ants_ledger
@@ -39,4 +40,10 @@ if(BUILD_TESTING)
     # probe) and needs ants_strerror, so it links ants_cbor explicitly.
     target_link_libraries(test_ledger PRIVATE ants_ledger ants_cbor)
     add_test(NAME ledger_basic COMMAND test_ledger)
+
+    add_executable(test_payment tests/test_payment.c)
+    # Same rationale: the payment-terms tests probe ants_cbor canonicity
+    # directly and need ants_strerror.
+    target_link_libraries(test_payment PRIVATE ants_ledger ants_cbor)
+    add_test(NAME payment_basic COMMAND test_payment)
 endif()

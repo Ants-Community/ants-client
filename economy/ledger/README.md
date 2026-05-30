@@ -2,14 +2,13 @@
 
 Local economic ledger. Economy & coordination layer.
 
-**Status:** PR1 (accounting core) + PR2 (choke/unchoke loop) implemented; payment-terms pending.
+**Status:** PR1 (accounting core) + PR2 (choke/unchoke loop) + PR3 (payment-terms object) implemented — Component #14 feature-complete at the v0.x level.
 **Effort:** 2 EM.
 **Spec:** [RFC-0001 v0.3](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0001-community-economy.md), [RFC-0006 v0.1](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0006-payment-terms.md).
-**Dependencies:** `foundation/cbor` (canonical record serialisation). The
-payment-terms work will additionally use `reputation/identity` once that
-component lands; the code so far does not depend on it (the ledger keys
-peers by their raw 32-byte Ed25519 id, and the generosity score is purely
-local recent-receipts).
+**Dependencies:** `foundation/cbor` (canonical record serialisation). None
+of the code so far depends on `reputation/identity` (the ledger keys peers
+by their raw 32-byte Ed25519 id, the generosity score is purely local
+recent-receipts, and payment terms are a self-describing advertisement).
 
 ## Scope
 
@@ -51,9 +50,29 @@ community economy runs on.
 > say 1/8. We follow 1/8 (authoritative) and flag the pseudocode/table
 > mismatch for an upstream clarification.
 
-**Pending (later PRs):**
+**Implemented (PR3 — the payment-terms object, RFC-0006):**
 
-- **Payment-terms negotiation** per RFC-0006 (the metadata field by which any peer declares its economic terms).
+- **`payment_terms` advertisement object** (`ants_payment.h` /
+  `payment.c`): the structured metadata by which a peer declares the
+  economic terms it transacts under. An ordered list of `PaymentScheme`s
+  (most-preferred first), a `validity` deadline, a `scope`, and free-form
+  `notes`. The six schemes of RFC-0006 §"Standard schemes" are modelled:
+  `none`, `ncs`, `fiat_stripe`, `fiat_lightning`, `subscription`,
+  `custom`; each carries only its kind's fields (no floats — Stripe rate
+  and Lightning sats are u64).
+- **Canonical-CBOR codec** (RFC-0008 §1.1) + structural validation +
+  `ants_payment_terms_intersects` (the RFC-0006 match test: do two
+  parties share at least one scheme kind). The decoder is strict — a
+  scheme whose key set does not match its kind, an over-long text field,
+  too many schemes, or any non-canonical framing is rejected.
+- **Deliberately out of scope** (RFC-0006 is v0.1 early): the requester's
+  candidate-ranking / price-matching *policy* (described in prose, not
+  pinned), cross-economy cache settlement, and the fiat-NCS gateway. This
+  PR ships the stable object + codec, not the volatile policy.
+
+Payment terms are a separate module (`payment.c`) inside this component,
+linked into `ants_ledger`; they are conceptually distinct from the
+per-pair NCS ledger but share the economy layer and the CBOR discipline.
 
 ## Good-first-contribution flag
 
