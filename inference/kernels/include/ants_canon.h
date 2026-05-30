@@ -34,9 +34,10 @@
  *   - FP32 × FP32 → FP32 matmul (strict left-to-right): implemented (§3 + §5)
  *   - Softmax with stable subtract-max + divide: implemented (§3)
  *   - Full scaled-dot-product attention (Q·K^T + softmax + ·V): implemented (§3)
- *   - Per-channel symmetric INT8 weight quantization (§1, AbsMax variant
- *     without group-size-128 + without GPTQ Hessian optimization): implemented
- *   - Group-size-128 quantization (§1 full canonical): future PR
+ *   - Per-channel symmetric INT8 weight quantization (§1, AbsMax variant,
+ *     one scale per channel): implemented
+ *   - Group-wise symmetric INT8 weight quantization (§1, AbsMax per group,
+ *     canonical group size 128): implemented
  *   - GPTQ Hessian-optimized scales: future PR (calibration-driven)
  *   - SIMD parity (AVX2/AVX-512/NEON/SVE): future PRs
  *
@@ -87,6 +88,14 @@ typedef int32_t ants_canon_q24_t;
  * it as a named constant makes the recipe self-documenting; tests
  * compare against this value. */
 #define ANTS_CANON_NEG_INF_BITS 0xFF800000u
+
+/* Canonical group size for group-wise weight quantization (RFC-0009 §1:
+ * "per-channel symmetric scaling, group size 128"). Each contiguous run
+ * of this many weights within an output channel gets its own scale. The
+ * grouped entry point takes the size as a parameter so short final groups
+ * and finer/coarser grids are testable, but 128 is the value the canonical
+ * INT8-GPTQ-128 audited path pins. */
+#define ANTS_CANON_QUANT_GROUP_SIZE 128u
 
 /* ------------------------------------------------------------------------ */
 /* q24 fixed-point conversion (RFC-0009 §5)                                 */
@@ -445,6 +454,54 @@ ants_error_t ants_canon_quantize_weights_symmetric_per_channel(const float *w,
                                                                float *scales,
                                                                size_t n_channels,
                                                                size_t channel_size);
+
+/*
+ * Quantize FP32 weights to INT8 with group-wise symmetric scaling
+ * (RFC-0009 §1: "per-channel symmetric scaling, group size 128"). This
+ * is the finer-grained sibling of the per-channel entry point above:
+ * each output channel is split into contiguous groups of `group_size`
+ * weights along the input dimension, and each group gets its own scale.
+ * It is the granularity the canonical INT8-GPTQ-128 audited path uses;
+ * per-channel is the special case group_size >= channel_size.
+ *
+ * Per channel ch, per group g (same recipe as per-channel, applied to
+ * the group's slice — §2.1 discipline throughout):
+ *   max_abs = left-biased-tree-max(|w[ch, g*G .. g*G + len - 1]|)
+ *   if max_abs == 0:
+ *     scales[ch, g] = 1.0f                   (zero-group sentinel)
+ *     w_int8[...]   = 0 for the group
+ *   else:
+ *     scales[ch, g] = max_abs / 127.0f       (single FP32 divide, NOT
+ *                                             a precomputed reciprocal)
+ *     w_int8[ch, i] = clamp(rintf(w[ch, i] / scales[ch, g]), -127, +127)
+ *
+ * When channel_size is not a multiple of group_size, the final group is
+ * SHORT (covers the remainder, `len` < group_size) and scales over just
+ * those weights — no padding. The number of groups per channel is
+ * n_groups = (channel_size + group_size - 1) / group_size.
+ *
+ * Because each absmax reduces over one group, channel_size is NOT bound
+ * by ANTS_CANON_MAX_REDUCE_LEN here (only group_size is) — unlike the
+ * per-channel variant, which reduces the whole channel at once.
+ *
+ * Shapes (row-major):
+ *   w:       [n_channels × channel_size]   FP32
+ *   w_int8:  [n_channels × channel_size]   INT8 (output)
+ *   scales:  [n_channels × n_groups]       FP32 (output, n_groups above)
+ *
+ * Dequantization: w_fp32 ≈ w_int8[ch, i] * scales[ch, i / group_size].
+ *
+ * Returns:
+ *   ANTS_OK                — quantization complete;
+ *   ANTS_ERROR_INVALID_ARG — NULL args, zero-sized dim, group_size == 0,
+ *                            or group_size > ANTS_CANON_MAX_REDUCE_LEN.
+ */
+ants_error_t ants_canon_quantize_weights_symmetric_grouped(const float *w,
+                                                           int8_t *w_int8,
+                                                           float *scales,
+                                                           size_t n_channels,
+                                                           size_t channel_size,
+                                                           size_t group_size);
 
 #ifdef __cplusplus
 }
