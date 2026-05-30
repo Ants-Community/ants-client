@@ -1,17 +1,23 @@
 /*
  * ledger.c — Local community-layer economic ledger (Component #14).
  *
- * PR1: the accounting core. Per-pair u64 micro-NCS running totals with
+ * PR1: the accounting core — per-pair u64 micro-NCS running totals with
  * overflow-checked credits, an on-demand signed net balance, and
  * canonical-CBOR (de)serialisation of one peer record.
+ * PR2: the choke / unchoke loop — a windowed generosity score over a
+ * recent-receipts ring buffer, and ants_ledger_unchoke_round (rank by
+ * generosity*quality, earned slots + a reserved optimistic-unchoke
+ * slot). The record + CBOR grow by the recent[] array (key 8).
  *
  * No floats anywhere (RFC-0008 §6). No malloc, no threads, no hidden
- * global state — every entry point operates on a caller-allocated
- * record. The CBOR codec helpers mirror the precedent established by
+ * global state — every entry point operates on caller-allocated records
+ * (the loop takes a caller score-scratch buffer, no internal alloc). The
+ * CBOR codec helpers mirror the precedent established by
  * inference/orchestration (commit_encode/decode): a strict decoder that
  * folds the codec's error vocabulary onto {NON_CANONICAL, MALFORMED}.
  *
- * Spec: RFC-0001 v0.3 §"The local ledger"; RFC-0008 v0.5 §6 + §1.1.
+ * Spec: RFC-0001 v0.3 §"The local ledger" + §"The choke / unchoke
+ * algorithm"; RFC-0008 v0.5 §6 + §1.1 + §7 (choke constants).
  */
 
 #include "ants_ledger.h"
@@ -26,18 +32,19 @@
 /* ------------------------------------------------------------------------ */
 /* Canonical CBOR record schema (DRAFT, defined by this PR)                  */
 /*                                                                          */
-/* A definite-length CBOR map of 7 pairs with ascending integer keys 1..7   */
-/* in struct-field order, float-free. Keys 1..7 each encode to a single     */
-/* byte (0x01..0x07) and so are already in canonical bytewise-ascending     */
+/* A definite-length CBOR map of 8 pairs with ascending integer keys 1..8   */
+/* in struct-field order, float-free. Keys 1..8 each encode to a single     */
+/* byte (0x01..0x08) and so are already in canonical bytewise-ascending     */
 /* order. Documented here for byte-for-byte agreement with any independent  */
 /* implementation, pending an RFC-0008 §"Ledger record" section.            */
 /*                                                                          */
 /*   1 peer_id[32]   2 served_to(u64)   3 served_by(u64)                     */
 /*   4 since_unix_s(u64)   5 last_update_unix_s(u64)                         */
 /*   6 quality_q14k(u16)   7 choked(bool)                                    */
+/*   8 recent(array of [unix_s(u64), amount_uncs(u64)], oldest-first)        */
 /* ------------------------------------------------------------------------ */
 
-#define LEDGER_CBOR_PAIRS 7
+#define LEDGER_CBOR_PAIRS 8
 
 enum {
     LEDGER_KEY_PEER_ID = 1,
@@ -46,7 +53,8 @@ enum {
     LEDGER_KEY_SINCE = 4,
     LEDGER_KEY_LAST_UPDATE = 5,
     LEDGER_KEY_QUALITY = 6,
-    LEDGER_KEY_CHOKED = 7
+    LEDGER_KEY_CHOKED = 7,
+    LEDGER_KEY_RECENT = 8
 };
 
 /* Quality fixed-point scale: 10000 == 1.0 (verified-correct rate). */
@@ -142,6 +150,219 @@ ants_error_t ants_ledger_net_balance(const ants_ledger_peer_t *rec, int64_t *out
 }
 
 /* ------------------------------------------------------------------------ */
+/* Choke / unchoke loop                                                     */
+/* ------------------------------------------------------------------------ */
+
+/* Saturating u64 add / multiply: used for the generosity sum and the
+ * generosity*quality ranking score. Saturation is a guard against
+ * pathological inputs (real 20-minute sums sit far below UINT64_MAX); it
+ * preserves ordering everywhere the product fits, which is the only
+ * property the ranking needs. */
+static uint64_t sat_add_u64(uint64_t a, uint64_t b)
+{
+    if (a > UINT64_MAX - b) {
+        return UINT64_MAX;
+    }
+    return a + b;
+}
+
+static uint64_t sat_mul_u64(uint64_t a, uint64_t b)
+{
+    if (a != 0 && b > UINT64_MAX / a) {
+        return UINT64_MAX;
+    }
+    return a * b;
+}
+
+/* Push a receipt sample into the ring buffer (head = next write). */
+static void recent_push(ants_ledger_peer_t *rec, uint64_t now_unix_s, uint64_t amount_uncs)
+{
+    uint32_t cap = ANTS_LEDGER_RECENT_SAMPLES;
+    rec->recent[rec->recent_head].unix_s = now_unix_s;
+    rec->recent[rec->recent_head].amount_uncs = amount_uncs;
+    rec->recent_head = (rec->recent_head + 1u) % cap;
+    if (rec->recent_count < cap) {
+        rec->recent_count++;
+    }
+}
+
+ants_error_t
+ants_ledger_record_recv(ants_ledger_peer_t *rec, uint64_t amount_uncs, uint64_t now_unix_s)
+{
+    ants_error_t rc;
+    if (rec == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Credit the cumulative total first; on overflow the record is left
+     * unchanged and we push no sample (RFC-0008 §6). */
+    rc = credit(rec, &rec->served_by, amount_uncs, now_unix_s);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    recent_push(rec, now_unix_s, amount_uncs);
+    return ANTS_OK;
+}
+
+ants_error_t ants_ledger_generosity(const ants_ledger_peer_t *rec,
+                                    uint64_t now_unix_s,
+                                    uint64_t window_s,
+                                    uint64_t *out_uncs)
+{
+    uint64_t sum = 0;
+    uint32_t k;
+
+    if (rec == NULL || out_uncs == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    for (k = 0; k < rec->recent_count; k++) {
+        const ants_ledger_recv_sample_t *s = &rec->recent[k];
+        /* In window iff sample.unix_s + window_s >= now_unix_s, computed
+         * without overflow. unix_s == 0 (clockless) is always in window.
+         * now <= window means everything is in window. */
+        bool in_window;
+        if (s->unix_s == 0 || now_unix_s <= window_s) {
+            in_window = true;
+        } else {
+            /* now - window is the cutoff; sample is in if unix_s >= cutoff. */
+            in_window = (s->unix_s >= now_unix_s - window_s);
+        }
+        if (in_window) {
+            sum = sat_add_u64(sum, s->amount_uncs);
+        }
+    }
+    *out_uncs = sum;
+    return ANTS_OK;
+}
+
+/* Rank score for one record: generosity over the window, weighted by the
+ * quality multiplier. quality_q14k in [0,10000]; the product is the sort
+ * key (no divide — ordering is preserved, and dividing would only lose
+ * precision). */
+static uint64_t unchoke_score(const ants_ledger_peer_t *rec, uint64_t now_unix_s, uint64_t window_s)
+{
+    uint64_t gen = 0;
+    (void)ants_ledger_generosity(rec, now_unix_s, window_s, &gen);
+    return sat_mul_u64(gen, (uint64_t)rec->quality_q14k);
+}
+
+/* Strict ranking comparison: is record `i` ranked ABOVE record `j`?
+ * Higher score wins; ties break by peer_id bytewise-ascending (a total,
+ * deterministic, unbiased order). */
+static bool
+ranks_above(const ants_ledger_peer_t *records, const uint64_t *scores, size_t i, size_t j)
+{
+    if (scores[i] != scores[j]) {
+        return scores[i] > scores[j];
+    }
+    return memcmp(records[i].peer_id, records[j].peer_id, ANTS_LEDGER_PEER_ID_SIZE) < 0;
+}
+
+ants_error_t ants_ledger_unchoke_round(ants_ledger_peer_t *records,
+                                       size_t n_records,
+                                       uint64_t now_unix_s,
+                                       uint64_t window_s,
+                                       uint32_t slots,
+                                       uint64_t rotation,
+                                       uint64_t *score_scratch,
+                                       size_t scratch_len)
+{
+    size_t i, j;
+    uint32_t optimistic, earned;
+    size_t still_choked;
+    uint64_t opt_taken;
+
+    if (n_records == 0) {
+        return ANTS_OK;
+    }
+    if (records == NULL || score_scratch == NULL || scratch_len < n_records) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Slot split: reserve 1/DIVISOR (>=1) for optimistic unchoke, the
+     * rest are earned. slots == 0 chokes everyone. */
+    if (slots == 0) {
+        for (i = 0; i < n_records; i++) {
+            records[i].choked = true;
+        }
+        return ANTS_OK;
+    }
+    optimistic = slots / ANTS_LEDGER_OPTIMISTIC_UNCHOKE_DIVISOR;
+    if (optimistic == 0) {
+        optimistic = 1;
+    }
+    earned = (optimistic >= slots) ? 0 : (slots - optimistic);
+
+    /* Score every record once into the caller scratch. */
+    for (i = 0; i < n_records; i++) {
+        score_scratch[i] = unchoke_score(&records[i], now_unix_s, window_s);
+    }
+
+    /* Earned slots: a record is earned-unchoked iff strictly fewer than
+     * `earned` other records rank above it (rank-counting, no sort, no
+     * extra scratch). Everything starts choked. */
+    for (i = 0; i < n_records; i++) {
+        uint32_t above = 0;
+        bool earned_unchoked;
+        records[i].choked = true;
+        if (earned == 0) {
+            continue;
+        }
+        for (j = 0; j < n_records; j++) {
+            if (j != i && ranks_above(records, score_scratch, j, i)) {
+                above++;
+                if (above >= earned) {
+                    break;
+                }
+            }
+        }
+        earned_unchoked = (above < earned);
+        if (earned_unchoked) {
+            records[i].choked = false;
+        }
+    }
+
+    /* Optimistic slots: among the still-choked records, pick `optimistic`
+     * of them round-robin starting at rotation % still_choked. This is
+     * the deterministic, RNG-free stand-in for the reference impl's
+     * random optimistic pick. */
+    still_choked = 0;
+    for (i = 0; i < n_records; i++) {
+        if (records[i].choked) {
+            still_choked++;
+        }
+    }
+    if (still_choked == 0 || optimistic == 0) {
+        return ANTS_OK;
+    }
+
+    {
+        size_t start = (size_t)(rotation % (uint64_t)still_choked);
+        size_t seen = 0;
+        opt_taken = 0;
+        /* Walk the still-choked records in index order; unchoke those at
+         * logical positions [start, start+optimistic) modulo the count. */
+        for (i = 0; i < n_records && opt_taken < optimistic; i++) {
+            if (!records[i].choked) {
+                continue;
+            }
+            /* `seen` is this choked record's logical position. It is in
+             * the optimistic window if (seen - start) mod still_choked
+             * < optimistic. */
+            {
+                size_t rel = (seen + still_choked - start) % still_choked;
+                if (rel < optimistic) {
+                    records[i].choked = false;
+                    opt_taken++;
+                }
+            }
+            seen++;
+        }
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Encode helpers (mirror inference/orchestration precedent)                */
 /* ------------------------------------------------------------------------ */
 
@@ -217,6 +438,38 @@ ants_ledger_record_encode(const ants_ledger_peer_t *rec, uint8_t *buf, size_t ca
     rc = enc_kv_bool(&enc, LEDGER_KEY_CHOKED, rec->choked);
     if (rc != ANTS_OK) {
         return rc;
+    }
+
+    /* key 8: recent receipts, normalised oldest-first (the ring head is
+     * not serialised, so the bytes are canonical regardless of where the
+     * head sits internally). */
+    rc = ants_cbor_enc_uint(&enc, LEDGER_KEY_RECENT);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_array(&enc, rec->recent_count);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    {
+        uint32_t ring_cap = ANTS_LEDGER_RECENT_SAMPLES;
+        uint32_t oldest = (rec->recent_head + ring_cap - rec->recent_count) % ring_cap;
+        uint32_t k;
+        for (k = 0; k < rec->recent_count; k++) {
+            uint32_t idx = (oldest + k) % ring_cap;
+            rc = ants_cbor_enc_array(&enc, 2);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            rc = ants_cbor_enc_uint(&enc, rec->recent[idx].unix_s);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            rc = ants_cbor_enc_uint(&enc, rec->recent[idx].amount_uncs);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+        }
     }
 
     rc = ants_cbor_enc_finalise(&enc);
@@ -358,6 +611,48 @@ ants_error_t ants_ledger_record_decode(const uint8_t *buf, size_t len, ants_ledg
     rc = decode_bool_field(&dec, LEDGER_KEY_CHOKED, &rec->choked);
     if (rc != ANTS_OK) {
         return rc;
+    }
+
+    /* key 8: recent receipts array, oldest-first. Rebuilds the ring with
+     * recent_count samples at indices [0, recent_count). */
+    rc = expect_key(&dec, LEDGER_KEY_RECENT);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    {
+        size_t n_recent = 0;
+        size_t k;
+        rc = norm_decode_err(ants_cbor_dec_array(&dec, &n_recent));
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (n_recent > ANTS_LEDGER_RECENT_SAMPLES) {
+            return ANTS_ERROR_MALFORMED; /* would not fit the ring buffer */
+        }
+        for (k = 0; k < n_recent; k++) {
+            size_t two = 0;
+            uint64_t ts = 0;
+            uint64_t amt = 0;
+            rc = norm_decode_err(ants_cbor_dec_array(&dec, &two));
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            if (two != 2) {
+                return ANTS_ERROR_MALFORMED;
+            }
+            rc = norm_decode_err(ants_cbor_dec_uint(&dec, &ts));
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            rc = norm_decode_err(ants_cbor_dec_uint(&dec, &amt));
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            rec->recent[k].unix_s = ts;
+            rec->recent[k].amount_uncs = amt;
+        }
+        rec->recent_count = (uint32_t)n_recent;
+        rec->recent_head = (n_recent == ANTS_LEDGER_RECENT_SAMPLES) ? 0u : (uint32_t)n_recent;
     }
 
     /* Reject trailing bytes / unclosed container (closes the strict
