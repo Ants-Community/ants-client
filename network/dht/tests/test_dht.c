@@ -15,6 +15,14 @@
  *   - Kademlia parameters (K, alpha, bucket count) pinned.
  */
 
+/* POSIX feature test — required on glibc to expose nanosleep() from
+ * <time.h>. macOS exposes it by default; this keeps the Linux CI jobs
+ * (gcc/clang) compiling without _GNU_SOURCE. Mirrors the same block in
+ * network/dht/src/dht.c. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_common.h"
 #include "ants_crypto.h"
 #include "ants_dht.h"
@@ -55,6 +63,21 @@ static int failures = 0;
                     (int)_a);                                                                      \
         }                                                                                          \
     } while (0)
+
+/* Pace a tick spin-loop. picoquic drives its handshake and retransmit
+ * timers off the wall clock, so spinning ants_transport_tick() with no
+ * delay can run a fixed-count loop to exhaustion in a few milliseconds —
+ * before those timers fire. That is the long-standing macOS CI flake in
+ * this file (dht_basic intermittently failing on conn_ready / stream_* /
+ * lookup_complete, on different assertions each run). A short sleep per
+ * iteration lets real time advance so the QUIC handshake and RPC round
+ * trips can progress; on the green path the loop still breaks as soon as
+ * its predicate holds, so passing runs stay fast. */
+static void tick_pace(void)
+{
+    struct timespec ts = {0, 1000000L}; /* 1 ms */
+    nanosleep(&ts, NULL);
+}
 
 static void test_pinned_constants(void)
 {
@@ -1045,6 +1068,7 @@ static void test_rpc_round_trip(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (client.conn_ready >= 1) {
@@ -1060,6 +1084,7 @@ static void test_rpc_round_trip(void)
     CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp_ping), ANTS_OK);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp_ping.fired >= 1) {
@@ -1091,6 +1116,7 @@ static void test_rpc_round_trip(void)
         ANTS_OK);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp_fn.fired >= 1) {
@@ -1257,6 +1283,7 @@ static void test_lookup_round_trip(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (client.conn_ready >= 1) {
@@ -1283,6 +1310,7 @@ static void test_lookup_round_trip(void)
     CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
 
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -1521,6 +1549,7 @@ static void test_server_responds_to_ping(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1534,6 +1563,7 @@ static void test_server_responds_to_ping(void)
     memset(&comp, 0, sizeof comp);
     CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp.fired >= 1) {
@@ -1616,6 +1646,7 @@ static void test_server_get_peers_with_announce(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1630,6 +1661,7 @@ static void test_server_get_peers_with_announce(void)
     CHECK_EQ(ants_dht__test_send_get_peers(&da, &conn, shard_x, test_rpc_complete_ping, &comp),
              ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (comp.fired >= 1) {
@@ -1714,6 +1746,7 @@ static void test_bootstrap_completes(void)
     CHECK_EQ(ants_dht_bootstrap(&da, baddr, NULL), ANTS_ERROR_INVALID_ARG);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1725,6 +1758,7 @@ static void test_bootstrap_completes(void)
 
     /* Drive a few more ticks for the self-FIND_NODE round-trip. */
     for (int i = 0; i < 50; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
     }
@@ -1839,6 +1873,7 @@ static void test_refresh_pings_stale_peer(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -1869,6 +1904,7 @@ static void test_refresh_pings_stale_peer(void)
     /* Drive ticks. The refresh sweep should issue a PING; B's DHT
      * responds; A's completion bumps last_seen_us and keeps strikes at 0. */
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -1951,6 +1987,7 @@ static void test_refresh_evicts_after_threshold(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1) {
@@ -1972,6 +2009,7 @@ static void test_refresh_evicts_after_threshold(void)
      * each PING fails on round-trip within a few ms, so 3 strikes take
      * ~50-80 ms; 500 ticks gives comfortable margin even on a slow CI. */
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2055,6 +2093,7 @@ static void test_refresh_no_ping_when_fresh(void)
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
@@ -2072,6 +2111,7 @@ static void test_refresh_no_ping_when_fresh(void)
 
     int b_streams_before = b_ep.stream_opened;
     for (int i = 0; i < 100; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2179,6 +2219,7 @@ static void republish_fixture_init(test_republish_fixture_t *fx,
 
     CHECK_EQ(ants_transport_dial(&fx->ta, baddr, NULL, &fx->conn), ANTS_OK);
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&fx->ta);
         ants_transport_tick(&fx->tb);
         if (fx->a_ep.conn_ready >= 1 && fx->b_ep.conn_ready >= 1) {
@@ -2221,6 +2262,7 @@ static void test_republish_propagates_to_closest_peer(void)
     /* Drive ticks. The chain is GET_PEERS round-trip + ANNOUNCE_PEER
      * round-trip; both fit comfortably in a 300-iter loop on localhost. */
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&fx.ta);
         ants_transport_tick(&fx.tb);
         (void)ants_dht_tick(&fx.da);
@@ -2248,6 +2290,7 @@ static void test_republish_fires_announce_confirmed(void)
     CHECK_EQ(ants_dht_announce(&fx.da, shard_y), ANTS_OK);
 
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&fx.ta);
         ants_transport_tick(&fx.tb);
         (void)ants_dht_tick(&fx.da);
@@ -2275,6 +2318,7 @@ static void test_republish_only_once_per_cycle(void)
 
     /* Drive enough ticks for the chain to complete. */
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&fx.ta);
         ants_transport_tick(&fx.tb);
         (void)ants_dht_tick(&fx.da);
@@ -2287,6 +2331,7 @@ static void test_republish_only_once_per_cycle(void)
 
     /* Now keep ticking; count must NOT increase. */
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&fx.ta);
         ants_transport_tick(&fx.tb);
         (void)ants_dht_tick(&fx.da);
@@ -2397,6 +2442,7 @@ static void test_lookup_dial_promotes_null_conn_candidate(void)
     CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2560,6 +2606,7 @@ static void test_two_node_end_to_end(void)
     /* Drive until both directions complete the handshake (each side
      * sees one outbound CONN_READY and one inbound CONN_READY). */
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         if (a_ep.conn_ready >= 2 && b_ep.conn_ready >= 2) {
@@ -2574,6 +2621,7 @@ static void test_two_node_end_to_end(void)
      * any inserts yet), so FIND_NODE returns peer_count=0 from each
      * server. */
     for (int i = 0; i < 100; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2598,6 +2646,7 @@ static void test_two_node_end_to_end(void)
     ants_dht_lookup_t la = {{0}};
     CHECK_EQ(ants_dht_lookup(&da, shard_y, &la), ANTS_OK);
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2617,6 +2666,7 @@ static void test_two_node_end_to_end(void)
     ants_dht_lookup_t lb = {{0}};
     CHECK_EQ(ants_dht_lookup(&db, shard_x, &lb), ANTS_OK);
     for (int i = 0; i < 300; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
