@@ -1,0 +1,290 @@
+/*
+ * ants_reputation.h — The (A, T, κ) reputation spine (Component #9,
+ * RFC-0004 §"Tenure: the (A, T, κ) spine" + §"Bond accounting model /
+ * Computing A").
+ *
+ * The keystone the rest of the architecture leans on. Two reputation
+ * quantities, both deterministic pure functions of the SAME receipt bag
+ * (the set of counterparty-countersigned NCS receipts), differing only
+ * in decay rate and (for T) a per-identity accrual rate cap:
+ *
+ *   A  "active"  fast decay δ_A, uncapped — serving priority, audit-window
+ *               bound, genesis retirement, and the bondable quantity.
+ *   T  "tenure"  slow decay δ_T, accrual κ-clipped per time bin — verifier
+ *               eligibility and stable fork-succession ranking.
+ *
+ *   A(t) = Σ_i  c_i · decay_A(t − t_i)
+ *   T(t) = Σ_bins  min(κ · bin_width, Σ c in bin) · decay_T(t − t_bin)
+ *
+ * (RFC-0004 §816, §825). κ is what makes time the non-buyable resource:
+ * tenure cannot accrue faster than κ per identity, no matter the spend.
+ *
+ * DETERMINISM IS LOAD-BEARING. Every honest peer must compute the SAME
+ * T_X from the same receipt bag (RFC-0004 §"Why fake tenure is
+ * strategically inert"), so the decay MUST be bit-exact across hardware.
+ * Floating-point exp() is not (RFC-0004 §"A reference sketch": "the
+ * production code uses a fixed-point decay table — see RFC-0009 for the
+ * canonical-numerics discipline"). This module therefore computes decay
+ * in PINNED FIXED-POINT INTEGER arithmetic, no float anywhere:
+ *
+ *   - decay over k bins = r^k, where r = exp(−δ · bin_width) ∈ (0,1) is a
+ *     single per-rate ratio stored as a q32 fixed-point integer
+ *     (ANTS_REP_FP_ONE = 2^32 represents 1.0);
+ *   - r^k is built by repeated q32 multiply (fp_mul), an exact integer
+ *     mul-then-shift — identical on every conformant C target;
+ *   - age is quantised to whole bins (age_bins = age_s / bin_width); the
+ *     reference sketch already evaluates T's decay per bin, and applying
+ *     the same quantisation to A keeps ONE deterministic step unit.
+ *
+ * Scope of THIS module (PR1 of Component #9 — the spine):
+ *   - the countersigned NCS receipt (RFC-0004 §"The receipt that matters
+ *     for tenure"): body + dual Ed25519 signatures, canonical-CBOR body,
+ *     verification;
+ *   - the deterministic fixed-point decay primitive;
+ *   - ants_reputation_compute: A and T from a receipt bag, invalid
+ *     receipts skipped (sketch §1398 "if not verify_receipt: continue").
+ *
+ * Deliberately NOT here (later PRs, each its own RFC-0004 section): the
+ * saturating T_eff fork-choice transform (§"T_eff"), bond accounting +
+ * race-safe admission (§"Bond accounting model" / §Atomicity), selective
+ * disclosure (§"Selective disclosure of receipts"), the receipt-bag
+ * Merkle tree, and L1/L2 slash integration (needs reputation/crdt +
+ * chain, not yet built).
+ *
+ * STATUS OF THE NUMERIC CONSTANTS. The decay ratios, κ, and bin width are
+ * **DRAFT placeholders, NOT calibrated** — RFC-0004 §835 makes δ and κ
+ * b2-class testnet measurements. The fixed-point *recipe* (this file) is
+ * the deliverable; the *values* below are illustrative so the code runs
+ * and tests, exactly as the embedding component ships all-zero pinned
+ * hashes pending the real checkpoint. The recipe should be upstreamed to
+ * RFC-0004 (or a reputation-numerics section in RFC-0009 style) and the
+ * values fixed by b2 before peers compute interoperable T.
+ *
+ * No floats, no malloc, no threads, no hidden global state; caller-owned
+ * arrays throughout. Spec: RFC-0004 v0.6; RFC-0008 v0.5 §1.1 (canonical
+ * CBOR) + §6 (NCS as u64 μ-NCS). Component README:
+ * ants-client/reputation/identity/README.md.
+ */
+
+#ifndef ANTS_REPUTATION_H
+#define ANTS_REPUTATION_H
+
+#include "ants_common.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------------ */
+/* Constants                                                                */
+/* ------------------------------------------------------------------------ */
+
+/* A peer is its 32-byte Ed25519 public key (== protocol peer-id). Kept
+ * local rather than importing the network/transport type, so the
+ * reputation layer takes no dependency on the transport layer for a
+ * 32-byte array. MUST equal ANTS_ED25519_PUBKEY_SIZE. */
+#define ANTS_REP_PEER_ID_SIZE 32u
+
+/* Receipt nonce: issuer-fresh, anti-replay (RFC-0004 §"The receipt").
+ * 16 bytes (128 bits) is collision-free for an honest issuer that never
+ * reuses a nonce with the same client. DRAFT — RFC-0008 does not yet pin
+ * the receipt nonce width. */
+#define ANTS_REP_NONCE_SIZE 16u
+
+/* Ed25519 signature size (mirrors ANTS_ED25519_SIG_SIZE = 64). */
+#define ANTS_REP_SIG_SIZE 64u
+
+/* Fixed-point format for the decay arithmetic: q32 (32 fractional bits).
+ * A decay factor / ratio in [0.0, 1.0] is stored as a u64 in
+ * [0, ANTS_REP_FP_ONE]. q32 gives ~9-10 significant decimal digits, far
+ * beyond what any decay schedule needs, and a u64 product of two q32
+ * values never overflows before the shift. */
+#define ANTS_REP_FP_BITS 32u
+#define ANTS_REP_FP_ONE  (((uint64_t)1) << ANTS_REP_FP_BITS) /* 1.0 in q32 */
+
+/* --- DRAFT placeholder parameters (NOT calibrated — see file header) --- */
+
+/* Decay step / tenure bin width, seconds. Decay is evaluated at this
+ * granularity. Placeholder: 1 hour. */
+#define ANTS_REP_BIN_WIDTH_S 3600u
+
+/* Per-bin decay ratio r = exp(−δ · bin_width), as q32. Placeholders:
+ *   A: r = 0.5  → fast (half the weight gone each bin).
+ *   T: r = 0.99 → slow (≈ a few-month half-life at a 1h bin).
+ * Illustrative only; real δ_A/δ_T are b2-class (RFC-0004 §835). */
+#define ANTS_REP_DECAY_RATIO_A_Q32 (((uint64_t)1) << (ANTS_REP_FP_BITS - 1)) /* 0.5 */
+#define ANTS_REP_DECAY_RATIO_T_Q32 ((uint64_t)4252017623)                    /* ≈0.99 */
+
+/* Per-bin tenure accrual cap κ · bin_width, in μ-NCS. Placeholder:
+ * 1 NCS per bin. The κ rate cap is b2-class (RFC-0004 §835). */
+#define ANTS_REP_KAPPA_UNCS_PER_BIN ((uint64_t)1000000)
+
+/* ------------------------------------------------------------------------ */
+/* Receipt                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A counterparty-countersigned NCS receipt (RFC-0004 §"The receipt that
+ * matters for tenure"). The server did `ncs_value` μ-NCS of useful work
+ * for the client at `timestamp`; both sign. Only receipts with BOTH
+ * valid signatures count toward the server's A and T.
+ *
+ * The signed body is (server, client, ncs_value, timestamp, nonce); the
+ * two signatures are over its canonical CBOR encoding (RFC-0008 §1.1).
+ */
+typedef struct {
+    uint8_t server[ANTS_REP_PEER_ID_SIZE]; /* who did the work (accrues A,T) */
+    uint8_t client[ANTS_REP_PEER_ID_SIZE]; /* who countersigns              */
+    uint64_t ncs_value;                    /* μ-NCS of work (RFC-0008 §6)    */
+    uint64_t timestamp_unix_s;             /* unix seconds                  */
+    uint8_t nonce[ANTS_REP_NONCE_SIZE];    /* issuer-fresh anti-replay      */
+    uint8_t server_sig[ANTS_REP_SIG_SIZE]; /* server over the body          */
+    uint8_t client_sig[ANTS_REP_SIG_SIZE]; /* client countersig over body   */
+} ants_reputation_receipt_t;
+
+/*
+ * Parameters of the (A, T) computation. Carried as an explicit struct so
+ * the b2-calibratable values are inputs, not buried constants; the
+ * ANTS_REP_* macros above are the DRAFT defaults
+ * (ants_reputation_params_default).
+ *
+ * decay_ratio_*_q32 are per-bin ratios in (0, ANTS_REP_FP_ONE]; a value
+ * of 0 would annihilate all history on the first bin and is rejected.
+ */
+typedef struct {
+    uint64_t decay_ratio_a_q32;  /* A: per-bin r_A in q32   */
+    uint64_t decay_ratio_t_q32;  /* T: per-bin r_T in q32   */
+    uint64_t kappa_uncs_per_bin; /* T: per-bin accrual cap */
+    uint64_t bin_width_s;        /* decay/bin granularity  */
+} ants_reputation_params_t;
+
+/* ------------------------------------------------------------------------ */
+/* Fixed-point decay primitive (deterministic, no float)                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * q32 multiply: (a · b) >> 32, for a, b each in [0, ANTS_REP_FP_ONE].
+ * A value >= 1.0 (>= ANTS_REP_FP_ONE) short-circuits (1.0 · x = x), so
+ * the actual multiply runs only when both operands are < 1.0 (each
+ * <= 2^32 − 1) and the product is therefore < 2^64 — exact, no overflow.
+ * Exposed for tests.
+ */
+uint64_t ants_reputation_fp_mul(uint64_t a_q32, uint64_t b_q32);
+
+/*
+ * Decay factor over `age_bins` whole bins: ratio_q32 ^ age_bins, in q32,
+ * computed by **repeated multiplication** — fp_mul applied `age_bins`
+ * times starting from 1.0. This exact sequence is the pinned canonical
+ * recipe: q32 multiply truncates and is therefore NOT associative, so
+ * square-and-multiply would yield a different (also-plausible) bit result
+ * and break cross-peer agreement. The *method* is part of the recipe,
+ * not just the inputs. The loop is bounded by a zero short-circuit: once
+ * the factor underflows to 0 it stays 0 (≤ ~2200 iterations for the
+ * slowest realistic ratio), so a large age cannot drive unbounded work.
+ *
+ * age_bins == 0 returns ANTS_REP_FP_ONE (1.0); a ratio >= 1.0 (no decay)
+ * returns ANTS_REP_FP_ONE for any age. The factor falls toward 0 as age
+ * grows. Exposed for tests.
+ *
+ * @return the q32 decay factor in [0, ANTS_REP_FP_ONE].
+ */
+uint64_t ants_reputation_decay_factor(uint64_t ratio_q32, uint64_t age_bins);
+
+/* ------------------------------------------------------------------------ */
+/* Receipt body serialisation + verification                                */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Worst-case encoded size of a receipt BODY (the signed part, no
+ * signatures): a 5-pair canonical CBOR map — two 32-byte keys, two u64s,
+ * one 16-byte nonce, plus integer keys and headers. Comfortably < 128.
+ */
+#define ANTS_REP_RECEIPT_BODY_ENCODED_MAX 128u
+
+/*
+ * Encode the receipt BODY (server, client, ncs_value, timestamp, nonce)
+ * as canonical CBOR (RFC-0008 §1.1) into `buf` — the exact bytes both
+ * signatures are computed over. Definite-length map of 5 integer-keyed
+ * pairs in ascending key order:
+ *   1: server (bytes 32)  2: client (bytes 32)  3: ncs_value (uint)
+ *   4: timestamp (uint)   5: nonce (bytes 16)
+ * Float-free by construction.
+ *
+ * @return ANTS_OK with *out_len set; ANTS_ERROR_INVALID_ARG on NULL;
+ *         ANTS_ERROR_BUFFER_TOO_SMALL if cap is insufficient.
+ */
+ants_error_t ants_reputation_receipt_body_encode(const ants_reputation_receipt_t *r,
+                                                 uint8_t *buf,
+                                                 size_t cap,
+                                                 size_t *out_len);
+
+/*
+ * Verify a receipt: both the server signature and the client
+ * countersignature must validate over the canonical body encoding
+ * (RFC-0004 §"A receipt without both signatures does not count").
+ *
+ * @param r        the receipt.
+ * @param out_ok   set to true iff both signatures are valid. A bad
+ *                 signature is a *false verdict* (*out_ok=false, return
+ *                 ANTS_OK), not an error.
+ * @return ANTS_OK with *out_ok set; ANTS_ERROR_INVALID_ARG on NULL.
+ */
+ants_error_t ants_reputation_receipt_verify(const ants_reputation_receipt_t *r, bool *out_ok);
+
+/* ------------------------------------------------------------------------ */
+/* The (A, T) computation                                                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Fill `params` with the DRAFT placeholder defaults (the ANTS_REP_*
+ * macros). @return ANTS_OK; ANTS_ERROR_INVALID_ARG if params is NULL.
+ */
+ants_error_t ants_reputation_params_default(ants_reputation_params_t *params);
+
+/*
+ * Compute A and T for `server_id` from a receipt bag at time `now_unix_s`
+ * (RFC-0004 §816 / §825 / reference sketch §1392). Both are u64 μ-NCS.
+ *
+ * For each receipt in `receipts`:
+ *   - skipped unless ants_reputation_receipt_verify says both signatures
+ *     are valid AND receipt.server == server_id AND timestamp <= now
+ *     (a future-dated receipt does not yet contribute);
+ *   - A += ncs_value · decay_A(age_bins)      (uncapped, fast decay);
+ *   - the receipt's ncs_value is added into its time bin for T.
+ * Then T = Σ_bins min(κ·bin_width, bin_total) · decay_T(bin_age_bins).
+ *
+ * age_bins = (now − timestamp) / bin_width (floor); bin index =
+ * timestamp / bin_width; bin_age = now_bin − receipt_bin. Both totals
+ * saturate at UINT64_MAX rather than wrapping (a guard; real reputation
+ * sits far below that).
+ *
+ * T's per-bin grouping is done in-place over the input array with NO
+ * allocation and no scratch: each bin is processed once, by its
+ * first-occurring receipt (a receipt is a bin's representative iff no
+ * earlier verified receipt shares its bin). This is O(n²) in the bag
+ * size — acceptable for a cold reputation recompute — so n is capped at
+ * ANTS_REP_MAX_RECEIPTS to keep the bound sane.
+ *
+ * @return ANTS_OK with *out_a / *out_t set; ANTS_ERROR_INVALID_ARG on
+ *         NULL, a degenerate param (zero bin_width or zero decay ratio),
+ *         or n_receipts > ANTS_REP_MAX_RECEIPTS.
+ */
+#define ANTS_REP_MAX_RECEIPTS 4096u
+
+ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SIZE],
+                                     const ants_reputation_receipt_t *receipts,
+                                     size_t n_receipts,
+                                     uint64_t now_unix_s,
+                                     const ants_reputation_params_t *params,
+                                     uint64_t *out_a,
+                                     uint64_t *out_t);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ANTS_REPUTATION_H */

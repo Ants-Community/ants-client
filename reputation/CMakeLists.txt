@@ -11,4 +11,4 @@
 # add_subdirectory(chain)
 
 # Component #9 — Identity & reputation service  (3 EM)
-# add_subdirectory(identity)
+add_subdirectory(identity)
