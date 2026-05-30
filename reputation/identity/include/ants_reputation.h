@@ -123,6 +123,25 @@ extern "C" {
  * 1 NCS per bin. The κ rate cap is b2-class (RFC-0004 §835). */
 #define ANTS_REP_KAPPA_UNCS_PER_BIN ((uint64_t)1000000)
 
+/* Fork-choice tenure cap T_CAP (RFC-0008 §7 `T_FORK_CHOICE_CAP`), in
+ * μ-NCS, used ONLY by the saturating T_eff transform (RFC-0004 §"The
+ * saturating T → T_eff transform"). Placeholder: 2000 NCS — the spec's
+ * starting point is "~2 years of κ-bound tenure", a b2-class measurement
+ * once κ is fixed. DRAFT, NOT calibrated. */
+#define ANTS_REP_T_FORK_CHOICE_CAP ((uint64_t)2000000000)
+
+/* exp(−1) in q32 fixed-point = round(0.367879441… · 2^32). The base for
+ * the integer part of the T_eff exponential (exp(−n) = exp(−1)^n via the
+ * pinned repeated-multiplication decay_factor). PINNED — part of the
+ * canonical recipe; every peer uses this exact constant. */
+#define ANTS_REP_EXP_NEG1_Q32 ((uint64_t)1580030169)
+
+/* Number of Taylor terms for the fractional part exp(−f), f ∈ [0,1).
+ * 16 is overkill-accurate (the q32 truncation floor at ~2e-9 is reached
+ * by N≈10); PINNED so the series is bit-identical across peers — the
+ * term count is part of the recipe, not a tunable. */
+#define ANTS_REP_TAYLOR_TERMS 16u
+
 /* ------------------------------------------------------------------------ */
 /* Receipt                                                                  */
 /* ------------------------------------------------------------------------ */
@@ -282,6 +301,49 @@ ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SI
                                      const ants_reputation_params_t *params,
                                      uint64_t *out_a,
                                      uint64_t *out_t);
+
+/* ------------------------------------------------------------------------ */
+/* Saturating T_eff fork-choice transform (RFC-0004 §"The saturating       */
+/* T → T_eff transform")                                                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The saturating transform applied to tenure `t` FOR FORK-CHOICE ONLY:
+ *
+ *   T_eff(t) = t_cap · (1 − exp(−t / t_cap))
+ *
+ * (RFC-0004 §492). It bounds the *relative* fork-choice weight of an
+ * arbitrarily old peer so the founder cohort cannot retain fork-choice
+ * dominance indefinitely (long-tail centralisation). Raw `t` — uncapped
+ * — still governs verifier eligibility, bond capacity, and persistence;
+ * the cap is applied ONLY here, because fork-choice is the only place one
+ * peer's weight *relative to another* sets the network's path. The caller
+ * sums T_eff over a fork's validators (Σ T_eff) to compare forks.
+ *
+ * Properties (all verified; all intentional per the RFC):
+ *   - linear for t ≪ t_cap: T_eff(t) ≈ t;
+ *   - saturating: T_eff(t) → t_cap as t → ∞, never exceeding t_cap;
+ *   - monotone non-decreasing and DETERMINISTIC — every honest peer
+ *     computes the same T_eff from the same (t, t_cap), so fork choice
+ *     does not split on numerics.
+ *
+ * Determinism is achieved with NO float: exp(−t/t_cap) is computed in
+ * pinned q32 fixed-point by range reduction t/t_cap = n + f —
+ *   exp(−(n+f)) = exp(−1)^n · exp(−f),
+ * the integer power exp(−1)^n via the same repeated-multiplication
+ * decay_factor as the decay primitive (base ANTS_REP_EXP_NEG1_Q32), and
+ * the fractional exp(−f), f ∈ [0,1), via a pinned ANTS_REP_TAYLOR_TERMS
+ * Horner series. The fraction f and the final t_cap·(1−exp) scaling use
+ * overflow-safe integer long-division / multiply-shift (no 128-bit type,
+ * no float). The exact method is the canonical recipe.
+ *
+ * @param t       the peer's raw tenure (μ-NCS), as from ants_reputation_compute.
+ * @param t_cap   the fork-choice cap (e.g. ANTS_REP_T_FORK_CHOICE_CAP);
+ *                must be > 0.
+ * @param out     the effective tenure, in [0, t_cap].
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG if out is NULL or t_cap == 0.
+ */
+ants_error_t ants_reputation_t_eff(uint64_t t, uint64_t t_cap, uint64_t *out);
 
 #ifdef __cplusplus
 }

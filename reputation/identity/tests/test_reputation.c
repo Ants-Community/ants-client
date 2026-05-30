@@ -311,6 +311,82 @@ static void test_params_default(void)
     CHECK_EQ(ants_reputation_params_default(NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- saturating T_eff fork-choice transform ------------------------- */
+
+static void test_t_eff_pinned_values(void)
+{
+    /* Exact pinned outputs of the fixed-point recipe (cap = 2e9). These
+     * are the canonical bytes: if a future change to the exp recipe (term
+     * count, range-reduction split, the muldiv) shifts any of them, fork
+     * choice would silently diverge across peers — so they are nailed
+     * down. Verified against a double-precision reference offline. */
+    uint64_t cap = ANTS_REP_T_FORK_CHOICE_CAP; /* 2e9 */
+    uint64_t v;
+
+    CHECK_EQ(ants_reputation_t_eff(0, cap, &v), ANTS_OK);
+    CHECK(v == 0);
+    CHECK_EQ(ants_reputation_t_eff(2000000, cap, &v), ANTS_OK);
+    CHECK(v == 1999000);
+    CHECK_EQ(ants_reputation_t_eff(20000000, cap, &v), ANTS_OK);
+    CHECK(v == 19900333);
+    CHECK_EQ(ants_reputation_t_eff(200000000, cap, &v), ANTS_OK);
+    CHECK(v == 190325687);
+    /* At t == cap, T_eff = cap·(1 − 1/e) = 0.632121·2e9. */
+    CHECK_EQ(ants_reputation_t_eff(cap, cap, &v), ANTS_OK);
+    CHECK(v == 1264241734);
+}
+
+static void test_t_eff_properties(void)
+{
+    uint64_t cap = ANTS_REP_T_FORK_CHOICE_CAP;
+    uint64_t v, prev;
+    uint64_t i;
+
+    /* Linear regime: for t ≪ cap, T_eff(t) ≈ t (within ~0.1% at t=cap/1000). */
+    CHECK_EQ(ants_reputation_t_eff(cap / 1000, cap, &v), ANTS_OK);
+    {
+        uint64_t t = cap / 1000;
+        uint64_t diff = (v > t) ? (v - t) : (t - v);
+        CHECK(diff * 1000 <= t); /* |T_eff − t| ≤ 0.1% of t */
+    }
+
+    /* Never exceeds the cap, and saturates toward it. */
+    CHECK_EQ(ants_reputation_t_eff(50 * cap, cap, &v), ANTS_OK);
+    CHECK(v <= cap);
+    CHECK(v >= cap - cap / 1000); /* within 0.1% of cap by 50× */
+    CHECK_EQ(ants_reputation_t_eff(UINT64_MAX, cap, &v), ANTS_OK);
+    CHECK(v <= cap); /* pathological huge t still bounded, no runaway */
+
+    /* Monotone non-decreasing across a sweep (the recipe was checked to
+     * have zero inversions; assert it holds). */
+    prev = 0;
+    for (i = 0; i <= 200; i++) {
+        uint64_t t = i * (cap / 20); /* 0 … 10·cap */
+        CHECK_EQ(ants_reputation_t_eff(t, cap, &v), ANTS_OK);
+        CHECK(v >= prev);
+        prev = v;
+    }
+
+    /* Determinism: same input → same output (no hidden state). */
+    {
+        uint64_t a = 0, b = 0;
+        CHECK_EQ(ants_reputation_t_eff(123456789, cap, &a), ANTS_OK);
+        CHECK_EQ(ants_reputation_t_eff(123456789, cap, &b), ANTS_OK);
+        CHECK(a == b);
+    }
+
+    /* A small cap (edge of the range reduction) still obeys the bound. */
+    CHECK_EQ(ants_reputation_t_eff(5, 1, &v), ANTS_OK);
+    CHECK(v <= 1);
+}
+
+static void test_t_eff_args(void)
+{
+    uint64_t v;
+    CHECK_EQ(ants_reputation_t_eff(100, 0, &v), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_t_eff(100, 2000000000, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -321,6 +397,10 @@ int main(void)
     test_compute_kappa_clips_a_bin();
     test_compute_empty_and_args();
     test_params_default();
+
+    test_t_eff_pinned_values();
+    test_t_eff_properties();
+    test_t_eff_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);
