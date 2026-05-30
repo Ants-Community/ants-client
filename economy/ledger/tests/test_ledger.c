@@ -263,7 +263,16 @@ static void test_record_round_trip_zeroes(void)
 
     ants_ledger_peer_t got;
     CHECK_EQ(ants_ledger_record_decode(buf, n, &got), ANTS_OK);
-    CHECK(memcmp(&got, &rec, sizeof rec) == 0);
+    /* Compare field-by-field, not memcmp over the struct: decode fills
+     * the 7 logical fields but not the trailing padding bytes, so a raw
+     * struct memcmp would read uninitialised padding (and is UB). */
+    CHECK(memcmp(got.peer_id, rec.peer_id, ANTS_LEDGER_PEER_ID_SIZE) == 0);
+    CHECK(got.served_to == rec.served_to);
+    CHECK(got.served_by == rec.served_by);
+    CHECK(got.since_unix_s == rec.since_unix_s);
+    CHECK(got.last_update_unix_s == rec.last_update_unix_s);
+    CHECK(got.quality_q14k == rec.quality_q14k);
+    CHECK(got.choked == rec.choked);
 }
 
 static void test_encode_buffer_too_small(void)

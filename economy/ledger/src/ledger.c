@@ -304,7 +304,7 @@ static ants_error_t decode_bool_field(ants_cbor_dec_t *dec, uint64_t key, bool *
 ants_error_t ants_ledger_record_decode(const uint8_t *buf, size_t len, ants_ledger_peer_t *rec)
 {
     ants_cbor_dec_t dec;
-    uint64_t n_pairs = 0;
+    size_t n_pairs = 0;
     uint64_t u;
     ants_error_t rc;
 
