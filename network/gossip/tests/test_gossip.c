@@ -435,32 +435,44 @@ static void test_malformed_frame_rejected(void)
 {
     struct harness h;
     node_t *b;
-    const uint8_t junk[3] = {0xFF, 0xFF, 0xFF};
+    /* A truncated map(2) header with no body: declares two pairs but the
+     * buffer ends immediately, so it is unambiguously not well-formed CBOR
+     * → MALFORMED (distinct from a well-formed frame carrying a bad proof,
+     * which is the per-proof reject path). */
+    const uint8_t truncated[1] = {0xA2};
     size_t nw = 9, rj = 9;
 
     harness_init(&h, 1, 0x40);
     b = &h.nodes[0];
 
-    CHECK_EQ(ants_gossip_on_message(&b->g, NULL, junk, sizeof junk, &nw, &rj),
+    CHECK_EQ(ants_gossip_on_message(&b->g, NULL, truncated, sizeof truncated, &nw, &rj),
              ANTS_ERROR_MALFORMED);
     CHECK(nw == 0 && rj == 0); /* neither new nor a per-proof reject */
 
-    /* An oversized frame is rejected without decoding. */
+    /* An oversized frame is rejected by the size cap, without decoding. The
+     * frame is a real, well-formed PUSH frame (so the rejection is the cap,
+     * not malformedness); the cap is set one byte below the frame size. */
     {
         ants_gossip_config_t cfg;
         node_t *s = &h.nodes[0];
-        uint8_t small_ok[64];
+        uint8_t frame[600];
         size_t fl = 0;
         uint8_t sp[32], su[32], proof[512];
         size_t plen;
         cfg.fanout = 0;
-        cfg.max_frame_bytes = 8; /* absurdly small cap */
-        CHECK_EQ(ants_gossip_init(&s->g, s->set, s->id, &cfg, harness_send, s), ANTS_OK);
         make_key(0x55, sp, su);
         plen = make_proof(sp, su, 1, proof);
-        CHECK_EQ(ants_gossip_push_encode(proof, plen, small_ok, sizeof small_ok, &fl), ANTS_OK);
-        CHECK(fl > 8);
-        CHECK_EQ(ants_gossip_on_message(&s->g, NULL, small_ok, fl, &nw, &rj), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &fl), ANTS_OK);
+        CHECK(fl > 0);
+        /* Cap one byte below the real frame size → rejected without decoding. */
+        cfg.max_frame_bytes = fl - 1;
+        CHECK_EQ(ants_gossip_init(&s->g, s->set, s->id, &cfg, harness_send, s), ANTS_OK);
+        CHECK_EQ(ants_gossip_on_message(&s->g, NULL, frame, fl, &nw, &rj), ANTS_ERROR_MALFORMED);
+        /* The same frame within the cap decodes + inserts fine (new). */
+        cfg.max_frame_bytes = fl;
+        CHECK_EQ(ants_gossip_init(&s->g, s->set, s->id, &cfg, harness_send, s), ANTS_OK);
+        CHECK_EQ(ants_gossip_on_message(&s->g, NULL, frame, fl, &nw, &rj), ANTS_OK);
+        CHECK(nw == 1 && rj == 0);
     }
 
     harness_destroy(&h);

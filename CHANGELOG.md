@@ -13,6 +13,58 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #6 (gossip overlay) — L1-CRDT dissemination engine · 2026-05-31
+
+**The G-Set learns to travel.** Component #7 built the L1 fault G-Set and
+`VERIFY`; #9 made a slashed peer compute to zero; this is the epidemic
+dissemination that carries a fault proof from the peer that detected it to
+every other honest peer (RFC-0004 §"Layer 1", reference sketch
+`on_receive_proof`). The dedup line is load-bearing: it terminates the
+epidemic *and* gives the one-honest-path property — a proof needs only one
+honest path from detector to victim within `T_prop` to slash globally, not
+an honest majority (RFC-0004 §"The structural win"). New module
+`network/gossip/`, wired as the 6th ctest target `gossip_basic` (suite now
+19).
+
+- **Peer view**: a fixed, malloc-free neighbour set
+  (`ANTS_GOSSIP_MAX_VIEW=64`) with idempotent add/remove and
+  self-exclusion. Caller-managed in PR1; anti-eclipse DHT sampling
+  (RFC-0005) is a later PR.
+- **Push wire frame**: canonical CBOR `map(2){0:type, 1:proof(bytes)}`, one
+  fault proof per frame, float-free (RFC-0008 §1.1). Message-type enum
+  integer-stable/append-only; `IHAVE`/`IWANT` lazy-pull reserved; unknown
+  type fails closed (`UNSUPPORTED_TYPE`).
+- **Engine**: `ants_gossip_submit` (local origination) +
+  `ants_gossip_on_message` (receive → insert → forward). The G-Set
+  (`ants_crdt_insert`) is the VERIFY-and-dedup oracle — runs VERIFY, stores
+  a private copy, reports NEW vs duplicate — so the engine never
+  re-implements verify-or-dedup. An unverifiable proof is counted (the
+  rate-limit / attributable-fault hook, RFC-0004 §DoS) and dropped, never
+  forwarded; a duplicate is dropped silently (epidemic terminates); a new
+  valid proof is forwarded to up-to-`fanout` view peers **excluding the
+  sender** (no bounce-back). Fanout selection rotates deterministically (no
+  RNG).
+
+**Why transport is behind a callback.** Byte delivery is a caller-supplied
+`send_fn`; the canonical binding opens an `ants_transport` bidi stream per
+peer, but PR1 leaves that (and the inbound demux) to a later PR so the
+dissemination core is fully testable without a live QUIC handshake (the
+same staging `cache/semantic` used). The library links `ants_crdt` (PUBLIC,
+the G-Set type) + `ants_cbor` (PRIVATE, the frame codec); no transport
+dependency. Wire format is **DRAFT** pending RFC-0008 formalisation.
+
+Landed across the engine commit (`860fcb6`) and a same-day follow-up that
+corrected two test-harness assertions (an over-narrow malformed-frame
+expectation and an oversized-frame fixture that under-sized its buffer);
+the engine itself was unchanged. Tests (real Ed25519 + the real Component
+#7 G-Set, not mocked) drive an in-process "network" of gossip instances
+through their send callbacks — a faithful epidemic terminating by G-Set
+dedup, no QUIC — covering the push codec + reject verdicts, view
+management, submit-forwards-and-dedups, an A→B→C line that reaches the far
+end without bouncing back to the sender, invalid-proof reject-not-forward,
+truncated vs over-cap frame rejection, and arg guards. Full suite 19/19
+green; 0 warnings on a full rebuild; clang-format clean.
+
 ### reputation: Component #9 — L1 slash gate on (A, T) compute · 2026-05-31
 
 **The G-Set starts to bite.** Component #7 (above) built the L1 fault
