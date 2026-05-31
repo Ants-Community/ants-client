@@ -1,0 +1,431 @@
+/*
+ * test_crdt.c — Tests for Layer 1, the consensus-free fault G-Set
+ * (Component #7 PR1): the self-authenticating fault proof.
+ *
+ * Covers the statement + equivocation-proof canonical-CBOR codec, the
+ * BLAKE3 content-address, and VERIFY(π) for the equivocation fault class.
+ * Statements are signed with REAL Ed25519 keys so verification is
+ * exercised end-to-end, not mocked. The negative paths assert the precise
+ * typed verdict the header promises (a same-payload "proof" is MALFORMED,
+ * an unknown class is UNSUPPORTED_TYPE, etc.), and a byte-flip sweep
+ * asserts tamper-detection independently of the impl's internals.
+ */
+
+#include "ants_cbor.h"
+#include "ants_common.h"
+#include "ants_crdt.h"
+#include "ants_crypto.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static int failures = 0;
+
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);                        \
+        }                                                                                          \
+    } while (0)
+
+#define CHECK_EQ(actual, expected)                                                                 \
+    do {                                                                                           \
+        ants_error_t _a = (actual);                                                                \
+        ants_error_t _e = (expected);                                                              \
+        if (_a != _e) {                                                                            \
+            failures++;                                                                            \
+            fprintf(stderr,                                                                        \
+                    "FAIL %s:%d  expected %s (%d), got %s (%d)\n",                                 \
+                    __FILE__,                                                                      \
+                    __LINE__,                                                                      \
+                    ants_strerror(_e),                                                             \
+                    (int)_e,                                                                       \
+                    ants_strerror(_a),                                                             \
+                    (int)_a);                                                                      \
+        }                                                                                          \
+    } while (0)
+
+/* ---- helpers -------------------------------------------------------- */
+
+static void make_key(uint8_t seed, uint8_t priv[32], uint8_t pub[32])
+{
+    memset(priv, seed, 32);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv, pub), ANTS_OK);
+}
+
+/* Encode a statement, sign it with `signer_priv`, return body + sig. */
+static void sign_statement(uint64_t domain,
+                           uint64_t epoch,
+                           uint64_t slot,
+                           const uint8_t *payload,
+                           size_t payload_len,
+                           const uint8_t signer_priv[32],
+                           uint8_t body[256],
+                           size_t *body_len,
+                           uint8_t sig[64])
+{
+    CHECK_EQ(
+        ants_crdt_statement_encode(domain, epoch, slot, payload, payload_len, body, 256, body_len),
+        ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(signer_priv, body, *body_len, sig), ANTS_OK);
+}
+
+/* Build a canonical fault-proof envelope with an arbitrary fault_type and
+ * an empty evidence array — used to exercise the fault_type dispatch
+ * (unknown class / not-implemented class) where evidence is never read. */
+static ants_error_t build_envelope_ftype(const uint8_t subject[32],
+                                         uint64_t fault_type,
+                                         uint64_t epoch,
+                                         uint8_t *buf,
+                                         size_t cap,
+                                         size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+    if ((rc = ants_cbor_enc_init(&enc, buf, cap)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_map(&enc, 4)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 0)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, subject, 32)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 1)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, fault_type)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 2)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, epoch)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 3)) != ANTS_OK ||
+        (rc = ants_cbor_enc_array(&enc, 0)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return rc;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+/* A canonical, valid equivocation proof: subject signed two statements
+ * over the same (domain=9, epoch, slot=3) with different payloads. */
+static size_t make_valid_proof(const uint8_t subj_priv[32],
+                               const uint8_t subj_pub[32],
+                               uint64_t epoch,
+                               uint8_t proof[512])
+{
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    const uint8_t pa[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    const uint8_t pb[4] = {0x11, 0x22, 0x33, 0x44};
+
+    sign_statement(9, epoch, 3, pa, sizeof pa, subj_priv, body_a, &la, sig_a);
+    sign_statement(9, epoch, 3, pb, sizeof pb, subj_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, epoch, body_a, la, sig_a, body_b, lb, sig_b, proof, 512, &plen),
+             ANTS_OK);
+    return plen;
+}
+
+/* ---- tests ---------------------------------------------------------- */
+
+static void test_statement_encode_canonical(void)
+{
+    uint8_t body[256];
+    size_t len = 0;
+    const uint8_t payload[3] = {1, 2, 3};
+    CHECK_EQ(
+        ants_crdt_statement_encode(9, 100, 3, payload, sizeof payload, body, sizeof body, &len),
+        ANTS_OK);
+    CHECK(len > 0);
+    /* The body must itself be canonical CBOR (it is a signed message). */
+    CHECK_EQ(ants_cbor_is_canonical(body, len), ANTS_OK);
+
+    /* Empty payload is legal. */
+    CHECK_EQ(ants_crdt_statement_encode(0, 0, 0, NULL, 0, body, sizeof body, &len), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(body, len), ANTS_OK);
+
+    /* NULL payload with non-zero len is rejected. */
+    CHECK_EQ(ants_crdt_statement_encode(0, 0, 0, NULL, 4, body, sizeof body, &len),
+             ANTS_ERROR_INVALID_ARG);
+    /* Too-small buffer reports BUFFER_TOO_SMALL, not a crash. */
+    CHECK_EQ(ants_crdt_statement_encode(9, 100, 3, payload, sizeof payload, body, 2, &len),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+static void test_valid_equivocation_verifies(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t proof[512];
+    size_t plen;
+    make_key(0x42, subj_priv, subj_pub);
+    plen = make_valid_proof(subj_priv, subj_pub, 100, proof);
+
+    /* The proof is canonical and VERIFY accepts it. */
+    CHECK_EQ(ants_cbor_is_canonical(proof, plen), ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+}
+
+static void test_decode_view(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t proof[512];
+    size_t plen;
+    ants_fault_proof_view_t v;
+    make_key(0x07, subj_priv, subj_pub);
+    plen = make_valid_proof(subj_priv, subj_pub, 777, proof);
+
+    CHECK_EQ(ants_crdt_fault_proof_decode(proof, plen, &v), ANTS_OK);
+    CHECK(v.fault_type == ANTS_FAULT_EQUIVOCATION);
+    CHECK(v.epoch == 777);
+    CHECK(memcmp(v.subject, subj_pub, 32) == 0);
+    CHECK(v.evidence_len > 0);
+    CHECK(v.evidence >= proof && v.evidence < proof + plen);
+}
+
+static void test_content_id_stable_and_distinct(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t proof1[512], proof2[512];
+    size_t l1, l2;
+    uint8_t id1[32], id2[32], id3[32];
+    make_key(0x55, subj_priv, subj_pub);
+
+    /* Same logical proof encoded twice → identical bytes → identical id. */
+    l1 = make_valid_proof(subj_priv, subj_pub, 100, proof1);
+    l2 = make_valid_proof(subj_priv, subj_pub, 100, proof2);
+    CHECK(l1 == l2);
+    CHECK(memcmp(proof1, proof2, l1) == 0);
+    CHECK_EQ(ants_crdt_content_id(proof1, l1, id1), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(proof2, l2, id2), ANTS_OK);
+    CHECK(memcmp(id1, id2, 32) == 0);
+
+    /* A different epoch → different proof → different id. */
+    l2 = make_valid_proof(subj_priv, subj_pub, 101, proof2);
+    CHECK_EQ(ants_crdt_content_id(proof2, l2, id3), ANTS_OK);
+    CHECK(memcmp(id1, id3, 32) != 0);
+
+    CHECK_EQ(ants_crdt_content_id(NULL, 4, id1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_content_id(proof1, 0, id1), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_same_payload_is_not_a_fault(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0;
+    uint8_t proof[512];
+    size_t plen = 0;
+    const uint8_t same[4] = {9, 9, 9, 9};
+    make_key(0x42, subj_priv, subj_pub);
+
+    /* Two honest signatures over the SAME (domain, epoch, slot, payload)
+     * are not an equivocation — a peer may legitimately re-sign. */
+    sign_statement(9, 100, 3, same, sizeof same, subj_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 3, same, sizeof same, subj_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+static void test_slot_and_domain_mismatch(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    uint8_t proof[512];
+    const uint8_t pa[2] = {1, 2};
+    const uint8_t pb[2] = {3, 4};
+    make_key(0x42, subj_priv, subj_pub);
+
+    /* Different slot → not the same commitment point → not a fault. */
+    sign_statement(9, 100, 3, pa, sizeof pa, subj_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 4, pb, sizeof pb, subj_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* Different domain → statements are about different things. */
+    sign_statement(9, 100, 3, pa, sizeof pa, subj_priv, body_a, &la, sig_a);
+    sign_statement(8, 100, 3, pb, sizeof pb, subj_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+static void test_envelope_epoch_mismatch(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    uint8_t proof[512];
+    const uint8_t pa[2] = {1, 2};
+    const uint8_t pb[2] = {3, 4};
+    make_key(0x42, subj_priv, subj_pub);
+
+    /* Statements bind epoch 100, but the envelope claims epoch 101. The
+     * binding cross-check (statement.epoch == envelope.epoch) must fail. */
+    sign_statement(9, 100, 3, pa, sizeof pa, subj_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 3, pb, sizeof pb, subj_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 101, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+static void test_bad_and_wrong_signatures(void)
+{
+    uint8_t subj_priv[32], subj_pub[32], other_priv[32], other_pub[32];
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    uint8_t proof[512];
+    const uint8_t pa[2] = {1, 2};
+    const uint8_t pb[2] = {3, 4};
+    make_key(0x42, subj_priv, subj_pub);
+    make_key(0x99, other_priv, other_pub);
+
+    /* A zeroed (structurally invalid) signature → not authentic → MALFORMED. */
+    sign_statement(9, 100, 3, pa, sizeof pa, subj_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 3, pb, sizeof pb, subj_priv, body_b, &lb, sig_b);
+    memset(sig_a, 0, sizeof sig_a);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* Statements signed by `other` but accusing `subject` → the signatures
+     * are valid Ed25519 but not under the accused key → MALFORMED. */
+    sign_statement(9, 100, 3, pa, sizeof pa, other_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 3, pb, sizeof pb, other_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 subj_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, proof, sizeof proof, &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+static void test_fault_type_dispatch(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t env[128];
+    size_t len = 0;
+    make_key(0x42, subj_priv, subj_pub);
+
+    /* Defined-but-unimplemented class → NOT_IMPLEMENTED. */
+    CHECK_EQ(
+        build_envelope_ftype(subj_pub, ANTS_FAULT_INVALID_TRANSITION, 100, env, sizeof env, &len),
+        ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(env, len), ANTS_ERROR_NOT_IMPLEMENTED);
+
+    /* Unknown/unassigned class → UNSUPPORTED_TYPE (fail closed). */
+    CHECK_EQ(build_envelope_ftype(subj_pub, 7, 100, env, sizeof env, &len), ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(env, len), ANTS_ERROR_UNSUPPORTED_TYPE);
+}
+
+static void test_malformed_and_noncanonical(void)
+{
+    ants_fault_proof_view_t v;
+    /* Non-shortest uint 23 (0x18 0x17): well-formed but non-canonical. */
+    const uint8_t noncanon[2] = {0x18, 0x17};
+    /* A byte-string header claiming 32 bytes with only 2 present. */
+    const uint8_t truncated[4] = {0x58, 0x20, 0x00, 0x00};
+
+    CHECK_EQ(ants_crdt_verify(noncanon, sizeof noncanon), ANTS_ERROR_NON_CANONICAL);
+    CHECK_EQ(ants_crdt_fault_proof_decode(noncanon, sizeof noncanon, &v), ANTS_ERROR_NON_CANONICAL);
+
+    CHECK_EQ(ants_crdt_verify(truncated, sizeof truncated), ANTS_ERROR_MALFORMED);
+    CHECK_EQ(ants_crdt_fault_proof_decode(truncated, sizeof truncated, &v), ANTS_ERROR_MALFORMED);
+
+    /* Well-formed canonical CBOR that is not a fault-proof envelope (a bare
+     * uint) → MALFORMED (wrong structure for the schema). */
+    {
+        const uint8_t bare_uint[1] = {0x05};
+        CHECK_EQ(ants_crdt_verify(bare_uint, sizeof bare_uint), ANTS_ERROR_MALFORMED);
+    }
+}
+
+static void test_null_and_empty_args(void)
+{
+    uint8_t buf[16];
+    size_t len = 0;
+    ants_fault_proof_view_t v;
+    uint8_t id[32];
+    uint8_t sig[64] = {0};
+    uint8_t body[8] = {0};
+
+    CHECK_EQ(ants_crdt_verify(NULL, 10), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_verify(buf, 0), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_fault_proof_decode(NULL, 10, &v), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_fault_proof_decode(buf, 10, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_content_id(NULL, 10, id), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_statement_encode(0, 0, 0, NULL, 0, NULL, 16, &len), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_equivocation_encode(NULL, 0, body, 8, sig, body, 8, sig, buf, 16, &len),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+/* Tamper-detection: flipping any single bit of a valid proof must make
+ * VERIFY reject it — an assertion independent of the impl's internals.
+ * (A flip either breaks the CBOR structure, breaks a signed body, or
+ * breaks a signature; none can survive without a signature forgery.) */
+static void test_single_byte_tamper_rejected(void)
+{
+    uint8_t subj_priv[32], subj_pub[32];
+    uint8_t proof[512], tampered[512];
+    size_t plen, i;
+    int bit;
+    make_key(0x42, subj_priv, subj_pub);
+    plen = make_valid_proof(subj_priv, subj_pub, 100, proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+
+    for (i = 0; i < plen; i++) {
+        for (bit = 0; bit < 8; bit++) {
+            memcpy(tampered, proof, plen);
+            tampered[i] ^= (uint8_t)(1u << bit);
+            if (memcmp(tampered, proof, plen) == 0) {
+                continue;
+            }
+            if (ants_crdt_verify(tampered, plen) == ANTS_OK) {
+                failures++;
+                fprintf(stderr,
+                        "FAIL %s:%d  tamper at byte %zu bit %d survived VERIFY\n",
+                        __FILE__,
+                        __LINE__,
+                        i,
+                        bit);
+            }
+        }
+    }
+}
+
+int main(void)
+{
+    test_statement_encode_canonical();
+    test_valid_equivocation_verifies();
+    test_decode_view();
+    test_content_id_stable_and_distinct();
+    test_same_payload_is_not_a_fault();
+    test_slot_and_domain_mismatch();
+    test_envelope_epoch_mismatch();
+    test_bad_and_wrong_signatures();
+    test_fault_type_dispatch();
+    test_malformed_and_noncanonical();
+    test_null_and_empty_args();
+    test_single_byte_tamper_rejected();
+
+    if (failures == 0) {
+        printf("test_crdt: all checks passed\n");
+        return 0;
+    }
+    fprintf(stderr, "test_crdt: %d check(s) failed\n", failures);
+    return 1;
+}
