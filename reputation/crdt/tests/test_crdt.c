@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -633,6 +634,192 @@ static void test_gset_merge(void)
     ants_crdt_destroy(empty);
 }
 
+/* ---- pruning + snapshot tests --------------------------------------- */
+
+static void test_gset_prune(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t proof[512];
+    uint8_t id1[ANTS_CRDT_CONTENT_ID_SIZE], id4[ANTS_CRDT_CONTENT_ID_SIZE];
+    size_t plen, pruned, e;
+    bool ins;
+
+    make_key(0x71, priv, pub);
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+
+    /* Five proofs at epochs 1..5 (distinct proofs, same subject). */
+    for (e = 1; e <= 5; e++) {
+        plen = make_valid_proof(priv, pub, (uint64_t)e, proof);
+        if (e == 1) {
+            CHECK_EQ(ants_crdt_content_id(proof, plen, id1), ANTS_OK);
+        }
+        if (e == 4) {
+            CHECK_EQ(ants_crdt_content_id(proof, plen, id4), ANTS_OK);
+        }
+        CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    }
+    CHECK(ants_crdt_size(set) == 5);
+
+    /* Keep epoch >= 3: drops epochs 1 and 2. */
+    pruned = 0;
+    CHECK_EQ(ants_crdt_prune(set, 3, &pruned), ANTS_OK);
+    CHECK(pruned == 2);
+    CHECK(ants_crdt_size(set) == 3);
+    CHECK(ants_crdt_contains(set, id1) == false);  /* epoch 1 gone */
+    CHECK(ants_crdt_contains(set, id4) == true);   /* epoch 4 kept */
+    CHECK(ants_crdt_is_slashed(set, pub) == true); /* epochs 3-5 remain */
+
+    /* The rebuilt table still accepts inserts and dedupes. */
+    plen = make_valid_proof(priv, pub, 4, proof); /* epoch 4 already present */
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == false);
+    CHECK(ants_crdt_size(set) == 3);
+
+    /* Prune everything. */
+    pruned = 0;
+    CHECK_EQ(ants_crdt_prune(set, 1000, &pruned), ANTS_OK);
+    CHECK(pruned == 3);
+    CHECK(ants_crdt_size(set) == 0);
+    CHECK(ants_crdt_is_slashed(set, pub) == false);
+
+    /* Prune an empty set, and the NULL out-param + NULL set paths. */
+    CHECK_EQ(ants_crdt_prune(set, 5, NULL), ANTS_OK);
+    CHECK(ants_crdt_size(set) == 0);
+    CHECK_EQ(ants_crdt_prune(NULL, 5, &pruned), ANTS_ERROR_INVALID_ARG);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_gset_snapshot_roundtrip(void)
+{
+    ants_crdt_t *a = NULL, *b = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t proof[512];
+    uint8_t *snap;
+    uint8_t id2[ANTS_CRDT_CONTENT_ID_SIZE];
+    size_t plen, bound, slen = 0, added, rejected, i;
+    bool ins;
+
+    make_key(0x81, priv, pub);
+    CHECK_EQ(ants_crdt_init(&a), ANTS_OK);
+    CHECK_EQ(ants_crdt_init(&b), ANTS_OK);
+
+    for (i = 1; i <= 3; i++) {
+        plen = make_valid_proof(priv, pub, (uint64_t)i, proof);
+        if (i == 2) {
+            CHECK_EQ(ants_crdt_content_id(proof, plen, id2), ANTS_OK);
+        }
+        CHECK_EQ(ants_crdt_insert(a, proof, plen, &ins), ANTS_OK);
+    }
+
+    bound = ants_crdt_snapshot_bound(a);
+    CHECK(bound > 0);
+    snap = (uint8_t *)malloc(bound);
+    CHECK(snap != NULL);
+
+    CHECK_EQ(ants_crdt_snapshot_encode(a, snap, bound, &slen), ANTS_OK);
+    CHECK(slen > 0 && slen <= bound);
+    /* The frame is canonical CBOR (array of canonical byte-strings). */
+    CHECK_EQ(ants_cbor_is_canonical(snap, slen), ANTS_OK);
+
+    /* Import into a fresh set: all three admitted, none rejected. */
+    added = rejected = 999;
+    CHECK_EQ(ants_crdt_snapshot_merge(b, snap, slen, &added, &rejected), ANTS_OK);
+    CHECK(added == 3);
+    CHECK(rejected == 0);
+    CHECK(ants_crdt_size(b) == 3);
+    CHECK(ants_crdt_contains(b, id2) == true);
+    CHECK(ants_crdt_is_slashed(b, pub) == true);
+
+    /* Re-import is idempotent (dedup by content-id). */
+    added = rejected = 999;
+    CHECK_EQ(ants_crdt_snapshot_merge(b, snap, slen, &added, &rejected), ANTS_OK);
+    CHECK(added == 0);
+    CHECK(rejected == 0);
+    CHECK(ants_crdt_size(b) == 3);
+
+    /* Too-small buffer is reported, not overrun. */
+    CHECK_EQ(ants_crdt_snapshot_encode(a, snap, 2, &slen), ANTS_ERROR_BUFFER_TOO_SMALL);
+
+    free(snap);
+    ants_crdt_destroy(a);
+    ants_crdt_destroy(b);
+}
+
+static void test_gset_snapshot_empty(void)
+{
+    ants_crdt_t *a = NULL, *b = NULL;
+    uint8_t snap[16];
+    size_t slen = 0, added = 9, rejected = 9;
+
+    CHECK_EQ(ants_crdt_init(&a), ANTS_OK);
+    CHECK_EQ(ants_crdt_init(&b), ANTS_OK);
+
+    CHECK_EQ(ants_crdt_snapshot_encode(a, snap, sizeof snap, &slen), ANTS_OK);
+    CHECK(slen >= 1); /* at least the array(0) header */
+    CHECK_EQ(ants_cbor_is_canonical(snap, slen), ANTS_OK);
+
+    CHECK_EQ(ants_crdt_snapshot_merge(b, snap, slen, &added, &rejected), ANTS_OK);
+    CHECK(added == 0);
+    CHECK(rejected == 0);
+    CHECK(ants_crdt_size(b) == 0);
+
+    ants_crdt_destroy(a);
+    ants_crdt_destroy(b);
+}
+
+static void test_gset_snapshot_rejects_bad(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t valid[512];
+    uint8_t frame[640];
+    ants_cbor_enc_t enc;
+    size_t vlen, flen = 0, added = 9, rejected = 9;
+    const uint8_t junk[1] = {0x05};           /* canonical bytes, but not a fault proof */
+    const uint8_t noncanon[2] = {0x18, 0x17}; /* well-formed, non-canonical */
+    const uint8_t truncated[4] = {0x58, 0x20, 0x00, 0x00};
+
+    make_key(0x91, priv, pub);
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    vlen = make_valid_proof(priv, pub, 1, valid);
+
+    /* Hand-build a well-formed frame: array(2)[ bytes(valid), bytes(junk) ].
+     * The frame is canonical, but the second element's content is not a
+     * valid proof, so it must be skipped (rejected), the first admitted. */
+    CHECK_EQ(ants_cbor_enc_init(&enc, frame, sizeof frame), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, valid, vlen), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, junk, sizeof junk), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+    flen = ants_cbor_enc_size(&enc);
+
+    added = rejected = 9;
+    CHECK_EQ(ants_crdt_snapshot_merge(set, frame, flen, &added, &rejected), ANTS_OK);
+    CHECK(added == 1);
+    CHECK(rejected == 1);
+    CHECK(ants_crdt_size(set) == 1);
+    CHECK(ants_crdt_is_slashed(set, pub) == true);
+
+    /* A structurally bad frame is rejected wholesale, with the precise
+     * verdict (not a per-element skip). */
+    CHECK_EQ(ants_crdt_snapshot_merge(set, noncanon, sizeof noncanon, &added, &rejected),
+             ANTS_ERROR_NON_CANONICAL);
+    CHECK_EQ(ants_crdt_snapshot_merge(set, truncated, sizeof truncated, &added, &rejected),
+             ANTS_ERROR_MALFORMED);
+
+    /* NULL / empty guards. */
+    CHECK_EQ(ants_crdt_snapshot_merge(NULL, frame, flen, &added, &rejected),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_snapshot_merge(set, NULL, flen, &added, &rejected), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_snapshot_merge(set, frame, 0, &added, &rejected), ANTS_ERROR_INVALID_ARG);
+    CHECK(ants_crdt_snapshot_bound(NULL) == 0);
+    CHECK_EQ(ants_crdt_snapshot_encode(NULL, frame, sizeof frame, &flen), ANTS_ERROR_INVALID_ARG);
+
+    ants_crdt_destroy(set);
+}
+
 int main(void)
 {
     test_statement_encode_canonical();
@@ -653,6 +840,11 @@ int main(void)
     test_gset_multi_subject();
     test_gset_grow_and_enumerate();
     test_gset_merge();
+
+    test_gset_prune();
+    test_gset_snapshot_roundtrip();
+    test_gset_snapshot_empty();
+    test_gset_snapshot_rejects_bad();
 
     if (failures == 0) {
         printf("test_crdt: all checks passed\n");
