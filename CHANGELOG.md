@@ -13,6 +13,47 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #9 — L1 slash gate on (A, T) compute · 2026-05-31
+
+**The G-Set starts to bite.** Component #7 (above) built the L1 fault
+G-Set; this wires it into the (A, T, κ) spine so a slashed peer's
+reputation actually computes to zero — the negative half of the spine
+(RFC-0004 §"How tenure interacts with Layer 1", §597: *"T is negatively
+zeroed by self-authenticating fault … applied at L1 propagation time,
+immediately, locally"*; the reference sketch's `tenure()` opens with
+`if is_slashed_locally(peer_id): return 0`).
+
+**PR #99 — `ants_reputation_compute_checked`** (+296/−11):
+
+- New entry point alongside the unchanged `ants_reputation_compute`. If a
+  caller-supplied slash predicate reports the server slashed, **both `A`
+  and `T` are set to 0** without inspecting the receipt bag; otherwise it
+  delegates verbatim. Zeroing `A` as well as `T` follows the spec — a
+  slashed identity is *"globally dead, permanently"* (§110) and the slash
+  event destroys the whole of its reputation (§"Release and slash"). Zero
+  is the safe direction of error.
+- **The slash check is a callback (`ants_reputation_is_slashed_fn`), not a
+  hard `reputation/crdt` dependency** — on purpose. The slash *source* is
+  context-dependent: the canonical binding is `ants_crdt_is_slashed` over
+  the live L1 G-Set, but a late joiner that has not synced a proof instead
+  consults the L2 chain's slashed-identity index and **defaults to slashed**
+  on a retrieval miss (RFC-0004 §"Late-joiner protocol", the safe
+  direction). Same predicate, different binding. The reputation library
+  therefore takes no crdt link; only the test binds the real one.
+- Arg validation: `server_id` / `out_a` / `out_t` are NULL-checked before
+  the gate; the non-slashed path delegates all remaining validation
+  (params, `n_receipts`, degenerate values) to `compute()` as the single
+  source of truth. A NULL predicate is exactly the unchecked computation.
+
+Tests (real Ed25519 **+ the real Component #7 G-Set**, not a mock): a real
+equivocation proof against the server, inserted into a live `ants_crdt_t`,
+makes `compute_checked` return 0/0 for a bag that otherwise yields nonzero
+`A` and `T` (asserted), while a different non-slashed server in the same
+set is unaffected; not-slashed is byte-identical to unchecked; NULL
+predicate equals unchecked; the slash short-circuits before params; arg
+guards. `test_reputation` now also links `ants_crdt` (test-only). Full
+suite 18/18 green; 0 warnings on a full rebuild; clang-format clean.
+
 ### reputation: Component #7 (L1 CRDT) — the consensus-free fault G-Set · 2026-05-31
 
 **The architecture's load-bearing negative layer lands.** Component #7 is
