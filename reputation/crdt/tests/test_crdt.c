@@ -407,6 +407,232 @@ static void test_single_byte_tamper_rejected(void)
     }
 }
 
+/* ---- G-Set container tests ------------------------------------------ */
+
+struct visit_counter {
+    int seen;
+    int stop_at; /* 0 = never stop early */
+};
+
+static bool visit_count_cb(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
+                           const uint8_t *proof,
+                           size_t len,
+                           void *ctx)
+{
+    struct visit_counter *vc = (struct visit_counter *)ctx;
+    (void)content_id;
+    (void)proof;
+    (void)len;
+    vc->seen++;
+    if (vc->stop_at != 0 && vc->seen >= vc->stop_at) {
+        return false;
+    }
+    return true;
+}
+
+static void test_gset_init_insert_query(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], pub[32], other_priv[32], other[32];
+    uint8_t proof[512];
+    uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE];
+    size_t plen;
+    bool ins = false;
+
+    make_key(0x21, priv, pub);
+    make_key(0x22, other_priv, other);
+
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    CHECK(set != NULL);
+    CHECK(ants_crdt_size(set) == 0);
+
+    plen = make_valid_proof(priv, pub, 100, proof);
+    CHECK_EQ(ants_crdt_content_id(proof, plen, id), ANTS_OK);
+
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == true);
+    CHECK(ants_crdt_size(set) == 1);
+    CHECK(ants_crdt_contains(set, id) == true);
+    CHECK(ants_crdt_is_slashed(set, pub) == true);
+    CHECK(ants_crdt_is_slashed(set, other) == false);
+
+    /* Idempotent: the same proof again is a no-op. */
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == false);
+    CHECK(ants_crdt_size(set) == 1);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_gset_rejects_invalid(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t proof[512];
+    size_t plen;
+    const uint8_t bare_uint[1] = {0x05};
+    bool ins = true;
+    ants_error_t rc;
+
+    make_key(0x31, priv, pub);
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+
+    /* A tampered valid proof: a flipped byte breaks a body or a signature.
+     * The exact verdict depends on where the flip lands, so assert only
+     * that the proof is rejected and the set is left unchanged. */
+    plen = make_valid_proof(priv, pub, 7, proof);
+    proof[plen / 2] ^= 0xFF;
+    ins = true;
+    rc = ants_crdt_insert(set, proof, plen, &ins);
+    CHECK(rc != ANTS_OK);
+    CHECK(ins == false);
+    CHECK(ants_crdt_size(set) == 0);
+
+    /* Well-formed canonical CBOR that is not a fault-proof envelope. */
+    ins = true;
+    CHECK_EQ(ants_crdt_insert(set, bare_uint, sizeof bare_uint, &ins), ANTS_ERROR_MALFORMED);
+    CHECK(ins == false);
+    CHECK(ants_crdt_size(set) == 0);
+
+    /* NULL / empty args. */
+    CHECK_EQ(ants_crdt_insert(NULL, proof, plen, &ins), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_insert(set, NULL, plen, &ins), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_insert(set, proof, 0, &ins), ANTS_ERROR_INVALID_ARG);
+
+    /* Query NULL-safety. */
+    CHECK(ants_crdt_contains(NULL, NULL) == false);
+    CHECK(ants_crdt_is_slashed(NULL, pub) == false);
+    CHECK(ants_crdt_size(NULL) == 0);
+
+    ants_crdt_destroy(set);
+    ants_crdt_destroy(NULL); /* no-op */
+}
+
+static void test_gset_multi_subject(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t pa_priv[32], pa[32], pb_priv[32], pb[32], pc_priv[32], pc[32];
+    uint8_t proof[512];
+    size_t plen;
+    bool ins;
+
+    make_key(0x41, pa_priv, pa);
+    make_key(0x42, pb_priv, pb);
+    make_key(0x43, pc_priv, pc);
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+
+    plen = make_valid_proof(pa_priv, pa, 1, proof);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    plen = make_valid_proof(pb_priv, pb, 1, proof);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+
+    CHECK(ants_crdt_size(set) == 2);
+    CHECK(ants_crdt_is_slashed(set, pa) == true);
+    CHECK(ants_crdt_is_slashed(set, pb) == true);
+    CHECK(ants_crdt_is_slashed(set, pc) == false);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_gset_grow_and_enumerate(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t proof[512], id0[ANTS_CRDT_CONTENT_ID_SIZE];
+    size_t plen, i;
+    bool ins;
+    struct visit_counter vc;
+    const size_t N = 200;
+
+    make_key(0x51, priv, pub);
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+
+    /* 200 distinct proofs (epoch varies) force several table growths from
+     * the initial capacity; none may be lost or duplicated. */
+    for (i = 0; i < N; i++) {
+        plen = make_valid_proof(priv, pub, (uint64_t)i, proof);
+        if (i == 0) {
+            CHECK_EQ(ants_crdt_content_id(proof, plen, id0), ANTS_OK);
+        }
+        ins = false;
+        CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+        CHECK(ins == true);
+    }
+    CHECK(ants_crdt_size(set) == N);
+    CHECK(ants_crdt_contains(set, id0) == true);
+    CHECK(ants_crdt_is_slashed(set, pub) == true);
+
+    /* enumerate visits exactly N. */
+    vc.seen = 0;
+    vc.stop_at = 0;
+    ants_crdt_enumerate(set, visit_count_cb, &vc);
+    CHECK(vc.seen == (int)N);
+
+    /* Returning false stops the walk early. */
+    vc.seen = 0;
+    vc.stop_at = 1;
+    ants_crdt_enumerate(set, visit_count_cb, &vc);
+    CHECK(vc.seen == 1);
+
+    /* NULL-safety. */
+    ants_crdt_enumerate(NULL, visit_count_cb, &vc);
+    ants_crdt_enumerate(set, NULL, &vc);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_gset_merge(void)
+{
+    ants_crdt_t *a = NULL, *b = NULL, *empty = NULL;
+    uint8_t priv[32], pub[32];
+    uint8_t p1[512], p2[512], p3[512];
+    size_t l1, l2, l3;
+    uint8_t id1[ANTS_CRDT_CONTENT_ID_SIZE], id3[ANTS_CRDT_CONTENT_ID_SIZE];
+    bool ins;
+
+    make_key(0x61, priv, pub);
+    CHECK_EQ(ants_crdt_init(&a), ANTS_OK);
+    CHECK_EQ(ants_crdt_init(&b), ANTS_OK);
+    CHECK_EQ(ants_crdt_init(&empty), ANTS_OK);
+
+    l1 = make_valid_proof(priv, pub, 1, p1);
+    l2 = make_valid_proof(priv, pub, 2, p2);
+    l3 = make_valid_proof(priv, pub, 3, p3);
+    CHECK_EQ(ants_crdt_content_id(p1, l1, id1), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(p3, l3, id3), ANTS_OK);
+
+    /* A = {p1, p2}; B = {p2, p3} — p2 shared. */
+    CHECK_EQ(ants_crdt_insert(a, p1, l1, &ins), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(a, p2, l2, &ins), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(b, p2, l2, &ins), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(b, p3, l3, &ins), ANTS_OK);
+
+    /* Union, p2 not duplicated. */
+    CHECK_EQ(ants_crdt_merge(a, b), ANTS_OK);
+    CHECK(ants_crdt_size(a) == 3);
+    CHECK(ants_crdt_contains(a, id1) == true);
+    CHECK(ants_crdt_contains(a, id3) == true);
+
+    /* Idempotent. */
+    CHECK_EQ(ants_crdt_merge(a, b), ANTS_OK);
+    CHECK(ants_crdt_size(a) == 3);
+
+    /* Merging an empty set is a no-op; merging a non-empty into an empty
+     * copies it (commutative union). */
+    CHECK_EQ(ants_crdt_merge(a, empty), ANTS_OK);
+    CHECK(ants_crdt_size(a) == 3);
+    CHECK_EQ(ants_crdt_merge(empty, a), ANTS_OK);
+    CHECK(ants_crdt_size(empty) == 3);
+
+    /* NULL guards. */
+    CHECK_EQ(ants_crdt_merge(NULL, b), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_merge(a, NULL), ANTS_ERROR_INVALID_ARG);
+
+    ants_crdt_destroy(a);
+    ants_crdt_destroy(b);
+    ants_crdt_destroy(empty);
+}
+
 int main(void)
 {
     test_statement_encode_canonical();
@@ -421,6 +647,12 @@ int main(void)
     test_malformed_and_noncanonical();
     test_null_and_empty_args();
     test_single_byte_tamper_rejected();
+
+    test_gset_init_insert_query();
+    test_gset_rejects_invalid();
+    test_gset_multi_subject();
+    test_gset_grow_and_enumerate();
+    test_gset_merge();
 
     if (failures == 0) {
         printf("test_crdt: all checks passed\n");

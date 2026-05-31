@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
@@ -484,5 +485,275 @@ ants_error_t ants_crdt_verify(const uint8_t *buf, size_t len)
     default:
         /* Unknown/unassigned class — fail closed, never a valid slash. */
         return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* The G-Set — grow-only set of verified fault proofs                       */
+/*                                                                          */
+/* Storage is an open-addressed (linear-probe) hash table keyed by the      */
+/* 32-byte content-id. Because the content-id is a BLAKE3 hash it is        */
+/* already uniformly distributed, so the first 8 bytes serve directly as    */
+/* the bucket hash — no secondary mixing needed. The table is power-of-two  */
+/* sized and grows (doubling, full rehash) at a 0.7 load factor, so an      */
+/* empty slot always exists and probing terminates. An empty slot is one    */
+/* whose `proof` pointer is NULL (calloc-zeroed); the set is grow-only in   */
+/* this PR (no tombstones — pruning, which removes, is a later PR that       */
+/* rebuilds the table).                                                     */
+/* ------------------------------------------------------------------------ */
+
+#define CRDT_INITIAL_CAP 16u
+
+struct crdt_elem {
+    uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t subject[ANTS_CRDT_PEER_ID_SIZE];
+    uint64_t epoch;
+    uint8_t *proof; /* heap-owned copy; NULL marks an empty slot */
+    size_t proof_len;
+};
+
+struct ants_crdt {
+    struct crdt_elem *slots; /* `cap` buckets, power of two */
+    size_t cap;
+    size_t count; /* live elements */
+};
+
+/* First 8 bytes of the (uniformly random) content-id as the bucket hash. */
+static uint64_t id_hash(const uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    uint64_t h;
+    memcpy(&h, id, sizeof h);
+    return h;
+}
+
+/* Probe for `id` in `slots` (cap a power of two). On return *found tells
+ * whether the id is present; the returned index is its slot if found, else
+ * the empty slot where it would be inserted. */
+static size_t crdt_probe(const struct crdt_elem *slots,
+                         size_t cap,
+                         const uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE],
+                         bool *found)
+{
+    size_t mask = cap - 1u;
+    size_t i = (size_t)(id_hash(id) & mask);
+    while (slots[i].proof != NULL) {
+        if (memcmp(slots[i].content_id, id, ANTS_CRDT_CONTENT_ID_SIZE) == 0) {
+            *found = true;
+            return i;
+        }
+        i = (i + 1u) & mask;
+    }
+    *found = false;
+    return i;
+}
+
+/* Double the table and rehash every live element (pointers are moved, not
+ * re-copied). */
+static ants_error_t crdt_grow(struct ants_crdt *set)
+{
+    size_t new_cap = set->cap * 2u;
+    struct crdt_elem *ns = calloc(new_cap, sizeof *ns);
+    size_t i;
+
+    if (ns == NULL) {
+        return ANTS_ERROR_MALFORMED; /* OOM (project convention) */
+    }
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL) {
+            bool found;
+            size_t j = crdt_probe(ns, new_cap, set->slots[i].content_id, &found);
+            ns[j] = set->slots[i]; /* move; keep the proof pointer */
+        }
+    }
+    free(set->slots);
+    set->slots = ns;
+    set->cap = new_cap;
+    return ANTS_OK;
+}
+
+/* Insert an already-validated element (content-id, subject, epoch + bytes).
+ * Dedupes by content-id; copies the proof bytes. No VERIFY — callers that
+ * cross the deserialization boundary (ants_crdt_insert) verify first; merge
+ * relies on the set invariant. */
+static ants_error_t crdt_insert_elem(struct ants_crdt *set,
+                                     const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
+                                     const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE],
+                                     uint64_t epoch,
+                                     const uint8_t *proof,
+                                     size_t len,
+                                     bool *out_inserted)
+{
+    bool found;
+    size_t i;
+    uint8_t *copy;
+
+    /* Grow BEFORE probing so the slot we settle on is in the final table
+     * and an empty slot is guaranteed to exist. */
+    if ((set->count + 1u) * 10u >= set->cap * 7u) {
+        ants_error_t rc = crdt_grow(set);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    i = crdt_probe(set->slots, set->cap, content_id, &found);
+    if (found) {
+        if (out_inserted != NULL) {
+            *out_inserted = false;
+        }
+        return ANTS_OK; /* idempotent */
+    }
+    copy = malloc(len);
+    if (copy == NULL) {
+        return ANTS_ERROR_MALFORMED; /* OOM */
+    }
+    memcpy(copy, proof, len);
+    memcpy(set->slots[i].content_id, content_id, ANTS_CRDT_CONTENT_ID_SIZE);
+    memcpy(set->slots[i].subject, subject, ANTS_CRDT_PEER_ID_SIZE);
+    set->slots[i].epoch = epoch;
+    set->slots[i].proof = copy;
+    set->slots[i].proof_len = len;
+    set->count++;
+    if (out_inserted != NULL) {
+        *out_inserted = true;
+    }
+    return ANTS_OK;
+}
+
+ants_error_t ants_crdt_init(ants_crdt_t **out_set)
+{
+    struct ants_crdt *set;
+
+    if (out_set == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    set = malloc(sizeof *set);
+    if (set == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    set->slots = calloc(CRDT_INITIAL_CAP, sizeof *set->slots);
+    if (set->slots == NULL) {
+        free(set);
+        return ANTS_ERROR_MALFORMED;
+    }
+    set->cap = CRDT_INITIAL_CAP;
+    set->count = 0;
+    *out_set = set;
+    return ANTS_OK;
+}
+
+void ants_crdt_destroy(ants_crdt_t *set)
+{
+    size_t i;
+
+    if (set == NULL) {
+        return;
+    }
+    for (i = 0; i < set->cap; i++) {
+        free(set->slots[i].proof); /* free(NULL) is a no-op */
+    }
+    free(set->slots);
+    free(set);
+}
+
+ants_error_t
+ants_crdt_insert(ants_crdt_t *set, const uint8_t *proof, size_t len, bool *out_inserted)
+{
+    ants_fault_proof_view_t view;
+    uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t subject[ANTS_CRDT_PEER_ID_SIZE];
+    ants_error_t rc;
+
+    if (out_inserted != NULL) {
+        *out_inserted = false;
+    }
+    if (set == NULL || proof == NULL || len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* The trust boundary: never admit a proof that does not verify. */
+    rc = ants_crdt_verify(proof, len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    /* Extract subject + epoch for the index (decode cannot fail after a
+     * successful verify, but check defensively). */
+    rc = ants_crdt_fault_proof_decode(proof, len, &view);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    memcpy(subject, view.subject, ANTS_CRDT_PEER_ID_SIZE);
+
+    rc = ants_crdt_content_id(proof, len, content_id);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return crdt_insert_elem(set, content_id, subject, view.epoch, proof, len, out_inserted);
+}
+
+bool ants_crdt_contains(const ants_crdt_t *set, const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    bool found;
+
+    if (set == NULL || content_id == NULL) {
+        return false;
+    }
+    (void)crdt_probe(set->slots, set->cap, content_id, &found);
+    return found;
+}
+
+bool ants_crdt_is_slashed(const ants_crdt_t *set, const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE])
+{
+    size_t i;
+
+    if (set == NULL || subject == NULL) {
+        return false;
+    }
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL &&
+            memcmp(set->slots[i].subject, subject, ANTS_CRDT_PEER_ID_SIZE) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t ants_crdt_size(const ants_crdt_t *set)
+{
+    return (set == NULL) ? 0 : set->count;
+}
+
+ants_error_t ants_crdt_merge(ants_crdt_t *dst, const ants_crdt_t *src)
+{
+    size_t i;
+
+    if (dst == NULL || src == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    for (i = 0; i < src->cap; i++) {
+        const struct crdt_elem *e = &src->slots[i];
+        if (e->proof != NULL) {
+            ants_error_t rc = crdt_insert_elem(
+                dst, e->content_id, e->subject, e->epoch, e->proof, e->proof_len, NULL);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+        }
+    }
+    return ANTS_OK;
+}
+
+void ants_crdt_enumerate(const ants_crdt_t *set, ants_crdt_visit_fn fn, void *ctx)
+{
+    size_t i;
+
+    if (set == NULL || fn == NULL) {
+        return;
+    }
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL) {
+            if (!fn(set->slots[i].content_id, set->slots[i].proof, set->slots[i].proof_len, ctx)) {
+                return;
+            }
+        }
     }
 }
