@@ -757,3 +757,192 @@ void ants_crdt_enumerate(const ants_crdt_t *set, ants_crdt_visit_fn fn, void *ct
         }
     }
 }
+
+/* ------------------------------------------------------------------------ */
+/* Pruning + the late-joiner snapshot                                       */
+/* ------------------------------------------------------------------------ */
+
+/* Smallest power-of-two capacity keeping n elements strictly under the 0.7
+ * load factor, floored at CRDT_INITIAL_CAP. Mirrors the grow threshold in
+ * crdt_insert_elem so a freshly-rebuilt table does not immediately regrow. */
+static size_t crdt_cap_for(size_t n)
+{
+    size_t cap = CRDT_INITIAL_CAP;
+    while (n * 10u >= cap * 7u) {
+        cap *= 2u;
+    }
+    return cap;
+}
+
+ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *out_pruned)
+{
+    size_t survivors = 0, pruned = 0, i, new_cap;
+    struct crdt_elem *ns;
+
+    if (out_pruned != NULL) {
+        *out_pruned = 0;
+    }
+    if (set == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL && set->slots[i].epoch >= min_epoch_keep) {
+            survivors++;
+        }
+    }
+
+    /* Rebuild into a fresh, compact table. Allocated up front so an OOM
+     * leaves the original set untouched (no proof is freed until the new
+     * table is guaranteed). */
+    new_cap = crdt_cap_for(survivors);
+    ns = calloc(new_cap, sizeof *ns);
+    if (ns == NULL) {
+        return ANTS_ERROR_MALFORMED; /* OOM: set unchanged */
+    }
+    for (i = 0; i < set->cap; i++) {
+        struct crdt_elem *e = &set->slots[i];
+        if (e->proof == NULL) {
+            continue;
+        }
+        if (e->epoch >= min_epoch_keep) {
+            bool found;
+            size_t j = crdt_probe(ns, new_cap, e->content_id, &found);
+            ns[j] = *e; /* move; keep the proof pointer */
+        } else {
+            free(e->proof);
+            pruned++;
+        }
+    }
+    free(set->slots);
+    set->slots = ns;
+    set->cap = new_cap;
+    set->count = survivors;
+    if (out_pruned != NULL) {
+        *out_pruned = pruned;
+    }
+    return ANTS_OK;
+}
+
+size_t ants_crdt_snapshot_bound(const ants_crdt_t *set)
+{
+    size_t total = 9; /* outer array header, max width */
+    size_t i;
+
+    if (set == NULL) {
+        return 0;
+    }
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL) {
+            total += 9u + set->slots[i].proof_len; /* bytes header + payload */
+        }
+    }
+    return total;
+}
+
+ants_error_t
+ants_crdt_snapshot_encode(const ants_crdt_t *set, uint8_t *buf, size_t cap, size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+    size_t i;
+
+    if (set == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    rc = ants_cbor_enc_init(&enc, buf, cap);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_array(&enc, set->count);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    for (i = 0; i < set->cap; i++) {
+        if (set->slots[i].proof != NULL) {
+            rc = ants_cbor_enc_bytes(&enc, set->slots[i].proof, set->slots[i].proof_len);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+        }
+    }
+    rc = ants_cbor_enc_finalise(&enc);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+ants_error_t ants_crdt_snapshot_merge(ants_crdt_t *set,
+                                      const uint8_t *buf,
+                                      size_t len,
+                                      size_t *out_added,
+                                      size_t *out_rejected)
+{
+    ants_cbor_dec_t dec;
+    size_t n, i, added = 0, rejected = 0;
+    ants_error_t rc;
+
+    if (out_added != NULL) {
+        *out_added = 0;
+    }
+    if (out_rejected != NULL) {
+        *out_rejected = 0;
+    }
+    if (set == NULL || buf == NULL || len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Whole-frame canonical gate: cleanly separates "not even CBOR"
+     * (MALFORMED) from "well-formed but non-canonical" (NON_CANONICAL)
+     * before the structural walk. */
+    rc = ants_cbor_is_canonical(buf, len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (ants_cbor_dec_init(&dec, buf, len) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_array(&dec, &n) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    for (i = 0; i < n; i++) {
+        const uint8_t *p;
+        size_t plen;
+        ants_cbor_type_t ty;
+        bool ins = false;
+
+        if (ants_cbor_dec_peek_type(&dec, &ty) != ANTS_OK || ty != ANTS_CBOR_TYPE_BYTES) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        if (ants_cbor_dec_bytes(&dec, &p, &plen) != ANTS_OK) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        /* Re-VERIFY at the untrusted boundary. An invalid proof is skipped
+         * (the safe gossip-like default), not fatal. Verifying here first
+         * also lets us tell a bad proof (skip) apart from an OOM in insert
+         * (abort) — both of which ants_crdt_insert reports as MALFORMED. */
+        if (ants_crdt_verify(p, plen) != ANTS_OK) {
+            rejected++;
+            continue;
+        }
+        rc = ants_crdt_insert(set, p, plen, &ins);
+        if (rc != ANTS_OK) {
+            return rc; /* verify passed → this is allocation failure */
+        }
+        if (ins) {
+            added++;
+        }
+    }
+    if (ants_cbor_dec_finalise(&dec) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (out_added != NULL) {
+        *out_added = added;
+    }
+    if (out_rejected != NULL) {
+        *out_rejected = rejected;
+    }
+    return ANTS_OK;
+}

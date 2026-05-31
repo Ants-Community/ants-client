@@ -408,6 +408,95 @@ typedef bool (*ants_crdt_visit_fn)(const uint8_t content_id[ANTS_CRDT_CONTENT_ID
                                    void *ctx);
 void ants_crdt_enumerate(const ants_crdt_t *set, ants_crdt_visit_fn fn, void *ctx);
 
+/* ------------------------------------------------------------------------ */
+/* Pruning + the late-joiner snapshot (RFC-0004 v0.6 §"G-Set pruning and    */
+/* late-joiner protocol")                                                   */
+/*                                                                          */
+/* The G-Set is append-only, which is correct for security (monotone under  */
+/* attack) but unbounded over time. The RFC bounds it: once the L2 chain    */
+/* confirms an epoch, proofs from that epoch become prunable, with the L2   */
+/* Merkle root the canonical record from then on. This PR lands the         */
+/* L1-side MECHANISM — prune-by-epoch and the snapshot data plane a late    */
+/* joiner imports — driven by a caller-supplied cutoff. The cutoff POLICY   */
+/* (which epoch L2 has confirmed) and the historical on-demand fetch +      */
+/* Merkle-inclusion check belong to the L2 chain (Component #8), not built  */
+/* yet; see the per-function notes.                                         */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Prune every proof with `epoch < min_epoch_keep`, bounding storage
+ * (RFC-0004 §"G-Set pruning"). Because the table is open-addressed with no
+ * tombstones, this rebuilds it compactly around the survivors (their proof
+ * bytes are moved, not re-copied or re-verified — survivors already hold
+ * the set invariant). The remaining set is still a valid G-Set; pruning a
+ * proof does not un-slash anyone whose slash the L2 chain has recorded —
+ * that authority moves to L2, which this client does not yet implement, so
+ * a caller running without L2 should prune conservatively (keep recent
+ * epochs) or not at all.
+ *
+ * `min_epoch_keep` is the FIRST epoch to retain: a proof is kept iff its
+ * envelope epoch is >= min_epoch_keep. The caller supplies it; wiring it to
+ * "one epoch after the latest L2-confirmed epoch" is Component #8.
+ *
+ * @param out_pruned optional; set to the number of proofs removed.
+ * @return ANTS_OK (set rebuilt); ANTS_ERROR_INVALID_ARG if set is NULL;
+ *         ANTS_ERROR_MALFORMED on allocation failure (set left UNCHANGED).
+ */
+ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *out_pruned);
+
+/*
+ * A safe upper bound, in bytes, for the buffer ants_crdt_snapshot_encode
+ * needs for the current set. Lets a caller size the buffer in one shot
+ * rather than retry-on-BUFFER_TOO_SMALL. 0 if set is NULL.
+ */
+size_t ants_crdt_snapshot_bound(const ants_crdt_t *set);
+
+/*
+ * Serialise the whole set into one canonical-CBOR frame — a definite-length
+ * `array(N)` of the N proof byte-strings — for transfer to a late joiner
+ * (RFC-0004 §Late-joiner protocol step 2, "sync the current L1 CRDT").
+ *
+ * Element ORDER is the set's internal (hash) order, which is unspecified
+ * and peer-dependent; the frame is therefore not byte-identical across
+ * peers and is NOT itself content-addressed or signed. That is fine: the
+ * importer dedupes by content-id, so the imported set is order-independent.
+ * Each element IS canonical (it passed VERIFY), and array element order is
+ * unconstrained by RFC 8949 §4.2.1, so the frame passes
+ * ants_cbor_is_canonical regardless.
+ *
+ * @return ANTS_OK with *out_len set; INVALID_ARG on NULL; BUFFER_TOO_SMALL
+ *         if cap is short (use ants_crdt_snapshot_bound).
+ */
+ants_error_t
+ants_crdt_snapshot_encode(const ants_crdt_t *set, uint8_t *buf, size_t cap, size_t *out_len);
+
+/*
+ * Import a snapshot frame (from ants_crdt_snapshot_encode on a peer) into
+ * `set`, the receiving half of the late-joiner protocol. Every proof is
+ * re-run through VERIFY before admission — a snapshot from another peer is
+ * the SAME untrusted boundary as gossip, so we never trust the sender's
+ * claim that its proofs are valid. A proof that fails VERIFY is SKIPPED
+ * (counted in *out_rejected), not fatal: a misbehaving peer cannot abort
+ * the whole sync, only fail to contribute its bad entries (the
+ * safe-direction default). Valid proofs are unioned in, deduped by
+ * content-id (so re-importing is idempotent).
+ *
+ * A frame that is not well-formed canonical CBOR, or whose elements are not
+ * byte-strings, is rejected wholesale (MALFORMED / NON_CANONICAL) — that is
+ * a structural failure, distinct from an individual unverifiable proof.
+ *
+ * @param out_added    optional; number of NEW proofs admitted.
+ * @param out_rejected optional; number of elements that failed VERIFY.
+ * @return ANTS_OK; INVALID_ARG on NULL/empty; MALFORMED or NON_CANONICAL on
+ *         a bad frame; MALFORMED on allocation failure mid-import (the set
+ *         keeps whatever was admitted so far — a valid, smaller union).
+ */
+ants_error_t ants_crdt_snapshot_merge(ants_crdt_t *set,
+                                      const uint8_t *buf,
+                                      size_t len,
+                                      size_t *out_added,
+                                      size_t *out_rejected);
+
 #ifdef __cplusplus
 }
 #endif
