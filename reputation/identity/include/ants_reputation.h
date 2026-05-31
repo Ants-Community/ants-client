@@ -345,6 +345,77 @@ ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SI
  */
 ants_error_t ants_reputation_t_eff(uint64_t t, uint64_t t_cap, uint64_t *out);
 
+/* ------------------------------------------------------------------------ */
+/* L1 slash interaction (RFC-0004 §"How tenure interacts with Layer 1")     */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Predicate: is `peer_id` slashed? The negative half of the (A, T) spine.
+ * RFC-0004 §597: "T is negatively zeroed by self-authenticating fault — a
+ * confirmed fabrication, equivocation, or cache-poisoning proof against an
+ * identity zeroes its T. The zero is applied at L1 propagation time,
+ * immediately, locally." The reference sketch's `tenure()` opens with
+ * `if is_slashed_locally(peer_id): return 0`.
+ *
+ * This is a CALLBACK, not a hard dependency, on purpose: the slash *source*
+ * is context-dependent and the spine must not hard-wire one.
+ *   - The canonical binding is `ants_crdt_is_slashed` over the local L1
+ *     G-Set (reputation/crdt, Component #7) — the live, immediate check.
+ *   - A late joiner that has not yet synced the relevant proof instead
+ *     consults the L2 chain's slashed-identity index and DEFAULTS TO
+ *     SLASHED when it cannot retrieve the underlying proof (RFC-0004
+ *     §"Late-joiner protocol", the safe direction of error) — a different
+ *     binding of the same predicate.
+ * Keeping the reputation library free of an `ants_crdt` link also avoids a
+ * layering edge: the L1 set, the L2 chain, and any future source all plug
+ * into the same seam.
+ *
+ * @param peer_id   the 32-byte peer-id being scored (== receipt.server).
+ * @param ctx       caller cookie (e.g. the ants_crdt_t* G-Set handle).
+ * @return true iff a valid fault proof against peer_id is known.
+ */
+typedef bool (*ants_reputation_is_slashed_fn)(const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                              void *ctx);
+
+/*
+ * Compute A and T for `server_id` WITH the L1 slash gate applied first.
+ *
+ * If `is_slashed` is non-NULL and `is_slashed(server_id, slash_ctx)` returns
+ * true, the peer is slashed: BOTH `*out_a` and `*out_t` are set to 0 and the
+ * function returns ANTS_OK without inspecting the receipt bag. A slashed
+ * identity is "globally dead, permanently" (RFC-0004 §110) — the slash event
+ * destroys the whole of its reputation, A as well as T (§"Release and
+ * slash"), so a slashed peer has zero standing of any kind, not merely zero
+ * tenure. Zeroing is the safe direction of error: a peer wrongly treated as
+ * slashed loses serving priority and eligibility but cannot be exploited.
+ *
+ * If `is_slashed` is NULL, or returns false, this is exactly
+ * ants_reputation_compute (same arguments, same result) — the slash gate is
+ * the only thing added. The receipt-bag computation, decay recipe, κ-clip,
+ * and skip rules are unchanged.
+ *
+ * @param is_slashed  the L1 slash predicate, or NULL to skip the gate.
+ * @param slash_ctx   opaque cookie passed to is_slashed (may be NULL).
+ * @return ANTS_OK with *out_a / *out_t set (0/0 if slashed). server_id,
+ *         out_a, and out_t are NULL-checked before the slash gate, so a NULL
+ *         among them is INVALID_ARG regardless of slash status. On the
+ *         non-slashed path the call delegates to ants_reputation_compute and
+ *         returns exactly its codes (INVALID_ARG on NULL params, a
+ *         degenerate param, or n_receipts > ANTS_REP_MAX_RECEIPTS). A
+ *         slashed peer short-circuits to 0/0 without inspecting params or the
+ *         receipt bag — the peer is dead, so the bag is never read (matching
+ *         the reference sketch's early `return 0`).
+ */
+ants_error_t ants_reputation_compute_checked(const uint8_t server_id[ANTS_REP_PEER_ID_SIZE],
+                                             const ants_reputation_receipt_t *receipts,
+                                             size_t n_receipts,
+                                             uint64_t now_unix_s,
+                                             const ants_reputation_params_t *params,
+                                             ants_reputation_is_slashed_fn is_slashed,
+                                             void *slash_ctx,
+                                             uint64_t *out_a,
+                                             uint64_t *out_t);
+
 #ifdef __cplusplus
 }
 #endif
