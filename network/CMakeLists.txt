@@ -22,4 +22,9 @@ add_subdirectory(transport)
 add_subdirectory(dht)
 
 # Component #6 — Gossip overlay (L1 CRDT propagation)  (3 EM)
-# add_subdirectory(gossip)
+#
+# PR1 ships the transport-agnostic dissemination engine + eager-push wire
+# frame over the real L1 G-Set (reputation/crdt); byte delivery is behind a
+# send callback. Wiring to real ants_transport streams + the inbound demux,
+# lazy-pull anti-entropy, and anti-eclipse DHT peer sampling land later.
+add_subdirectory(gossip)
