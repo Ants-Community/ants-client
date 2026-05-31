@@ -442,3 +442,40 @@ ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SI
     *out_t = t_total;
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* L1 slash interaction (RFC-0004 §"How tenure interacts with Layer 1")     */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_reputation_compute_checked(const uint8_t server_id[ANTS_REP_PEER_ID_SIZE],
+                                             const ants_reputation_receipt_t *receipts,
+                                             size_t n_receipts,
+                                             uint64_t now_unix_s,
+                                             const ants_reputation_params_t *params,
+                                             ants_reputation_is_slashed_fn is_slashed,
+                                             void *slash_ctx,
+                                             uint64_t *out_a,
+                                             uint64_t *out_t)
+{
+    /* NULL-check only what the slash gate itself touches or writes, before
+     * the gate; the remaining preconditions (params, n_receipts, degenerate
+     * values) are the delegated ants_reputation_compute's single source of
+     * truth on the non-slashed path. */
+    if (server_id == NULL || out_a == NULL || out_t == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* The negative half of the spine (RFC-0004 §597 / reference sketch
+     * §1404): a slashed identity is globally dead — zero A AND zero T,
+     * without reading the receipt bag. */
+    if (is_slashed != NULL && is_slashed(server_id, slash_ctx)) {
+        *out_a = 0;
+        *out_t = 0;
+        return ANTS_OK;
+    }
+
+    /* Not slashed (or no slash source bound) → exactly the unchecked
+     * computation, including all of its argument validation. */
+    return ants_reputation_compute(
+        server_id, receipts, n_receipts, now_unix_s, params, out_a, out_t);
+}

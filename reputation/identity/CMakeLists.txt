@@ -2,13 +2,15 @@
 #
 # Spec: RFC-0004 v0.6 §"Tenure: the (A, T, κ) spine" + §"Computing A".
 #
-# Status: PR1 — the spine. The countersigned NCS receipt (canonical-CBOR
-# body + dual Ed25519 verification), the deterministic fixed-point decay
-# primitive (the spec-mandated alternative to non-deterministic float
-# exp(), RFC-0004 §"A reference sketch"), and the A / T computation from a
-# receipt bag. The saturating T_eff fork-choice transform, bond
-# accounting + race-safe admission, selective disclosure, the receipt-bag
-# Merkle tree, and L1/L2 slash integration land in later PRs.
+# Status: the (A, T, κ) spine + the saturating T_eff fork-choice transform
+# + the L1 slash gate. The countersigned NCS receipt (canonical-CBOR body +
+# dual Ed25519 verification), the deterministic fixed-point decay primitive
+# (the spec-mandated alternative to non-deterministic float exp(), RFC-0004
+# §"A reference sketch"), the A / T computation from a receipt bag, and
+# ants_reputation_compute_checked which zeroes a slashed peer's A and T via
+# a caller-supplied L1 slash predicate (canonically ants_crdt_is_slashed
+# over Component #7's G-Set). Bond accounting + race-safe admission,
+# selective disclosure, and the receipt-bag Merkle tree land in later PRs.
 
 add_library(ants_reputation STATIC
     src/reputation.c
@@ -38,7 +40,12 @@ if(BUILD_TESTING)
     add_executable(test_reputation tests/test_reputation.c)
     # The test signs real receipts (ants_ed25519_*) and probes canonical
     # CBOR + needs ants_strerror, so it links both crypto and cbor
-    # explicitly (PRIVATE deps of the lib are not re-exported).
-    target_link_libraries(test_reputation PRIVATE ants_reputation ants_crypto ants_cbor)
+    # explicitly (PRIVATE deps of the lib are not re-exported). It also
+    # binds the REAL L1 slash predicate (ants_crdt_is_slashed over a live
+    # G-Set built from a real equivocation proof) to exercise
+    # ants_reputation_compute_checked end-to-end, so it links ants_crdt
+    # (Component #7) — a test-only dep; the library itself takes no crdt
+    # dependency (the slash source is a caller-supplied callback).
+    target_link_libraries(test_reputation PRIVATE ants_reputation ants_crdt ants_crypto ants_cbor)
     add_test(NAME reputation_basic COMMAND test_reputation)
 endif()

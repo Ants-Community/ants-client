@@ -5,9 +5,12 @@
  * Covers the deterministic fixed-point decay primitive (fp_mul +
  * decay_factor: identities, monotone fall, cross-recipe determinism, the
  * no-decay and zero-age edges), the countersigned-receipt body codec +
- * dual-signature verification (real Ed25519), and ants_reputation_compute
+ * dual-signature verification (real Ed25519), ants_reputation_compute
  * (A uncapped fast decay; T binned + κ-clipped + slow decay; invalid /
- * wrong-server / future-dated receipts skipped; κ actually caps a bin).
+ * wrong-server / future-dated receipts skipped; κ actually caps a bin),
+ * the saturating T_eff fork-choice transform, and the L1 slash gate
+ * (ants_reputation_compute_checked) bound to the REAL Component #7 G-Set:
+ * an equivocation proof against the server zeroes both A and T.
  *
  * Receipts are signed with real Ed25519 keys, so verification is
  * exercised end-to-end rather than mocked.
@@ -15,6 +18,7 @@
 
 #include "ants_cbor.h"
 #include "ants_common.h"
+#include "ants_crdt.h"
 #include "ants_crypto.h"
 #include "ants_reputation.h"
 
@@ -404,6 +408,167 @@ static void test_t_eff_args(void)
     CHECK_EQ(ants_reputation_t_eff(100, 2000000000, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- L1 slash gate (compute_checked) ------------------------------- */
+
+/* Bind the REAL Component #7 G-Set check to the spine's slash predicate.
+ * ctx is the ants_crdt_t* G-Set handle. This is the canonical production
+ * binding, exercised here end-to-end rather than mocked. */
+static bool slash_via_crdt(const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE], void *ctx)
+{
+    return ants_crdt_is_slashed((const ants_crdt_t *)ctx, peer_id);
+}
+
+/* Forge a real equivocation fault proof against `s_pub`: two statements
+ * signed by s_priv over the same (domain=1, epoch=5, slot=0) with different
+ * payloads. Returns the encoded proof length. */
+static size_t
+build_equiv_against(const uint8_t s_priv[32], const uint8_t s_pub[32], uint8_t proof[512])
+{
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    const uint8_t pa[2] = {1, 2};
+    const uint8_t pb[2] = {3, 4};
+    CHECK_EQ(ants_crdt_statement_encode(1, 5, 0, pa, sizeof pa, body_a, sizeof body_a, &la),
+             ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(s_priv, body_a, la, sig_a), ANTS_OK);
+    CHECK_EQ(ants_crdt_statement_encode(1, 5, 0, pb, sizeof pb, body_b, sizeof body_b, &lb),
+             ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(s_priv, body_b, lb, sig_b), ANTS_OK);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 s_pub, 5, body_a, la, sig_a, body_b, lb, sig_b, proof, 512, &plen),
+             ANTS_OK);
+    return plen;
+}
+
+static void test_compute_checked_not_slashed(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32];
+    ants_reputation_params_t p;
+    ants_reputation_receipt_t r;
+    ants_crdt_t *set = NULL;
+    uint64_t a_chk = 0, t_chk = 0, a_un = 0, t_un = 0;
+
+    make_key(0xA1, s_priv, s_pub);
+    make_key(0xA2, c_priv, c_pub);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    r = make_receipt(s_priv, s_pub, c_priv, c_pub, 1000000, 1000000, 0x10);
+
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK); /* empty G-Set: S is not slashed */
+
+    CHECK_EQ(ants_reputation_compute(s_pub, &r, 1, 1000000, &p, &a_un, &t_un), ANTS_OK);
+    CHECK_EQ(ants_reputation_compute_checked(
+                 s_pub, &r, 1, 1000000, &p, slash_via_crdt, set, &a_chk, &t_chk),
+             ANTS_OK);
+    /* Not slashed → byte-identical to the unchecked computation, and nonzero. */
+    CHECK(a_un > 0 && t_un > 0);
+    CHECK(a_chk == a_un);
+    CHECK(t_chk == t_un);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_compute_checked_slashed_zeroes_both(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32], o_priv[32], o_pub[32];
+    ants_reputation_params_t p;
+    ants_reputation_receipt_t r, ro;
+    ants_crdt_t *set = NULL;
+    uint8_t proof[512];
+    size_t plen;
+    bool ins = false;
+    uint64_t a0 = 0, t0 = 0, a_chk = 1, t_chk = 1, a_o = 0, t_o = 0, a_d = 1, t_d = 1;
+
+    make_key(0xB1, s_priv, s_pub);
+    make_key(0xB2, c_priv, c_pub);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    r = make_receipt(s_priv, s_pub, c_priv, c_pub, 1000000, 1000000, 0x20);
+
+    /* Sanity: with no slash this exact bag yields nonzero A and T, so the
+     * zeroing below is a real effect, not an artefact of an empty bag. */
+    CHECK_EQ(ants_reputation_compute(s_pub, &r, 1, 1000000, &p, &a0, &t0), ANTS_OK);
+    CHECK(a0 > 0 && t0 > 0);
+
+    /* Insert a real equivocation proof against S into the live G-Set. */
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    plen = build_equiv_against(s_priv, s_pub, proof);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == true);
+    CHECK(ants_crdt_is_slashed(set, s_pub) == true);
+
+    /* The checked compute now zeroes BOTH A and T despite the live bag. */
+    CHECK_EQ(ants_reputation_compute_checked(
+                 s_pub, &r, 1, 1000000, &p, slash_via_crdt, set, &a_chk, &t_chk),
+             ANTS_OK);
+    CHECK(a_chk == 0);
+    CHECK(t_chk == 0);
+
+    /* A different (non-slashed) server in the same set is unaffected. */
+    make_key(0xB3, o_priv, o_pub);
+    ro = make_receipt(o_priv, o_pub, c_priv, c_pub, 1000000, 1000000, 0x21);
+    CHECK_EQ(ants_reputation_compute_checked(
+                 o_pub, &ro, 1, 1000000, &p, slash_via_crdt, set, &a_o, &t_o),
+             ANTS_OK);
+    CHECK(a_o > 0 && t_o > 0);
+
+    /* The slash gate short-circuits BEFORE the bag: a slashed peer returns
+     * 0/0 even with NULL params (params is never read on the slashed path). */
+    CHECK_EQ(ants_reputation_compute_checked(
+                 s_pub, &r, 1, 1000000, NULL, slash_via_crdt, set, &a_d, &t_d),
+             ANTS_OK);
+    CHECK(a_d == 0 && t_d == 0);
+
+    ants_crdt_destroy(set);
+}
+
+static void test_compute_checked_null_predicate_equals_unchecked(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32];
+    ants_reputation_params_t p;
+    ants_reputation_receipt_t r;
+    uint64_t a_un = 0, t_un = 0, a_chk = 0, t_chk = 0;
+
+    make_key(0xC1, s_priv, s_pub);
+    make_key(0xC2, c_priv, c_pub);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    r = make_receipt(s_priv, s_pub, c_priv, c_pub, 1000000, 1000000, 0x30);
+
+    CHECK_EQ(ants_reputation_compute(s_pub, &r, 1, 1000000, &p, &a_un, &t_un), ANTS_OK);
+    /* NULL predicate → no gate → identical to unchecked; slash_ctx ignored. */
+    CHECK_EQ(ants_reputation_compute_checked(s_pub, &r, 1, 1000000, &p, NULL, NULL, &a_chk, &t_chk),
+             ANTS_OK);
+    CHECK(a_chk == a_un && t_chk == t_un);
+    CHECK(a_chk > 0 && t_chk > 0);
+}
+
+static void test_compute_checked_args(void)
+{
+    uint8_t s_priv[32], s_pub[32];
+    ants_reputation_params_t p;
+    uint64_t a = 0, t = 0;
+
+    make_key(0xD1, s_priv, s_pub);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+
+    /* NULL server_id / out_a / out_t → INVALID_ARG before the gate. */
+    CHECK_EQ(ants_reputation_compute_checked(NULL, NULL, 0, 0, &p, NULL, NULL, &a, &t),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_compute_checked(s_pub, NULL, 0, 0, &p, NULL, NULL, NULL, &t),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_compute_checked(s_pub, NULL, 0, 0, &p, NULL, NULL, &a, NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Non-slashed path delegates full validation: NULL params → INVALID_ARG. */
+    CHECK_EQ(ants_reputation_compute_checked(s_pub, NULL, 0, 0, NULL, NULL, NULL, &a, &t),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Empty bag, not slashed → 0/0 with ANTS_OK (no receipts to credit). */
+    a = 1;
+    t = 1;
+    CHECK_EQ(ants_reputation_compute_checked(s_pub, NULL, 0, 1000, &p, NULL, NULL, &a, &t),
+             ANTS_OK);
+    CHECK(a == 0 && t == 0);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -418,6 +583,11 @@ int main(void)
     test_t_eff_pinned_values();
     test_t_eff_properties();
     test_t_eff_args();
+
+    test_compute_checked_not_slashed();
+    test_compute_checked_slashed_zeroes_both();
+    test_compute_checked_null_predicate_equals_unchecked();
+    test_compute_checked_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);
