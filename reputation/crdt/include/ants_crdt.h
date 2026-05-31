@@ -300,6 +300,114 @@ ants_error_t ants_crdt_verify(const uint8_t *buf, size_t len);
 ants_error_t
 ants_crdt_content_id(const uint8_t *buf, size_t len, uint8_t out_id[ANTS_CRDT_CONTENT_ID_SIZE]);
 
+/* ------------------------------------------------------------------------ */
+/* The G-Set — the grow-only set of verified fault proofs                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The Layer-1 CRDT: a grow-only set (G-Set) of self-authenticating fault
+ * proofs (RFC-0004 v0.6 §"Layer 1", reference sketch §1390). You can only
+ * add, never remove (pruning after L2 epoch-confirmation is a separate,
+ * later operation). Every element is a proof that passed VERIFY, so the
+ * set's defining invariant is: *every member verifies*.
+ *
+ * Two honest peers that have received the same proofs hold the same set;
+ * the only divergence the protocol admits is which proofs each has seen
+ * yet (set convergence, not value disagreement) — which is what gossip
+ * (Component #6) closes. Merge is therefore a plain set union, and it is
+ * idempotent, commutative, and associative (the CRDT laws).
+ *
+ * The handle is heap-allocated and OPAQUE — unlike the fixed-size
+ * caller-owned `_opaque[CTX_SIZE]` contexts elsewhere in the client, a
+ * G-Set is unbounded, so it cannot live in a caller struct. This is the
+ * module's first allocator. The set OWNS a private copy of every proof's
+ * bytes (it must re-serve them to gossip peers and to late joiners), so
+ * the caller's buffer need not outlive the insert.
+ */
+typedef struct ants_crdt ants_crdt_t;
+
+/*
+ * Create an empty G-Set. On success `*out_set` is a handle the caller must
+ * later pass to ants_crdt_destroy.
+ *
+ * @return ANTS_OK with *out_set set; ANTS_ERROR_INVALID_ARG if out_set is
+ *         NULL; ANTS_ERROR_MALFORMED on allocation failure (the project's
+ *         established out-of-memory convention — see cache/semantic).
+ */
+ants_error_t ants_crdt_init(ants_crdt_t **out_set);
+
+/* Free a G-Set and every proof it owns. NULL is a no-op. */
+void ants_crdt_destroy(ants_crdt_t *set);
+
+/*
+ * Insert a serialized fault proof (the gossip-receive path of the
+ * reference sketch). VERIFY-gated: runs ants_crdt_verify on the bytes;
+ * if that does not return ANTS_OK the proof is rejected and the set is
+ * unchanged (the VERIFY verdict is returned verbatim). Never trust a
+ * peer's claim that a proof verifies — this is the deserialization
+ * boundary where the check is enforced.
+ *
+ * Idempotent by content-id: inserting a proof already present is ANTS_OK
+ * with *out_inserted = false and no duplicate stored. On a new valid
+ * proof the set takes a private copy of the bytes.
+ *
+ * @param out_inserted optional; true iff a new element was added, false if
+ *        it was already present. May be NULL.
+ * @return ANTS_OK on insert-or-already-present; the VERIFY verdict
+ *         (MALFORMED / NON_CANONICAL / UNSUPPORTED_TYPE / NOT_IMPLEMENTED /
+ *         INVALID_ARG) on a proof that does not verify; ANTS_ERROR_MALFORMED
+ *         on allocation failure.
+ */
+ants_error_t
+ants_crdt_insert(ants_crdt_t *set, const uint8_t *proof, size_t len, bool *out_inserted);
+
+/*
+ * Does the set contain the exact proof with this content-id (the BLAKE3
+ * address from ants_crdt_content_id)? O(1) expected.
+ */
+bool ants_crdt_contains(const ants_crdt_t *set,
+                        const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE]);
+
+/*
+ * is_slashed_locally (RFC-0004 reference sketch §1400): does the set hold
+ * ANY proof whose subject == `subject`? This is the query the tenure
+ * computation and the serving path gate on — a slashed identity's T is
+ * zeroed and it is refused service. O(n) over the set (proofs-per-subject
+ * is ~1 in practice; a subject index is a later optimisation).
+ */
+bool ants_crdt_is_slashed(const ants_crdt_t *set, const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE]);
+
+/* Number of proofs currently in the set. */
+size_t ants_crdt_size(const ants_crdt_t *set);
+
+/*
+ * Merge `src` into `dst` (CRDT union): every element of `src` not already
+ * in `dst` is copied in (a private copy of the bytes). Elements of an
+ * ants_crdt_t are verified by the invariant (each passed VERIFY at its own
+ * insert), so merge does NOT re-verify — the trust boundary is
+ * ants_crdt_insert, not an in-process union of two sets we built. Used to
+ * fold a late-joiner snapshot or a peer's set into the local view.
+ * Idempotent and commutative.
+ *
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL; ANTS_ERROR_MALFORMED on
+ *         allocation failure (dst may be partially merged — still a valid,
+ *         smaller union, since the operation is monotone).
+ */
+ants_error_t ants_crdt_merge(ants_crdt_t *dst, const ants_crdt_t *src);
+
+/*
+ * Visit every proof in the set (iteration order unspecified). The callback
+ * receives the content-id and the proof bytes, which ALIAS the set's
+ * storage and are valid only for the duration of the call. Returning false
+ * stops the iteration early. Used to serialise the set for gossip or a
+ * late-joiner snapshot without exposing the internal layout.
+ */
+typedef bool (*ants_crdt_visit_fn)(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
+                                   const uint8_t *proof,
+                                   size_t len,
+                                   void *ctx);
+void ants_crdt_enumerate(const ants_crdt_t *set, ants_crdt_visit_fn fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
