@@ -13,6 +13,103 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #7 (L1 CRDT) — the consensus-free fault G-Set · 2026-05-31
+
+**The architecture's load-bearing negative layer lands.** Component #7 is
+the L1 of RFC-0004 §"Layer 1 — the consensus-free fault G-Set": the only
+thing the protocol gossips globally about reputation is a grow-only set of
+*self-authenticating fault proofs*, and `VERIFY(π)` is a pure,
+deterministic, context-free function. That asymmetry — a monotone
+self-authenticating fact needs **one honest gossip path, ever, not an
+honest majority** (RFC-0004 §"The structural win") — is what lets a global
+reputation layer exist without consensus. New module `reputation/crdt/`
+(`ants_crdt.{h,c}` + `test_crdt.c`), wired as the 18th ctest target
+`crdt_basic`; depends only on `foundation/crypto` + `foundation/cbor`.
+
+This is the critical-path unblock the rest of the reputation chain waited
+on (`#3 TEE → #7 → #8 L2 chain → #13 → #15`): #9's tenure-zeroing on slash,
+#8's epoch confirmation, and gossip (#6) all build on the proof + the set
+landed here. Three PRs.
+
+**PR #95 — the self-authenticating fault proof + VERIFY:**
+
+- Canonical-CBOR wire format (RFC-0008 §1.1, float-free): the proof is one
+  canonical document — envelope `map(4) {0 subject(bytes32), 1
+  fault_type(uint), 2 epoch(uint), 3 evidence}` with the equivocation
+  evidence a *native nested* `array(2)` of `[body(bytes), sig(bytes64)]`,
+  so encode is a single pass with no scratch buffer and no malloc. Each
+  statement body is itself a canonical `map(4) {0 domain, 1 epoch, 2 slot,
+  3 payload}`, opaque at the envelope level so it is reproduced verbatim as
+  the Ed25519 message.
+- `VERIFY` for `fault_type = equivocation` (the gold-standard,
+  offline-checkable fault): both statements bind the same `(domain, epoch,
+  slot)` and the envelope's epoch to *different* payloads, and both
+  signatures verify under the subject — two Ed25519 checks and an
+  inequality. Fail-closed dispatch: an unknown fault class →
+  `UNSUPPORTED_TYPE`; `invalid_transition` (class 1, needs the L2 chain) →
+  `NOT_IMPLEMENTED`. The fault-class enum is integer-stable and append-only
+  like `ants_error_t`.
+- BLAKE3 content-address the G-Set dedupes proofs on.
+
+**PR #96 — the grow-only set (G-Set):**
+
+- The container that holds verified proofs and answers the query the whole
+  reputation layer gates on: **is this peer slashed?** Opaque heap handle
+  (a set is unbounded — the module's first allocator, unlike the fixed
+  `_opaque[CTX_SIZE]` contexts elsewhere). `init` / `destroy` / `insert`
+  (VERIFY-gated — the deserialization trust boundary; idempotent by
+  content-id; private copy of the bytes) / `contains` / `is_slashed` /
+  `size` / `merge` (set union; no re-verify — the invariant already holds
+  for both operands) / `enumerate` (visit-with-early-stop).
+- Storage: open-addressed linear-probe hash table keyed by the content-id.
+  Because the content-id is a BLAKE3 hash it is already uniform, so its
+  first 8 bytes are the bucket hash directly — no secondary mixing.
+  Power-of-two sized, doubles + full rehash at 0.7 load.
+- The set's defining invariant is that **every member verifies**; merge is
+  therefore idempotent, commutative, and associative (the CRDT laws), and
+  convergence — not value agreement — is the only uncertainty, which gossip
+  (#6) closes.
+
+**PR #97 — pruning + the late-joiner snapshot:**
+
+- `ants_crdt_prune(set, min_epoch_keep, *pruned)` bounds the otherwise
+  unbounded set (RFC-0004 §"G-Set pruning"): drop every proof with `epoch <
+  min_epoch_keep`, rebuilding the (tombstone-free) table compactly around
+  the survivors, allocated up front so an OOM leaves the set unchanged. The
+  cutoff *mechanism* is here; the *policy* (which epoch the L2 chain has
+  confirmed) is Component #8.
+- `ants_crdt_snapshot_bound` / `_encode` / `_merge` are the late-joiner
+  data plane (RFC §"Late-joiner protocol" step 2): serialise the set to one
+  canonical-CBOR frame, and import a peer's frame re-running every proof
+  through `VERIFY` — a snapshot is the same untrusted boundary as gossip,
+  so an invalid proof is *skipped* (counted), not fatal (the safe-direction
+  default), while a structurally bad frame is rejected wholesale.
+
+**Why DRAFT.** The fault-proof + snapshot wire formats are defined by this
+module pending formalisation in RFC-0008 (the same status the DHT and cache
+wire formats carried before their spec sections existed); they MUST be
+upstreamed before two independent implementations gossip proofs to each
+other.
+
+**Not yet here.** Gossip propagation (#6); the L1→tenure slash wiring that
+zeroes a slashed peer's `T` in `reputation/identity` (#9); the L2 chain
+(#8) and the parts of the late-joiner protocol that need it (the epoch
+index of slashed identities, Merkle-inclusion proofs, on-demand historical
+fetch); archive-node redundancy; the non-equivocation fault classes.
+
+**Tests** (real Ed25519, ASan+UBSan; `crdt_basic`): valid proof verifies;
+same-payload / slot / domain / envelope-epoch / bad-signature /
+wrong-signer rejected as `MALFORMED`; unknown class → `UNSUPPORTED_TYPE`;
+class 1 → `NOT_IMPLEMENTED`; non-canonical → `NON_CANONICAL`; a
+single-bit-flip sweep over a valid proof confirms no tamper survives; the
+container's insert/contains/is_slashed/idempotence, a 200-proof growth
+sweep cross-checked by `enumerate`, multi-subject `is_slashed`, and `merge`
+union semantics; prune drops the right epochs and rebuilds a working table;
+snapshot round-trips with `added`/`rejected` accounting, idempotent
+re-merge, and per-element skip vs whole-frame rejection. Full suite 18/18
+green; 0 warnings on a full rebuild; clang-format clean; CI 7/7 on every
+PR.
+
 ### cache: Component #10 (semantic cache) step 9 — quality signals + decay + challenge invalidation · 2026-05-27
 
 **The cache learns to forget.** Step 9 lands the three mechanisms
