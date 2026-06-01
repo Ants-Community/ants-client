@@ -2,12 +2,21 @@
  * chain.c — Layer 2: the PoUH chain as ordered witness (Component #8,
  * RFC-0004 v0.6 §"Layer 2 — the PoUH chain as ordered witness").
  *
- * PR1: SCAFFOLD. Every public entry point is present so the surface
- * compiles, links, and can be argued with, but returns
- * ANTS_ERROR_NOT_IMPLEMENTED until its PR lands (see the per-group map in
- * ants_chain.h). The protocol structs and tunable constants are real now;
- * only the behaviour is deferred. No floats, no malloc, no threads, no
- * hidden global state on any path this module will ever take.
+ * Implemented so far:
+ *   PR1  SCAFFOLD — the full public surface; the still-deferred entry
+ *        points return ANTS_ERROR_NOT_IMPLEMENTED.
+ *   PR2  the confirmed_proofs Merkle root + inclusion proof, and the
+ *        EpochSummary canonical-CBOR codec — pure functions over bytes, no
+ *        I/O, no malloc, no threads, no floats.
+ *
+ * The confirmed_proofs Merkle construction mirrors inference/orchestration's
+ * commit Merkle exactly (domain-separated leaf/node, promote-lone-trailing,
+ * online MMR build with an O(log n) bounded stack), so the two corpora share
+ * one canonical scheme. The only chain-specific differences: leaves are the
+ * 32-byte L1 proof content-ids (leaf = BLAKE3(0x00 ‖ content_id)), the
+ * caller passes them STRICTLY ASCENDING (the canonical order that makes the
+ * root reproducible across peers regardless of G-Set iteration order), and a
+ * zero-proof epoch has a defined empty root BLAKE3(0x02).
  *
  * Spec: RFC-0004 v0.6 §"Layer 2"; RFC-0008 v0.5 §1.1 (canonical CBOR),
  * §2.1 (BLAKE3), §3.1/§3.3 (signatures), §4.2 (ECVRF).
@@ -15,18 +24,188 @@
 
 #include "ants_chain.h"
 
-/* ======================================================================== */
-/* PR2 — confirmed_proofs Merkle root + inclusion proof                      */
-/* ======================================================================== */
+#include "ants_cbor.h"
+#include "ants_crypto.h"
+
+#include <string.h>
+
+/* ------------------------------------------------------------------------ */
+/* confirmed_proofs Merkle: domain-separated hashing + bounded MMR build      */
+/* ------------------------------------------------------------------------ */
+
+/* Domain separation tags. leaf and node match inference/orchestration's
+ * commit Merkle (0x00 / 0x01); 0x02 is the chain's empty-set root, a value
+ * that can never collide with a leaf or node hash (different prefix). */
+#define CHAIN_MERKLE_LEAF_PREFIX  0x00u
+#define CHAIN_MERKLE_NODE_PREFIX  0x01u
+#define CHAIN_MERKLE_EMPTY_PREFIX 0x02u
+
+/* leaf(content_id) = BLAKE3(0x00 ‖ content_id). */
+static ants_error_t leaf_hash(const uint8_t content_id[ANTS_CHAIN_HASH_SIZE],
+                              uint8_t out[ANTS_CHAIN_HASH_SIZE])
+{
+    const uint8_t prefix = CHAIN_MERKLE_LEAF_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, content_id, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* node(L,R) = BLAKE3(0x01 ‖ L ‖ R). `out` may alias `left` or `right`:
+ * each input is consumed into the hasher before `final` writes `out`. */
+static ants_error_t node_hash(const uint8_t left[ANTS_CHAIN_HASH_SIZE],
+                              const uint8_t right[ANTS_CHAIN_HASH_SIZE],
+                              uint8_t out[ANTS_CHAIN_HASH_SIZE])
+{
+    const uint8_t prefix = CHAIN_MERKLE_NODE_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, left, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, right, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* The empty-set root, BLAKE3(0x02) — a legitimate zero-proof epoch. */
+static ants_error_t empty_root(uint8_t out[ANTS_CHAIN_HASH_SIZE])
+{
+    const uint8_t prefix = CHAIN_MERKLE_EMPTY_PREFIX;
+    return ants_blake3_hash(&prefix, 1, out);
+}
+
+/* Merkle root over the content-id range [lo, hi) (requires hi > lo) under
+ * the promote-lone-trailing-node level scheme, computed with an O(log n)
+ * bounded stack and no allocation (the same online MMR build as
+ * inference/orchestration). Leaves are hashed on push: leaf_hash(ids[i]). */
+static ants_error_t subtree_root_range(const uint8_t (*ids)[ANTS_CHAIN_HASH_SIZE],
+                                       size_t lo,
+                                       size_t hi,
+                                       uint8_t out[ANTS_CHAIN_HASH_SIZE])
+{
+    uint8_t stack[ANTS_CHAIN_MERKLE_MAX_DEPTH + 2][ANTS_CHAIN_HASH_SIZE];
+    int height[ANTS_CHAIN_MERKLE_MAX_DEPTH + 2];
+    int top = 0;
+    ants_error_t rc;
+    size_t i;
+    int k;
+
+    for (i = lo; i < hi; i++) {
+        rc = leaf_hash(ids[i], stack[top]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        height[top] = 0;
+        top++;
+        while (top >= 2 && height[top - 1] == height[top - 2]) {
+            rc = node_hash(stack[top - 2], stack[top - 1], stack[top - 2]);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            height[top - 2]++;
+            top--;
+        }
+    }
+
+    /* Bag the leftover peaks right-to-left: the accumulator is the rightmost
+     * (smallest) peak at stack[top - 1]; each peak to its left folds in as
+     * the left child, reproducing the lone-trailing-node promotion. */
+    for (k = top - 2; k >= 0; k--) {
+        rc = node_hash(stack[k], stack[top - 1], stack[top - 1]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    memcpy(out, stack[top - 1], ANTS_CHAIN_HASH_SIZE);
+    return ANTS_OK;
+}
+
+/* Number of sibling hashes on the path from leaf `index` to the root in a
+ * promote-lone-node tree of `n_leaves` (identical to the inference scheme). */
+static size_t merkle_path_len(size_t index, size_t n_leaves)
+{
+    size_t len = 0;
+    size_t idx = index;
+    size_t count = n_leaves;
+
+    while (count > 1) {
+        if ((idx & 1u) == 1u) {
+            len++; /* right child: always has a left sibling */
+        } else if (idx + 1 < count) {
+            len++; /* left child with a right sibling present */
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+    return len;
+}
+
+/* True iff the n content-ids are strictly ascending (the canonical order).
+ * Strict ascent also rules out duplicates, which a set satisfies. */
+static bool ids_strictly_ascending(const uint8_t (*ids)[ANTS_CHAIN_HASH_SIZE], size_t n)
+{
+    size_t i;
+    for (i = 1; i < n; i++) {
+        if (memcmp(ids[i - 1], ids[i], ANTS_CHAIN_HASH_SIZE) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* n exceeding 2^MAX_DEPTH would overflow the bounded MMR stack. */
+static bool n_leaves_in_range(size_t n)
+{
+#if SIZE_MAX > 0xFFFFFFFFu
+    return (uint64_t)n <= ((uint64_t)1 << ANTS_CHAIN_MERKLE_MAX_DEPTH);
+#else
+    (void)n;
+    return true; /* size_t can't exceed 2^32 == 2^MAX_DEPTH here */
+#endif
+}
 
 ants_error_t ants_chain_confirmed_root(const uint8_t (*content_ids)[ANTS_CHAIN_HASH_SIZE],
                                        size_t n,
                                        uint8_t out_root[ANTS_CHAIN_HASH_SIZE])
 {
-    (void)content_ids;
-    (void)n;
-    (void)out_root;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (out_root == NULL || (content_ids == NULL && n != 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n == 0) {
+        return empty_root(out_root);
+    }
+    if (!n_leaves_in_range(n)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (!ids_strictly_ascending(content_ids, n)) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    return subtree_root_range(content_ids, 0, n, out_root);
 }
 
 ants_error_t ants_chain_confirmed_prove(const uint8_t (*content_ids)[ANTS_CHAIN_HASH_SIZE],
@@ -36,13 +215,62 @@ ants_error_t ants_chain_confirmed_prove(const uint8_t (*content_ids)[ANTS_CHAIN_
                                         size_t path_cap,
                                         size_t *out_path_len)
 {
-    (void)content_ids;
-    (void)n;
-    (void)index;
-    (void)out_path;
-    (void)path_cap;
-    (void)out_path_len;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    size_t need_bytes;
+    size_t written = 0;
+    size_t idx;
+    size_t count;
+    int level = 0;
+    ants_error_t rc;
+
+    if (content_ids == NULL || n == 0 || index >= n || out_path == NULL || out_path_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (!n_leaves_in_range(n)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (!ids_strictly_ascending(content_ids, n)) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+
+    need_bytes = merkle_path_len(index, n) * ANTS_CHAIN_HASH_SIZE;
+    if (need_bytes > path_cap) {
+        *out_path_len = need_bytes;
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    idx = index;
+    count = n;
+    while (count > 1) {
+        bool has_sib = false;
+        size_t sib = 0;
+
+        if ((idx & 1u) == 1u) {
+            has_sib = true;
+            sib = idx - 1;
+        } else if (idx + 1 < count) {
+            has_sib = true;
+            sib = idx + 1;
+        }
+        if (has_sib) {
+            uint64_t lo64 = (uint64_t)sib << level;
+            uint64_t hi64 = ((uint64_t)sib + 1) << level;
+            if (hi64 > (uint64_t)n) {
+                hi64 = (uint64_t)n;
+            }
+            rc = subtree_root_range(
+                content_ids, (size_t)lo64, (size_t)hi64, out_path + written * ANTS_CHAIN_HASH_SIZE);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            written++;
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+        level++;
+    }
+
+    *out_path_len = written * ANTS_CHAIN_HASH_SIZE;
+    return ANTS_OK;
 }
 
 ants_error_t ants_chain_confirmed_verify(const uint8_t leaf_content_id[ANTS_CHAIN_HASH_SIZE],
@@ -53,24 +281,182 @@ ants_error_t ants_chain_confirmed_verify(const uint8_t leaf_content_id[ANTS_CHAI
                                          const uint8_t root[ANTS_CHAIN_HASH_SIZE],
                                          bool *out_ok)
 {
-    (void)leaf_content_id;
-    (void)index;
-    (void)n;
-    (void)path;
-    (void)path_len;
-    (void)root;
-    (void)out_ok;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint8_t cur[ANTS_CHAIN_HASH_SIZE];
+    size_t consumed = 0;
+    size_t idx;
+    size_t count;
+    ants_error_t rc;
+
+    if (leaf_content_id == NULL || n == 0 || index >= n || path == NULL || root == NULL ||
+        out_ok == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (!n_leaves_in_range(n)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (path_len != merkle_path_len(index, n) * ANTS_CHAIN_HASH_SIZE) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    rc = leaf_hash(leaf_content_id, cur);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    idx = index;
+    count = n;
+    while (count > 1) {
+        bool has_sib = false;
+        bool sib_on_left = false;
+
+        if ((idx & 1u) == 1u) {
+            has_sib = true;
+            sib_on_left = true;
+        } else if (idx + 1 < count) {
+            has_sib = true;
+            sib_on_left = false;
+        }
+        if (has_sib) {
+            const uint8_t *sib = path + consumed * ANTS_CHAIN_HASH_SIZE;
+            if (sib_on_left) {
+                rc = node_hash(sib, cur, cur);
+            } else {
+                rc = node_hash(cur, sib, cur);
+            }
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            consumed++;
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+
+    *out_ok = (consumed * ANTS_CHAIN_HASH_SIZE == path_len) &&
+              (memcmp(cur, root, ANTS_CHAIN_HASH_SIZE) == 0);
+    return ANTS_OK;
 }
 
-/* ======================================================================== */
-/* PR2 — EpochSummary canonical-CBOR codec                                   */
-/* ======================================================================== */
+/* ------------------------------------------------------------------------ */
+/* EpochSummary canonical-CBOR codec                                          */
+/*                                                                            */
+/* A definite-length, float-free map(4) with ascending integer keys; the     */
+/* findings ride in key 4 as an array of fixed-shape map(5)s. DRAFT, defined  */
+/* by this module pending RFC-0008.                                           */
+/*                                                                            */
+/*   summary  1:epoch(u) 2:cutoff_time(u) 3:confirmed_proofs(bytes32)         */
+/*            4:findings(array of map(5))                                     */
+/*   finding  1:subject(bytes32) 2:rule_id(u) 3:window_s(u) 4:count(u)        */
+/*            5:severity(u)                                                    */
+/* ------------------------------------------------------------------------ */
+
+#define CHAIN_SUMMARY_PAIRS 4u
+#define CHAIN_FINDING_PAIRS 5u
+
+enum {
+    SUMMARY_KEY_EPOCH = 1,
+    SUMMARY_KEY_CUTOFF = 2,
+    SUMMARY_KEY_CONFIRMED = 3,
+    SUMMARY_KEY_FINDINGS = 4
+};
+
+enum {
+    FINDING_KEY_SUBJECT = 1,
+    FINDING_KEY_RULE = 2,
+    FINDING_KEY_WINDOW = 3,
+    FINDING_KEY_COUNT = 4,
+    FINDING_KEY_SEVERITY = 5
+};
+
+static bool severity_valid(uint64_t s)
+{
+    return s >= ANTS_CHAIN_SEVERITY_SOFT && s < ANTS_CHAIN_SEVERITY__RESERVED_MIN;
+}
+
+static ants_error_t enc_kv_uint(ants_cbor_enc_t *enc, uint64_t key, uint64_t val)
+{
+    ants_error_t rc = ants_cbor_enc_uint(enc, key);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_cbor_enc_uint(enc, val);
+}
+
+static ants_error_t enc_kv_bytes(ants_cbor_enc_t *enc, uint64_t key, const uint8_t *b, size_t len)
+{
+    ants_error_t rc = ants_cbor_enc_uint(enc, key);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_cbor_enc_bytes(enc, b, len);
+}
+
+/* Collapse the decoder's full error vocabulary onto the codec contract: a
+ * §4.2.1 canonical violation keeps NON_CANONICAL, everything else structural
+ * folds to MALFORMED. INVALID_ARG can't occur (the decoder only raises it for
+ * NULL, which these paths never pass). Mirrors inference/orchestration. */
+static ants_error_t norm_decode_err(ants_error_t rc)
+{
+    if (rc == ANTS_OK || rc == ANTS_ERROR_NON_CANONICAL) {
+        return rc;
+    }
+    return ANTS_ERROR_MALFORMED;
+}
+
+static ants_error_t expect_key(ants_cbor_dec_t *dec, uint64_t want)
+{
+    uint64_t key;
+    ants_error_t rc = norm_decode_err(ants_cbor_dec_uint(dec, &key));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (key != want) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t decode_uint_field(ants_cbor_dec_t *dec, uint64_t key, uint64_t *out)
+{
+    ants_error_t rc = expect_key(dec, key);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return norm_decode_err(ants_cbor_dec_uint(dec, out));
+}
+
+static ants_error_t
+decode_bytes_field(ants_cbor_dec_t *dec, uint64_t key, uint8_t *dst, size_t want)
+{
+    const uint8_t *p;
+    size_t len;
+    ants_error_t rc;
+
+    rc = expect_key(dec, key);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_bytes(dec, &p, &len));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (len != want) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(dst, p, want);
+    return ANTS_OK;
+}
 
 size_t ants_chain_epoch_summary_bound(const ants_chain_epoch_summary_t *s)
 {
-    (void)s;
-    return 0;
+    if (s == NULL) {
+        return 0;
+    }
+    /* map(4) + two u64 KVs + a 32-byte KV + the findings array header, then
+     * each finding map(5) of one 32-byte KV and four u64 KVs. Each u64 KV is
+     * <= 1 (key) + 9 (uint) bytes; a 32-byte KV <= 1 + 3 (bytes header) + 32.
+     * Rounded up generously to stay a one-shot sizing. */
+    return 80u + s->n_findings * 96u;
 }
 
 ants_error_t ants_chain_epoch_summary_encode(const ants_chain_epoch_summary_t *s,
@@ -78,11 +464,87 @@ ants_error_t ants_chain_epoch_summary_encode(const ants_chain_epoch_summary_t *s
                                              size_t cap,
                                              size_t *out_len)
 {
-    (void)s;
-    (void)buf;
-    (void)cap;
-    (void)out_len;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+    size_t i;
+
+    if (s == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (s->n_findings > ANTS_CHAIN_MAX_PATTERN_FINDINGS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (s->n_findings > 0 && s->findings == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    for (i = 0; i < s->n_findings; i++) {
+        if (!severity_valid(s->findings[i].severity)) {
+            return ANTS_ERROR_INVALID_ARG;
+        }
+    }
+
+    rc = ants_cbor_enc_init(&enc, buf, cap);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_map(&enc, CHAIN_SUMMARY_PAIRS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_uint(&enc, SUMMARY_KEY_EPOCH, s->epoch);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_uint(&enc, SUMMARY_KEY_CUTOFF, s->cutoff_time);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_bytes(&enc, SUMMARY_KEY_CONFIRMED, s->confirmed_proofs, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_uint(&enc, SUMMARY_KEY_FINDINGS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_array(&enc, s->n_findings);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    for (i = 0; i < s->n_findings; i++) {
+        const ants_chain_pattern_finding_t *f = &s->findings[i];
+        rc = ants_cbor_enc_map(&enc, CHAIN_FINDING_PAIRS);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = enc_kv_bytes(&enc, FINDING_KEY_SUBJECT, f->subject, ANTS_CHAIN_PEER_ID_SIZE);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = enc_kv_uint(&enc, FINDING_KEY_RULE, f->rule_id);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = enc_kv_uint(&enc, FINDING_KEY_WINDOW, f->window_s);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = enc_kv_uint(&enc, FINDING_KEY_COUNT, f->count);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = enc_kv_uint(&enc, FINDING_KEY_SEVERITY, f->severity);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    rc = ants_cbor_enc_finalise(&enc);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
 }
 
 ants_error_t ants_chain_epoch_summary_decode(const uint8_t *buf,
@@ -92,17 +554,103 @@ ants_error_t ants_chain_epoch_summary_decode(const uint8_t *buf,
                                              size_t findings_cap,
                                              size_t *out_n_findings)
 {
-    (void)buf;
-    (void)len;
-    (void)out_summary;
-    (void)findings_buf;
-    (void)findings_cap;
-    (void)out_n_findings;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    ants_cbor_dec_t dec;
+    size_t n_pairs;
+    size_t n_findings;
+    uint64_t u;
+    ants_error_t rc;
+    size_t i;
+
+    if (buf == NULL || len == 0 || out_summary == NULL || out_n_findings == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    rc = ants_cbor_dec_init(&dec, buf, len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_map(&dec, &n_pairs));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (n_pairs != CHAIN_SUMMARY_PAIRS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    rc = decode_uint_field(&dec, SUMMARY_KEY_EPOCH, &out_summary->epoch);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = decode_uint_field(&dec, SUMMARY_KEY_CUTOFF, &out_summary->cutoff_time);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = decode_bytes_field(
+        &dec, SUMMARY_KEY_CONFIRMED, out_summary->confirmed_proofs, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = expect_key(&dec, SUMMARY_KEY_FINDINGS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_array(&dec, &n_findings));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    *out_n_findings = n_findings;
+    if (n_findings > findings_cap) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    for (i = 0; i < n_findings; i++) {
+        ants_chain_pattern_finding_t *f = &findings_buf[i];
+        rc = norm_decode_err(ants_cbor_dec_map(&dec, &n_pairs));
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (n_pairs != CHAIN_FINDING_PAIRS) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        rc = decode_bytes_field(&dec, FINDING_KEY_SUBJECT, f->subject, ANTS_CHAIN_PEER_ID_SIZE);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = decode_uint_field(&dec, FINDING_KEY_RULE, &f->rule_id);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = decode_uint_field(&dec, FINDING_KEY_WINDOW, &f->window_s);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = decode_uint_field(&dec, FINDING_KEY_COUNT, &f->count);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = decode_uint_field(&dec, FINDING_KEY_SEVERITY, &u);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (!severity_valid(u)) {
+            return ANTS_ERROR_UNSUPPORTED_TYPE;
+        }
+        f->severity = (uint32_t)u;
+    }
+
+    rc = norm_decode_err(ants_cbor_dec_finalise(&dec));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    out_summary->findings = findings_buf;
+    out_summary->n_findings = n_findings;
+    return ANTS_OK;
 }
 
 /* ======================================================================== */
-/* PR3 — the pattern-rule engine                                             */
+/* PR3 — the pattern-rule engine (stub)                                      */
 /* ======================================================================== */
 
 ants_error_t ants_chain_pattern_scan(const ants_chain_event_t *events,
@@ -122,7 +670,7 @@ ants_error_t ants_chain_pattern_scan(const ants_chain_event_t *events,
 }
 
 /* ======================================================================== */
-/* PR4 — VRF committee selection                                             */
+/* PR4 — VRF committee selection (stub)                                      */
 /* ======================================================================== */
 
 ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
@@ -144,7 +692,7 @@ ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAI
 }
 
 /* ======================================================================== */
-/* PR5 — block hashing, encoding, and 2/3 finality                           */
+/* PR5 — block hashing, encoding, and 2/3 finality (stub)                    */
 /* ======================================================================== */
 
 ants_error_t ants_chain_block_hash(const ants_chain_block_t *b,
@@ -206,7 +754,7 @@ ants_error_t ants_chain_finality_verify(const uint8_t block_hash[ANTS_CHAIN_HASH
 }
 
 /* ======================================================================== */
-/* PR6 — partition recovery: Σ T_eff fork choice                             */
+/* PR6 — partition recovery: Σ T_eff fork choice (stub)                      */
 /* ======================================================================== */
 
 ants_error_t ants_chain_fork_weight(const uint64_t *validator_tenures,
