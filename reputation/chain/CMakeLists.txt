@@ -29,15 +29,17 @@ target_include_directories(ants_chain
         ${CMAKE_SOURCE_DIR}/include
 )
 
-# ants_crypto (#1) — BLAKE3 for the confirmed_proofs Merkle — and ants_cbor
-# (#2) — the canonical EpochSummary codec — are PRIVATE deps: chain.c calls
-# their symbols directly (since PR2). ants_cbor also hosts ants_strerror
-# during the transitional period. reputation/crdt (#7) + reputation/identity
-# (#9) wire in with their PRs (VRF/finality/fork-choice).
+# PRIVATE deps (chain.c calls their symbols directly): ants_crypto (#1) —
+# BLAKE3 for the confirmed_proofs Merkle + Ed25519 for finality; ants_cbor
+# (#2) — the canonical EpochSummary / block codec (also hosts ants_strerror);
+# ants_reputation (#9) — the saturating T_eff transform reused by the Σ T_eff
+# fork choice, so the two components agree bit-for-bit. (CMake resolves the
+# ants_reputation target even though identity/ is configured after chain/.)
 target_link_libraries(ants_chain
     PRIVATE
         ants_crypto
         ants_cbor
+        ants_reputation
 )
 
 target_compile_features(ants_chain PUBLIC c_std_99)
@@ -46,9 +48,18 @@ target_compile_features(ants_chain PUBLIC c_std_99)
 
 if(BUILD_TESTING)
     add_executable(test_chain tests/test_chain.c)
-    # The test recomputes BLAKE3 leaf/node hashes independently and probes
-    # canonical CBOR (ants_cbor_is_canonical), so it links crypto + cbor
-    # explicitly (PRIVATE deps of the lib are not re-exported).
-    target_link_libraries(test_chain PRIVATE ants_chain ants_crypto ants_cbor)
+    # The test recomputes BLAKE3 leaf/node hashes, signs real Ed25519
+    # committee attestations, probes canonical CBOR, and cross-checks Σ T_eff
+    # against ants_reputation_t_eff. All those symbols resolve transitively
+    # through ants_chain's (static) PRIVATE deps, so we link ONLY ants_chain
+    # and add the include directories for the headers the test references
+    # directly (PRIVATE deps don't export their include dirs). Linking those
+    # libs explicitly too would list them twice on the link line — the macOS
+    # ld "ignoring duplicate libraries" warning.
+    target_link_libraries(test_chain PRIVATE ants_chain)
+    target_include_directories(test_chain PRIVATE
+        ${CMAKE_SOURCE_DIR}/foundation/crypto/include
+        ${CMAKE_SOURCE_DIR}/foundation/cbor/include
+        ${CMAKE_SOURCE_DIR}/reputation/identity/include)
     add_test(NAME chain_basic COMMAND test_chain)
 endif()

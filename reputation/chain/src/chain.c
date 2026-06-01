@@ -2,12 +2,16 @@
  * chain.c — Layer 2: the PoUH chain as ordered witness (Component #8,
  * RFC-0004 v0.6 §"Layer 2 — the PoUH chain as ordered witness").
  *
- * Implemented so far:
- *   PR1  SCAFFOLD — the full public surface; the still-deferred entry
- *        points return ANTS_ERROR_NOT_IMPLEMENTED.
- *   PR2  the confirmed_proofs Merkle root + inclusion proof, and the
- *        EpochSummary canonical-CBOR codec — pure functions over bytes, no
- *        I/O, no malloc, no threads, no floats.
+ * Component #8 is feature-complete at the v0.x level:
+ *   - the confirmed_proofs Merkle root + inclusion proof, and the
+ *     EpochSummary + Block canonical-CBOR codecs;
+ *   - the pattern-rule engine (L1 events -> severity findings per window);
+ *   - VRF committee selection (deterministic, beacon-seeded, distinct);
+ *   - block hashing + 2/3 finality over Ed25519 committee signatures;
+ *   - Sigma T_eff fork choice + the social-Schelling fallback (partition
+ *     recovery), reusing reputation/identity's saturating T_eff transform.
+ * Pure functions over bytes — no I/O, no malloc, no threads, and no floats
+ * on any path a second peer must reproduce (determinism is load-bearing).
  *
  * The confirmed_proofs Merkle construction mirrors inference/orchestration's
  * commit Merkle exactly (domain-separated leaf/node, promote-lone-trailing,
@@ -26,6 +30,7 @@
 
 #include "ants_cbor.h"
 #include "ants_crypto.h"
+#include "ants_reputation.h"
 
 #include <string.h>
 
@@ -1120,7 +1125,7 @@ ants_error_t ants_chain_finality_verify(const uint8_t block_hash[ANTS_CHAIN_HASH
 }
 
 /* ======================================================================== */
-/* PR6 — partition recovery: Σ T_eff fork choice (stub)                      */
+/* PR6 — partition recovery: Σ T_eff fork choice                             */
 /* ======================================================================== */
 
 ants_error_t ants_chain_fork_weight(const uint64_t *validator_tenures,
@@ -1128,11 +1133,30 @@ ants_error_t ants_chain_fork_weight(const uint64_t *validator_tenures,
                                     uint64_t t_cap,
                                     uint64_t *out_sum_t_eff)
 {
-    (void)validator_tenures;
-    (void)n;
-    (void)t_cap;
-    (void)out_sum_t_eff;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint64_t sum = 0;
+    size_t i;
+
+    if (out_sum_t_eff == NULL || t_cap == 0 || (validator_tenures == NULL && n != 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Σ T_eff over the fork's validators, with the saturating transform
+     * applied by reputation/identity verbatim so the two components agree
+     * bit-for-bit (the whole point of a shared, float-free t_eff). */
+    for (i = 0; i < n; i++) {
+        uint64_t te;
+        ants_error_t rc = ants_reputation_t_eff(validator_tenures[i], t_cap, &te);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (sum > UINT64_MAX - te) {
+            return ANTS_ERROR_OVERFLOW;
+        }
+        sum += te;
+    }
+
+    *out_sum_t_eff = sum;
+    return ANTS_OK;
 }
 
 ants_error_t ants_chain_fork_choice(uint64_t weight_a,
@@ -1142,11 +1166,39 @@ ants_error_t ants_chain_fork_choice(uint64_t weight_a,
                                     uint64_t theta_den,
                                     int *out_winner)
 {
-    (void)weight_a;
-    (void)weight_b;
-    (void)total_t_eff;
-    (void)theta_num;
-    (void)theta_den;
-    (void)out_winner;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint64_t q;
+    uint64_t r;
+    uint64_t thresh;
+    bool a_clears;
+    bool b_clears;
+
+    if (out_winner == NULL || theta_den == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (weight_a > total_t_eff || weight_b > total_t_eff) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* thresh = floor(total * theta_num / theta_den), computed without
+     * overflow: for a proper fraction theta_num < theta_den the result is
+     * <= total <= UINT64_MAX, and q*theta_num <= total, so neither term
+     * overflows. */
+    q = total_t_eff / theta_den;
+    r = total_t_eff % theta_den;
+    thresh = q * theta_num + (r * theta_num) / theta_den;
+
+    /* A fork is a legitimate-majority claimant iff its Σ T_eff exceeds θ of
+     * the agreed total. If BOTH clear θ the partition is fundamentally
+     * balanced → hand to the social layer; otherwise the heavier fork wins
+     * (ties break to A, deterministically). */
+    a_clears = weight_a > thresh;
+    b_clears = weight_b > thresh;
+    if (a_clears && b_clears) {
+        *out_winner = ANTS_CHAIN_FORK_SOCIAL_SCHELLING;
+    } else if (weight_a >= weight_b) {
+        *out_winner = ANTS_CHAIN_FORK_A;
+    } else {
+        *out_winner = ANTS_CHAIN_FORK_B;
+    }
+    return ANTS_OK;
 }
