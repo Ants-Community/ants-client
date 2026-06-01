@@ -650,8 +650,28 @@ ants_error_t ants_chain_epoch_summary_decode(const uint8_t *buf,
 }
 
 /* ======================================================================== */
-/* PR3 — the pattern-rule engine (stub)                                      */
+/* PR3 — the pattern-rule engine                                             */
 /* ======================================================================== */
+
+/* The §Slash-mechanics escalation band for a within-window event count
+ * (count >= 1 guaranteed by the caller). */
+static uint32_t severity_for_count(uint64_t count)
+{
+    if (count >= ANTS_CHAIN_PATTERN_HARD_MIN_EVENTS) {
+        return ANTS_CHAIN_SEVERITY_HARD;
+    }
+    if (count >= ANTS_CHAIN_PATTERN_MEDIUM_MIN_EVENTS) {
+        return ANTS_CHAIN_SEVERITY_MEDIUM;
+    }
+    return ANTS_CHAIN_SEVERITY_SOFT;
+}
+
+/* An event falls in the (now - WINDOW, now] counting window. Future events
+ * (timestamp > now) and events at or older than the window are excluded. */
+static bool event_in_window(const ants_chain_event_t *e, uint64_t now)
+{
+    return e->timestamp <= now && (now - e->timestamp) < ANTS_CHAIN_PATTERN_WINDOW_S;
+}
 
 ants_error_t ants_chain_pattern_scan(const ants_chain_event_t *events,
                                      size_t n_events,
@@ -660,13 +680,72 @@ ants_error_t ants_chain_pattern_scan(const ants_chain_event_t *events,
                                      size_t cap,
                                      size_t *out_n)
 {
-    (void)events;
-    (void)n_events;
-    (void)now;
-    (void)out_findings;
-    (void)cap;
-    (void)out_n;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    size_t total = 0;
+    size_t i;
+    size_t j;
+
+    if (out_n == NULL || (events == NULL && n_events != 0) || (out_findings == NULL && cap != 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    for (i = 0; i < n_events; i++) {
+        bool first = true;
+        uint64_t count = 0;
+
+        /* Act only on the first occurrence of each subject (one finding per
+         * subject), so the result does not depend on duplicate listing. */
+        for (j = 0; j < i; j++) {
+            if (memcmp(events[j].subject, events[i].subject, ANTS_CHAIN_PEER_ID_SIZE) == 0) {
+                first = false;
+                break;
+            }
+        }
+        if (!first) {
+            continue;
+        }
+
+        for (j = 0; j < n_events; j++) {
+            if (memcmp(events[j].subject, events[i].subject, ANTS_CHAIN_PEER_ID_SIZE) == 0 &&
+                event_in_window(&events[j], now)) {
+                count++;
+            }
+        }
+        if (count < ANTS_CHAIN_PATTERN_SOFT_MIN_EVENTS) {
+            continue; /* no in-window events for this subject */
+        }
+
+        if (total < cap) {
+            ants_chain_pattern_finding_t *f = &out_findings[total];
+            memcpy(f->subject, events[i].subject, ANTS_CHAIN_PEER_ID_SIZE);
+            f->rule_id = ANTS_CHAIN_RULE_FAULT_COUNT_30D;
+            f->window_s = ANTS_CHAIN_PATTERN_WINDOW_S;
+            f->count = count;
+            f->severity = severity_for_count(count);
+        }
+        total++;
+    }
+
+    *out_n = total;
+    if (total > cap) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Canonicalise the emitted findings by subject ascending, so re-running
+     * the rules over the same event SET yields byte-identical output
+     * regardless of the order the events were listed in. Insertion sort over
+     * the <= cap findings actually written (total <= cap here). */
+    for (i = 1; i < total; i++) {
+        ants_chain_pattern_finding_t key = out_findings[i];
+        j = i;
+        while (j > 0 &&
+               memcmp(out_findings[j - 1].subject, key.subject, ANTS_CHAIN_PEER_ID_SIZE) > 0) {
+            out_findings[j] = out_findings[j - 1];
+            j--;
+        }
+        out_findings[j] = key;
+    }
+
+    return ANTS_OK;
 }
 
 /* ======================================================================== */

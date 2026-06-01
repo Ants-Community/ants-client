@@ -413,6 +413,114 @@ static void test_epoch_summary_encode_args(void)
     CHECK_EQ(ants_chain_epoch_summary_encode(&s, buf, 4, &len), ANTS_ERROR_BUFFER_TOO_SMALL);
 }
 
+/* ---- pattern-rule engine ------------------------------------------------ */
+
+/* One subject with `cnt` in-window events lands in `expect_sev`. */
+static void check_band(uint64_t cnt, uint32_t expect_sev)
+{
+    uint64_t now = 100000000ull;
+    ants_chain_event_t ev[16];
+    ants_chain_pattern_finding_t out[4];
+    size_t out_n = 0;
+    uint64_t i;
+
+    for (i = 0; i < cnt; i++) {
+        memset(&ev[i], 0, sizeof ev[i]);
+        ev[i].subject[0] = 7;
+        ev[i].timestamp = now - (i + 1) * 10;
+    }
+    CHECK_EQ(ants_chain_pattern_scan(ev, (size_t)cnt, now, out, 4, &out_n), ANTS_OK);
+    CHECK(out_n == 1);
+    CHECK(out[0].count == cnt);
+    CHECK(out[0].severity == expect_sev);
+    CHECK(out[0].rule_id == ANTS_CHAIN_RULE_FAULT_COUNT_30D);
+    CHECK(out[0].window_s == ANTS_CHAIN_PATTERN_WINDOW_S);
+    CHECK(out[0].subject[0] == 7);
+}
+
+static void test_pattern_scan(void)
+{
+    uint64_t now = 100000000ull;
+    ants_chain_event_t ev[16];
+    ants_chain_pattern_finding_t out[8];
+    size_t out_n = 0;
+    size_t k = 0;
+    size_t i;
+
+    /* Severity bands by in-window event count (independent of the impl:
+     * the expected band follows the documented thresholds). */
+    check_band(1, ANTS_CHAIN_SEVERITY_SOFT);
+    check_band(2, ANTS_CHAIN_SEVERITY_SOFT);
+    check_band(3, ANTS_CHAIN_SEVERITY_MEDIUM);
+    check_band(5, ANTS_CHAIN_SEVERITY_MEDIUM);
+    check_band(6, ANTS_CHAIN_SEVERITY_HARD);
+    check_band(10, ANTS_CHAIN_SEVERITY_HARD);
+
+    /* Empty input → no findings. */
+    CHECK_EQ(ants_chain_pattern_scan(NULL, 0, now, out, 8, &out_n), ANTS_OK);
+    CHECK(out_n == 0);
+
+    /* Windowing: subject A has 1 in-window, 1 at the exact boundary
+     * (excluded: now - ts == WINDOW is not < WINDOW), 1 in the future
+     * (excluded); subject B has 6 in-window. Two findings, sorted
+     * subject-ascending (A's first byte 1 before B's 2). */
+    memset(ev, 0, sizeof ev);
+    ev[k].subject[0] = 1;
+    ev[k].timestamp = now - 1000;
+    k++;
+    ev[k].subject[0] = 1;
+    ev[k].timestamp = now - ANTS_CHAIN_PATTERN_WINDOW_S;
+    k++;
+    ev[k].subject[0] = 1;
+    ev[k].timestamp = now + 5000;
+    k++;
+    for (i = 0; i < 6; i++) {
+        ev[k].subject[0] = 2;
+        ev[k].timestamp = now - (i + 1) * 100;
+        k++;
+    }
+
+    CHECK_EQ(ants_chain_pattern_scan(ev, k, now, out, 8, &out_n), ANTS_OK);
+    CHECK(out_n == 2);
+    CHECK(out[0].subject[0] == 1);
+    CHECK(out[0].count == 1);
+    CHECK(out[0].severity == ANTS_CHAIN_SEVERITY_SOFT);
+    CHECK(out[1].subject[0] == 2);
+    CHECK(out[1].count == 6);
+    CHECK(out[1].severity == ANTS_CHAIN_SEVERITY_HARD);
+
+    /* Determinism + order-independence: reverse the event list, identical
+     * findings. Compare FIELD BY FIELD (never memcmp the struct — its
+     * trailing padding after `severity` is not zero-initialised). */
+    {
+        ants_chain_event_t rev[16];
+        ants_chain_pattern_finding_t out2[8];
+        size_t out_n2 = 0;
+        for (i = 0; i < k; i++) {
+            rev[i] = ev[k - 1 - i];
+        }
+        CHECK_EQ(ants_chain_pattern_scan(rev, k, now, out2, 8, &out_n2), ANTS_OK);
+        CHECK(out_n2 == out_n);
+        for (i = 0; i < out_n; i++) {
+            CHECK(memcmp(out[i].subject, out2[i].subject, 32) == 0);
+            CHECK(out[i].count == out2[i].count);
+            CHECK(out[i].severity == out2[i].severity);
+            CHECK(out[i].rule_id == out2[i].rule_id);
+            CHECK(out[i].window_s == out2[i].window_s);
+        }
+    }
+
+    /* BUFFER_TOO_SMALL reports the full count. */
+    CHECK_EQ(ants_chain_pattern_scan(ev, k, now, out, 0, &out_n), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 2);
+    CHECK_EQ(ants_chain_pattern_scan(ev, k, now, out, 1, &out_n), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 2);
+
+    /* NULL args. */
+    CHECK_EQ(ants_chain_pattern_scan(ev, k, now, out, 8, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_pattern_scan(NULL, 2, now, out, 8, &out_n), ANTS_ERROR_INVALID_ARG);
+}
+
 /* ---- still-deferred entry points report the scaffold state -------------- */
 
 static void test_stubs_not_implemented(void)
@@ -429,14 +537,10 @@ static void test_stubs_not_implemented(void)
     uint64_t out_u64 = 0;
     ants_chain_block_t block;
     ants_chain_pattern_finding_t findings[2];
-    ants_chain_event_t events[2];
 
     memset(&block, 0, sizeof block);
     memset(findings, 0, sizeof findings);
-    memset(events, 0, sizeof events);
 
-    CHECK_EQ(ants_chain_pattern_scan(events, 2, 0, findings, 2, &out_n),
-             ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_chain_committee_select(hash, hash, 100, 16, &out_n, 1, &out_n),
              ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_chain_block_hash(&block, hash), ANTS_ERROR_NOT_IMPLEMENTED);
@@ -469,6 +573,8 @@ int main(void)
     test_epoch_summary_roundtrip();
     test_epoch_summary_probe_and_strict();
     test_epoch_summary_encode_args();
+
+    test_pattern_scan();
 
     test_stubs_not_implemented();
 

@@ -193,6 +193,27 @@ extern "C" {
 #define ANTS_CHAIN_SEVERITY__RESERVED_MIN 5u
 
 /* ------------------------------------------------------------------------ */
+/* Pattern-rule tunables — DRAFT b2-class (RFC-0004 §Slash mechanics)        */
+/* ------------------------------------------------------------------------ */
+
+/* The counting window the pattern engine bins L1 events into — the
+ * "...in thirty days" of the §Slash-mechanics table. */
+#define ANTS_CHAIN_PATTERN_WINDOW_S 2592000u /* 30 days */
+
+/* Event-count escalation thresholds within the window (RFC-0004
+ * §Slash-mechanics): 1-2 events → SOFT, 3-5 → MEDIUM, 6+ → HARD. TERMINAL
+ * (confirmed Sybil / deliberate consensus attack / repeated hard) is not a
+ * single-window count and is out of scope for the count rule. */
+#define ANTS_CHAIN_PATTERN_SOFT_MIN_EVENTS   1u
+#define ANTS_CHAIN_PATTERN_MEDIUM_MIN_EVENTS 3u
+#define ANTS_CHAIN_PATTERN_HARD_MIN_EVENTS   6u
+
+/* The id of the count-based escalation rule (PR3's single rule). Richer
+ * rules — cache-poisoning, validator misconduct — need event typing the L1
+ * fault classes don't yet carry, so they land in later PRs with new ids. */
+#define ANTS_CHAIN_RULE_FAULT_COUNT_30D 1u
+
+/* ------------------------------------------------------------------------ */
 /* Fork-choice outcome                                                       */
 /* ------------------------------------------------------------------------ */
 
@@ -399,7 +420,10 @@ ants_error_t ants_chain_epoch_summary_decode(const uint8_t *buf,
  * findings whose thresholds are crossed (the reference sketch's
  * `count_events ≥ rule.threshold` loop). Pure and deterministic: the same
  * events and `now` yield the same findings on every honest committee.
- * `events` need not be ordered; the engine bins per subject and window.
+ * `events` need not be ordered; the engine bins per subject and window and
+ * returns one finding per subject, subject-ascending — a canonical order so
+ * the output is byte-identical for the same event SET regardless of listing
+ * order.
  *
  * @return ANTS_OK with *out_n set; INVALID_ARG on NULL; BUFFER_TOO_SMALL if
  *         `cap` is short (*out_n set to the count needed).
