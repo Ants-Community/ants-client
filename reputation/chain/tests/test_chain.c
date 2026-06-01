@@ -1,27 +1,29 @@
 /*
  * test_chain.c — Tests for Layer 2, the PoUH chain as ordered witness
- * (Component #8).
+ * (Component #8), now feature-complete at v0.x.
  *
- * PR1 (scaffold): contract tests — the still-deferred entry points return
- * ANTS_ERROR_NOT_IMPLEMENTED, and the protocol constants hold their
- * invariants.
- *
- * PR2: the confirmed_proofs Merkle root + inclusion proof, and the
- * EpochSummary canonical-CBOR codec. The Merkle tests verify against an
- * INDEPENDENT reference — leaf/node hashes recomputed directly with raw
- * BLAKE3 and the small trees composed by hand (n = 0..4, incl. the
- * promote-lone-trailing case at n=3) — rather than mirroring the impl's MMR
- * build, so a divergence in the construction is caught. prove/verify is a
- * round-trip + single-byte tamper sweep against the committed root. The
- * codec is a canonical round-trip (cross-checked with ants_cbor_is_canonical)
- * plus a strict-decode battery (truncation, trailing byte, wrong map size,
- * out-of-range severity, unknown severity).
+ * The suite covers every entry point and, where a value is computable, checks
+ * it against an INDEPENDENT reference rather than mirroring the impl: the
+ * confirmed_proofs Merkle root vs leaf/node hashes recomputed by hand with
+ * raw BLAKE3 (n = 0..4, incl. the promote-lone-trailing case) + a
+ * prove/verify round-trip with a single-byte tamper sweep; the EpochSummary
+ * and Block codecs as canonical round-trips (cross-checked with
+ * ants_cbor_is_canonical) plus a strict-decode battery (truncation, trailing
+ * byte, wrong map size, unknown / out-of-range severity); the pattern
+ * engine's severity bands against the documented thresholds; committee
+ * selection's structural properties (distinct, in-range, sorted,
+ * deterministic, seed-sensitive, k==N full set); 2/3 finality with REAL
+ * Ed25519 keypairs at the threshold boundary; and the Σ T_eff fork choice
+ * (cross-checked against ants_reputation_t_eff) + the social-Schelling
+ * fallback, incl. the overflow-safe θ threshold near UINT64_MAX. The protocol
+ * constant invariants are asserted too.
  */
 
 #include "ants_cbor.h"
 #include "ants_chain.h"
 #include "ants_common.h"
 #include "ants_crypto.h"
+#include "ants_reputation.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -808,19 +810,101 @@ static void test_finality(void)
              ANTS_ERROR_INVALID_ARG);
 }
 
-/* ---- still-deferred entry points report the scaffold state -------------- */
+/* ---- partition recovery: Σ T_eff fork choice ---------------------------- */
 
-static void test_stubs_not_implemented(void)
+static void test_fork_weight(void)
 {
-    int winner = -1;
-    uint64_t out_u64 = 0;
-    uint64_t tenures[2] = {1000, 2000};
+    uint64_t cap = ANTS_CHAIN_T_FORK_CHOICE_CAP;
+    uint64_t got;
+    uint64_t te;
 
-    CHECK_EQ(ants_chain_fork_weight(tenures, 2, ANTS_CHAIN_T_FORK_CHOICE_CAP, &out_u64),
-             ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_chain_fork_choice(
-                 10, 20, 100, ANTS_CHAIN_FORK_THETA_NUM, ANTS_CHAIN_FORK_THETA_DEN, &winner),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+    /* Empty fork → 0. */
+    CHECK_EQ(ants_chain_fork_weight(NULL, 0, cap, &got), ANTS_OK);
+    CHECK(got == 0);
+
+    /* All-zero tenures → 0 (t_eff(0) == 0). */
+    {
+        uint64_t t[3] = {0, 0, 0};
+        CHECK_EQ(ants_chain_fork_weight(t, 3, cap, &got), ANTS_OK);
+        CHECK(got == 0);
+    }
+
+    /* A single validator equals ants_reputation_t_eff — cross-check the sum
+     * against the shared transform itself, not a re-implementation. */
+    {
+        uint64_t t[1] = {cap};
+        CHECK_EQ(ants_reputation_t_eff(cap, cap, &te), ANTS_OK);
+        CHECK_EQ(ants_chain_fork_weight(t, 1, cap, &got), ANTS_OK);
+        CHECK(got == te);
+    }
+
+    /* Linearity: N copies of one tenure sum to N * t_eff(tenure). */
+    {
+        uint64_t t[4] = {1000000, 1000000, 1000000, 1000000};
+        CHECK_EQ(ants_reputation_t_eff(1000000, cap, &te), ANTS_OK);
+        CHECK_EQ(ants_chain_fork_weight(t, 4, cap, &got), ANTS_OK);
+        CHECK(got == 4 * te);
+    }
+
+    /* Saturation: a tenure many caps deep folds to ~cap, never above. */
+    {
+        uint64_t t[1] = {30 * cap};
+        CHECK_EQ(ants_chain_fork_weight(t, 1, cap, &got), ANTS_OK);
+        CHECK(got <= cap);
+        CHECK(got > cap - cap / 100);
+    }
+
+    /* Arg guards. */
+    {
+        uint64_t t[1] = {5};
+        CHECK_EQ(ants_chain_fork_weight(t, 1, 0, &got), ANTS_ERROR_INVALID_ARG);
+        CHECK_EQ(ants_chain_fork_weight(t, 1, cap, NULL), ANTS_ERROR_INVALID_ARG);
+        CHECK_EQ(ants_chain_fork_weight(NULL, 3, cap, &got), ANTS_ERROR_INVALID_ARG);
+    }
+}
+
+static void test_fork_choice(void)
+{
+    int w;
+
+    /* θ = 1/3 of 100 → thresh = 33. A clears (40>33), B does not → the
+     * heavier fork (A) wins. */
+    CHECK_EQ(ants_chain_fork_choice(40, 10, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_A);
+
+    /* Symmetric → B. */
+    CHECK_EQ(ants_chain_fork_choice(10, 40, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_B);
+
+    /* Both clear θ → balanced → social (equal, and unequal-but-both-over). */
+    CHECK_EQ(ants_chain_fork_choice(40, 40, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_SOCIAL_SCHELLING);
+    CHECK_EQ(ants_chain_fork_choice(40, 35, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_SOCIAL_SCHELLING);
+
+    /* Neither clears → heavier (A); a tie breaks to A deterministically. */
+    CHECK_EQ(ants_chain_fork_choice(30, 20, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_A);
+    CHECK_EQ(ants_chain_fork_choice(30, 30, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_A);
+
+    /* Exactly at the threshold does NOT clear (strict >): a=33 doesn't clear. */
+    CHECK_EQ(ants_chain_fork_choice(33, 20, 100, 1, 3, &w), ANTS_OK);
+    CHECK(w == ANTS_CHAIN_FORK_A);
+
+    /* Overflow-safe threshold with total near UINT64_MAX (thresh ~ total/3):
+     * A just over the third clears, B just under does not. */
+    {
+        uint64_t total = UINT64_MAX;
+        uint64_t third = total / 3;
+        CHECK_EQ(ants_chain_fork_choice(third + 2, third - 1, total, 1, 3, &w), ANTS_OK);
+        CHECK(w == ANTS_CHAIN_FORK_A);
+    }
+
+    /* Arg guards: theta_den 0, weight > total, NULL out. */
+    CHECK_EQ(ants_chain_fork_choice(10, 10, 100, 1, 0, &w), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_fork_choice(101, 10, 100, 1, 3, &w), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_fork_choice(10, 10, 100, 1, 3, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
 int main(void)
@@ -840,8 +924,8 @@ int main(void)
     test_committee_select();
     test_block();
     test_finality();
-
-    test_stubs_not_implemented();
+    test_fork_weight();
+    test_fork_choice();
 
     if (failures == 0) {
         printf("test_chain: all checks passed\n");
