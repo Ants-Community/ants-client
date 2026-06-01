@@ -359,8 +359,9 @@ size_t ants_chain_epoch_summary_bound(const ants_chain_epoch_summary_t *s);
  * byte sequence committee attestations sign (via the enclosing block hash).
  *
  * @return ANTS_OK with *out_len set; INVALID_ARG on NULL or an out-of-range
- *         severity / n_findings; BUFFER_TOO_SMALL if cap is short (buf
- *         untouched — size with ants_chain_epoch_summary_bound).
+ *         severity / n_findings; BUFFER_TOO_SMALL if cap is short (size with
+ *         ants_chain_epoch_summary_bound; partial bytes may have been written
+ *         into buf, *out_len untouched).
  */
 ants_error_t ants_chain_epoch_summary_encode(const ants_chain_epoch_summary_t *s,
                                              uint8_t *buf,
