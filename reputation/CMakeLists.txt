@@ -8,7 +8,7 @@
 add_subdirectory(crdt)
 
 # Component #8 — L2 PoUH chain  (6 EM)
-# add_subdirectory(chain)
+add_subdirectory(chain)
 
 # Component #9 — Identity & reputation service  (3 EM)
 add_subdirectory(identity)
