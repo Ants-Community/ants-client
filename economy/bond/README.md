@@ -3,7 +3,11 @@
 Bond accounting service. Economy & coordination layer.
 **On the critical path (tail).**
 
-**Status:** pending claim.
+**Status:** PR1 — the local bond ledger (init / locked_total / bondable_a /
+admit / release / slash + additive multi-act composition); `A` is delegated
+to `reputation/identity` (passed in). PR2 adds the per-class bond formulas,
+the canonical-CBOR `bond_admission` object, and the race-safe tie-break (see
+the PR map in [`ants_bond.h`](include/ants_bond.h)). Founder interim primary.
 **Effort:** 2 EM.
 **Spec:** [RFC-0004 v0.6 §Bond accounting model + §Atomicity](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md).
 **Dependencies:** `reputation/identity`, `reputation/crdt`, `foundation/crypto`.

@@ -8,4 +8,4 @@
 add_subdirectory(ledger)
 
 # Component #15 — Bond accounting service  (2 EM)
-# add_subdirectory(bond)
+add_subdirectory(bond)
