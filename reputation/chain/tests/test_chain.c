@@ -521,6 +521,80 @@ static void test_pattern_scan(void)
     CHECK_EQ(ants_chain_pattern_scan(NULL, 2, now, out, 8, &out_n), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- VRF committee selection -------------------------------------------- */
+
+static void test_committee_select(void)
+{
+    uint8_t prev[32];
+    uint8_t beacon[32];
+    uint8_t beacon2[32];
+    size_t idx[64];
+    size_t idx2[64];
+    size_t out_n = 0;
+    size_t out_n2 = 0;
+    size_t i;
+
+    memset(prev, 0xAB, 32);
+    memset(beacon, 0x11, 32);
+    memset(beacon2, 0x22, 32);
+
+    /* k of N: k distinct indices in [0,N), strictly ascending. */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 16, idx, 64, &out_n), ANTS_OK);
+    CHECK(out_n == 16);
+    for (i = 0; i < out_n; i++) {
+        CHECK(idx[i] < 100);
+        if (i > 0) {
+            CHECK(idx[i - 1] < idx[i]); /* strictly ascending ⇒ distinct */
+        }
+    }
+
+    /* Deterministic: same inputs → identical committee. */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 16, idx2, 64, &out_n2), ANTS_OK);
+    CHECK(out_n2 == 16);
+    for (i = 0; i < 16; i++) {
+        CHECK(idx[i] == idx2[i]);
+    }
+
+    /* Different beacon → different committee (overwhelmingly likely; idx
+     * still holds the first beacon's committee here). */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon2, 100, 16, idx2, 64, &out_n2), ANTS_OK);
+    {
+        bool same = (out_n2 == 16);
+        for (i = 0; same && i < 16; i++) {
+            if (idx[i] != idx2[i]) {
+                same = false;
+            }
+        }
+        CHECK(!same);
+    }
+
+    /* k == N → the full set 0..N-1. */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 8, 8, idx, 64, &out_n), ANTS_OK);
+    CHECK(out_n == 8);
+    for (i = 0; i < 8; i++) {
+        CHECK(idx[i] == i);
+    }
+
+    /* BUFFER_TOO_SMALL reports the needed k. */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 16, idx, 8, &out_n),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 16);
+
+    /* INVALID_ARG: k 0, k > population, NULLs. */
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 0, idx, 64, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 10, 11, idx, 64, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_committee_select(NULL, beacon, 100, 16, idx, 64, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_committee_select(prev, NULL, 100, 16, idx, 64, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 16, NULL, 64, &out_n),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_committee_select(prev, beacon, 100, 16, idx, 64, NULL),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 /* ---- still-deferred entry points report the scaffold state -------------- */
 
 static void test_stubs_not_implemented(void)
@@ -541,8 +615,6 @@ static void test_stubs_not_implemented(void)
     memset(&block, 0, sizeof block);
     memset(findings, 0, sizeof findings);
 
-    CHECK_EQ(ants_chain_committee_select(hash, hash, 100, 16, &out_n, 1, &out_n),
-             ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_chain_block_hash(&block, hash), ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK(ants_chain_block_bound(&block) == 0);
     CHECK_EQ(ants_chain_block_encode(&block, buf, sizeof buf, &out_len),
@@ -575,6 +647,7 @@ int main(void)
     test_epoch_summary_encode_args();
 
     test_pattern_scan();
+    test_committee_select();
 
     test_stubs_not_implemented();
 

@@ -749,8 +749,104 @@ ants_error_t ants_chain_pattern_scan(const ants_chain_event_t *events,
 }
 
 /* ======================================================================== */
-/* PR4 — VRF committee selection (stub)                                      */
+/* PR4 — VRF committee selection                                             */
 /* ======================================================================== */
+
+/* The committee for a block is a deterministic, publicly-recomputable
+ * k-subset of the attested population, drawn from a beacon released AFTER
+ * the previous block (so it is unpredictable and non-grindable at proposal
+ * time) keyed together with the previous block hash. Every peer derives the
+ * same committee, and selection uses unbiased rejection sampling (the
+ * arc4random_uniform trick, as in inference/orchestration's auditor draw)
+ * inside Floyd's algorithm for distinct sampling — O(k) space, no
+ * population-sized array, no float, no malloc. (Per-peer ECVRF sortition
+ * proof — a peer proving its own membership — is a later refinement; the
+ * committee SET derived here is the canonical reference.) */
+
+static void write_le64(uint8_t out[8], uint64_t v)
+{
+    out[0] = (uint8_t)v;
+    out[1] = (uint8_t)(v >> 8);
+    out[2] = (uint8_t)(v >> 16);
+    out[3] = (uint8_t)(v >> 24);
+    out[4] = (uint8_t)(v >> 32);
+    out[5] = (uint8_t)(v >> 40);
+    out[6] = (uint8_t)(v >> 48);
+    out[7] = (uint8_t)(v >> 56);
+}
+
+static uint64_t read_be64(const uint8_t b[8])
+{
+    return ((uint64_t)b[0] << 56) | ((uint64_t)b[1] << 48) | ((uint64_t)b[2] << 40) |
+           ((uint64_t)b[3] << 32) | ((uint64_t)b[4] << 24) | ((uint64_t)b[5] << 16) |
+           ((uint64_t)b[6] << 8) | (uint64_t)b[7];
+}
+
+/* The next 64-bit keystream word: BLAKE3(prev ‖ beacon ‖ "cmte" ‖ LE64(ctr))
+ * read big-endian over the first 8 digest bytes; `ctr` increments per word. */
+static ants_error_t committee_draw_word(const uint8_t prev[ANTS_CHAIN_HASH_SIZE],
+                                        const uint8_t beacon[ANTS_CHAIN_HASH_SIZE],
+                                        uint64_t *ctr,
+                                        uint64_t *out_w)
+{
+    static const uint8_t tag[4] = {'c', 'm', 't', 'e'};
+    uint8_t le[8];
+    uint8_t digest[ANTS_CHAIN_HASH_SIZE];
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    write_le64(le, (*ctr)++);
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, prev, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, beacon, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, tag, sizeof tag);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, le, sizeof le);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_final(&h, digest);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_w = read_be64(digest);
+    return ANTS_OK;
+}
+
+/* An unbiased uniform draw in [0, bound) (bound >= 1): reject the low
+ * `2^64 mod bound` band, then take the remainder. */
+static ants_error_t committee_uniform(const uint8_t prev[ANTS_CHAIN_HASH_SIZE],
+                                      const uint8_t beacon[ANTS_CHAIN_HASH_SIZE],
+                                      uint64_t *ctr,
+                                      uint64_t bound,
+                                      uint64_t *out)
+{
+    uint64_t min = ((uint64_t)0 - bound) % bound; /* == 2^64 mod bound */
+    uint64_t w;
+    ants_error_t rc;
+
+    for (;;) {
+        rc = committee_draw_word(prev, beacon, ctr, &w);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (w >= min) {
+            *out = w % bound;
+            return ANTS_OK;
+        }
+    }
+}
 
 ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
                                          const uint8_t beacon[ANTS_CHAIN_HASH_SIZE],
@@ -760,14 +856,57 @@ ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAI
                                          size_t cap,
                                          size_t *out_n)
 {
-    (void)prev_block_hash;
-    (void)beacon;
-    (void)population_size;
-    (void)k;
-    (void)out_indices;
-    (void)cap;
-    (void)out_n;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint64_t ctr = 0;
+    size_t s;
+    size_t m;
+    ants_error_t rc;
+
+    if (prev_block_hash == NULL || beacon == NULL || out_indices == NULL || out_n == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (k == 0 || k > population_size) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (cap < k) {
+        *out_n = k;
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Floyd's distinct-sampling: for j = N-k .. N-1, draw t in [0, j]; take t
+     * if unused, else j (always fresh — j strictly grows past every earlier
+     * candidate). Produces exactly k distinct indices in [0, N). */
+    for (s = 0; s < k; s++) {
+        size_t j = population_size - k + s;
+        uint64_t t;
+        bool found = false;
+
+        rc = committee_uniform(prev_block_hash, beacon, &ctr, (uint64_t)j + 1, &t);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        for (m = 0; m < s; m++) {
+            if (out_indices[m] == (size_t)t) {
+                found = true;
+                break;
+            }
+        }
+        out_indices[s] = found ? j : (size_t)t;
+    }
+
+    /* Canonicalise the committee as an ascending index list (insertion sort,
+     * k <= K_MAX = 64), so the set has one byte representation. */
+    for (s = 1; s < k; s++) {
+        size_t key = out_indices[s];
+        m = s;
+        while (m > 0 && out_indices[m - 1] > key) {
+            out_indices[m] = out_indices[m - 1];
+            m--;
+        }
+        out_indices[m] = key;
+    }
+
+    *out_n = k;
+    return ANTS_OK;
 }
 
 /* ======================================================================== */
