@@ -595,32 +595,123 @@ static void test_committee_select(void)
              ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- block hashing + codec ---------------------------------------------- */
+
+static void fill_block(ants_chain_block_t *b, ants_chain_pattern_finding_t *f, size_t nf)
+{
+    size_t i;
+    memset(b, 0, sizeof *b);
+    b->height = 7;
+    for (i = 0; i < 32; i++) {
+        b->prev_block_hash[i] = (uint8_t)(0xF0 - i);
+    }
+    fill_summary(&b->summary, f, nf);
+}
+
+static void test_block(void)
+{
+    ants_chain_block_t b;
+    ants_chain_pattern_finding_t fin[3];
+    ants_chain_block_t out;
+    ants_chain_pattern_finding_t fout[3];
+    uint8_t buf[ANTS_CHAIN_BLOCK_ENCODED_MAX];
+    uint8_t buf2[ANTS_CHAIN_BLOCK_ENCODED_MAX + 1];
+    uint8_t h1[32];
+    uint8_t h2[32];
+    uint8_t ref[32];
+    size_t len = 0;
+    size_t out_n = 0;
+    size_t i;
+    size_t k;
+
+    fill_block(&b, fin, 3);
+
+    /* bound, encode, canonical. */
+    CHECK(ants_chain_block_bound(&b) <= ANTS_CHAIN_BLOCK_ENCODED_MAX);
+    CHECK_EQ(ants_chain_block_encode(&b, buf, sizeof buf, &len), ANTS_OK);
+    CHECK(len > 0);
+    CHECK_EQ(ants_cbor_is_canonical(buf, len), ANTS_OK);
+
+    /* decode round-trip. */
+    CHECK_EQ(ants_chain_block_decode(buf, len, &out, fout, 3, &out_n), ANTS_OK);
+    CHECK(out.height == b.height);
+    CHECK(memcmp(out.prev_block_hash, b.prev_block_hash, 32) == 0);
+    CHECK(out.summary.epoch == b.summary.epoch);
+    CHECK(out.summary.cutoff_time == b.summary.cutoff_time);
+    CHECK(memcmp(out.summary.confirmed_proofs, b.summary.confirmed_proofs, 32) == 0);
+    CHECK(out_n == 3);
+    CHECK(out.summary.n_findings == 3);
+    for (i = 0; i < 3; i++) {
+        CHECK(memcmp(fout[i].subject, fin[i].subject, 32) == 0);
+        CHECK(fout[i].rule_id == fin[i].rule_id);
+        CHECK(fout[i].severity == fin[i].severity);
+    }
+
+    /* block_hash == BLAKE3(canonical block encoding) — independent recompute. */
+    CHECK_EQ(ants_blake3_hash(buf, len, ref), ANTS_OK);
+    CHECK_EQ(ants_chain_block_hash(&b, h1), ANTS_OK);
+    CHECK(memcmp(h1, ref, 32) == 0);
+
+    /* determinism. */
+    CHECK_EQ(ants_chain_block_hash(&b, h2), ANTS_OK);
+    CHECK(memcmp(h1, h2, 32) == 0);
+
+    /* sensitivity: height and prev-hash each change the block hash. */
+    {
+        ants_chain_block_t b2 = b;
+        b2.height = b.height + 1;
+        CHECK_EQ(ants_chain_block_hash(&b2, h2), ANTS_OK);
+        CHECK(memcmp(h1, h2, 32) != 0);
+    }
+    {
+        ants_chain_block_t b2 = b;
+        b2.prev_block_hash[0] ^= 0xFFu;
+        CHECK_EQ(ants_chain_block_hash(&b2, h2), ANTS_OK);
+        CHECK(memcmp(h1, h2, 32) != 0);
+    }
+
+    /* probe decode reports the findings count. */
+    CHECK_EQ(ants_chain_block_decode(buf, len, &out, NULL, 0, &out_n), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 3);
+
+    /* strict decode: truncation never yields OK. */
+    for (k = 1; k < len; k++) {
+        CHECK(ants_chain_block_decode(buf, k, &out, fout, 3, &out_n) != ANTS_OK);
+    }
+    /* trailing byte → MALFORMED. */
+    memcpy(buf2, buf, len);
+    buf2[len] = 0x00;
+    CHECK_EQ(ants_chain_block_decode(buf2, len + 1, &out, fout, 3, &out_n), ANTS_ERROR_MALFORMED);
+    /* wrong outer map size: map(3) 0xA3 → map(2) 0xA2. */
+    memcpy(buf2, buf, len);
+    CHECK(buf2[0] == 0xA3u);
+    buf2[0] = 0xA2u;
+    CHECK_EQ(ants_chain_block_decode(buf2, len, &out, fout, 3, &out_n), ANTS_ERROR_MALFORMED);
+
+    /* invalid summary inside the block → INVALID_ARG (encode and hash). */
+    fin[0].severity = ANTS_CHAIN_SEVERITY__RESERVED_MIN;
+    CHECK_EQ(ants_chain_block_encode(&b, buf, sizeof buf, &len), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_hash(&b, h1), ANTS_ERROR_INVALID_ARG);
+    fin[0].severity = ANTS_CHAIN_SEVERITY_SOFT;
+
+    /* NULL args. */
+    CHECK_EQ(ants_chain_block_encode(NULL, buf, sizeof buf, &len), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_hash(NULL, h1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_decode(NULL, len, &out, fout, 3, &out_n), ANTS_ERROR_INVALID_ARG);
+}
+
 /* ---- still-deferred entry points report the scaffold state -------------- */
 
 static void test_stubs_not_implemented(void)
 {
     uint8_t hash[32] = {0};
     uint8_t pks[2][ANTS_CHAIN_PEER_ID_SIZE] = {{0}};
-    uint8_t buf[64] = {0};
     uint8_t sigs[2 * ANTS_CHAIN_SIG_SIZE] = {0};
     bool mask[2] = {true, true};
     bool out_ok = true;
-    size_t out_n = 0;
-    size_t out_len = 0;
     int winner = -1;
     uint64_t out_u64 = 0;
-    ants_chain_block_t block;
-    ants_chain_pattern_finding_t findings[2];
 
-    memset(&block, 0, sizeof block);
-    memset(findings, 0, sizeof findings);
-
-    CHECK_EQ(ants_chain_block_hash(&block, hash), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK(ants_chain_block_bound(&block) == 0);
-    CHECK_EQ(ants_chain_block_encode(&block, buf, sizeof buf, &out_len),
-             ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_chain_block_decode(buf, sizeof buf, &block, findings, 2, &out_n),
-             ANTS_ERROR_NOT_IMPLEMENTED);
     CHECK_EQ(ants_chain_finality_verify(hash, pks, 2, sigs, sizeof sigs, mask, &out_ok),
              ANTS_ERROR_NOT_IMPLEMENTED);
     {
@@ -648,6 +739,7 @@ int main(void)
 
     test_pattern_scan();
     test_committee_select();
+    test_block();
 
     test_stubs_not_implemented();
 
