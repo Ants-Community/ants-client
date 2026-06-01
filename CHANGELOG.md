@@ -13,6 +13,66 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #8 (L2 PoUH chain) — chain-as-witness, feature-complete at v0.x · 2026-06-01
+
+**The ordered layer.** Component #7's L1 G-Set destroys trust immediately and
+without consensus, but it cannot *count* — pattern rules ("six medium events
+in thirty days → escalate") need a global ordered tally, which is what a chain
+is for and a CRDT is not. Component #8 is that chain: small, slow (30 s
+blocks), and a **witness, not a judge**. It records `EpochSummary` objects — a
+Merkle root over the L1 fault proofs visible at a cutoff plus the pattern
+findings crossed — finalised at 2/3 by a VRF-selected committee. The
+load-bearing property: `VERIFY` is pure, so a committee that cites a
+non-verifying proof is caught by any peer; a compromised committee can only
+suppress or omit (recovered by the next epoch), never fabricate. The
+compromise scenario is **degradation, not corruption** (RFC-0004 §"Layer 2").
+New module `reputation/chain/`, the 20th ctest target `chain_basic`.
+
+Landed across seven PRs (#104–#110), each gated build-clean (`-Wall -Wextra
+-Wpedantic`, 0 warnings) + CI 7/7:
+
+- **scaffold** (#104): the full public surface, the protocol structs
+  (`EpochSummary`, `PatternFinding`, `Block`) and DRAFT tunables, all entry
+  points stubbed to `NOT_IMPLEMENTED`.
+- **confirmed_proofs Merkle + EpochSummary codec** (#105): domain-separated
+  leaf/node, promote-lone-trailing, malloc-free online MMR — the same
+  canonical scheme as the inference commit Merkle; leaves are L1 proof
+  content-ids passed strictly ascending (the canonical order that makes the
+  root reproducible across peers regardless of G-Set iteration order); an
+  empty epoch has root `BLAKE3(0x02)`.
+- **pattern-rule engine** (#106): count an L1 subject's fault events in a
+  30-day window → SOFT/MEDIUM/HARD bands (the §Slash-mechanics ladder); one
+  finding per subject, returned subject-ascending (order-independent for the
+  same event set). DRAFT thresholds.
+- **VRF committee selection** (#107): deterministic, beacon-seeded, unbiased
+  (arc4random_uniform rejection) k-of-N via Floyd's algorithm — O(k) space, no
+  population-sized array — sorted to a canonical committee.
+- **block hashing + codec** (#108): a block is canonical CBOR `map(3)` with
+  the summary embedded as a byte-string (composes the #105 codec, the same
+  shape the L1 statement bodies use); `block_hash` = BLAKE3 over the encoding
+  — the message the committee attests to.
+- **2/3 finality** (#109): at least `ceil(2k/3)` valid Ed25519 committee
+  signatures over the block hash, packed one-per-signer. The BLS12-381
+  aggregate compression for `k > 16` (RFC-0008 §3.3) is a deferred *wire*
+  optimisation (needs separate BLS committee keys); the security is identical.
+- **Σ T_eff fork choice + partition recovery** (#110): the heavier fork by
+  cumulative saturating tenure wins unless both clear the social-Schelling
+  threshold `θ·total` (a balanced partition → the social layer). `T_eff` is
+  reused verbatim from `reputation/identity` so the two components agree
+  bit-for-bit; the θ comparison is overflow-safe.
+
+**Now**: the L2 chain-as-witness is feature-complete at v0.x — every entry
+point is live, tested against an independent reference wherever a value is
+computable (hand-built Merkle trees, real Ed25519 finality, `T_eff`
+cross-checks). **Deferred** (later PRs / their dependencies): wiring block
+production + the mempool + the drand beacon into a running node; the
+BLS-aggregate attestation path; the `INVALID_TRANSITION` L1 fault class (needs
+the chain's state-transition validation); and feeding L2 epoch confirmation
+back into Component #7's G-Set pruning cutoff. Wire formats + numeric tunables
+(K, block time, severity windows, `T_CAP`, θ) are **DRAFT** pending RFC-0008
+formalisation / b2 testnet calibration — the recipes are the deliverable, the
+values illustrative. No floats on any reproduced path, no malloc, no threads.
+
 ### network: Component #6 (gossip overlay) — L1-CRDT dissemination engine · 2026-05-31
 
 **The G-Set learns to travel.** Component #7 built the L1 fault G-Set and
