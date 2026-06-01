@@ -13,6 +13,50 @@ the spec repo's
 
 ## Unreleased
 
+### economy: Component #15 (bond accounting) — A-as-bond for high-stakes acts, feature-complete at v0.x · 2026-06-01
+
+**Closing the high-stakes branch.** §Tenure's trilemma against farmed tenure
+left one branch open: a defector colluding on an act whose one-shot payoff
+exceeds the standard slash value `S_NCS`. Component #15 closes it — high-stakes
+acts (Tier-3 verification, an L2 committee suppressing a finding, a perennial
+high-value cache write, a fork-recovery vote, a cross-economy settlement) must
+**lock a bond of `A`** before admission; a fault against the act during the
+dispute window adds the bonded `A` to the slash. It binds because `A` decays
+fast (δ_A, minutes) and so **cannot be accumulated in advance**: a defector
+with mature `T` but neglected `A` cannot post the bond, and assembling it *is*
+the sustained honest contribution the network wanted (RFC-0004 §"Why this
+works"). New module `economy/bond/`, the 21st ctest target `bond_basic`; 2 EM,
+the "small, scope-clear" good-first-contribution candidate, now in.
+
+Two PRs (#112–#113), each CI 7/7:
+- **local bond ledger** (#112): `bondable_A = max(0, A − Σ locks)` — the clamp
+  matters, `A` decays while locked amounts stay frozen, so `A` can fall below
+  the locked total mid-hold; `admit` (insufficient headroom is a *verdict*,
+  not an error); `release` (clean) / `slash` (reports the frozen amount to add
+  to the standard slash); additive multi-act composition; full-ledger +
+  `t_start+window` overflow + NULL guards. `A` is **delegated to
+  reputation/identity** (the caller passes it in via
+  `ants_reputation_compute`), so the accounting is pure — no deps, no malloc,
+  no float.
+- **formulas + admission object + tie-break** (#113): the per-class bond
+  formulas (`query_stakes/N`, total `T`, `value·mult` computed overflow-safe);
+  the canonical-CBOR `bond_admission` object the verifier signs + gossips to
+  L1; and the race-safe admission tie-break —
+  `BLAKE3.derive_key("ants-v1-bond-tiebreak", epoch_seed ‖ act_id ‖ v_id ‖
+  LE64(round))`, smaller key wins, loser nulls its admission. The `epoch_seed`
+  (from the L2 chain) blocks precomputing favourable timings; only loose
+  clock-sync (epoch + seed agreement) is needed, **no NTP**. `ants_bond`
+  PRIVATE-links `ants_cbor` + `ants_crypto`.
+
+**Now**: bond accounting is feature-complete at v0.x, tested against
+independent references throughout (hand-computed formula values incl. the
+`UINT64_MAX × 2 → OVERFLOW` boundary, a raw-BLAKE3 tie-break recompute,
+canonical-CBOR round-trips). **Deferred**: wiring `admit`/`release`/`slash`
+into the actual high-stakes act sites (Tier-3 committee per RFC-0003, the L2
+committee + fork-recovery vote per #8) and the `bond_admission` L1 gossip.
+Numeric tunables (7-day dispute window, δ_admission 5 s, the risk multipliers)
++ wire format are **DRAFT** (RFC-0008 §7 / pending §"Bonds").
+
 ### reputation: Component #8 (L2 PoUH chain) — chain-as-witness, feature-complete at v0.x · 2026-06-01
 
 **The ordered layer.** Component #7's L1 G-Set destroys trust immediately and
