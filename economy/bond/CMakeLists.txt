@@ -21,12 +21,29 @@ target_include_directories(ants_bond
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# ants_cbor (#2) — the canonical bond_admission codec — and ants_crypto (#1)
+# — BLAKE3 derive_key for the race-safe tie-break — are PRIVATE deps since
+# PR2: bond.c calls their symbols directly. ants_cbor also hosts ants_strerror.
+target_link_libraries(ants_bond
+    PRIVATE
+        ants_cbor
+        ants_crypto
+)
+
 target_compile_features(ants_bond PUBLIC c_std_99)
 
 # ---- Tests ---------------------------------------------------------------
 
 if(BUILD_TESTING)
     add_executable(test_bond tests/test_bond.c)
+    # The test probes canonical CBOR (ants_cbor_is_canonical) and recomputes
+    # the BLAKE3 derive_key tie-break independently, so it references those
+    # headers. Symbols resolve transitively through ants_bond's static PRIVATE
+    # deps; we add only the include dirs (PRIVATE deps don't export them),
+    # which avoids the macOS "ignoring duplicate libraries" ld warning.
     target_link_libraries(test_bond PRIVATE ants_bond)
+    target_include_directories(test_bond PRIVATE
+        ${CMAKE_SOURCE_DIR}/foundation/cbor/include
+        ${CMAKE_SOURCE_DIR}/foundation/crypto/include)
     add_test(NAME bond_basic COMMAND test_bond)
 endif()
