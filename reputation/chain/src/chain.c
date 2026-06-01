@@ -1067,14 +1067,56 @@ ants_error_t ants_chain_finality_verify(const uint8_t block_hash[ANTS_CHAIN_HASH
                                         const bool *signed_mask,
                                         bool *out_final)
 {
-    (void)block_hash;
-    (void)committee_pubkeys;
-    (void)k;
-    (void)attestations;
-    (void)attestations_len;
-    (void)signed_mask;
-    (void)out_final;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    size_t n_signers = 0;
+    size_t valid = 0;
+    size_t threshold;
+    size_t sig_idx = 0;
+    size_t i;
+
+    if (block_hash == NULL || committee_pubkeys == NULL || signed_mask == NULL ||
+        out_final == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (k == 0 || k > ANTS_CHAIN_COMMITTEE_K_MAX) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* The attestation buffer is one Ed25519 signature per SIGNER (the
+     * committee members with signed_mask set), packed in ascending member
+     * order — so its length pins the signer count. */
+    for (i = 0; i < k; i++) {
+        if (signed_mask[i]) {
+            n_signers++;
+        }
+    }
+    if (attestations_len != n_signers * ANTS_CHAIN_SIG_SIZE) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_signers > 0 && attestations == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* 2/3 finality: at least ceil(FINALITY_NUM * k / FINALITY_DEN) valid. */
+    threshold =
+        (ANTS_CHAIN_FINALITY_NUM * k + (ANTS_CHAIN_FINALITY_DEN - 1)) / ANTS_CHAIN_FINALITY_DEN;
+
+    for (i = 0; i < k; i++) {
+        if (!signed_mask[i]) {
+            continue;
+        }
+        if (ants_ed25519_verify(committee_pubkeys[i],
+                                block_hash,
+                                ANTS_CHAIN_HASH_SIZE,
+                                attestations + sig_idx * ANTS_CHAIN_SIG_SIZE) == ANTS_OK) {
+            valid++;
+        }
+        sig_idx++;
+    }
+
+    /* A signature shortfall or any invalid signature is a false verdict, not
+     * an error. */
+    *out_final = (valid >= threshold);
+    return ANTS_OK;
 }
 
 /* ======================================================================== */
