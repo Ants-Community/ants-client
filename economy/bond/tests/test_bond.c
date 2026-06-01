@@ -13,7 +13,9 @@
  */
 
 #include "ants_bond.h"
+#include "ants_cbor.h"
 #include "ants_common.h"
+#include "ants_crypto.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -50,6 +52,15 @@ static void make_act(uint8_t act_id[ANTS_BOND_ACT_ID_SIZE], uint8_t byte)
 {
     memset(act_id, 0, ANTS_BOND_ACT_ID_SIZE);
     act_id[0] = byte;
+}
+
+/* Independent little-endian u64 writer for the tie-break cross-check. */
+static void wr_le64(uint8_t out[8], uint64_t v)
+{
+    size_t i;
+    for (i = 0; i < 8; i++) {
+        out[i] = (uint8_t)(v >> (i * 8));
+    }
 }
 
 static void test_constants(void)
@@ -199,27 +210,139 @@ static void test_admit_edges(void)
     CHECK(ants_bond_find(&L, NULL) == NULL);
 }
 
-static void test_pr2_stubs(void)
+/* ---- PR2: bond formulas, the bond_admission codec, the tie-break -------- */
+
+static void test_formulas(void)
 {
     uint64_t out = 0;
+
+    /* Tier 3: query_stakes / N (floor). */
+    CHECK_EQ(ants_bond_required_tier3(1000, 4, &out), ANTS_OK);
+    CHECK(out == 250);
+    CHECK_EQ(ants_bond_required_tier3(1000, 3, &out), ANTS_OK);
+    CHECK(out == 333); /* floor(333.33) */
+    CHECK_EQ(ants_bond_required_tier3(1000, 0, &out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bond_required_tier3(1000, 4, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* Fork recovery: the whole T at stake. */
+    CHECK_EQ(ants_bond_required_fork_recovery(123456789, &out), ANTS_OK);
+    CHECK(out == 123456789);
+    CHECK_EQ(ants_bond_required_fork_recovery(1, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* Value-scaled: value * num / den (floor), overflow-safe. */
+    CHECK_EQ(ants_bond_required_value_scaled(1000, 3, 2, &out), ANTS_OK);
+    CHECK(out == 1500);
+    CHECK_EQ(ants_bond_required_value_scaled(1000, 1, 1, &out), ANTS_OK);
+    CHECK(out == 1000);
+    CHECK_EQ(ants_bond_required_value_scaled(7, 1, 2, &out), ANTS_OK);
+    CHECK(out == 3); /* floor(3.5) */
+    CHECK_EQ(ants_bond_required_value_scaled(1000, 1, 0, &out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bond_required_value_scaled(1000, 1, 2, NULL), ANTS_ERROR_INVALID_ARG);
+    /* x1 of UINT64_MAX fits; x2 overflows. */
+    CHECK_EQ(ants_bond_required_value_scaled(UINT64_MAX, 1, 1, &out), ANTS_OK);
+    CHECK(out == UINT64_MAX);
+    CHECK_EQ(ants_bond_required_value_scaled(UINT64_MAX, 2, 1, &out), ANTS_ERROR_OVERFLOW);
+}
+
+static void test_admission_codec(void)
+{
+    ants_bond_admission_t in;
+    ants_bond_admission_t out;
     uint8_t buf[ANTS_BOND_ADMISSION_ENCODED_MAX];
-    size_t olen = 0;
-    ants_bond_admission_t adm;
-    uint8_t key[ANTS_BOND_HASH_SIZE] = {0};
-    uint8_t seed[ANTS_BOND_HASH_SIZE] = {0};
-    uint8_t aid[ANTS_BOND_ACT_ID_SIZE] = {0};
-    uint8_t vid[ANTS_BOND_PEER_ID_SIZE] = {0};
+    uint8_t buf2[ANTS_BOND_ADMISSION_ENCODED_MAX + 1];
+    size_t len = 0;
+    size_t k;
+    size_t i;
 
-    memset(&adm, 0, sizeof adm);
-    memset(buf, 0, sizeof buf);
+    memset(&in, 0, sizeof in);
+    for (i = 0; i < 32; i++) {
+        in.act_id[i] = (uint8_t)(i + 1);
+        in.peer[i] = (uint8_t)(i + 40);
+        in.v_id[i] = (uint8_t)(i + 80);
+        in.l1_view_hash[i] = (uint8_t)(i * 3 + 1);
+    }
+    in.amount = 0xDEADBEEF12345678ull;
 
-    CHECK_EQ(ants_bond_required_tier3(1000, 4, &out), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bond_required_fork_recovery(1000, &out), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bond_required_value_scaled(1000, 1, 2, &out), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bond_admission_encode(&adm, buf, sizeof buf, &olen), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bond_admission_decode(buf, sizeof buf, &adm), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(ants_bond_tiebreak_key(seed, aid, vid, 0, key), ANTS_ERROR_NOT_IMPLEMENTED);
-    CHECK(ants_bond_admission_wins(key, key) == false); /* stub */
+    CHECK_EQ(ants_bond_admission_encode(&in, buf, sizeof buf, &len), ANTS_OK);
+    CHECK(len > 0 && len <= ANTS_BOND_ADMISSION_ENCODED_MAX);
+    CHECK_EQ(ants_cbor_is_canonical(buf, len), ANTS_OK);
+
+    memset(&out, 0, sizeof out);
+    CHECK_EQ(ants_bond_admission_decode(buf, len, &out), ANTS_OK);
+    CHECK(memcmp(out.act_id, in.act_id, 32) == 0);
+    CHECK(memcmp(out.peer, in.peer, 32) == 0);
+    CHECK(out.amount == in.amount);
+    CHECK(memcmp(out.v_id, in.v_id, 32) == 0);
+    CHECK(memcmp(out.l1_view_hash, in.l1_view_hash, 32) == 0);
+
+    /* Truncation never yields OK. */
+    for (k = 1; k < len; k++) {
+        CHECK(ants_bond_admission_decode(buf, k, &out) != ANTS_OK);
+    }
+    /* Trailing byte → MALFORMED. */
+    memcpy(buf2, buf, len);
+    buf2[len] = 0x00;
+    CHECK_EQ(ants_bond_admission_decode(buf2, len + 1, &out), ANTS_ERROR_MALFORMED);
+    /* Wrong map size: map(5) 0xA5 → map(4) 0xA4. */
+    memcpy(buf2, buf, len);
+    CHECK(buf2[0] == 0xA5u);
+    buf2[0] = 0xA4u;
+    CHECK_EQ(ants_bond_admission_decode(buf2, len, &out), ANTS_ERROR_MALFORMED);
+    /* NULL / empty. */
+    CHECK_EQ(ants_bond_admission_encode(NULL, buf, sizeof buf, &len), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bond_admission_decode(NULL, len, &out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bond_admission_decode(buf, 0, &out), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_tiebreak(void)
+{
+    uint8_t seed[32], act[32], vid[32];
+    uint8_t k1[32], k2[32], ref[32];
+    uint8_t le[8];
+    ants_blake3_ctx_t h;
+    size_t i;
+
+    for (i = 0; i < 32; i++) {
+        seed[i] = (uint8_t)(i + 1);
+        act[i] = (uint8_t)(i + 50);
+        vid[i] = (uint8_t)(i + 100);
+    }
+
+    /* Deterministic. */
+    CHECK_EQ(ants_bond_tiebreak_key(seed, act, vid, 7, k1), ANTS_OK);
+    CHECK_EQ(ants_bond_tiebreak_key(seed, act, vid, 7, k2), ANTS_OK);
+    CHECK(memcmp(k1, k2, 32) == 0);
+
+    /* Independent recompute via raw BLAKE3 derive_key. */
+    CHECK_EQ(ants_blake3_init_derive(&h, "ants-v1-bond-tiebreak"), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, seed, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, act, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, vid, 32), ANTS_OK);
+    wr_le64(le, 7);
+    CHECK_EQ(ants_blake3_update(&h, le, 8), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&h, ref), ANTS_OK);
+    CHECK(memcmp(k1, ref, 32) == 0);
+
+    /* Round sensitivity. */
+    CHECK_EQ(ants_bond_tiebreak_key(seed, act, vid, 8, k2), ANTS_OK);
+    CHECK(memcmp(k1, k2, 32) != 0);
+
+    /* NULL guards. */
+    CHECK_EQ(ants_bond_tiebreak_key(NULL, act, vid, 7, k1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_bond_tiebreak_key(seed, act, vid, 7, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* admission_wins: the smaller key wins; equal does not; NULL loses. */
+    {
+        uint8_t a[32], b[32];
+        memset(a, 0, 32);
+        memset(b, 0, 32);
+        a[0] = 1;
+        b[0] = 2;
+        CHECK(ants_bond_admission_wins(a, b) == true);
+        CHECK(ants_bond_admission_wins(b, a) == false);
+        CHECK(ants_bond_admission_wins(a, a) == false);
+        CHECK(ants_bond_admission_wins(NULL, b) == false);
+    }
 }
 
 int main(void)
@@ -227,7 +350,9 @@ int main(void)
     test_constants();
     test_accounting();
     test_admit_edges();
-    test_pr2_stubs();
+    test_formulas();
+    test_admission_codec();
+    test_tiebreak();
 
     if (failures == 0) {
         printf("test_bond: all checks passed\n");

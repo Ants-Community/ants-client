@@ -34,8 +34,9 @@
  *        malloc, no float.
  *   PR2  bond formulas per act class; the `bond_admission` canonical-CBOR
  *        object (signed by the verifier, gossiped to L1); the race-safe
- *        admission tie-break (BLAKE3 derive_key, no clock-sync). Stubbed
- *        here, returning ANTS_ERROR_NOT_IMPLEMENTED.
+ *        admission tie-break (BLAKE3 derive_key, no clock-sync).
+ *
+ * Both PRs have landed: Component #15 is feature-complete at v0.x.
  *
  * Numeric tunables (the dispute window, δ_admission, the formula risk
  * multipliers) are DRAFT b2-class — RFC-0008 §7; the recipes are the
