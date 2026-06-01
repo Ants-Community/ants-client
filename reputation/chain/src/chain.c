@@ -910,31 +910,95 @@ ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAI
 }
 
 /* ======================================================================== */
-/* PR5 — block hashing, encoding, and 2/3 finality (stub)                    */
+/* PR5 — block hashing + encoding (finality_verify below remains a stub)     */
 /* ======================================================================== */
 
-ants_error_t ants_chain_block_hash(const ants_chain_block_t *b,
-                                   uint8_t out_hash[ANTS_CHAIN_HASH_SIZE])
-{
-    (void)b;
-    (void)out_hash;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
-}
+/* A block is canonical CBOR map(3): {1: height, 2: prev_block_hash(32),
+ * 3: summary}. The epoch summary rides as a byte-string holding its own
+ * complete canonical encoding — the same "embed a sub-document as bytes"
+ * shape reputation/crdt uses for signed statement bodies — so the block
+ * codec composes ants_chain_epoch_summary_{encode,decode} without
+ * duplicating the summary wire format. */
+#define CHAIN_BLOCK_PAIRS 3u
+
+enum { BLOCK_KEY_HEIGHT = 1, BLOCK_KEY_PREV = 2, BLOCK_KEY_SUMMARY = 3 };
 
 size_t ants_chain_block_bound(const ants_chain_block_t *b)
 {
-    (void)b;
-    return 0;
+    if (b == NULL) {
+        return 0;
+    }
+    /* map(3) + height KV + prev-hash KV + summary byte-string header, then
+     * the embedded summary encoding. */
+    return 64u + ants_chain_epoch_summary_bound(&b->summary);
 }
 
 ants_error_t
 ants_chain_block_encode(const ants_chain_block_t *b, uint8_t *buf, size_t cap, size_t *out_len)
 {
-    (void)b;
-    (void)buf;
-    (void)cap;
-    (void)out_len;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint8_t sbuf[ANTS_CHAIN_EPOCH_SUMMARY_ENCODED_MAX];
+    ants_cbor_enc_t enc;
+    size_t slen;
+    ants_error_t rc;
+
+    if (b == NULL || buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Encode the summary to its own canonical doc first (this also validates
+     * the summary — findings count + severities). */
+    rc = ants_chain_epoch_summary_encode(&b->summary, sbuf, sizeof sbuf, &slen);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    rc = ants_cbor_enc_init(&enc, buf, cap);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_map(&enc, CHAIN_BLOCK_PAIRS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_uint(&enc, BLOCK_KEY_HEIGHT, b->height);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_bytes(&enc, BLOCK_KEY_PREV, b->prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_uint(&enc, BLOCK_KEY_SUMMARY);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_bytes(&enc, sbuf, slen);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_finalise(&enc);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+ants_error_t ants_chain_block_hash(const ants_chain_block_t *b,
+                                   uint8_t out_hash[ANTS_CHAIN_HASH_SIZE])
+{
+    uint8_t buf[ANTS_CHAIN_BLOCK_ENCODED_MAX];
+    size_t len;
+    ants_error_t rc;
+
+    if (b == NULL || out_hash == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    rc = ants_chain_block_encode(b, buf, sizeof buf, &len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_hash(buf, len, out_hash);
 }
 
 ants_error_t ants_chain_block_decode(const uint8_t *buf,
@@ -944,13 +1008,55 @@ ants_error_t ants_chain_block_decode(const uint8_t *buf,
                                      size_t findings_cap,
                                      size_t *out_n_findings)
 {
-    (void)buf;
-    (void)len;
-    (void)out_block;
-    (void)findings_buf;
-    (void)findings_cap;
-    (void)out_n_findings;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    ants_cbor_dec_t dec;
+    const uint8_t *sp;
+    size_t slen;
+    size_t n_pairs;
+    ants_error_t rc;
+
+    if (buf == NULL || len == 0 || out_block == NULL || out_n_findings == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    rc = ants_cbor_dec_init(&dec, buf, len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_map(&dec, &n_pairs));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (n_pairs != CHAIN_BLOCK_PAIRS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    rc = decode_uint_field(&dec, BLOCK_KEY_HEIGHT, &out_block->height);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = decode_bytes_field(&dec, BLOCK_KEY_PREV, out_block->prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = expect_key(&dec, BLOCK_KEY_SUMMARY);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_bytes(&dec, &sp, &slen));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* Decode the embedded summary doc (validates it fully, including its own
+     * no-trailing-bytes check). A probe (findings_cap 0) propagates
+     * BUFFER_TOO_SMALL with *out_n_findings set. */
+    rc = ants_chain_epoch_summary_decode(
+        sp, slen, &out_block->summary, findings_buf, findings_cap, out_n_findings);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* No trailing bytes after the block map. */
+    return norm_decode_err(ants_cbor_dec_finalise(&dec));
 }
 
 ants_error_t ants_chain_finality_verify(const uint8_t block_hash[ANTS_CHAIN_HASH_SIZE],

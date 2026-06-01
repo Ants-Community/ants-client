@@ -164,6 +164,13 @@ extern "C" {
  * pathological and split across epochs. */
 #define ANTS_CHAIN_MAX_PATTERN_FINDINGS 256u
 
+/* Compile-time upper bounds on the encoded sizes: an EpochSummary at the
+ * maximum findings count, and a Block (the summary embedded as a byte-string
+ * plus the small block header). Used to size the block-hash scratch buffer;
+ * callers may size encode buffers from these or from the bound() helpers. */
+#define ANTS_CHAIN_EPOCH_SUMMARY_ENCODED_MAX (80u + ANTS_CHAIN_MAX_PATTERN_FINDINGS * 96u)
+#define ANTS_CHAIN_BLOCK_ENCODED_MAX         (64u + ANTS_CHAIN_EPOCH_SUMMARY_ENCODED_MAX)
+
 /* ------------------------------------------------------------------------ */
 /* Severity (the §Slash-mechanics escalation ladder)                         */
 /* ------------------------------------------------------------------------ */
