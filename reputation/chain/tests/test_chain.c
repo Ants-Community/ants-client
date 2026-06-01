@@ -700,25 +700,124 @@ static void test_block(void)
     CHECK_EQ(ants_chain_block_decode(NULL, len, &out, fout, 3, &out_n), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- block finality (2/3) ----------------------------------------------- */
+
+/* k deterministic Ed25519 keypairs from a seed byte. */
+static void build_committee(uint8_t priv[][32], uint8_t pub[][32], size_t k)
+{
+    size_t i;
+    for (i = 0; i < k; i++) {
+        memset(priv[i], 0, 32);
+        priv[i][0] = (uint8_t)(i + 1);
+        CHECK_EQ(ants_ed25519_pubkey_from_priv(priv[i], pub[i]), ANTS_OK);
+    }
+}
+
+static void test_finality(void)
+{
+    enum { K = 4 }; /* threshold = ceil(2*4/3) = 3 */
+    uint8_t priv[K][32];
+    uint8_t pub[K][32];
+    uint8_t sigs[K][64];
+    uint8_t att[K * 64];
+    uint8_t bh[32];
+    bool mask[K];
+    bool final = false;
+    size_t i;
+
+    build_committee(priv, pub, K);
+    memset(bh, 0x5A, 32);
+    for (i = 0; i < K; i++) {
+        CHECK_EQ(ants_ed25519_sign(priv[i], bh, 32, sigs[i]), ANTS_OK);
+    }
+
+    /* 3 of 4 valid signers (members 0,1,2) → final. */
+    mask[0] = true;
+    mask[1] = true;
+    mask[2] = true;
+    mask[3] = false;
+    memcpy(att + 0 * 64, sigs[0], 64);
+    memcpy(att + 1 * 64, sigs[1], 64);
+    memcpy(att + 2 * 64, sigs[2], 64);
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 3 * 64, mask, &final), ANTS_OK);
+    CHECK(final);
+
+    /* 2 of 4 → below threshold → not final. */
+    mask[2] = false;
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 2 * 64, mask, &final), ANTS_OK);
+    CHECK(!final);
+
+    /* 3 signers but one signature tampered → only 2 valid → not final. */
+    mask[2] = true;
+    att[2 * 64] ^= 0xFFu;
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 3 * 64, mask, &final), ANTS_OK);
+    CHECK(!final);
+    memcpy(att + 2 * 64, sigs[2], 64); /* restore */
+
+    /* Signers (0,2,3), signatures packed in member order → final. */
+    mask[0] = true;
+    mask[1] = false;
+    mask[2] = true;
+    mask[3] = true;
+    memcpy(att + 0 * 64, sigs[0], 64);
+    memcpy(att + 1 * 64, sigs[2], 64);
+    memcpy(att + 2 * 64, sigs[3], 64);
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 3 * 64, mask, &final), ANTS_OK);
+    CHECK(final);
+
+    /* A signature that does not match its member's pubkey is not counted:
+     * mask claims members {0,1,2}, but slot 1 holds member 0's signature →
+     * it verifies against pub[1] and fails → 2 valid → not final. */
+    mask[0] = true;
+    mask[1] = true;
+    mask[2] = true;
+    mask[3] = false;
+    memcpy(att + 0 * 64, sigs[0], 64);
+    memcpy(att + 1 * 64, sigs[0], 64);
+    memcpy(att + 2 * 64, sigs[2], 64);
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 3 * 64, mask, &final), ANTS_OK);
+    CHECK(!final);
+
+    /* attestations_len must equal popcount(mask) signatures. */
+    mask[0] = true;
+    mask[1] = true;
+    mask[2] = true;
+    mask[3] = false;
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 2 * 64, mask, &final),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* Zero signers: len 0, attestations NULL → not final. */
+    mask[0] = false;
+    mask[1] = false;
+    mask[2] = false;
+    mask[3] = false;
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, NULL, 0, mask, &final), ANTS_OK);
+    CHECK(!final);
+
+    /* Arg guards. */
+    mask[0] = true;
+    mask[1] = true;
+    mask[2] = true;
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, 0, att, 0, mask, &final), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_finality_verify(
+                 bh, pub, ANTS_CHAIN_COMMITTEE_K_MAX + 1, att, 3 * 64, mask, &final),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_finality_verify(NULL, pub, K, att, 3 * 64, mask, &final),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_finality_verify(bh, pub, K, att, 3 * 64, mask, NULL),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 /* ---- still-deferred entry points report the scaffold state -------------- */
 
 static void test_stubs_not_implemented(void)
 {
-    uint8_t hash[32] = {0};
-    uint8_t pks[2][ANTS_CHAIN_PEER_ID_SIZE] = {{0}};
-    uint8_t sigs[2 * ANTS_CHAIN_SIG_SIZE] = {0};
-    bool mask[2] = {true, true};
-    bool out_ok = true;
     int winner = -1;
     uint64_t out_u64 = 0;
+    uint64_t tenures[2] = {1000, 2000};
 
-    CHECK_EQ(ants_chain_finality_verify(hash, pks, 2, sigs, sizeof sigs, mask, &out_ok),
+    CHECK_EQ(ants_chain_fork_weight(tenures, 2, ANTS_CHAIN_T_FORK_CHOICE_CAP, &out_u64),
              ANTS_ERROR_NOT_IMPLEMENTED);
-    {
-        uint64_t tenures[2] = {1000, 2000};
-        CHECK_EQ(ants_chain_fork_weight(tenures, 2, ANTS_CHAIN_T_FORK_CHOICE_CAP, &out_u64),
-                 ANTS_ERROR_NOT_IMPLEMENTED);
-    }
     CHECK_EQ(ants_chain_fork_choice(
                  10, 20, 100, ANTS_CHAIN_FORK_THETA_NUM, ANTS_CHAIN_FORK_THETA_DEN, &winner),
              ANTS_ERROR_NOT_IMPLEMENTED);
@@ -740,6 +839,7 @@ int main(void)
     test_pattern_scan();
     test_committee_select();
     test_block();
+    test_finality();
 
     test_stubs_not_implemented();
 

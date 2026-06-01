@@ -506,16 +506,23 @@ ants_error_t ants_chain_block_decode(const uint8_t *buf,
 /*
  * Verify block finality: does the committee's attestation set carry at
  * least ceil(FINALITY_NUM * k / FINALITY_DEN) valid signatures over
- * `block_hash`? The signature primitive is epoch-atomic (RFC-0008 §3.3):
- * an Ed25519 multi-signature for k ≤ BLS_TRANSITION_K, a BLS12-381
- * aggregate above — selected internally from k. `signed_mask[i]` marks
- * which of the `k` committee members contributed (so both the count and
- * the public keys to check are unambiguous). A signature shortfall or an
- * invalid signature is a FALSE VERDICT (*out_final = false, return
- * ANTS_OK), not an error.
+ * `block_hash`? `signed_mask[i]` marks which of the `k` committee members
+ * contributed; `attestations` is one Ed25519 signature per SIGNER, packed
+ * in ascending member order (so `attestations_len == popcount(mask) *
+ * ANTS_CHAIN_SIG_SIZE`, which pins the signer count). Each signer's
+ * signature is checked against its committee public key over `block_hash`.
+ * A signature shortfall or any invalid signature is a FALSE VERDICT
+ * (*out_final = false, return ANTS_OK), not an error.
  *
- * @return ANTS_OK with *out_final set; INVALID_ARG on NULL or k 0 / k >
- *         K_MAX.
+ * v0.x verifies per-signer Ed25519 for every k. The epoch-atomic BLS12-381
+ * AGGREGATE compression for k > BLS_TRANSITION_K (RFC-0008 §3.3) — one
+ * 96-byte signature instead of k 64-byte ones — is a deferred WIRE
+ * optimisation: it needs the committee's separate BLS public keys (the
+ * peer-id here is the Ed25519 key), so it lands with that plumbing. The
+ * security is identical; only the attestation size differs.
+ *
+ * @return ANTS_OK with *out_final set; INVALID_ARG on NULL, k 0 / k > K_MAX,
+ *         or attestations_len not equal to popcount(signed_mask) signatures.
  */
 ants_error_t ants_chain_finality_verify(const uint8_t block_hash[ANTS_CHAIN_HASH_SIZE],
                                         const uint8_t (*committee_pubkeys)[ANTS_CHAIN_PEER_ID_SIZE],
