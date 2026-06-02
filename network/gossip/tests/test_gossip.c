@@ -19,12 +19,14 @@
 #include "ants_crdt.h"
 #include "ants_crypto.h"
 #include "ants_gossip.h"
+#include "ants_transport.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -518,6 +520,157 @@ static void test_engine_args(void)
     harness_destroy(&h);
 }
 
+/* ---- real-QUIC transport binding ------------------------------------ */
+
+/* Pace a tick spin-loop: picoquic drives its handshake/retransmit timers off
+ * the wall clock, so a no-delay fixed-count loop can exhaust before they
+ * fire. A 1 ms sleep per iteration lets real time advance (the same macOS-CI
+ * flake mitigation as test_dht.c); the loop still breaks as soon as its
+ * predicate holds, so green runs stay fast. */
+static void tick_pace(void)
+{
+    struct timespec ts = {0, 1000000L}; /* 1 ms */
+    nanosleep(&ts, NULL);
+}
+
+/* In-memory-key sign callback (the minimal binding from ants_transport.h):
+ * ctx is the 32-byte Ed25519 private key. */
+static ants_error_t gt_sign(const uint8_t *transcript, size_t len, uint8_t out_sig[64], void *ctx)
+{
+    return ants_ed25519_sign((const uint8_t *)ctx, transcript, len, out_sig);
+}
+
+/* Per-node event context: forward every transport event into the gossip
+ * binding (the single-event_fn delegation pattern) and count CONN_READYs. */
+typedef struct {
+    ants_gossip_transport_t *binding;
+    int conn_ready;
+} gt_node_ctx;
+
+static ants_error_t gt_event(const ants_transport_event_t *ev, void *ctx)
+{
+    gt_node_ctx *n = (gt_node_ctx *)ctx;
+    ants_gossip_transport_handle_event(n->binding, ev);
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        n->conn_ready++;
+    }
+    return ANTS_OK;
+}
+
+/* End-to-end over a real QUIC link: A detects a fault and originates the
+ * proof; the binding opens a uni stream to B and writes the push frame; B's
+ * inbound demux accumulates it to FIN and feeds the engine, which inserts it
+ * into B's real G-Set. The L1 reputation path now runs on the wire:
+ * detect → submit → uni-stream → demux → VERIFY-insert → slash. */
+static void test_two_node_over_quic(void)
+{
+    uint8_t a_priv[32], a_pub[32], b_priv[32], b_pub[32];
+    make_key(0x33, a_priv, a_pub);
+    make_key(0x77, b_priv, b_pub);
+
+    ants_crdt_t *a_set = NULL, *b_set = NULL;
+    CHECK_EQ(ants_crdt_init(&a_set), ANTS_OK);
+    CHECK_EQ(ants_crdt_init(&b_set), ANTS_OK);
+
+    gt_node_ctx actx, bctx;
+    memset(&actx, 0, sizeof actx);
+    memset(&bctx, 0, sizeof bctx);
+
+    /* B = listener. */
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, 32);
+    bcfg.sign_fn = gt_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = gt_event;
+    bcfg.event_ctx = &bctx;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    /* A = dialer. */
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, 32);
+    acfg.sign_fn = gt_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = gt_event;
+    acfg.event_ctx = &actx;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    /* Bindings capture (engine, transport) pointers; engines are then
+     * initialised with the binding as send_ctx (the two-call wiring). */
+    ants_gossip_transport_t a_bind, b_bind;
+    ants_gossip_t a_eng, b_eng;
+    CHECK_EQ(ants_gossip_transport_init(&a_bind, &a_eng, &ta), ANTS_OK);
+    CHECK_EQ(ants_gossip_transport_init(&b_bind, &b_eng, &tb), ANTS_OK);
+    actx.binding = &a_bind;
+    bctx.binding = &b_bind;
+    CHECK_EQ(ants_gossip_init(&a_eng, a_set, a_pub, NULL, ants_gossip_transport_send, &a_bind),
+             ANTS_OK);
+    CHECK_EQ(ants_gossip_init(&b_eng, b_set, b_pub, NULL, ants_gossip_transport_send, &b_bind),
+             ANTS_OK);
+
+    /* A gossips to B. */
+    CHECK_EQ(ants_gossip_add_peer(&a_eng, b_pub), ANTS_OK);
+
+    /* Dial and wait until the dialer's handshake completes (A must know B's
+     * connection before it can send). */
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (actx.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(actx.conn_ready >= 1);
+    /* A learned B's connection from CONN_READY → it can route a forward. */
+    CHECK(ants_gossip_transport_conn_count(&a_bind) == 1);
+
+    /* A detects an equivocation by a third party S and originates the proof.
+     * It inserts into A's G-Set and forwards to B over a real uni stream. */
+    uint8_t s_priv[32], s_pub[32], proof[512];
+    size_t plen, fwd = 0;
+    make_key(0xCC, s_priv, s_pub);
+    plen = make_proof(s_priv, s_pub, 100, proof);
+    CHECK_EQ(ants_gossip_submit(&a_eng, proof, plen, &fwd), ANTS_OK);
+    CHECK(fwd == 1); /* one fanout peer (B) on the wire */
+    CHECK(ants_crdt_size(a_set) == 1);
+    CHECK(ants_crdt_is_slashed(a_set, s_pub));
+    CHECK(ants_crdt_size(b_set) == 0); /* not yet delivered */
+
+    /* Pump both transports until B ingests the proof from the wire. */
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (ants_crdt_size(b_set) >= 1) {
+            break;
+        }
+    }
+    CHECK(ants_crdt_size(b_set) == 1);         /* received over real QUIC */
+    CHECK(ants_crdt_is_slashed(b_set, s_pub)); /* S slashed at B too */
+    /* By now B's handshake has completed (it delivered a stream), so B has
+     * also learned A's connection. */
+    CHECK(ants_gossip_transport_conn_count(&b_bind) == 1);
+
+    /* Teardown: transports FIRST so their CONN_CLOSED callbacks free the
+     * bindings' retained outbound handles while picoquic still owns the
+     * connections; then the bindings; then the G-Sets. */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    ants_gossip_transport_destroy(&a_bind);
+    ants_gossip_transport_destroy(&b_bind);
+    ants_crdt_destroy(a_set);
+    ants_crdt_destroy(b_set);
+}
+
 int main(void)
 {
     test_push_codec_roundtrip();
@@ -528,6 +681,7 @@ int main(void)
     test_invalid_proof_rejected_not_forwarded();
     test_malformed_frame_rejected();
     test_engine_args();
+    test_two_node_over_quic();
 
     if (failures == 0) {
         printf("test_gossip: all checks passed\n");
