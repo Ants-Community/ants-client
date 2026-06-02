@@ -2691,6 +2691,85 @@ static void test_two_node_end_to_end(void)
     CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
 }
 
+/* Helper: a peer whose highest set bit is `bucket_bit` (so it lands in bucket
+ * `bucket_bit` against an all-zero local id), with low bits `disc` for
+ * distinctness so several peers can share one bucket. Requires bucket_bit > 7
+ * so the disc bits (in the lowest byte) stay below the bucket bit. */
+static void make_peer_bucket_disc(uint32_t bucket_bit, uint8_t disc, ants_dht_peer_t *out)
+{
+    uint32_t byte_idx = (uint32_t)ANTS_PEER_ID_SIZE - 1 - bucket_bit / 8;
+    memset(out, 0, sizeof *out);
+    out->peer_id.bytes[byte_idx] |= (uint8_t)(1u << (bucket_bit % 8));
+    out->peer_id.bytes[ANTS_PEER_ID_SIZE - 1] |= disc; /* low bits, below bucket_bit */
+    snprintf(out->multiaddr,
+             sizeof out->multiaddr,
+             "/ip4/127.0.0.1/udp/%u/quic-v1",
+             (unsigned)(bucket_bit * 8 + disc));
+}
+
+/* The sampler spreads across buckets one-per-bucket before taking a second from
+ * any (RFC-0005 §Anti-eclipse, axis S1), so a fat bucket cannot dominate a
+ * small sample. */
+static void test_sample_peers_bucket_diverse(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    ants_dht_peer_t out[16];
+    size_t n, i, j;
+
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* Five distinct peers all in bucket 200; one each in buckets 100/120/150. */
+    for (i = 0; i < 5; i++) {
+        ants_dht_peer_t p;
+        make_peer_bucket_disc(200, (uint8_t)(1u << i), &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 1000 + i), ANTS_OK);
+    }
+    {
+        ants_dht_peer_t p;
+        make_peer_bucket_disc(100, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2000), ANTS_OK);
+        make_peer_bucket_disc(120, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2001), ANTS_OK);
+        make_peer_bucket_disc(150, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2002), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(&d) == 8);
+
+    /* Sample 4 → one from each of the four distinct buckets, NOT four from the
+     * fat bucket 200. Assert four distinct bucket indices. */
+    n = ants_dht_sample_peers(&d, out, 4);
+    CHECK(n == 4);
+    for (i = 0; i < n; i++) {
+        for (j = i + 1; j < n; j++) {
+            CHECK(ants_dht__test_bucket_index(&d, &out[i].peer_id) !=
+                  ants_dht__test_bucket_index(&d, &out[j].peer_id));
+        }
+    }
+
+    /* Sampling the whole table returns all 8; asking for more is capped. */
+    n = ants_dht_sample_peers(&d, out, 8);
+    CHECK(n == 8);
+    n = ants_dht_sample_peers(&d, out, 16);
+    CHECK(n == 8);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_sample_peers_args(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    ants_dht_peer_t out[4];
+
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+    CHECK(ants_dht_sample_peers(NULL, out, 4) == 0);
+    CHECK(ants_dht_sample_peers(&d, NULL, 4) == 0);
+    CHECK(ants_dht_sample_peers(&d, out, 0) == 0);
+    CHECK(ants_dht_sample_peers(&d, out, 4) == 0); /* empty table → 0 */
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -2705,6 +2784,8 @@ int main(void)
     test_kbucket_full_rejects();
     test_kbucket_remove();
     test_destroy_frees_heap_entries();
+    test_sample_peers_bucket_diverse();
+    test_sample_peers_args();
 
     test_wire_peek_type();
     test_wire_ping_roundtrip();

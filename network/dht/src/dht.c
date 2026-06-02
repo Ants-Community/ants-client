@@ -898,6 +898,47 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
     return kbucket_enumerate(state, out_peers, cap, out_count);
 }
 
+/* Bucket-diverse sample: a round-robin sweep across all buckets, taking the
+ * depth-th entry of each non-empty bucket per sweep (depth 0, then 1, ...)
+ * until n_out is reached or the table is exhausted. Spreading one-per-bucket
+ * before taking a second from any bucket maximises XOR distance-class diversity
+ * (RFC-0005 §"Anti-eclipse peer sampling", axis S1) — a fat bucket cannot
+ * dominate the sample. Each peer occupies exactly one bucket, so the result has
+ * no duplicates. */
+static size_t kbucket_sample(const struct ants_dht_state *state, ants_dht_peer_t *out, size_t n_out)
+{
+    size_t written = 0;
+    size_t depth = 0;
+    int progress;
+
+    do {
+        progress = 0;
+        for (size_t b = 0; b < ANTS_DHT_BUCKET_COUNT && written < n_out; b++) {
+            const struct ants_dht_bucket_entry *e = state->buckets[b].head;
+            size_t k = 0;
+            while (e != NULL && k < depth) {
+                e = e->next;
+                k++;
+            }
+            if (e != NULL) {
+                out[written++] = e->peer;
+                progress = 1;
+            }
+        }
+        depth++;
+    } while (progress && written < n_out);
+    return written;
+}
+
+size_t ants_dht_sample_peers(const ants_dht_t *dht, ants_dht_peer_t *out_peers, size_t n_out)
+{
+    if (dht == NULL || out_peers == NULL || n_out == 0) {
+        return 0;
+    }
+    const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
+    return kbucket_sample(state, out_peers, n_out);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Bootstrap event hooks                                                    */
 /*                                                                          */
