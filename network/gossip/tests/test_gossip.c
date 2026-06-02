@@ -688,6 +688,198 @@ static void test_lazy_pull_codec_and_edges(void)
     harness_destroy(&h);
 }
 
+/* ---- propagation instrumentation (stats + observer) ----------------- */
+
+/* Observer capture: count calls + record the last (content-id, stamp, origin). */
+struct obs_capture {
+    size_t calls;
+    uint8_t last_cid[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint64_t last_us;
+    int last_origin;
+};
+static void obs_fn(const uint8_t cid[ANTS_CRDT_CONTENT_ID_SIZE], uint64_t us, int origin, void *ctx)
+{
+    struct obs_capture *c = (struct obs_capture *)ctx;
+    c->calls++;
+    memcpy(c->last_cid, cid, ANTS_CRDT_CONTENT_ID_SIZE);
+    c->last_us = us;
+    c->last_origin = origin;
+}
+
+/* Counters track the dissemination outcome at each node of a 0->1->2 line: the
+ * originator counts originated + forwarded; the relay counts received_new +
+ * forwarded onward; the tail counts received_new with an empty view to forward
+ * to. A re-delivered proof is a duplicate; a tampered one a reject. */
+static void test_stats_counters(void)
+{
+    struct harness h;
+    uint8_t sp[32], su[32], proof[512];
+    uint8_t frame[ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+    size_t plen, flen = 0, fwd = 0, nw = 0, rj = 0;
+    ants_gossip_stats_t st;
+
+    harness_init(&h, 3, 0x90);
+    link_dir(&h.nodes[0], &h.nodes[1]); /* 0 -> 1 */
+    link_dir(&h.nodes[1], &h.nodes[2]); /* 1 -> 2 */
+
+    make_key(0xC8, sp, su); /* subject (accused), not a node */
+    plen = make_proof(sp, su, 100, proof);
+
+    CHECK_EQ(ants_gossip_submit(&h.nodes[0].g, proof, plen, &fwd), ANTS_OK);
+    CHECK(fwd == 1);
+    harness_pump(&h); /* drains 0->1 and the 1->2 forward it triggers */
+
+    /* originator: originated + forwarded once, received nothing */
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[0].g, &st), ANTS_OK);
+    CHECK(st.originated == 1 && st.forwarded == 1);
+    CHECK(st.received_new == 0 && st.duplicates == 0 && st.rejected == 0);
+    CHECK(st.first_seen_us > 0 && st.last_seen_us >= st.first_seen_us);
+
+    /* middle relay: learned new, forwarded onward, originated nothing */
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[1].g, &st), ANTS_OK);
+    CHECK(st.received_new == 1 && st.forwarded == 1 && st.originated == 0);
+    CHECK(st.first_seen_us > 0);
+
+    /* tail: learned new, empty view so nothing to forward */
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[2].g, &st), ANTS_OK);
+    CHECK(st.received_new == 1 && st.forwarded == 0);
+
+    /* a re-delivered PUSH is a duplicate (epidemic stop), not a new proof */
+    CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &flen), ANTS_OK);
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[1].g, h.nodes[0].id, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(nw == 0 && rj == 0);
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[1].g, &st), ANTS_OK);
+    CHECK(st.duplicates == 1 && st.received_new == 1);
+
+    /* a tampered proof fails VERIFY → counted as a reject, never stored */
+    proof[plen / 2] ^= 0xFF;
+    CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &flen), ANTS_OK);
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[2].g, h.nodes[1].id, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(rj == 1);
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[2].g, &st), ANTS_OK);
+    CHECK(st.rejected == 1 && st.received_new == 1);
+
+    harness_destroy(&h);
+}
+
+/* The lazy-pull counters: A originates with no peers (so B has a real gap),
+ * then one anti-entropy round (IHAVE -> IWANT -> PUSH) closes it. */
+static void test_stats_lazy_pull(void)
+{
+    struct harness h;
+    uint8_t sp[32], su[32], proof[512];
+    size_t plen, sent = 0, fwd = 0;
+    ants_gossip_stats_t sa, sb;
+
+    harness_init(&h, 2, 0xA0);
+
+    make_key(0xD0, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+
+    /* originate while view is empty → held but pushed nowhere (a genuine gap) */
+    CHECK_EQ(ants_gossip_submit(&h.nodes[0].g, proof, plen, &fwd), ANTS_OK);
+    CHECK(fwd == 0);
+
+    link_dir(&h.nodes[0], &h.nodes[1]);
+    link_dir(&h.nodes[1], &h.nodes[0]);
+
+    CHECK_EQ(ants_gossip_announce(&h.nodes[0].g, &sent), ANTS_OK);
+    CHECK(sent == 1);
+    harness_pump(&h); /* IHAVE->B; B IWANTs; A serves PUSH; B inserts */
+    CHECK(ants_crdt_size(h.nodes[1].set) == 1);
+
+    /* A: advertised, fielded the request, served the proof */
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[0].g, &sa), ANTS_OK);
+    CHECK(sa.originated == 1 && sa.ihave_sent == 1);
+    CHECK(sa.iwant_received == 1 && sa.pulled_served == 1);
+
+    /* B: heard the digest, pulled, learned the proof as new */
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[1].g, &sb), ANTS_OK);
+    CHECK(sb.ihave_received == 1 && sb.iwant_sent == 1 && sb.received_new == 1);
+
+    harness_destroy(&h);
+}
+
+/* The observation hook fires exactly once per NEW proof, with the right origin
+ * and content-id, and NOT for duplicates or rejects; clearing it stops calls. */
+static void test_observer_hook(void)
+{
+    struct harness h;
+    struct obs_capture oa, ob;
+    uint8_t sp[32], su[32], proof[512], expect[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t frame[ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+    size_t plen, flen = 0, fwd = 0, nw = 0, rj = 0;
+
+    memset(&oa, 0, sizeof oa);
+    memset(&ob, 0, sizeof ob);
+    harness_init(&h, 2, 0xB0);
+    link_dir(&h.nodes[0], &h.nodes[1]);
+    CHECK_EQ(ants_gossip_set_observer(&h.nodes[0].g, obs_fn, &oa), ANTS_OK);
+    CHECK_EQ(ants_gossip_set_observer(&h.nodes[1].g, obs_fn, &ob), ANTS_OK);
+
+    make_key(0xD8, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    CHECK_EQ(ants_crdt_content_id(proof, plen, expect), ANTS_OK);
+
+    /* originate at node 0 → one LOCAL observation, content-id matches */
+    CHECK_EQ(ants_gossip_submit(&h.nodes[0].g, proof, plen, &fwd), ANTS_OK);
+    CHECK(oa.calls == 1 && oa.last_origin == ANTS_GOSSIP_PROOF_ORIGIN_LOCAL);
+    CHECK(memcmp(oa.last_cid, expect, ANTS_CRDT_CONTENT_ID_SIZE) == 0);
+    CHECK(oa.last_us > 0);
+
+    /* deliver to node 1 → one PEER observation */
+    harness_pump(&h);
+    CHECK(ob.calls == 1 && ob.last_origin == ANTS_GOSSIP_PROOF_ORIGIN_PEER);
+    CHECK(memcmp(ob.last_cid, expect, ANTS_CRDT_CONTENT_ID_SIZE) == 0);
+
+    /* re-originating the same proof is a duplicate → no further observation */
+    CHECK_EQ(ants_gossip_submit(&h.nodes[0].g, proof, plen, &fwd), ANTS_OK);
+    CHECK(oa.calls == 1);
+
+    /* a tampered proof fails VERIFY → the receiver's hook does NOT fire */
+    proof[plen / 2] ^= 0xFF;
+    CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &flen), ANTS_OK);
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[1].g, h.nodes[0].id, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(rj == 1 && ob.calls == 1);
+
+    /* clearing the observer: a fresh proof originates without firing the hook */
+    CHECK_EQ(ants_gossip_set_observer(&h.nodes[0].g, NULL, NULL), ANTS_OK);
+    {
+        uint8_t p2[512];
+        size_t l2 = make_proof(sp, su, 101, p2);
+        CHECK_EQ(ants_gossip_submit(&h.nodes[0].g, p2, l2, &fwd), ANTS_OK);
+        CHECK(oa.calls == 1);
+    }
+
+    harness_destroy(&h);
+}
+
+static void test_stats_observer_args(void)
+{
+    ants_crdt_t *set = NULL;
+    uint8_t priv[32], self[32];
+    ants_gossip_t g;
+    ants_gossip_stats_t st;
+
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    make_key(0x71, priv, self);
+    CHECK_EQ(ants_gossip_init(&g, set, self, NULL, harness_send, NULL), ANTS_OK);
+
+    /* NULL-arg guards */
+    CHECK_EQ(ants_gossip_get_stats(NULL, &st), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_gossip_get_stats(&g, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_gossip_set_observer(NULL, obs_fn, NULL), ANTS_ERROR_INVALID_ARG);
+
+    /* a fresh engine reports all-zero counters */
+    CHECK_EQ(ants_gossip_get_stats(&g, &st), ANTS_OK);
+    CHECK(st.originated == 0 && st.received_new == 0 && st.forwarded == 0);
+    CHECK(st.duplicates == 0 && st.rejected == 0);
+    CHECK(st.ihave_sent == 0 && st.iwant_sent == 0 && st.pulled_served == 0);
+    CHECK(st.first_seen_us == 0 && st.last_seen_us == 0);
+
+    ants_crdt_destroy(set);
+}
+
 /* ---- real-QUIC transport binding ------------------------------------ */
 
 /* Pace a tick spin-loop: picoquic drives its handshake/retransmit timers off
@@ -877,6 +1069,10 @@ int main(void)
     test_lazy_pull_no_gap();
     test_announce_edges();
     test_lazy_pull_codec_and_edges();
+    test_stats_counters();
+    test_stats_lazy_pull();
+    test_observer_hook();
+    test_stats_observer_args();
     test_two_node_over_quic();
 
     if (failures == 0) {
