@@ -12,6 +12,7 @@
 
 add_library(ants_gossip STATIC
     src/gossip.c
+    src/gossip_transport.c
 )
 
 target_include_directories(ants_gossip
@@ -22,13 +23,16 @@ target_include_directories(ants_gossip
 
 # ants_crdt (#7) — the L1 G-Set used as the VERIFY-and-dedup oracle — is a
 # PUBLIC dep: ants_gossip.h includes ants_crdt.h (the engine takes an
-# ants_crdt_t*). ants_cbor (#2) — the push-frame codec — is PRIVATE:
-# gossip.c calls it but the header does not expose it. ants_cbor also hosts
-# ants_strerror during the transitional period. The transport layer is
-# deliberately NOT a dependency in PR1 (delivery is behind a callback).
+# ants_crdt_t*). ants_transport (#4) is PUBLIC too as of PR2: ants_gossip.h
+# includes ants_transport.h for the transport binding (gossip_transport.c
+# opens uni streams and demuxes inbound frames). ants_cbor (#2) — the
+# push-frame codec — is PRIVATE: gossip.c calls it but the header does not
+# expose it. ants_cbor also hosts ants_strerror during the transitional
+# period.
 target_link_libraries(ants_gossip
     PUBLIC
         ants_crdt
+        ants_transport
     PRIVATE
         ants_cbor
 )
@@ -39,10 +43,19 @@ target_compile_features(ants_gossip PUBLIC c_std_99)
 
 if(BUILD_TESTING)
     add_executable(test_gossip tests/test_gossip.c)
-    # The test builds real equivocation proofs (ants_crdt_* + ants_crypto +
-    # ants_cbor) and exercises two in-process gossip instances exchanging
-    # frames, so it links crdt, crypto, and cbor explicitly (PRIVATE deps
-    # of the lib are not re-exported).
-    target_link_libraries(test_gossip PRIVATE ants_gossip ants_crdt ants_crypto ants_cbor)
+    # Link ONLY the top lib: ants_gossip's static archive transitively pulls
+    # ants_crdt + ants_transport (PUBLIC) and ants_cbor + ants_crypto (one
+    # level down), so every symbol the test calls resolves. Linking just the
+    # top lib avoids the macOS 'ld: ignoring duplicate libraries' warning.
+    # The test references headers of those lower-level libs directly (real
+    # Ed25519 proofs via ants_crypto, frame encode via ants_cbor, the G-Set
+    # via ants_crdt) — PRIVATE deps don't re-export include dirs, so add them
+    # explicitly. ants_transport's headers come through the PUBLIC link.
+    target_link_libraries(test_gossip PRIVATE ants_gossip)
+    target_include_directories(test_gossip PRIVATE
+        ${CMAKE_SOURCE_DIR}/reputation/crdt/include
+        ${CMAKE_SOURCE_DIR}/foundation/crypto/include
+        ${CMAKE_SOURCE_DIR}/foundation/cbor/include
+    )
     add_test(NAME gossip_basic COMMAND test_gossip)
 endif()

@@ -71,6 +71,7 @@
 
 #include "ants_common.h"
 #include "ants_crdt.h"
+#include "ants_transport.h" /* for the transport binding at the foot of this header */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -318,6 +319,146 @@ ants_error_t ants_gossip_on_message(ants_gossip_t *g,
                                     size_t len,
                                     size_t *out_new,
                                     size_t *out_rejected);
+
+/* ------------------------------------------------------------------------ */
+/* Transport binding (Component #6 PR2)                                     */
+/*                                                                          */
+/* The canonical wiring of the engine's send_fn to a real ants_transport,    */
+/* plus the inbound demux that feeds received frames back into the engine.   */
+/* The engine (above) stays transport-agnostic; this binding is the glue,    */
+/* so the in-process engine tests keep working without a QUIC handshake.     */
+/*                                                                          */
+/* Each gossip PUSH is fire-and-forget: the binding opens a UNIDIRECTIONAL   */
+/* stream to the peer (RFC-0004 §Layer 1 propagation is one-way; the         */
+/* transport reserves uni streams for exactly this, see ants_transport.h),   */
+/* writes the frame with FIN, and never expects a reply. The peer's inbound  */
+/* uni stream is accumulated until FIN and handed to ants_gossip_on_message; */
+/* the per-message FIN gives the frame boundary, so no length prefix or      */
+/* incremental framing is needed.                                            */
+/*                                                                          */
+/* Connection discovery is REACTIVE: the binding learns (peer_id → conn)     */
+/* from CONN_READY events and uses those connections for sends. It does NOT  */
+/* dial — the caller (bootstrap, the DHT, or a later anti-eclipse PR that    */
+/* samples the view from the DHT) owns dialing. A send to a peer the binding */
+/* has no live connection to is dropped: gossip is best-effort by design     */
+/* (the epidemic's redundancy and the Component #7 late-joiner snapshot      */
+/* recover dropped frames).                                                  */
+/*                                                                          */
+/* Outbound stream lifetime: the transport leaves locally-opened stream      */
+/* handles to the caller (it reclaims only inbound heap streams, at conn     */
+/* teardown), and fires no "send complete" event for a one-way stream. So a  */
+/* forwarded proof's uni-stream handle is retained until its connection      */
+/* closes (CONN_CLOSED), bounded by a fixed pool of                          */
+/* ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS; beyond the pool, further       */
+/* forwards are dropped best-effort. A persistent per-peer gossip channel    */
+/* that reclaims continuously is a later PR.                                 */
+/*                                                                          */
+/* TEARDOWN ORDER: ants_transport_destroy MUST run BEFORE                    */
+/* ants_gossip_transport_destroy whenever the binding may hold outbound      */
+/* handles, so transport_destroy's CONN_CLOSED callbacks free them while     */
+/* picoquic still owns the connection (same rule the DHT follows for its     */
+/* heap conns/streams).                                                      */
+/* ------------------------------------------------------------------------ */
+
+/* Maximum live (peer_id → conn) mappings. One per gossip neighbour we have a
+ * connection to; sized to the view ceiling. */
+#define ANTS_GOSSIP_TRANSPORT_MAX_CONNS 64u
+
+/* Maximum concurrent inbound gossip streams being accumulated. A peer pushes
+ * one proof per stream and FINs promptly, so concurrency is low. */
+#define ANTS_GOSSIP_TRANSPORT_MAX_INBOUND_STREAMS 32u
+
+/* Per-inbound-stream accumulation cap (bytes). A push frame is one fault
+ * proof plus a few bytes of envelope; matches the engine's default frame cap
+ * headroom. Overflow releases the stream (it is not a valid gossip frame). */
+#define ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP 4096u
+
+/* Maximum retained outbound uni-stream handles (see lifetime note above). */
+#define ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS 64u
+
+/* Caller-allocated opaque context for the binding, same idiom as the engine
+ * / transport / dht: a byte buffer with a uint64_t alignment anchor; the .c
+ * enforces the real size via the compile-time-assert idiom. Holds the engine
+ * + transport back-pointers and the three registries (conns, inbound streams,
+ * retained outbound streams). The binding heap-allocates per-stream handles
+ * and inbound accumulation buffers, like the DHT. */
+#define ANTS_GOSSIP_TRANSPORT_CTX_SIZE 16384
+
+typedef union {
+    uint8_t _opaque[ANTS_GOSSIP_TRANSPORT_CTX_SIZE];
+    uint64_t _align;
+} ants_gossip_transport_t;
+
+/*
+ * Initialise the transport binding.
+ *
+ * Wiring is two calls, in this order:
+ *
+ *     ants_gossip_transport_init(&binding, &engine, &transport);
+ *     ants_gossip_init(&engine, gset, self_id, cfg,
+ *                      ants_gossip_transport_send, &binding);
+ *
+ * The binding stores the engine pointer (used by the inbound demux to call
+ * ants_gossip_on_message) and the transport pointer (used to open streams);
+ * the engine stores the binding as its send_ctx. `engine` need not be
+ * initialised yet at this call — only the pointer is captured.
+ *
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on any NULL argument.
+ */
+ants_error_t ants_gossip_transport_init(ants_gossip_transport_t *b,
+                                        ants_gossip_t *engine,
+                                        ants_transport_t *transport);
+
+/*
+ * The engine send_fn binding: opens a uni stream to `peer_id` (if a live
+ * connection is known) and writes `frame` with FIN. `ctx` MUST be the
+ * ants_gossip_transport_t* passed to ants_gossip_init as send_ctx. Matches
+ * the ants_gossip_send_fn signature. Best-effort: silently drops when no
+ * connection is known or the outbound pool is exhausted.
+ */
+void ants_gossip_transport_send(const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE],
+                                const uint8_t *frame,
+                                size_t len,
+                                void *ctx);
+
+/*
+ * Hand a transport event to the binding. Call this from inside the caller's
+ * single registered transport event_fn (the transport allows only one), the
+ * same delegation pattern as ants_dht_handle_transport_event:
+ *
+ *     static ants_error_t my_event(const ants_transport_event_t *ev, void *c) {
+ *         my_app_t *app = c;
+ *         ants_dht_handle_transport_event(&app->dht, ev);
+ *         ants_gossip_transport_handle_event(&app->gossip_binding, ev);
+ *         return ANTS_OK;
+ *     }
+ *
+ * Consumes: CONN_READY (register peer_id → conn), CONN_CLOSED (free this
+ * conn's retained outbound handles + inbound accumulators, drop the mapping),
+ * and inbound STREAM_OPENED/READABLE/FIN/RESET (accumulate a pushed frame and,
+ * on FIN, feed it to the engine). Events that belong to another subsystem
+ * (e.g. the DHT's own streams) are left untouched — a stream the binding did
+ * not open as inbound is a cheap no-op. Does NOT call back into the
+ * transport for inbound handling; forwarding triggered by on_message goes
+ * through the engine's send_fn (this binding's send), which opens new streams
+ * on OTHER connections — safe per the transport's callback contract.
+ *
+ * @return ANTS_OK (including when the event was not the binding's);
+ *         ANTS_ERROR_INVALID_ARG on NULL args.
+ */
+ants_error_t ants_gossip_transport_handle_event(ants_gossip_transport_t *b,
+                                                const ants_transport_event_t *event);
+
+/* Number of live (peer_id → conn) mappings the binding currently holds. 0 if
+ * b is NULL. Introspection for tests / diagnostics. */
+size_t ants_gossip_transport_conn_count(const ants_gossip_transport_t *b);
+
+/*
+ * Tear down the binding: free every retained outbound stream handle and
+ * inbound accumulation buffer. Idempotent on a zeroed binding. See the
+ * TEARDOWN ORDER note above — destroy the transport first.
+ */
+void ants_gossip_transport_destroy(ants_gossip_transport_t *b);
 
 #ifdef __cplusplus
 }
