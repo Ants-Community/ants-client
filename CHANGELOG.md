@@ -13,6 +13,28 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #5 (DHT) — anti-eclipse peer sampling (axis S1) · 2026-06-02
+
+RFC-0005 v0.2 §"Anti-eclipse peer sampling" decided the architecture: the
+Sybil-resistant peer selection lives in the DHT (not the gossip engine, which
+stays substrate-agnostic; not in integration glue), with diversity from a bucket
+draw + random-target probes + rotation, attestation-weighting deferred. This
+lands the placement decision plus the axis-S1 core in the reference client.
+
+`ants_dht_sample_peers(dht, out, n_out)` returns a bucket-diverse set from the
+routing table: a round-robin sweep across the 256 XOR distance-class buckets,
+one-per-bucket before a second from any, so a fat bucket cannot dominate a small
+sample and an adversary must surround a victim across the whole keyspace rather
+than one neighbourhood. `const`, no malloc; peers are returned regardless of
+live-connection state (reachability is the caller's / transport's concern).
+
+Axis S2 (random-target probe enrichment via `ants_dht_lookup`) and axis S3
+(rotation across refreshes) are caller-side composition over this primitive; axis
+S4 (attestation-weighting) is deferred per the RFC; and wiring the sample into
+the gossip view waits on the node daemon. A *provable* eclipse-probability bound
+remains the open RFC-0005 item — the one-honest-path assumption is narrowed and
+made costly, not discharged.
+
 ### network: Component #6 (gossip overlay) — local reject accountability (rate-limit the sender) · 2026-06-02
 
 Invalid-proof spam (RFC-0004 W3) is bounded, not prevented: a relayer flooding
