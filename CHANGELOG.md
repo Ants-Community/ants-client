@@ -13,6 +13,58 @@ the spec repo's
 
 ## Unreleased
 
+### inference: Component #13 (inference orchestration) — surface 4 (serving runtime + audit), feature-complete at v0.x · 2026-06-02
+
+**The critical-path capstone closes.** Component #13's three primitive surfaces
+(commit-at-send, anti-grinding challenge, the betting e-process) were already in;
+surface 4 — the serving runtime + audit — ties them, the #12 canonical kernels,
+and the identity layer into the producer/verifier machinery RFC-0003 specifies.
+The scheme-C loop now runs end to end: a producer answers, commits to the whole
+computation, and signs; a verifier seeded by a posterior beacon decides whether
+to audit, opens a strided position set, reruns the canonical numerics, and runs
+the anytime-valid e-process that slashes fraud while Ville-bounding the honest
+false-accusation rate by α. Critical path `#3 → #7 → #8 → #13 → #15`: **#13 done.**
+
+A deliberate scoping call: the reference client is **model-agnostic glue**, but
+surface 4 has to run *some* model to produce per-position logit distributions.
+Rather than wire a full GGUF transformer (RFC-0009 calls the canonical kernel
+library a 6–12 month effort), it ships a small, deterministic next-token
+predictor built **entirely on the #12 canonical kernels** — a byte-vocabulary
+causal-attention block (token embedding → single-head causal SDPA → output
+projection + residual → unembedding → q24 logits). Every step is a
+canonical-kernel call, so two honest peers compute byte-identical logits — the
+property the whole audit rests on. Same posture as embedding (#11): the
+canonical RECIPE is the deliverable, the weight VALUES illustrative; the model
+swaps out behind the `reference_distribution` seam for a production deployment.
+
+Three PRs (#115–#117), each CI 7/7:
+- **loader + canonical forward + init** (#115): a DRAFT weight-blob format
+  (magic + dims + six FP32 tensors, 4-byte aligned, validated against bounded
+  caps); `init` binds `H(M) = BLAKE3(blob)` and derives the producer key;
+  `ants_inference_reference_distribution` is the producer/verifier-shared
+  canonical forward (the seam a verifier wraps so its rerun is bit-identical).
+- **serve + answer-envelope codec** (#116): greedy generation, each position
+  committed as a Merkle leaf; the commit binds root / H(M) / H(x) / nonce /
+  agent-meas (all-zero placeholder pending the TEE harness #3) / round /
+  per-tier audit probability / m / L, then is Ed25519-signed. The answer
+  envelope is a DRAFT canonical-CBOR document (input ‖ generated tokens ‖
+  per-position q24 distributions). The reference vocabulary is capped at 256
+  (a byte vocab) so a generated token fits one byte and producer/auditor prefix
+  reconstruction is unambiguous.
+- **the audit capstone** (#117): decode + strictly validate the envelope, gate
+  integrity by recomputing the Merkle root against the signed commit, derive
+  audit?/positions from the posterior beacon, then per opened position rerun the
+  reference, score the total-variation discrepancy, and fold it into the
+  e-process — short-circuiting to FRAUD once the capital crosses 1/α. The tests
+  exercise the whole loop against the reference model: honest → CONTINUE,
+  not-audited → CONTINUE, a tampered envelope → MALFORMED, a disagreeing
+  reference → FRAUD.
+
+**DRAFT** (pinned locally pending RFC formalization, as crdt/chain/dht/gossip
+do): the weight-blob layout and the answer-envelope format. The opaque ctx was
+tightened to 100 KiB (measured ~98.4 KiB footprint, scratch-dominated).
+`orchestration_basic` stays green across the suite's 21 ctest targets.
+
 ### economy: Component #15 (bond accounting) — A-as-bond for high-stakes acts, feature-complete at v0.x · 2026-06-01
 
 **Closing the high-stakes branch.** §Tenure's trilemma against farmed tenure

@@ -1,19 +1,15 @@
 /*
  * orchestration.c — Inference orchestration (Component #13).
  *
- * Per RFC-0003 v0.2 + RFC-0009 v0.5. Surfaces 1-3 are implemented; surface 4
- * (the serving runtime) is landing incrementally — init + the reference-model
- * forward pass are implemented here, with serve + the audit capstone still
- * stubs that validate arguments and return ANTS_ERROR_NOT_IMPLEMENTED until
- * their PRs:
+ * Per RFC-0003 v0.2 + RFC-0009 v0.5. All four surfaces are implemented:
  *
  *   1. Commit-at-send  — leaf hash, Merkle root/prove/verify, commit
  *                        encode/decode, Ed25519 sign/verify. IMPLEMENTED.
  *   2. Challenge       — the three beacon-bound PRF derivations. IMPLEMENTED.
  *   3. e-process       — init/update + discrepancy scoring. IMPLEMENTED.
- *   4. Serving runtime — init + the DRAFT reference model (a canonical forward
- *                        over the #12 kernels) + reference_distribution:
- *                        IMPLEMENTED. serve + the audit capstone: pending.
+ *   4. Serving runtime — the DRAFT reference model (a canonical forward over
+ *                        the #12 kernels), init / serve / audit, and the
+ *                        shared reference_distribution seam. IMPLEMENTED.
  *
  * Discipline: caller-owned state, no internal allocation, no threads, no
  * global mutable state, no logging — matching foundation/, network/,
