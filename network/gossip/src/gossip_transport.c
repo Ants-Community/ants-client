@@ -3,24 +3,27 @@
  * RFC-0004 v0.6 §"Layer 1 — the consensus-free fault G-Set").
  *
  * Wires the transport-agnostic dissemination engine (gossip.c) to a real
- * ants_transport: the engine's send_fn opens a unidirectional QUIC stream
- * per forwarded proof, and the inbound demux accumulates a peer's pushed
- * frame until FIN and feeds it to ants_gossip_on_message. See the
- * "Transport binding" section of ants_gossip.h for the full design.
+ * ants_transport: the engine's send_fn writes each forwarded proof, length-
+ * prefixed, on a persistent per-connection unidirectional QUIC stream, and
+ * the inbound demux deframes a peer's pushed byte stream and feeds each frame
+ * to ants_gossip_on_message. See the "Transport binding" section of
+ * ants_gossip.h for the full design.
  *
  * Three registries live in the caller's opaque ctx:
  *   - conns[]    : (peer_id → conn), learned from CONN_READY, used by send
  *                  to map a fanout peer to a live connection;
  *   - inbound[]  : per inbound stream, a lazily-allocated accumulation buffer
  *                  (heap), released on FIN/RESET or the conn's CONN_CLOSED;
- *   - outbound[] : retained handles for the uni streams we opened to forward
- *                  proofs. The transport leaves locally-opened handles to the
- *                  caller and fires no completion event for a one-way stream,
- *                  so each is held until its connection closes; the pool is
- *                  bounded and further forwards are dropped best-effort.
+ *   - outbound[] : one PERSISTENT unidirectional stream per connection, reused
+ *                  for every proof forwarded to that peer. Frames are length-
+ *                  prefixed (2-byte big-endian) since the stream is never FIN'd
+ *                  per message. The transport fires no completion event for a
+ *                  one-way stream, so the handle is freed on the connection's
+ *                  CONN_CLOSED; the channel count is bounded by the connection
+ *                  count, not the proof volume.
  *
- * Per-stream handles and accumulation buffers are heap-allocated (so the
- * registries hold pointers, not 1 KB inline structs) — the same ownership
+ * Per-channel handles and inbound accumulation buffers are heap-allocated (so
+ * the registries hold pointers, not 1 KB inline structs) — the same ownership
  * model as network/dht's dht_rpc / dht_server. The transport never frees a
  * locally-opened handle; we reclaim it on CONN_CLOSED, by which point
  * picoquic has no further callbacks targeting that stream_ctx.
@@ -34,6 +37,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Length prefix (bytes) framing each frame on the persistent per-connection
+ * outbound stream: 2-byte big-endian, since the stream is never FIN'd per
+ * message and the receiver must re-delimit the continuous byte stream. A
+ * gossip frame is <= ANTS_GOSSIP_DEFAULT_MAX_FRAME, which fits a u16. */
+#define GT_LEN_PREFIX 2u
 
 /* ------------------------------------------------------------------------ */
 /* Registry entry types + engine state (lives in the caller's opaque ctx)    */
@@ -192,24 +201,100 @@ static void inbound_release(struct gt_inbound *slot)
     memset(slot, 0, sizeof *slot);
 }
 
-/* On FIN the accumulated bytes are a complete push frame: hand them to the
- * engine (which decodes, VERIFY-inserts, dedups, and may forward — the
- * forward goes back through this binding's send on OTHER conns). A frame the
- * engine cannot decode is rejected there; we release either way and never
- * reset, so a stream that belongs to another subsystem is left for it to
- * claim (same politeness as dht_server's process_fin). */
+/* Deframe complete [u16 BE len][frame] units from the head of the accumulation
+ * buffer, handing each frame to the engine and shifting the buffer down. The
+ * forward an inserted proof triggers goes back through this binding's send on
+ * OTHER connections. Returns true if the slot is still alive (a partial tail
+ * may remain, awaiting more bytes); false if a malformed length (zero, or over
+ * the engine's frame cap) released the slot — we release rather than reset, so
+ * a stream that belongs to another subsystem is left for it to claim (same
+ * politeness as dht_server's process_fin). */
+static bool inbound_drain(struct gossip_transport_state *s, struct gt_inbound *slot)
+{
+    while (slot->recv_len >= GT_LEN_PREFIX) {
+        size_t flen = ((size_t)slot->recv_buf[0] << 8) | (size_t)slot->recv_buf[1];
+        if (flen == 0 || flen > ANTS_GOSSIP_DEFAULT_MAX_FRAME) {
+            inbound_release(slot);
+            return false;
+        }
+        if (slot->recv_len < GT_LEN_PREFIX + flen) {
+            break; /* need more bytes for this frame */
+        }
+        (void)ants_gossip_on_message(
+            s->engine, slot->peer_id, slot->recv_buf + GT_LEN_PREFIX, flen, NULL, NULL);
+        {
+            size_t consumed = GT_LEN_PREFIX + flen;
+            size_t rest = slot->recv_len - consumed;
+            if (rest > 0) {
+                memmove(slot->recv_buf, slot->recv_buf + consumed, rest);
+            }
+            slot->recv_len = rest;
+        }
+    }
+    return true;
+}
+
+/* Append a READABLE payload, draining complete frames as the buffer fills so
+ * it never holds more than one in-progress prefixed frame. recv_buf is lazily
+ * allocated; an allocation failure or a malformed frame releases the slot. */
+static void
+inbound_feed(struct gossip_transport_state *s, struct gt_inbound *slot, const uint8_t *p, size_t n)
+{
+    if (slot->recv_buf == NULL) {
+        slot->recv_buf = (uint8_t *)malloc(ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP);
+        if (slot->recv_buf == NULL) {
+            inbound_release(slot);
+            return;
+        }
+        slot->recv_cap = ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP;
+        slot->recv_len = 0;
+    }
+    while (n > 0) {
+        size_t space = slot->recv_cap - slot->recv_len;
+        size_t take = (n < space) ? n : space;
+        if (take == 0) {
+            /* Buffer full yet no complete frame could be drained → not
+             * well-formed gossip framing. */
+            inbound_release(slot);
+            return;
+        }
+        memcpy(slot->recv_buf + slot->recv_len, p, take);
+        slot->recv_len += take;
+        p += take;
+        n -= take;
+        if (!inbound_drain(s, slot)) {
+            return; /* slot released (malformed) */
+        }
+    }
+}
+
+/* FIN (or conn half-close): drain any remaining complete frames, then release.
+ * A trailing partial frame is discarded — a well-behaved sender frames whole
+ * proofs. */
 static void process_inbound_fin(struct gossip_transport_state *s, struct gt_inbound *slot)
 {
-    if (slot->recv_buf != NULL && slot->recv_len > 0) {
-        (void)ants_gossip_on_message(
-            s->engine, slot->peer_id, slot->recv_buf, slot->recv_len, NULL, NULL);
+    if (inbound_drain(s, slot)) {
+        inbound_release(slot);
     }
-    inbound_release(slot);
 }
 
 /* ------------------------------------------------------------------------ */
-/* Outbound stream registry                                                  */
+/* Outbound stream registry (one persistent channel per connection)          */
 /* ------------------------------------------------------------------------ */
+
+/* The live channel for `conn`, or NULL if none is open yet. Keyed by conn (not
+ * peer_id) so a peer that reconnects on a fresh conn opens a fresh channel and
+ * the stale one is swept by the old conn's CONN_CLOSED. */
+static struct gt_outbound *outbound_find_by_conn(struct gossip_transport_state *s,
+                                                 const ants_transport_conn_t *conn)
+{
+    for (size_t i = 0; i < ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS; i++) {
+        if (s->outbound[i].in_use && s->outbound[i].conn == conn) {
+            return &s->outbound[i];
+        }
+    }
+    return NULL;
+}
 
 static struct gt_outbound *outbound_alloc(struct gossip_transport_state *s)
 {
@@ -218,7 +303,7 @@ static struct gt_outbound *outbound_alloc(struct gossip_transport_state *s)
             return &s->outbound[i];
         }
     }
-    return NULL; /* pool exhausted — drop the forward (best-effort) */
+    return NULL; /* pool exhausted (one channel per conn) — drop (best-effort) */
 }
 
 /* Free every retained outbound handle bound to `conn`. Called on CONN_CLOSED,
@@ -265,27 +350,42 @@ void ants_gossip_transport_send(const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE],
     if (conn == NULL) {
         return; /* no live connection to this peer — best-effort drop */
     }
-    struct gt_outbound *slot = outbound_alloc(s);
+
+    /* Find (or lazily open) the persistent channel for this connection. */
+    struct gt_outbound *slot = outbound_find_by_conn(s, conn);
     if (slot == NULL) {
-        return; /* outbound pool exhausted — drop */
+        slot = outbound_alloc(s);
+        if (slot == NULL) {
+            return; /* channel pool exhausted (one per conn) — drop */
+        }
+        ants_transport_stream_t *stream =
+            (ants_transport_stream_t *)malloc(sizeof(ants_transport_stream_t));
+        if (stream == NULL) {
+            return; /* slot left free (not marked in_use) */
+        }
+        if (ants_transport_open_uni_stream(conn, stream) != ANTS_OK) {
+            /* open failed → picoquic holds no reference → safe to free now. */
+            free(stream);
+            return;
+        }
+        /* picoquic now references the handle as the stream's app ctx — retain
+         * it until this connection's CONN_CLOSED. */
+        slot->in_use = true;
+        slot->conn = conn;
+        slot->stream = stream;
     }
-    ants_transport_stream_t *stream =
-        (ants_transport_stream_t *)malloc(sizeof(ants_transport_stream_t));
-    if (stream == NULL) {
-        return; /* slot left free (not marked in_use) */
+
+    /* Frame the proof as [u16 BE len][frame] and queue it on the persistent
+     * stream WITHOUT FIN. picoquic copies the whole buffer into its ordered
+     * send queue (all-or-nothing), so no partial frame can corrupt the
+     * receiver's deframing; a rare queue-full drops this whole frame. */
+    {
+        uint8_t out[GT_LEN_PREFIX + ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+        out[0] = (uint8_t)((len >> 8) & 0xFFu);
+        out[1] = (uint8_t)(len & 0xFFu);
+        memcpy(out + GT_LEN_PREFIX, frame, len);
+        (void)ants_transport_stream_send(slot->stream, out, GT_LEN_PREFIX + len, false);
     }
-    if (ants_transport_open_uni_stream(conn, stream) != ANTS_OK) {
-        /* open failed → picoquic holds no reference to the handle → safe to
-         * free immediately. */
-        free(stream);
-        return;
-    }
-    /* picoquic now references the handle as the stream's app ctx — retain it
-     * until CONN_CLOSED regardless of whether the send succeeds. */
-    slot->in_use = true;
-    slot->conn = conn;
-    slot->stream = stream;
-    (void)ants_transport_stream_send(stream, frame, len, true /* fin */);
 }
 
 ants_error_t ants_gossip_transport_handle_event(ants_gossip_transport_t *b,
@@ -340,23 +440,7 @@ ants_error_t ants_gossip_transport_handle_event(ants_gossip_transport_t *b,
         if (event->payload == NULL || event->payload_len == 0) {
             break;
         }
-        if (slot->recv_buf == NULL) {
-            slot->recv_buf = (uint8_t *)malloc(ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP);
-            if (slot->recv_buf == NULL) {
-                inbound_release(slot);
-                break;
-            }
-            slot->recv_cap = ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP;
-            slot->recv_len = 0;
-        }
-        if (event->payload_len > slot->recv_cap - slot->recv_len) {
-            /* Overflows the frame cap — not a valid gossip push frame. Stop
-             * accumulating; release (no reset, so a sibling can claim it). */
-            inbound_release(slot);
-            break;
-        }
-        memcpy(slot->recv_buf + slot->recv_len, event->payload, event->payload_len);
-        slot->recv_len += event->payload_len;
+        inbound_feed(s, slot, event->payload, event->payload_len);
         break;
 
     case ANTS_TRANSPORT_EV_STREAM_FIN:

@@ -828,6 +828,30 @@ static void test_two_node_over_quic(void)
      * also learned A's connection. */
     CHECK(ants_gossip_transport_conn_count(&b_bind) == 1);
 
+    /* Persistent channel: A forwards two MORE proofs to B over the SAME uni
+     * stream (length-prefixed, no per-message FIN). B's deframer must split
+     * the continuous byte stream back into individual frames; the outbound
+     * channel count stays one (bounded by connections, not proofs). */
+    {
+        uint8_t p2[512], p3[512];
+        size_t l2, l3, f2 = 0, f3 = 0;
+        l2 = make_proof(s_priv, s_pub, 101, p2); /* distinct epochs → distinct */
+        l3 = make_proof(s_priv, s_pub, 102, p3); /* content-ids, all vs S      */
+        CHECK_EQ(ants_gossip_submit(&a_eng, p2, l2, &f2), ANTS_OK);
+        CHECK_EQ(ants_gossip_submit(&a_eng, p3, l3, &f3), ANTS_OK);
+        CHECK(f2 == 1 && f3 == 1); /* each forwarded to the one peer (B) */
+        for (int i = 0; i < 500; i++) {
+            tick_pace();
+            ants_transport_tick(&ta);
+            ants_transport_tick(&tb);
+            if (ants_crdt_size(b_set) >= 3) {
+                break;
+            }
+        }
+        CHECK(ants_crdt_size(b_set) == 3);                     /* all three deframed */
+        CHECK(ants_gossip_transport_conn_count(&a_bind) == 1); /* still one channel  */
+    }
+
     /* Teardown: transports FIRST so their CONN_CLOSED callbacks free the
      * bindings' retained outbound handles while picoquic still owns the
      * connections; then the bindings; then the G-Sets. */
