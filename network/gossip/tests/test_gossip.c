@@ -14,6 +14,14 @@
  * to its sender) directly.
  */
 
+/* POSIX feature test — required on glibc to expose nanosleep() / struct
+ * timespec from <time.h> for the real-QUIC tick spin-loop. macOS exposes them
+ * by default; this keeps the Linux CI jobs (gcc/clang) compiling without
+ * _GNU_SOURCE. Mirrors the same block in network/dht/tests/test_dht.c. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_cbor.h"
 #include "ants_common.h"
 #include "ants_crdt.h"
