@@ -396,13 +396,18 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
 /* The engine (above) stays transport-agnostic; this binding is the glue,    */
 /* so the in-process engine tests keep working without a QUIC handshake.     */
 /*                                                                          */
-/* Each gossip PUSH is fire-and-forget: the binding opens a UNIDIRECTIONAL   */
-/* stream to the peer (RFC-0004 §Layer 1 propagation is one-way; the         */
-/* transport reserves uni streams for exactly this, see ants_transport.h),   */
-/* writes the frame with FIN, and never expects a reply. The peer's inbound  */
-/* uni stream is accumulated until FIN and handed to ants_gossip_on_message; */
-/* the per-message FIN gives the frame boundary, so no length prefix or      */
-/* incremental framing is needed.                                            */
+/* The binding opens ONE persistent UNIDIRECTIONAL stream per connection      */
+/* (RFC-0004 §Layer 1 propagation is one-way; the transport reserves uni      */
+/* streams for exactly this, see ants_transport.h) and reuses it for every    */
+/* proof forwarded to that peer — so the number of retained outbound handles  */
+/* is bounded by the connection count, not the proof volume. Because the      */
+/* stream is never FIN'd per message, each frame is length-delimited: a       */
+/* 2-byte big-endian length prefix precedes the frame bytes. The receiver's   */
+/* inbound demux deframes the continuous byte stream back into individual     */
+/* frames and hands each to ants_gossip_on_message. (picoquic copies each     */
+/* send into its own ordered queue, so a frame is queued whole or not at all  */
+/* — no partial frame ever corrupts the framing; a rare queue-full drops a    */
+/* whole frame, best-effort.)                                                 */
 /*                                                                          */
 /* Connection discovery is REACTIVE: the binding learns (peer_id → conn)     */
 /* from CONN_READY events and uses those connections for sends. It does NOT  */
@@ -412,14 +417,15 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
 /* (the epidemic's redundancy and the Component #7 late-joiner snapshot      */
 /* recover dropped frames).                                                  */
 /*                                                                          */
-/* Outbound stream lifetime: the transport leaves locally-opened stream      */
-/* handles to the caller (it reclaims only inbound heap streams, at conn     */
-/* teardown), and fires no "send complete" event for a one-way stream. So a  */
-/* forwarded proof's uni-stream handle is retained until its connection      */
-/* closes (CONN_CLOSED), bounded by a fixed pool of                          */
-/* ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS; beyond the pool, further       */
-/* forwards are dropped best-effort. A persistent per-peer gossip channel    */
-/* that reclaims continuously is a later PR.                                 */
+/* Outbound stream lifetime: the transport leaves locally-opened handles to  */
+/* the caller and fires no "send complete" event for a one-way stream, so a  */
+/* handle is freed only when its connection closes (CONN_CLOSED). The         */
+/* persistent-per-connection channel means at most                           */
+/* ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS handles (one per live           */
+/* connection) are ever held — proof volume no longer fills the pool. A peer  */
+/* with no live connection, or one whose channel cannot be opened, drops the  */
+/* forward best-effort (the epidemic's redundancy + the #7 snapshot recover   */
+/* it).                                                                       */
 /*                                                                          */
 /* TEARDOWN ORDER: ants_transport_destroy MUST run BEFORE                    */
 /* ants_gossip_transport_destroy whenever the binding may hold outbound      */
@@ -436,12 +442,16 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
  * one proof per stream and FINs promptly, so concurrency is low. */
 #define ANTS_GOSSIP_TRANSPORT_MAX_INBOUND_STREAMS 32u
 
-/* Per-inbound-stream accumulation cap (bytes). A push frame is one fault
- * proof plus a few bytes of envelope; matches the engine's default frame cap
- * headroom. Overflow releases the stream (it is not a valid gossip frame). */
-#define ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP 4096u
+/* Per-inbound-stream accumulation cap (bytes): one length-prefixed frame —
+ * the engine's default max frame plus the 2-byte length prefix. The deframer
+ * drains complete frames as they arrive, so the buffer never holds more than
+ * one in-progress prefixed frame; a declared length over the engine cap, or a
+ * frame that otherwise cannot be deframed, releases the stream. */
+#define ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP (ANTS_GOSSIP_DEFAULT_MAX_FRAME + 2u)
 
-/* Maximum retained outbound uni-stream handles (see lifetime note above). */
+/* Maximum persistent outbound channels — one unidirectional stream per live
+ * connection (see the lifetime note above). Bounded by the connection count,
+ * not the proof volume. */
 #define ANTS_GOSSIP_TRANSPORT_MAX_OUTBOUND_STREAMS 64u
 
 /* Caller-allocated opaque context for the binding, same idiom as the engine
