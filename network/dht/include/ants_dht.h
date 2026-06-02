@@ -458,6 +458,24 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
                                               size_t cap,
                                               size_t *out_count);
 
+/*
+ * Sample up to `n_out` bucket-diverse peers from the routing table into
+ * `out_peers`, for an anti-eclipse gossip view (RFC-0005 §"Anti-eclipse peer
+ * sampling", axis S1 — the bucket-diverse draw). A round-robin sweep takes
+ * peers spread across the 256 XOR distance-class buckets rather than clustering
+ * in the nearest ones, so an adversary must surround a victim across the whole
+ * keyspace, not just one neighbourhood. Returns the number of peers written
+ * (<= n_out, <= routing-table size); 0 on NULL args, n_out == 0, or an empty
+ * table.
+ *
+ * Peers are returned regardless of live-connection state — reachability is the
+ * caller's / transport's concern. This primitive is axis S1 only; the caller
+ * composes the rest of the RFC's defence: rotation across refreshes (axis S3),
+ * random-target probes to enrich the table before sampling (axis S2, via
+ * ants_dht_lookup), and attestation-weighted selection (axis S4) is deferred.
+ */
+size_t ants_dht_sample_peers(const ants_dht_t *dht, ants_dht_peer_t *out_peers, size_t n_out);
+
 #ifdef __cplusplus
 }
 #endif
