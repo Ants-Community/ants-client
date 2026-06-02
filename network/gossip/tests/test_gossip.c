@@ -880,6 +880,107 @@ static void test_stats_observer_args(void)
     ants_crdt_destroy(set);
 }
 
+/* ---- reject accountability (rate-limit the sender) ------------------ */
+
+struct reject_capture {
+    size_t calls;
+    uint8_t last_peer[32];
+    uint64_t last_count;
+};
+static void rej_fn(const uint8_t peer[32], uint64_t count, void *ctx)
+{
+    struct reject_capture *c = (struct reject_capture *)ctx;
+    c->calls++;
+    memcpy(c->last_peer, peer, 32);
+    c->last_count = count;
+}
+
+/* Per-peer reject tallies accumulate against the authenticated from_peer; the
+ * hook fires with the running count; a NULL source is aggregate-only. */
+static void test_reject_accountability(void)
+{
+    struct harness h;
+    struct reject_capture cap;
+    uint8_t sp[32], su[32], proof[512], frame[ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+    uint8_t pa[32], pb[32], priv[32];
+    size_t plen, flen = 0, nw = 0, rj = 0;
+    ants_gossip_stats_t st;
+
+    harness_init(&h, 1, 0xE0);
+    make_key(0xE5, priv, pa); /* two fake relayer ids (opaque to accounting) */
+    make_key(0xE6, priv, pb);
+    memset(&cap, 0, sizeof cap);
+    CHECK_EQ(ants_gossip_set_reject_handler(&h.nodes[0].g, rej_fn, &cap), ANTS_OK);
+
+    make_key(0xC0, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    proof[plen / 2] ^= 0xFF; /* tamper → fails VERIFY */
+    CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &flen), ANTS_OK);
+
+    /* two rejects from pa, one from pb */
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, pa, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(rj == 1 && cap.calls == 1 && cap.last_count == 1);
+    CHECK(memcmp(cap.last_peer, pa, 32) == 0);
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, pa, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(cap.last_count == 2); /* per-peer count accumulates */
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, pb, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(memcmp(cap.last_peer, pb, 32) == 0 && cap.last_count == 1);
+
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, pa) == 2);
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, pb) == 1);
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[0].g, &st), ANTS_OK);
+    CHECK(st.rejected == 3);
+
+    /* NULL source → unattributable: aggregate bumps, no per-peer, no hook */
+    cap.calls = 0;
+    CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, NULL, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(rj == 1 && cap.calls == 0);
+    CHECK_EQ(ants_gossip_get_stats(&h.nodes[0].g, &st), ANTS_OK);
+    CHECK(st.rejected == 4);
+
+    /* NULL-arg guards */
+    CHECK(ants_gossip_peer_reject_count(NULL, pa) == 0);
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, NULL) == 0);
+    CHECK_EQ(ants_gossip_set_reject_handler(NULL, rej_fn, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, pb) == 1); /* untouched */
+
+    harness_destroy(&h);
+}
+
+/* A full reject table reuses the lowest-count slot, so a persistent offender is
+ * never evicted by a flood of one-off garbage from many distinct peers. */
+static void test_reject_table_overflow(void)
+{
+    struct harness h;
+    uint8_t sp[32], su[32], proof[512], frame[ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+    uint8_t off[32], priv[32];
+    size_t plen, flen = 0, nw = 0, rj = 0, i;
+
+    harness_init(&h, 1, 0xF0);
+    make_key(0xC1, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    proof[plen / 2] ^= 0xFF;
+    CHECK_EQ(ants_gossip_push_encode(proof, plen, frame, sizeof frame, &flen), ANTS_OK);
+
+    /* a persistent offender: 5 rejects */
+    make_key(0x01, priv, off);
+    for (i = 0; i < 5; i++) {
+        CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, off, frame, flen, &nw, &rj), ANTS_OK);
+    }
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, off) == 5);
+
+    /* flood with > table-size distinct one-off peers */
+    for (i = 0; i < ANTS_GOSSIP_REJECT_TABLE_SIZE + 16; i++) {
+        uint8_t fp[32], fpriv[32];
+        make_key((uint8_t)(0x20 + i), fpriv, fp);
+        CHECK_EQ(ants_gossip_on_message(&h.nodes[0].g, fp, frame, flen, &nw, &rj), ANTS_OK);
+    }
+    /* the count-5 offender survived; one-offs (count 1) were the eviction set */
+    CHECK(ants_gossip_peer_reject_count(&h.nodes[0].g, off) == 5);
+
+    harness_destroy(&h);
+}
+
 /* ---- real-QUIC transport binding ------------------------------------ */
 
 /* Pace a tick spin-loop: picoquic drives its handshake/retransmit timers off
@@ -1073,6 +1174,8 @@ int main(void)
     test_stats_lazy_pull();
     test_observer_hook();
     test_stats_observer_args();
+    test_reject_accountability();
+    test_reject_table_overflow();
     test_two_node_over_quic();
 
     if (failures == 0) {

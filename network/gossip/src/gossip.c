@@ -74,19 +74,30 @@ enum { GOSSIP_KEY_TYPE = 0, GOSSIP_KEY_PROOF = 1, GOSSIP_KEY_IDS = 1 };
 /* Engine state (lives in the caller's opaque ctx)                           */
 /* ------------------------------------------------------------------------ */
 
+/* One reject-accounting slot: a source peer and how many of its relayed proofs
+ * failed VERIFY (RFC-0004 §DoS, "rate-limit the sender"). */
+struct gossip_reject_entry {
+    uint8_t peer[ANTS_GOSSIP_PEER_ID_SIZE];
+    uint64_t count;
+};
+
 struct gossip_state {
     ants_crdt_t *gset; /* borrowed L1 G-Set; the dedup oracle      */
     ants_gossip_send_fn send_fn;
     void *send_ctx;
     ants_gossip_observe_fn observe_fn; /* optional per-new-proof hook (NULL = off) */
     void *observe_ctx;
+    ants_gossip_reject_fn reject_fn; /* optional per-reject hook (NULL = off)    */
+    void *reject_ctx;
     uint8_t self_id[ANTS_GOSSIP_PEER_ID_SIZE];
     size_t fanout;             /* resolved (default applied)              */
     size_t max_frame_bytes;    /* resolved                               */
     size_t n_view;             /* peers in the view                       */
     size_t rotation;           /* cursor for deterministic fanout pick     */
+    size_t n_reject;           /* used entries in reject_tab              */
     bool seen_any;             /* gates stats.first_seen_us (the clock can read 0) */
     ants_gossip_stats_t stats; /* propagation instrumentation (T_prop budget)      */
+    struct gossip_reject_entry reject_tab[ANTS_GOSSIP_REJECT_TABLE_SIZE];
     uint8_t view[ANTS_GOSSIP_MAX_VIEW][ANTS_GOSSIP_PEER_ID_SIZE];
 };
 
@@ -492,6 +503,37 @@ ants_error_t ants_gossip_set_observer(ants_gossip_t *g, ants_gossip_observe_fn f
     return ANTS_OK;
 }
 
+ants_error_t ants_gossip_set_reject_handler(ants_gossip_t *g, ants_gossip_reject_fn fn, void *ctx)
+{
+    struct gossip_state *s;
+
+    if (g == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    s = state_of(g);
+    s->reject_fn = fn;
+    s->reject_ctx = ctx;
+    return ANTS_OK;
+}
+
+uint64_t ants_gossip_peer_reject_count(const ants_gossip_t *g,
+                                       const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE])
+{
+    const struct gossip_state *s;
+    size_t i;
+
+    if (g == NULL || peer_id == NULL) {
+        return 0;
+    }
+    s = (const struct gossip_state *)(const void *)g->_opaque;
+    for (i = 0; i < s->n_reject; i++) {
+        if (memcmp(s->reject_tab[i].peer, peer_id, ANTS_GOSSIP_PEER_ID_SIZE) == 0) {
+            return s->reject_tab[i].count;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Forwarding                                                                */
 /* ------------------------------------------------------------------------ */
@@ -570,6 +612,51 @@ static void record_new_proof(struct gossip_state *s, const uint8_t *proof, size_
         if (ants_crdt_content_id(proof, len, cid) == ANTS_OK) {
             s->observe_fn(cid, now, origin, s->observe_ctx);
         }
+    }
+}
+
+/* Tally an inbound proof that failed VERIFY against the (transport-authenticated)
+ * from_peer and fire the reject hook with the running count — the local
+ * "rate-limit the sender" of RFC-0004 §DoS. from_peer is NULL when the source is
+ * unknown (no attribution possible): then this is aggregate-only (stats.rejected,
+ * bumped by the caller). The table is fixed; when full the lowest-count slot is
+ * reused, so a flood of one-off garbage from many peers never evicts a persistent
+ * offender. */
+static void record_reject(struct gossip_state *s, const uint8_t *from_peer)
+{
+    size_t i, slot, min_i;
+    uint64_t min_c;
+
+    if (from_peer == NULL) {
+        return;
+    }
+    for (i = 0; i < s->n_reject; i++) {
+        if (memcmp(s->reject_tab[i].peer, from_peer, ANTS_GOSSIP_PEER_ID_SIZE) == 0) {
+            s->reject_tab[i].count++;
+            if (s->reject_fn != NULL) {
+                s->reject_fn(from_peer, s->reject_tab[i].count, s->reject_ctx);
+            }
+            return;
+        }
+    }
+    /* not tracked yet: take a free slot, else reuse the lowest-count one */
+    if (s->n_reject < ANTS_GOSSIP_REJECT_TABLE_SIZE) {
+        slot = s->n_reject++;
+    } else {
+        min_i = 0;
+        min_c = s->reject_tab[0].count;
+        for (i = 1; i < s->n_reject; i++) {
+            if (s->reject_tab[i].count < min_c) {
+                min_c = s->reject_tab[i].count;
+                min_i = i;
+            }
+        }
+        slot = min_i;
+    }
+    memcpy(s->reject_tab[slot].peer, from_peer, ANTS_GOSSIP_PEER_ID_SIZE);
+    s->reject_tab[slot].count = 1;
+    if (s->reject_fn != NULL) {
+        s->reject_fn(from_peer, 1, s->reject_ctx);
     }
 }
 
@@ -713,6 +800,7 @@ static ants_error_t handle_push(struct gossip_state *s,
          * so the call itself succeeds — a peer relaying a bad proof is a
          * per-proof event, not a transport error. */
         s->stats.rejected++;
+        record_reject(s, from_peer);
         if (out_rejected != NULL) {
             *out_rejected = 1;
         }

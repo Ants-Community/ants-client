@@ -6,10 +6,13 @@ Gossip overlay (L1 CRDT propagation). Network layer.
 fanout, sender-exclusion, reject counting), the real-`ants_transport` binding
 with a **persistent per-connection channel** (length-prefixed frames, so
 outbound handles are bounded by the connection count, not proof volume) plus
-the inbound deframer, and lazy-pull anti-entropy (IHAVE/IWANT digest + pull)
-are implemented. Remaining: anti-eclipse peer sampling from the DHT, the
-`T_prop < T_beacon` budget instrumentation, and turning the relay
-reject-counter into an emitted fault proof.
+the inbound deframer, lazy-pull anti-entropy (IHAVE/IWANT digest + pull),
+`T_prop` propagation instrumentation (per-node stats + a per-new-proof
+observation hook), and **local reject accountability** (per-peer reject
+tallies + a hook to rate-limit the sender, RFC-0004 §DoS) are implemented.
+Remaining: anti-eclipse peer sampling from the DHT, and a globally-attributable
+*emitted* fault proof against a garbage relayer (needs signed forwards — a wire
+change — plus a fault class).
 **Effort:** 3 EM.
 **Spec:** [RFC-0004 §Layer 1](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md), §G-Set pruning, §Archive nodes; anti-eclipse from [RFC-0005](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
 **Dependencies:** `network/transport`, `foundation/crypto`, `foundation/cbor`.

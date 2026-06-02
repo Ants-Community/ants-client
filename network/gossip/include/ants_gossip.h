@@ -53,15 +53,20 @@
  *     and a per-new-proof observation hook (ants_gossip_set_observer) that
  *     timestamp when each proof is first seen — the raw material a testnet
  *     correlates across nodes to check T_prop against the T_beacon budget;
+ *   - reject accountability (ants_gossip_set_reject_handler /
+ *     ants_gossip_peer_reject_count): a per-peer tally of proofs that failed
+ *     VERIFY — the local "rate-limit the sender" half of RFC-0004 §DoS;
  *   - the real-ants_transport binding (uni-stream push + inbound demux) at
  *     the foot of this header.
  *
- * Deliberately NOT here (a later PR): anti-eclipse peer SAMPLING from the DHT
- * (RFC-0005) — the view is still caller-managed — and turning a relay's
- * reject counter into an actual emitted fault proof. (The persistent
- * per-connection outbound channel and the `T_prop < T_beacon` budget
- * instrumentation have since landed; see the transport binding below and
- * §Instrumentation respectively.)
+ * Deliberately NOT here: anti-eclipse peer SAMPLING from the DHT (RFC-0005) —
+ * the view is still caller-managed — and a globally-attributable *emitted*
+ * fault proof against a garbage relayer, which needs signed forwards (a wire
+ * change) plus a fault class (RFC-0004 §DoS, "a relayer who signs forwards").
+ * (The persistent per-connection outbound channel, the `T_prop < T_beacon`
+ * instrumentation, and LOCAL reject accountability — rate-limit the sender —
+ * have since landed; see the transport binding below, §Instrumentation, and
+ * §Reject accountability respectively.)
  *
  * WIRE FORMAT IS DRAFT, defined by this module pending formalisation in
  * RFC-0008 (the same status the DHT and cache wire formats carried before
@@ -420,6 +425,52 @@ typedef void (*ants_gossip_observe_fn)(const uint8_t content_id[ANTS_CRDT_CONTEN
  * @return ANTS_OK; ANTS_ERROR_INVALID_ARG if g is NULL.
  */
 ants_error_t ants_gossip_set_observer(ants_gossip_t *g, ants_gossip_observe_fn fn, void *ctx);
+
+/* ------------------------------------------------------------------------ */
+/* Reject accountability — rate-limit the sender (RFC-0004 §DoS)            */
+/*                                                                          */
+/* Invalid-proof spam (W3) is bounded, not prevented: a relayer flooding     */
+/* unverifiable proofs costs every receiver an O(f) VERIFY per novel frame.  */
+/* The reference sketch's response is `rate_limit(sender_of(π))`. The frame   */
+/* source is the transport-authenticated `from_peer` (QUIC mutual auth), so a */
+/* receiver KNOWS locally who relayed garbage — enough to throttle or drop    */
+/* that peer. It is NOT enough to PROVE it to a third party: a globally-       */
+/* attributable, gossipable fault proof would need the relayer's signature    */
+/* over the forward (a wire change) plus a fault class — deferred (RFC-0004    */
+/* §DoS, "a relayer who signs forwards"). So this is the LOCAL half: the       */
+/* engine tallies rejects per source peer and fires a hook with the running    */
+/* count; the CALLER enforces policy (transport disconnect, view eviction).    */
+/* ------------------------------------------------------------------------ */
+
+/* Max distinct peers tracked for reject accounting. When full, the lowest-
+ * count slot is reused, so a flood of one-off garbage from many peers never
+ * evicts a persistent offender. */
+#define ANTS_GOSSIP_REJECT_TABLE_SIZE 64u
+
+/*
+ * Reject hook: called once per inbound proof that FAILS VERIFY, with the source
+ * peer and its running reject count (>= 1). Fires only when the source is known
+ * (a NULL from_peer in ants_gossip_on_message is unattributable — tallied in
+ * stats.rejected only). The caller uses the count to apply its own rate-limit /
+ * disconnect policy. peer_id aliases a buffer valid only for the call.
+ */
+typedef void (*ants_gossip_reject_fn)(const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE],
+                                      uint64_t reject_count,
+                                      void *ctx);
+
+/*
+ * Register (or clear, fn == NULL) the reject hook. Optional; takes effect
+ * immediately. @return ANTS_OK; ANTS_ERROR_INVALID_ARG if g is NULL.
+ */
+ants_error_t ants_gossip_set_reject_handler(ants_gossip_t *g, ants_gossip_reject_fn fn, void *ctx);
+
+/*
+ * The running count of inbound proofs from `peer_id` that failed VERIFY. 0 if
+ * g / peer_id is NULL or the peer is untracked (none rejected, or evicted from a
+ * full table). O(n) over the bounded reject table.
+ */
+uint64_t ants_gossip_peer_reject_count(const ants_gossip_t *g,
+                                       const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE]);
 
 /* ------------------------------------------------------------------------ */
 /* Lazy-pull anti-entropy (IHAVE / IWANT)                                   */
