@@ -1432,7 +1432,188 @@ static void test_serve_contract(void)
         CHECK_EQ(ants_inference_serve(&ctx, &req, &bad), ANTS_ERROR_INVALID_ARG);
     }
 
-    CHECK_EQ(ants_inference_serve(&ctx, &req, &resp), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* valid args but an uninitialized ctx → INVALID_ARG (the magic check). */
+    CHECK_EQ(ants_inference_serve(&ctx, &req, &resp), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_serve_behaviour(void)
+{
+    union {
+        uint64_t a;
+        uint8_t b[8192];
+    } blobu;
+    size_t len;
+    ants_inference_t ctx;
+    ants_inference_config_t config;
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    ants_inference_request_t req;
+    ants_inference_response_t resp;
+    uint8_t answer[8192];
+    const uint8_t input[] = "the quick brown fox jumps over";
+    uint8_t exp_model_hash[32];
+    uint8_t exp_pub[32];
+    uint8_t exp_input_hash[32];
+    bool ok = false;
+    size_t i;
+
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(i + 3);
+    }
+    /* small vocab (64) + d_model (8): a compact envelope for the stack. */
+    len = build_ref_model(blobu.b, sizeof blobu.b, 64, 8);
+    CHECK(len > 0);
+    memset(&config, 0, sizeof config);
+    config.model_weights = blobu.b;
+    config.model_weights_len = len;
+    config.producer_priv = priv;
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+
+    memset(&req, 0, sizeof req);
+    memset(&resp, 0, sizeof resp);
+    req.input = input;
+    req.input_len = sizeof input - 1;
+    req.tier = ANTS_INFERENCE_TIER_2;
+    req.round = 7;
+    for (i = 0; i < sizeof req.req_nonce; i++) {
+        req.req_nonce[i] = (uint8_t)(i + 100);
+    }
+    resp.answer_buf = answer;
+    resp.answer_cap = sizeof answer;
+
+    CHECK_EQ(ants_inference_serve(&ctx, &req, &resp), ANTS_OK);
+
+    /* commit fields */
+    CHECK(resp.commit.length > 0);
+    CHECK(resp.commit.m == resp.commit.length); /* the reference opens all */
+    CHECK(resp.commit.tier == ANTS_INFERENCE_TIER_2);
+    CHECK(resp.commit.audit_threshold == UINT64_MAX);
+    CHECK(resp.commit.round == 7);
+    CHECK_EQ(ants_inference__test_get_identity(&ctx, exp_model_hash, exp_pub), ANTS_OK);
+    CHECK(memcmp(resp.commit.model_hash, exp_model_hash, 32) == 0);
+    CHECK_EQ(ants_blake3_hash(input, sizeof input - 1, exp_input_hash), ANTS_OK);
+    CHECK(memcmp(resp.commit.input_hash, exp_input_hash, 32) == 0);
+    CHECK(memcmp(resp.commit.req_nonce, req.req_nonce, 32) == 0);
+    CHECK(memcmp(resp.producer_pub, exp_pub, 32) == 0);
+
+    /* the signature verifies against the returned producer public key */
+    CHECK_EQ(
+        ants_inference_commit_verify_sig(&resp.commit, resp.producer_pub, resp.commit_sig, &ok),
+        ANTS_OK);
+    CHECK(ok);
+
+    /* the envelope is canonical CBOR */
+    CHECK_EQ(ants_cbor_is_canonical(answer, resp.answer_len), ANTS_OK);
+
+    /* Independently reconstruct every committed position from the reference
+     * model and confirm serve's Merkle root, the envelope's per-position
+     * distributions, and the generated tokens all match. The prefix at
+     * position j is input ‖ generated[0..j-1]. */
+    {
+        ants_cbor_dec_t dec;
+        size_t npairs = 0;
+        size_t darr = 0;
+        uint64_t key = 0;
+        const uint8_t *ein = NULL;
+        size_t ein_len = 0;
+        const uint8_t *etok = NULL;
+        size_t etok_len = 0;
+        uint8_t pfx[ANTS_INFERENCE_REF_SEQLEN_MAX];
+        ants_canon_q24_t d[ANTS_INFERENCE_REF_VOCAB_MAX];
+        uint8_t db[ANTS_INFERENCE_REF_VOCAB_MAX * 4];
+        uint8_t leaves2[ANTS_INFERENCE_REF_SEQLEN_MAX][ANTS_INFERENCE_MERKLE_LEAF_SIZE];
+        uint8_t root2[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
+        size_t L = resp.commit.length;
+        size_t prompt_eff = sizeof input - 1;
+        size_t j;
+        size_t k;
+        size_t vocab = 0;
+
+        if (prompt_eff > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u) {
+            prompt_eff = (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u;
+        }
+
+        CHECK_EQ(ants_cbor_dec_init(&dec, answer, resp.answer_len), ANTS_OK);
+        CHECK_EQ(ants_cbor_dec_map(&dec, &npairs), ANTS_OK);
+        CHECK(npairs == 3);
+        CHECK_EQ(ants_cbor_dec_uint(&dec, &key), ANTS_OK);
+        CHECK(key == 0);
+        CHECK_EQ(ants_cbor_dec_bytes(&dec, &ein, &ein_len), ANTS_OK);
+        CHECK(ein_len == (size_t)(sizeof input - 1) && memcmp(ein, input, ein_len) == 0);
+        CHECK_EQ(ants_cbor_dec_uint(&dec, &key), ANTS_OK);
+        CHECK(key == 1);
+        CHECK_EQ(ants_cbor_dec_bytes(&dec, &etok, &etok_len), ANTS_OK);
+        CHECK(etok_len == L);
+        CHECK_EQ(ants_cbor_dec_uint(&dec, &key), ANTS_OK);
+        CHECK(key == 2);
+        CHECK_EQ(ants_cbor_dec_array(&dec, &darr), ANTS_OK);
+        CHECK(darr == L);
+
+        for (k = 0; k < prompt_eff; k++) {
+            pfx[k] = input[k];
+        }
+        for (j = 0; j < L; j++) {
+            const uint8_t *ed = NULL;
+            size_t ed_len = 0;
+            size_t amax = 0;
+
+            CHECK_EQ(ants_inference_reference_distribution(&ctx,
+                                                           pfx,
+                                                           prompt_eff + j,
+                                                           prompt_eff + j,
+                                                           d,
+                                                           ANTS_INFERENCE_REF_VOCAB_MAX,
+                                                           &vocab),
+                     ANTS_OK);
+            for (k = 0; k < vocab; k++) {
+                wr_le32(db + k * 4, (uint32_t)d[k]);
+            }
+            CHECK_EQ(ants_inference_leaf_hash(db, vocab * 4, (uint64_t)j, leaves2[j]), ANTS_OK);
+
+            /* the envelope's dist[j] matches the canonical serialization */
+            CHECK_EQ(ants_cbor_dec_bytes(&dec, &ed, &ed_len), ANTS_OK);
+            CHECK(ed_len == vocab * 4 && memcmp(ed, db, ed_len) == 0);
+
+            /* the generated token is the greedy argmax */
+            for (k = 1; k < vocab; k++) {
+                if (d[k] > d[amax]) {
+                    amax = k;
+                }
+            }
+            CHECK((size_t)etok[j] == amax);
+
+            pfx[prompt_eff + j] = etok[j];
+        }
+        CHECK_EQ(ants_cbor_dec_finalise(&dec), ANTS_OK);
+
+        CHECK_EQ(ants_inference_merkle_root(leaves2, L, root2), ANTS_OK);
+        CHECK(memcmp(root2, resp.commit.root, ANTS_INFERENCE_MERKLE_ROOT_SIZE) == 0);
+    }
+
+    /* Tier 1 sets a sampling threshold (< UINT64_MAX). */
+    {
+        ants_inference_response_t r1;
+        uint8_t a1[8192];
+        memset(&r1, 0, sizeof r1);
+        r1.answer_buf = a1;
+        r1.answer_cap = sizeof a1;
+        req.tier = ANTS_INFERENCE_TIER_1;
+        CHECK_EQ(ants_inference_serve(&ctx, &req, &r1), ANTS_OK);
+        CHECK(r1.commit.audit_threshold == (1ull << 59));
+        CHECK(r1.commit.tier == ANTS_INFERENCE_TIER_1);
+    }
+
+    /* BUFFER_TOO_SMALL when the answer buffer can't hold the envelope. */
+    {
+        ants_inference_response_t rs;
+        uint8_t small[32];
+        memset(&rs, 0, sizeof rs);
+        rs.answer_buf = small;
+        rs.answer_cap = sizeof small;
+        req.tier = ANTS_INFERENCE_TIER_2;
+        CHECK_EQ(ants_inference_serve(&ctx, &req, &rs), ANTS_ERROR_BUFFER_TOO_SMALL);
+    }
+
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
 }
 
 static void test_audit_contract(void)
@@ -1504,6 +1685,7 @@ int main(void)
     test_reference_distribution_contract();
     test_destroy_contract();
     test_serve_contract();
+    test_serve_behaviour();
     test_audit_contract();
 
     if (failures > 0) {

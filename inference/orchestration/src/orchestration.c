@@ -64,6 +64,11 @@ struct ants_inference_state {
     uint8_t model_hash[ANTS_INFERENCE_HASH_SIZE];
     uint8_t producer_pub[ANTS_INFERENCE_PUBKEY_SIZE];
 
+    /* Pointer (not a copy) to the caller-owned producer private key, used to
+     * sign each commit at serve time. The caller owns it for zeroization and
+     * must keep it valid for the context's lifetime (like the weight blob). */
+    const uint8_t *producer_priv;
+
     /* FP32 tensor views into the caller-owned weight blob (never copied — the
      * blob must outlive the context). Row-major; shapes in brackets. */
     const float *embed;   /* E  [V x D] */
@@ -1127,6 +1132,84 @@ forward_logits(struct ants_inference_state *st, const uint32_t *tokens, size_t T
     return ants_canon_matmul_fp32(hbuf, st->unembed, out_logits, 1, D, V);
 }
 
+/* The canonical forward pass + q24 quantization for a token prefix, producing
+ * the committed distribution at the next position. Shared by serve (producer
+ * side) and ants_inference_reference_distribution (the verifier seam), so a
+ * verifier's rerun is bit-identical to the producer's commit. */
+static ants_error_t forward_dist_q24(struct ants_inference_state *st,
+                                     const uint32_t *tokens,
+                                     size_t prefix_len,
+                                     ants_canon_q24_t *out_dist)
+{
+    float logits[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_error_t rc = forward_logits(st, tokens, prefix_len, logits);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_canon_q24_vec_from_f32(logits, out_dist, st->vocab);
+}
+
+/* ---- serve: producer-side helpers + DRAFT answer-envelope format -------- */
+/*
+ * The answer envelope is a DRAFT canonical-CBOR document, map(3) with ascending
+ * integer keys:
+ *     0: input   (bytes)            the request prompt x
+ *     1: tokens  (bytes)            the L generated answer-token bytes
+ *     2: dists   (array(L) of bytes) per-position q24 logit vectors, each
+ *                                   vocab*4 bytes little-endian
+ * It carries everything an auditor needs to open any committed position:
+ * dist_j is the j-th array entry; the prefix at position j is
+ * input ‖ tokens[0..j-1]; the Merkle leaf is recomputed from dist_j. The
+ * vocab is implied (dist byte-length / 4). DRAFT pending an RFC-0008 §answer
+ * appendix.
+ */
+#define ANTS_INFERENCE_ENV_PAIRS     3
+#define ANTS_INFERENCE_ENV_KEY_INPUT 0
+#define ANTS_INFERENCE_ENV_KEY_TOKS  1
+#define ANTS_INFERENCE_ENV_KEY_DISTS 2
+
+/* Positions the reference producer generates (capped so the prefix stays
+ * within ANTS_INFERENCE_REF_SEQLEN_MAX). DRAFT reference policy. */
+#define ANTS_INFERENCE_REF_GEN_TOKENS 16
+
+/* audit_threshold = floor(p * 2^64). Tier 1 samples at p = 1/32 (2^59);
+ * Tier 2/3 set p = 1 (UINT64_MAX — every answer auditable on request). */
+#define ANTS_INFERENCE_TIER1_AUDIT_THRESHOLD (1ull << 59)
+
+/* Little-endian 4-byte store (q24 logit serialization). */
+static void write_le32(uint8_t out[4], uint32_t v)
+{
+    out[0] = (uint8_t)(v);
+    out[1] = (uint8_t)(v >> 8);
+    out[2] = (uint8_t)(v >> 16);
+    out[3] = (uint8_t)(v >> 24);
+}
+
+/* Serialize a q24 logit vector to its canonical little-endian byte form
+ * (vocab * 4 bytes) — the Merkle-leaf preimage and the envelope's stored
+ * distribution. */
+static void serialize_dist(const ants_canon_q24_t *dist, size_t vocab, uint8_t *out)
+{
+    size_t i;
+    for (i = 0; i < vocab; i++) {
+        write_le32(out + i * 4u, (uint32_t)dist[i]);
+    }
+}
+
+/* argmax over a q24 logit vector (ties resolve to the lowest index). q24 is
+ * monotonic in the FP32 logit, so this is the greedy next token. */
+static uint32_t argmax_q24(const ants_canon_q24_t *dist, size_t vocab)
+{
+    size_t i;
+    size_t best = 0;
+    for (i = 1; i < vocab; i++) {
+        if (dist[i] > dist[best]) {
+            best = i;
+        }
+    }
+    return (uint32_t)best;
+}
+
 ants_error_t ants_inference_init(ants_inference_t *ctx, const ants_inference_config_t *config)
 {
     const uint8_t *blob;
@@ -1215,6 +1298,7 @@ ants_error_t ants_inference_init(ants_inference_t *ctx, const ants_inference_con
         memset(st, 0, sizeof *st);
         return rc;
     }
+    st->producer_priv = config->producer_priv;
 
     st->magic = ANTS_INFERENCE_STATE_MAGIC;
     return ANTS_OK;
@@ -1239,6 +1323,20 @@ ants_error_t ants_inference_serve(ants_inference_t *ctx,
                                   const ants_inference_request_t *req,
                                   ants_inference_response_t *resp)
 {
+    struct ants_inference_state *st;
+    uint32_t prefix[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    uint8_t gen_tokens[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    uint8_t leaves[ANTS_INFERENCE_REF_SEQLEN_MAX][ANTS_INFERENCE_MERKLE_LEAF_SIZE];
+    ants_canon_q24_t dist[ANTS_INFERENCE_REF_VOCAB_MAX];
+    uint8_t dist_bytes[ANTS_INFERENCE_REF_VOCAB_MAX * 4u];
+    ants_inference_commit_t commit;
+    ants_cbor_enc_t enc;
+    size_t prompt_eff;
+    size_t n_gen;
+    size_t dist_len;
+    size_t j;
+    ants_error_t rc;
+
     if (ctx == NULL || req == NULL || resp == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
@@ -1249,7 +1347,120 @@ ants_error_t ants_inference_serve(ants_inference_t *ctx,
         req->tier != ANTS_INFERENCE_TIER_3) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    st = (struct ants_inference_state *)(void *)ctx->_opaque;
+    if (st->magic != ANTS_INFERENCE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Tokenize the prompt as bytes (token id = byte mod vocab), capped so the
+     * prefix always leaves room for at least one generated position. */
+    prompt_eff = req->input_len;
+    if (prompt_eff > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u) {
+        prompt_eff = (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u;
+    }
+    for (j = 0; j < prompt_eff; j++) {
+        prefix[j] = (uint32_t)req->input[j] % st->vocab;
+    }
+
+    n_gen = ANTS_INFERENCE_REF_GEN_TOKENS;
+    if (n_gen > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - prompt_eff) {
+        n_gen = (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - prompt_eff;
+    }
+    dist_len = (size_t)st->vocab * 4u;
+
+    /* Phase 1 — greedy generation. Each position commits its q24 distribution
+     * as a Merkle leaf; the argmax token is appended to the prefix and recorded
+     * as the answer. */
+    for (j = 0; j < n_gen; j++) {
+        uint32_t tok;
+        rc = forward_dist_q24(st, prefix, prompt_eff + j, dist);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        serialize_dist(dist, st->vocab, dist_bytes);
+        rc = ants_inference_leaf_hash(dist_bytes, dist_len, (uint64_t)j, leaves[j]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        tok = argmax_q24(dist, st->vocab);
+        gen_tokens[j] = (uint8_t)tok; /* vocab <= 256 => fits a byte */
+        prefix[prompt_eff + j] = tok;
+    }
+
+    /* Build + sign the commit. */
+    memset(&commit, 0, sizeof commit);
+    rc = ants_inference_merkle_root(leaves, n_gen, commit.root);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    memcpy(commit.model_hash, st->model_hash, ANTS_INFERENCE_HASH_SIZE);
+    rc = ants_blake3_hash(req->input, req->input_len, commit.input_hash);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    memcpy(commit.req_nonce, req->req_nonce, ANTS_INFERENCE_HASH_SIZE);
+    /* agent_meas: all-zero placeholder pending the TEE attestation harness
+     * (#3); the field is reserved and bound now so the commit layout is
+     * stable. */
+    memset(commit.agent_meas, 0, ANTS_INFERENCE_HASH_SIZE);
+    commit.round = req->round;
+    commit.audit_threshold =
+        (req->tier == ANTS_INFERENCE_TIER_1) ? ANTS_INFERENCE_TIER1_AUDIT_THRESHOLD : UINT64_MAX;
+    commit.m = (uint32_t)n_gen; /* the reference audit opens every position */
+    commit.length = (uint32_t)n_gen;
+    commit.tier = req->tier;
+
+    rc = ants_inference_commit_sign(&commit, st->producer_priv, resp->commit_sig);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    resp->commit = commit;
+    memcpy(resp->producer_pub, st->producer_pub, ANTS_INFERENCE_PUBKEY_SIZE);
+
+    /* Phase 2 — encode the DRAFT answer envelope. The dists are recomputed
+     * (deterministic) rather than buffered, so no O(L*vocab) store is held. */
+    rc = ants_cbor_enc_init(&enc, resp->answer_buf, resp->answer_cap);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_map(&enc, ANTS_INFERENCE_ENV_PAIRS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_bytes(&enc, ANTS_INFERENCE_ENV_KEY_INPUT, req->input, req->input_len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = enc_kv_bytes(&enc, ANTS_INFERENCE_ENV_KEY_TOKS, gen_tokens, n_gen);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_uint(&enc, ANTS_INFERENCE_ENV_KEY_DISTS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_array(&enc, n_gen);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    for (j = 0; j < n_gen; j++) {
+        rc = forward_dist_q24(st, prefix, prompt_eff + j, dist);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        serialize_dist(dist, st->vocab, dist_bytes);
+        rc = ants_cbor_enc_bytes(&enc, dist_bytes, dist_len);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    rc = ants_cbor_enc_finalise(&enc);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    resp->answer_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
@@ -1262,7 +1473,6 @@ ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
 {
     struct ants_inference_state *st;
     uint32_t tokens[ANTS_INFERENCE_REF_SEQLEN_MAX];
-    float logits[ANTS_INFERENCE_REF_VOCAB_MAX];
     ants_error_t rc;
     size_t i;
 
@@ -1291,13 +1501,7 @@ ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
         tokens[i] = (uint32_t)prefix[i] % st->vocab;
     }
 
-    rc = forward_logits(st, tokens, prefix_len, logits);
-    if (rc != ANTS_OK) {
-        return rc;
-    }
-
-    /* Quantize the FP32 logits to canonical q24 (the committed leaf form). */
-    rc = ants_canon_q24_vec_from_f32(logits, out_dist, st->vocab);
+    rc = forward_dist_q24(st, tokens, prefix_len, out_dist);
     if (rc != ANTS_OK) {
         return rc;
     }
