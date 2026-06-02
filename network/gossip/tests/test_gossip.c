@@ -257,8 +257,9 @@ static void test_push_codec_errors(void)
     CHECK_EQ(ants_gossip_push_decode(bare, sizeof bare, &p, &pl), ANTS_ERROR_MALFORMED);
     CHECK_EQ(ants_gossip_push_decode(noncanon, sizeof noncanon, &p, &pl), ANTS_ERROR_NON_CANONICAL);
 
-    /* A well-formed frame with an unknown message type → UNSUPPORTED_TYPE.
-     * map(2){0: 1 (reserved), 1: bytes("x")}. */
+    /* A well-formed frame with an unknown message type → UNSUPPORTED_TYPE
+     * (PUSH-only decode rejects any non-PUSH type, including IHAVE/IWANT).
+     * map(2){0: 99 (unknown type), 1: bytes("x")}. */
     {
         ants_cbor_enc_t enc;
         uint8_t f[32];
@@ -267,7 +268,7 @@ static void test_push_codec_errors(void)
         CHECK_EQ(ants_cbor_enc_init(&enc, f, sizeof f), ANTS_OK);
         CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
         CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
-        CHECK_EQ(ants_cbor_enc_uint(&enc, ANTS_GOSSIP_MSG__RESERVED), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 99u), ANTS_OK);
         CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
         CHECK_EQ(ants_cbor_enc_bytes(&enc, x, sizeof x), ANTS_OK);
         CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
@@ -528,6 +529,165 @@ static void test_engine_args(void)
     harness_destroy(&h);
 }
 
+/* ---- lazy-pull anti-entropy (IHAVE / IWANT) ------------------------- */
+
+/* A holds a proof B is missing (a gap the eager push never filled). A
+ * announces its digest; B pulls via IWANT; A serves via PUSH. One pump()
+ * drains the whole IHAVE→IWANT→PUSH cascade (each step enqueues the next).
+ * End state: B holds the proof and applied the slash. */
+static void test_lazy_pull_end_to_end(void)
+{
+    struct harness h;
+    node_t *a, *b;
+    uint8_t sp[32], su[32], proof[512];
+    size_t plen, sent = 0;
+    bool ins = false;
+
+    harness_init(&h, 2, 0x60);
+    a = &h.nodes[0];
+    b = &h.nodes[1];
+    link_dir(a, b); /* A advertises to B (announce fans out over A's view) */
+
+    /* A holds a proof directly (no push), so B has a genuine gap. */
+    make_key(0x81, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    CHECK_EQ(ants_crdt_insert(a->set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == true);
+    CHECK(ants_crdt_size(a->set) == 1);
+    CHECK(ants_crdt_size(b->set) == 0);
+
+    CHECK_EQ(ants_gossip_announce(&a->g, &sent), ANTS_OK);
+    CHECK(sent == 1); /* IHAVE to B */
+    harness_pump(&h); /* IHAVE → IWANT → PUSH, all in one drain */
+
+    CHECK(ants_crdt_size(b->set) == 1);      /* B pulled the proof */
+    CHECK(ants_crdt_is_slashed(b->set, su)); /* and applied the slash */
+
+    harness_destroy(&h);
+}
+
+/* When B already holds everything A advertises, the IHAVE elicits no IWANT
+ * (and therefore no PUSH): exactly one frame — the IHAVE — goes on the wire. */
+static void test_lazy_pull_no_gap(void)
+{
+    struct harness h;
+    node_t *a, *b;
+    uint8_t sp[32], su[32], proof[512];
+    size_t plen, sent = 0, sends_before;
+    bool ins = false;
+
+    harness_init(&h, 2, 0x68);
+    a = &h.nodes[0];
+    b = &h.nodes[1];
+    link_dir(a, b);
+
+    make_key(0x82, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    CHECK_EQ(ants_crdt_insert(a->set, proof, plen, &ins), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(b->set, proof, plen, &ins), ANTS_OK); /* B already has it */
+
+    sends_before = h.total_sends;
+    CHECK_EQ(ants_gossip_announce(&a->g, &sent), ANTS_OK);
+    CHECK(sent == 1);
+    harness_pump(&h);
+    /* Only the IHAVE was ever sent: B wanted nothing, A served nothing. */
+    CHECK(h.total_sends == sends_before + 1);
+    CHECK(ants_crdt_size(b->set) == 1); /* unchanged */
+
+    harness_destroy(&h);
+}
+
+/* announce edge cases: NULL guard, empty view, empty G-Set. */
+static void test_announce_edges(void)
+{
+    struct harness h;
+    node_t *a, *b;
+    uint8_t sp[32], su[32], proof[512];
+    size_t plen, sent = 9;
+    bool ins = false;
+
+    CHECK_EQ(ants_gossip_announce(NULL, &sent), ANTS_ERROR_INVALID_ARG);
+
+    harness_init(&h, 2, 0x70);
+    a = &h.nodes[0];
+    b = &h.nodes[1];
+
+    /* Proofs held but empty view → nothing sent. */
+    make_key(0x83, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    CHECK_EQ(ants_crdt_insert(a->set, proof, plen, &ins), ANTS_OK);
+    sent = 9;
+    CHECK_EQ(ants_gossip_announce(&a->g, &sent), ANTS_OK);
+    CHECK(sent == 0);
+
+    /* A view but an empty G-Set → nothing sent. */
+    link_dir(b, a);
+    sent = 9;
+    CHECK_EQ(ants_gossip_announce(&b->g, &sent), ANTS_OK); /* b's set is empty */
+    CHECK(sent == 0);
+
+    harness_destroy(&h);
+}
+
+/* IHAVE codec + inbound edges: a valid IHAVE for an id the node lacks elicits
+ * one IWANT; an unknown source (from_peer NULL) cannot be replied to; a
+ * wrong-width id is MALFORMED. */
+static void test_lazy_pull_codec_and_edges(void)
+{
+    struct harness h;
+    node_t *a, *b;
+    uint8_t sp[32], su[32], proof[512];
+    uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t ids[1][ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t frame[ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+    size_t plen, flen = 0, nw = 9, rj = 9, sends_before;
+
+    harness_init(&h, 2, 0x78);
+    a = &h.nodes[0]; /* receives the IHAVE */
+    b = &h.nodes[1];
+    link_dir(a, b);
+
+    /* A real proof + its content-id; A does NOT hold it. */
+    make_key(0x84, sp, su);
+    plen = make_proof(sp, su, 100, proof);
+    CHECK_EQ(ants_crdt_content_id(proof, plen, id), ANTS_OK);
+    memcpy(ids[0], id, ANTS_CRDT_CONTENT_ID_SIZE);
+
+    /* Valid IHAVE advertising that id, delivered to A from B → A lacks it →
+     * A emits exactly one IWANT. */
+    CHECK_EQ(ants_gossip_ihave_encode(ids, 1, frame, sizeof frame, &flen), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(frame, flen), ANTS_OK);
+    sends_before = h.total_sends;
+    CHECK_EQ(ants_gossip_on_message(&a->g, b->id, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(nw == 0 && rj == 0);                /* an IHAVE inserts nothing itself */
+    CHECK(h.total_sends == sends_before + 1); /* one IWANT emitted to B */
+
+    /* Same IHAVE from an unknown source → cannot reply, nothing sent. */
+    sends_before = h.total_sends;
+    CHECK_EQ(ants_gossip_on_message(&a->g, NULL, frame, flen, &nw, &rj), ANTS_OK);
+    CHECK(h.total_sends == sends_before);
+
+    /* A wrong-width id (31 bytes) in an otherwise canonical IHAVE → MALFORMED. */
+    {
+        ants_cbor_enc_t enc;
+        uint8_t bad[64];
+        size_t bl = 0;
+        const uint8_t shortid[31] = {0};
+        CHECK_EQ(ants_cbor_enc_init(&enc, bad, sizeof bad), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_map(&enc, 2), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, ANTS_GOSSIP_MSG_IHAVE), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_array(&enc, 1), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_bytes(&enc, shortid, sizeof shortid), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+        bl = ants_cbor_enc_size(&enc);
+        CHECK_EQ(ants_gossip_on_message(&a->g, b->id, bad, bl, &nw, &rj), ANTS_ERROR_MALFORMED);
+    }
+
+    harness_destroy(&h);
+}
+
 /* ---- real-QUIC transport binding ------------------------------------ */
 
 /* Pace a tick spin-loop: picoquic drives its handshake/retransmit timers off
@@ -689,6 +849,10 @@ int main(void)
     test_invalid_proof_rejected_not_forwarded();
     test_malformed_frame_rejected();
     test_engine_args();
+    test_lazy_pull_end_to_end();
+    test_lazy_pull_no_gap();
+    test_announce_edges();
+    test_lazy_pull_codec_and_edges();
     test_two_node_over_quic();
 
     if (failures == 0) {

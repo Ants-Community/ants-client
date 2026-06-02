@@ -39,21 +39,24 @@
  * dropped (the epidemic terminates); only a genuinely new valid proof is
  * forwarded onward, excluding the peer it arrived from.
  *
- * Scope of THIS module (PR1 of Component #6):
+ * Scope of THIS module (Component #6):
  *   - the peer view (the set of neighbours we gossip to) + add/remove;
  *   - the eager-push wire frame (one fault proof per frame), canonical
  *     CBOR per RFC-0008 §1.1;
  *   - the dissemination engine: ants_gossip_submit (local origination) +
  *     ants_gossip_on_message (receive → insert → forward), with fanout,
- *     dedup via the G-Set, sender-exclusion, and per-peer reject counting.
+ *     dedup via the G-Set, sender-exclusion, and per-peer reject counting;
+ *   - lazy-pull anti-entropy (IHAVE/IWANT): ants_gossip_announce advertises
+ *     the local proof digest, a peer pulls what it lacks, and on_message
+ *     serves the request — catch-up for proofs the eager push missed;
+ *   - the real-ants_transport binding (uni-stream push + inbound demux) at
+ *     the foot of this header.
  *
- * Deliberately NOT here (later PRs): wiring send_fn to real
- * ants_transport bidi streams + the inbound stream demux; lazy-pull
- * (IHAVE/IWANT) anti-entropy for catch-up (the G-Set snapshot from
- * Component #7 already covers bulk late-joiner sync); anti-eclipse peer
- * SAMPLING from the DHT (RFC-0005) — PR1 takes the view as given by the
- * caller; the `T_prop < T_beacon` budget instrumentation; and turning a
- * relay's reject counter into an actual emitted fault proof.
+ * Deliberately NOT here (later PRs): anti-eclipse peer SAMPLING from the DHT
+ * (RFC-0005) — the view is still caller-managed; a persistent per-peer
+ * gossip channel that reclaims outbound handles continuously; the
+ * `T_prop < T_beacon` budget instrumentation; and turning a relay's reject
+ * counter into an actual emitted fault proof.
  *
  * WIRE FORMAT IS DRAFT, defined by this module pending formalisation in
  * RFC-0008 (the same status the DHT and cache wire formats carried before
@@ -117,12 +120,21 @@ extern "C" {
  * Gossip message types (the frame's `type` field). Integer-stable and
  * append-only, like ants_error_t and the fault-class enum: a deployed value
  * never changes its number.
- *   PUSH — eager push of a single fault proof. IMPLEMENTED here.
- * IHAVE / IWANT (lazy-pull anti-entropy) are reserved for a later PR;
- * decoding an unknown type fails closed with ANTS_ERROR_UNSUPPORTED_TYPE.
+ *   PUSH  — eager push of a single fault proof.
+ *   IHAVE — lazy-pull digest: "I hold these content-ids" (anti-entropy).
+ *   IWANT — lazy-pull request: "send me these content-ids".
+ * Decoding an unknown type fails closed with ANTS_ERROR_UNSUPPORTED_TYPE.
  */
-#define ANTS_GOSSIP_MSG_PUSH      0u
-#define ANTS_GOSSIP_MSG__RESERVED 1u
+#define ANTS_GOSSIP_MSG_PUSH  0u
+#define ANTS_GOSSIP_MSG_IHAVE 1u
+#define ANTS_GOSSIP_MSG_IWANT 2u
+
+/* Maximum content-ids carried in one IHAVE/IWANT frame. 64 ids × 32 bytes +
+ * envelope sits well under the default 4 KiB frame cap; anti-entropy here is
+ * incremental (bulk late-joiner sync is the Component #7 G-Set snapshot), so
+ * a bounded digest per round is by design. A frame carrying more ids than
+ * this is rejected MALFORMED. */
+#define ANTS_GOSSIP_MAX_IDS 64u
 
 /* ------------------------------------------------------------------------ */
 /* Outbound delivery callback                                               */
@@ -289,8 +301,13 @@ ants_error_t
 ants_gossip_submit(ants_gossip_t *g, const uint8_t *proof, size_t proof_len, size_t *out_forwarded);
 
 /*
- * Handle a gossip frame received from `from_peer`. Decodes the PUSH frame
- * and feeds the carried proof through the reference-sketch path:
+ * Handle a gossip frame received from `from_peer`, dispatching by its
+ * message type. A lazy-pull IHAVE/IWANT (see §Lazy-pull anti-entropy below)
+ * is answered back to `from_peer` only: IHAVE → an IWANT naming the ids the
+ * local G-Set lacks; IWANT → a PUSH of each requested proof held.
+ * out_new / out_rejected stay 0 for IHAVE/IWANT (no proof is inserted by the
+ * frame itself; pulled proofs surface as out_new on the PUSH that answers).
+ * A PUSH frame feeds its carried proof through the reference-sketch path:
  *   - VERIFY-insert into the G-Set;
  *   - if it fails VERIFY → *out_rejected += 1 (the rate-limit /
  *     attributable-fault hook), the proof is dropped, NOT forwarded;
@@ -319,6 +336,57 @@ ants_error_t ants_gossip_on_message(ants_gossip_t *g,
                                     size_t len,
                                     size_t *out_new,
                                     size_t *out_rejected);
+
+/* ------------------------------------------------------------------------ */
+/* Lazy-pull anti-entropy (IHAVE / IWANT)                                   */
+/*                                                                          */
+/* The eager push is best-effort: a frame lost in flight, or a peer that    */
+/* joined the view after a proof swept through, leaves a gap the push will   */
+/* not refill on its own. Lazy pull closes it. A peer periodically          */
+/* advertises a digest of the content-ids it holds (IHAVE); a receiver that  */
+/* is missing some replies with an IWANT naming exactly those; the           */
+/* advertiser answers each wanted id with an ordinary PUSH. on_message       */
+/* dispatches all three types, so the same receive entry point drives the    */
+/* whole protocol, and the IHAVE→IWANT / IWANT→PUSH replies go to from_peer  */
+/* only. Bulk late-joiner sync remains the Component #7 G-Set snapshot; this */
+/* is incremental catch-up, so each digest/request is bounded to             */
+/* ANTS_GOSSIP_MAX_IDS ids.                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Encode an IHAVE / IWANT frame: canonical CBOR map(2), integer keys
+ * ascending:
+ *   0: type (uint)           ANTS_GOSSIP_MSG_IHAVE / _IWANT.
+ *   1: ids  (array of bytes) `n` content-ids, each ANTS_CRDT_CONTENT_ID_SIZE.
+ * `n` must be in 1..ANTS_GOSSIP_MAX_IDS. Exposed for tests and external
+ * drivers; the engine builds these internally for announce / pull replies.
+ *
+ * @return ANTS_OK with *out_len set; INVALID_ARG on NULL or n out of range;
+ *         BUFFER_TOO_SMALL if cap is insufficient (buf untouched).
+ */
+ants_error_t ants_gossip_ihave_encode(const uint8_t (*ids)[ANTS_CRDT_CONTENT_ID_SIZE],
+                                      size_t n,
+                                      uint8_t *buf,
+                                      size_t cap,
+                                      size_t *out_len);
+ants_error_t ants_gossip_iwant_encode(const uint8_t (*ids)[ANTS_CRDT_CONTENT_ID_SIZE],
+                                      size_t n,
+                                      uint8_t *buf,
+                                      size_t cap,
+                                      size_t *out_len);
+
+/*
+ * Originate a lazy-pull round: build an IHAVE digest of up to
+ * ANTS_GOSSIP_MAX_IDS content-ids the local G-Set holds and send it to
+ * up-to-fanout view peers (the same rotating selection as push). A node
+ * calls this periodically (an anti-entropy tick); peers missing any
+ * advertised proof pull it via IWANT. With an empty G-Set or empty view,
+ * nothing is sent and *out_sent is 0.
+ *
+ * @param out_sent optional; the number of peers the IHAVE was sent to.
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL g.
+ */
+ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
 
 /* ------------------------------------------------------------------------ */
 /* Transport binding (Component #6 PR2)                                     */
