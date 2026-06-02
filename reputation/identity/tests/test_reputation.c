@@ -865,6 +865,252 @@ static void test_bag_args(void)
              ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- selective disclosure: A >= b recompute ------------------------ */
+
+/* Build openings for the given canonical indices: each gets its bag_prove
+ * inclusion path (into caller-owned `paths`) bound to the receipt + index. */
+static void bag_build_openings(const ants_reputation_receipt_t *bag,
+                               size_t n,
+                               const size_t *idx,
+                               size_t k,
+                               ants_reputation_bag_opening_t *out,
+                               uint8_t paths[][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32],
+                               size_t *plens)
+{
+    size_t j;
+    for (j = 0; j < k; j++) {
+        plens[j] = 0;
+        CHECK_EQ(ants_reputation_bag_prove(
+                     bag, n, idx[j], paths[j], ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32, &plens[j]),
+                 ANTS_OK);
+        out[j].receipt = bag[idx[j]];
+        out[j].index = idx[j];
+        out[j].path = paths[j];
+        out[j].path_len = plens[j];
+    }
+}
+
+static void test_bag_bound_select_and_verify(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32], root[32];
+    ants_reputation_params_t p;
+    ants_reputation_receipt_t bag[5];
+    ants_reputation_bag_opening_t op[5];
+    uint8_t paths[5][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plens[5];
+    size_t idx[5];
+    size_t count = 0;
+    bool reached = false, ok = false;
+    uint64_t A_full = 0, T = 0;
+    uint64_t now = 1000;
+    size_t i;
+
+    make_key(0x78, sp, su);
+    make_key(0x79, cp, cu);
+    memcpy(peer, su, 32); /* the committing peer == the server being scored */
+
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    p.bin_width_s = 100;
+    p.decay_ratio_a_q32 = ANTS_REP_FP_ONE >> 1; /* 0.5 */
+
+    /* Canonical order (ts ASC); the most recent (ts == now) is age 0, so its
+     * A contribution is exactly its ncs_value (decay factor 1.0). */
+    bag[0] = make_receipt(sp, su, cp, cu, 1000, 600, 1);
+    bag[1] = make_receipt(sp, su, cp, cu, 1000, 700, 2);
+    bag[2] = make_receipt(sp, su, cp, cu, 1000, 800, 3);
+    bag[3] = make_receipt(sp, su, cp, cu, 1000, 900, 4);
+    bag[4] = make_receipt(sp, su, cp, cu, 1000, 1000, 5);
+
+    CHECK_EQ(ants_reputation_bag_root(bag, 5, peer, root), ANTS_OK);
+    CHECK_EQ(ants_reputation_compute(su, bag, 5, now, &p, &A_full, &T), ANTS_OK);
+    CHECK(A_full > 0);
+
+    /* Exact lower-bound boundary: reveal only the age-0 receipt (index 4),
+     * contribution == 1000. Accept at b=1000, reject at b=1001. */
+    idx[0] = 4;
+    bag_build_openings(bag, 5, idx, 1, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 1, 5, peer, root, now, &p, 1000, &ok), ANTS_OK);
+    CHECK(ok == true);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 1, 5, peer, root, now, &p, 1001, &ok), ANTS_OK);
+    CHECK(ok == false);
+
+    /* select_for_bound reaches a small bound with just the most-recent. */
+    CHECK_EQ(
+        ants_reputation_bag_select_for_bound(bag, 5, su, now, &p, 1000, idx, 5, &count, &reached),
+        ANTS_OK);
+    CHECK(reached == true);
+    CHECK(count == 1 && idx[0] == 4); /* most-recent-first */
+    bag_build_openings(bag, 5, idx, count, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, count, 5, peer, root, now, &p, 1000, &ok),
+             ANTS_OK);
+    CHECK(ok == true);
+
+    /* b == full A: selection reaches it (revealing all eligible); verify ok. */
+    CHECK_EQ(
+        ants_reputation_bag_select_for_bound(bag, 5, su, now, &p, A_full, idx, 5, &count, &reached),
+        ANTS_OK);
+    CHECK(reached == true);
+    bag_build_openings(bag, 5, idx, count, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, count, 5, peer, root, now, &p, A_full, &ok),
+             ANTS_OK);
+    CHECK(ok == true);
+
+    /* b == full A + 1: unreachable, and revealing every receipt sums to A_full
+     * (< b), so the verifier rejects (the lower bound cannot exceed true A). */
+    CHECK_EQ(ants_reputation_bag_select_for_bound(
+                 bag, 5, su, now, &p, A_full + 1, idx, 5, &count, &reached),
+             ANTS_OK);
+    CHECK(reached == false);
+    for (i = 0; i < 5; i++) {
+        idx[i] = i;
+    }
+    bag_build_openings(bag, 5, idx, 5, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 5, 5, peer, root, now, &p, A_full, &ok), ANTS_OK);
+    CHECK(ok == true);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 5, 5, peer, root, now, &p, A_full + 1, &ok),
+             ANTS_OK);
+    CHECK(ok == false);
+}
+
+static void test_bag_bound_negatives(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], wp[32], wu[32], peer[32], root[32];
+    ants_reputation_params_t p;
+    ants_reputation_receipt_t bag[4];
+    ants_reputation_bag_opening_t op[4];
+    uint8_t paths[4][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plens[4];
+    size_t idx[4] = {0, 1, 2, 3};
+    bool ok = true;
+    uint64_t now = 1000;
+
+    make_key(0x7A, sp, su);
+    make_key(0x7B, cp, cu);
+    make_key(0x7C, wp, wu); /* a different server */
+    (void)wp;
+    memcpy(peer, su, 32);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    p.bin_width_s = 100;
+    p.decay_ratio_a_q32 = ANTS_REP_FP_ONE >> 1;
+
+    bag[0] = make_receipt(sp, su, cp, cu, 1000, 700, 1);
+    bag[1] = make_receipt(sp, su, cp, cu, 1000, 800, 2);
+    bag[2] = make_receipt(sp, su, cp, cu, 1000, 900, 3);
+    bag[3] = make_receipt(sp, su, cp, cu, 1000, 1000, 4);
+    CHECK_EQ(ants_reputation_bag_root(bag, 4, peer, root), ANTS_OK);
+
+    /* A valid full reveal clears a low bound. */
+    bag_build_openings(bag, 4, idx, 4, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 4, 4, peer, root, now, &p, 1000, &ok), ANTS_OK);
+    CHECK(ok == true);
+
+    /* Tamper one revealed receipt → its countersignature breaks → reject. */
+    {
+        ants_reputation_bag_opening_t bad[4];
+        memcpy(bad, op, sizeof bad);
+        bad[1].receipt.ncs_value += 1;
+        CHECK_EQ(ants_reputation_bag_verify_bound(bad, 4, 4, peer, root, now, &p, 1, &ok), ANTS_OK);
+        CHECK(ok == false);
+    }
+    /* Duplicate index → reject (no double-counting). */
+    {
+        ants_reputation_bag_opening_t dup[2];
+        dup[0] = op[3];
+        dup[1] = op[3];
+        CHECK_EQ(ants_reputation_bag_verify_bound(dup, 2, 4, peer, root, now, &p, 1, &ok), ANTS_OK);
+        CHECK(ok == false);
+    }
+    /* Wrong peer_id (receipts credit su, not wu) → reject. */
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 4, 4, wu, root, now, &p, 1, &ok), ANTS_OK);
+    CHECK(ok == false);
+    /* now earlier than a revealed receipt's timestamp → that opening is
+     * future-dated → reject (op[3] has ts 1000 > now 999). */
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 4, 4, peer, root, 999, &p, 1, &ok), ANTS_OK);
+    CHECK(ok == false);
+    /* Right index/path but the WRONG receipt at it → Merkle inclusion fails. */
+    {
+        ants_reputation_bag_opening_t swp[4];
+        ants_reputation_receipt_t tmp;
+        memcpy(swp, op, sizeof swp);
+        tmp = swp[0].receipt;
+        swp[0].receipt = swp[1].receipt; /* index 0 now carries receipt 1 */
+        swp[1].receipt = tmp;
+        CHECK_EQ(ants_reputation_bag_verify_bound(swp, 4, 4, peer, root, now, &p, 1, &ok), ANTS_OK);
+        CHECK(ok == false);
+    }
+}
+
+static void test_bag_bound_args(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32], root[32];
+    ants_reputation_params_t p, badp;
+    ants_reputation_receipt_t bag[3];
+    ants_reputation_bag_opening_t op[3];
+    uint8_t paths[3][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plens[3];
+    size_t idx[3] = {0, 1, 2};
+    size_t count = 9;
+    bool reached = false, ok = true;
+    uint64_t now = 1000;
+
+    make_key(0x7D, sp, su);
+    make_key(0x7E, cp, cu);
+    memcpy(peer, su, 32);
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    p.bin_width_s = 100;
+    bag[0] = make_receipt(sp, su, cp, cu, 1000, 800, 1);
+    bag[1] = make_receipt(sp, su, cp, cu, 1000, 900, 2);
+    bag[2] = make_receipt(sp, su, cp, cu, 1000, 1000, 3);
+    CHECK_EQ(ants_reputation_bag_root(bag, 3, peer, root), ANTS_OK);
+
+    /* select: b == 0 → reached immediately, empty subset. */
+    CHECK_EQ(ants_reputation_bag_select_for_bound(bag, 3, su, now, &p, 0, idx, 3, &count, &reached),
+             ANTS_OK);
+    CHECK(reached == true && count == 0);
+
+    /* select: NULL + degenerate-param + n guards. */
+    CHECK_EQ(
+        ants_reputation_bag_select_for_bound(NULL, 3, su, now, &p, 1, idx, 3, &count, &reached),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_select_for_bound(bag, 0, su, now, &p, 1, idx, 3, &count, &reached),
+             ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.bin_width_s = 0;
+    CHECK_EQ(
+        ants_reputation_bag_select_for_bound(bag, 3, su, now, &badp, 1, idx, 3, &count, &reached),
+        ANTS_ERROR_INVALID_ARG);
+
+    /* select: needing more than indices_cap to reach b → BUFFER_TOO_SMALL.
+     * Full A needs all 3 receipts; a cap of 1 cannot hold them. */
+    {
+        uint64_t A = 0, T = 0;
+        size_t small[1];
+        CHECK_EQ(ants_reputation_compute(su, bag, 3, now, &p, &A, &T), ANTS_OK);
+        CHECK_EQ(ants_reputation_bag_select_for_bound(
+                     bag, 3, su, now, &p, A, small, 1, &count, &reached),
+                 ANTS_ERROR_BUFFER_TOO_SMALL);
+    }
+
+    /* verify_bound: k == 0 → ok iff b == 0. */
+    CHECK_EQ(ants_reputation_bag_verify_bound(NULL, 0, 3, peer, root, now, &p, 0, &ok), ANTS_OK);
+    CHECK(ok == true);
+    CHECK_EQ(ants_reputation_bag_verify_bound(NULL, 0, 3, peer, root, now, &p, 1, &ok), ANTS_OK);
+    CHECK(ok == false);
+
+    /* verify_bound: NULL + degenerate-param guards. */
+    bag_build_openings(bag, 3, idx, 3, op, paths, plens);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 3, 3, NULL, root, now, &p, 1, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 3, 3, peer, NULL, now, &p, 1, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 3, 3, peer, root, now, NULL, 1, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.decay_ratio_a_q32 = 0;
+    CHECK_EQ(ants_reputation_bag_verify_bound(op, 3, 3, peer, root, now, &badp, 1, &ok),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -889,6 +1135,9 @@ int main(void)
     test_bag_prove_verify();
     test_bag_canonical_order();
     test_bag_args();
+    test_bag_bound_select_and_verify();
+    test_bag_bound_negatives();
+    test_bag_bound_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);

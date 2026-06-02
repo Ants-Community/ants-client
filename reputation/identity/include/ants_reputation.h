@@ -549,6 +549,85 @@ ants_error_t ants_reputation_bag_verify_inclusion(const ants_reputation_receipt_
                                                   const uint8_t bag_root[ANTS_REP_HASH_SIZE],
                                                   bool *out_ok);
 
+/*
+ * One opening in an A >= b proof: a revealed receipt together with its Merkle
+ * inclusion proof (the `path` + `index` from ants_reputation_bag_prove)
+ * against the peer's committed `bag_root`. `path` points into caller-owned
+ * memory that must outlive the verify call.
+ */
+typedef struct {
+    ants_reputation_receipt_t receipt; /* the revealed receipt              */
+    size_t index;                      /* its canonical leaf position       */
+    const uint8_t *path;               /* inclusion path (bag_prove output) */
+    size_t path_len;                   /* path length in bytes              */
+} ants_reputation_bag_opening_t;
+
+/*
+ * Prover side: choose a subset of the bag whose summed `A` contribution
+ * reaches the bound `b`, preferring MOST RECENT receipts first (they have
+ * decayed least, so the bound is reached revealing the fewest receipts —
+ * minimal information disclosed, RFC-0004 §"Selective disclosure" step 1).
+ * Only receipts that count toward A are eligible: both signatures valid,
+ * server == peer_id, timestamp <= now. `receipts` MUST be in canonical order
+ * (the indices returned are canonical leaf positions for
+ * ants_reputation_bag_prove).
+ *
+ * Writes the chosen canonical indices (most-recent-first) to `out_indices`
+ * and sets *out_count. *out_reached is true iff the running sum reached `b`
+ * (false means the peer's revealable A is below `b`). `b == 0` is reached
+ * immediately with the empty subset.
+ *
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL, n == 0 / over the cap, or a
+ *         degenerate param; ANTS_ERROR_NON_CANONICAL if the bag is not in
+ *         canonical order; ANTS_ERROR_BUFFER_TOO_SMALL if more than
+ *         `indices_cap` indices are needed to reach `b` (retry with
+ *         indices_cap >= n).
+ */
+ants_error_t ants_reputation_bag_select_for_bound(const ants_reputation_receipt_t *receipts,
+                                                  size_t n,
+                                                  const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                                  uint64_t now_unix_s,
+                                                  const ants_reputation_params_t *params,
+                                                  uint64_t b,
+                                                  size_t *out_indices,
+                                                  size_t indices_cap,
+                                                  size_t *out_count,
+                                                  bool *out_reached);
+
+/*
+ * Verifier side: confirm a peer's A >= b from a set of revealed openings
+ * against its committed `bag_root` (RFC-0004 §"Selective disclosure" step 3).
+ * Accepts (*out_ok = true) iff EVERY opening
+ *   - is a receipt with both signatures valid (countersignature integrity),
+ *   - credits this peer (receipt.server == peer_id),
+ *   - is not future-dated (timestamp <= now),
+ *   - sits at a DISTINCT canonical index (no double-counting), and
+ *   - has a valid Merkle inclusion proof against bag_root;
+ * AND the sum of the openings' `A` contributions (the same decayed-value
+ * recipe as ants_reputation_compute's A) is >= b.
+ *
+ * This is a LOWER BOUND on the peer's true A (a revealed subset understates,
+ * never overstates — RFC-0004 §"Why this is sound"): a peer cannot inflate A
+ * because every receipt is countersignature-checked and bound to the
+ * committed tree. Any failed opening, or a sum below `b`, is a *false
+ * verdict* (*out_ok = false, return ANTS_OK), not an error — the openings are
+ * untrusted input. Does NOT itself bound `n` against the true bag size; it
+ * verifies each opening against the (peer_id, bag_root, n) the caller states.
+ *
+ * @return ANTS_OK with *out_ok set; ANTS_ERROR_INVALID_ARG on NULL args
+ *         (openings with k != 0, peer_id, bag_root, params, out_ok), a
+ *         degenerate param, or k / n over ANTS_REP_MAX_RECEIPTS.
+ */
+ants_error_t ants_reputation_bag_verify_bound(const ants_reputation_bag_opening_t *openings,
+                                              size_t k,
+                                              size_t n,
+                                              const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                              const uint8_t bag_root[ANTS_REP_HASH_SIZE],
+                                              uint64_t now_unix_s,
+                                              const ants_reputation_params_t *params,
+                                              uint64_t b,
+                                              bool *out_ok);
+
 #ifdef __cplusplus
 }
 #endif

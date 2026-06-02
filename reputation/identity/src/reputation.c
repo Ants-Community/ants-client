@@ -132,6 +132,20 @@ static uint64_t apply_decay(uint64_t value, uint64_t factor_q32)
     return r;
 }
 
+/* A peer-receipt's contribution to A: ncs_value decayed by the fast δ_A
+ * factor over its whole-bin age. The single definition of "decayed_value"
+ * shared by ants_reputation_compute's A pass and the selective-disclosure
+ * A >= b recompute, so the two agree bit-for-bit (a verifier credits exactly
+ * what compute would). Requires params->bin_width_s > 0 (callers check). */
+static uint64_t receipt_a_contribution(const ants_reputation_receipt_t *r,
+                                       uint64_t now_unix_s,
+                                       const ants_reputation_params_t *params)
+{
+    uint64_t age_bins = (now_unix_s - r->timestamp_unix_s) / params->bin_width_s;
+    uint64_t factor = ants_reputation_decay_factor(params->decay_ratio_a_q32, age_bins);
+    return apply_decay(r->ncs_value, factor);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Saturating T_eff fork-choice transform (RFC-0004 §"T → T_eff")           */
 /* ------------------------------------------------------------------------ */
@@ -375,7 +389,6 @@ ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SI
         const ants_reputation_receipt_t *r = &receipts[i];
         bool ok = false;
         ants_error_t rc;
-        uint64_t age_bins, factor;
 
         valid[i] = false;
 
@@ -394,9 +407,7 @@ ants_error_t ants_reputation_compute(const uint8_t server_id[ANTS_REP_PEER_ID_SI
         }
         valid[i] = true;
 
-        age_bins = (now_unix_s - r->timestamp_unix_s) / params->bin_width_s;
-        factor = ants_reputation_decay_factor(params->decay_ratio_a_q32, age_bins);
-        a_total = sat_add_u64(a_total, apply_decay(r->ncs_value, factor));
+        a_total = sat_add_u64(a_total, receipt_a_contribution(r, now_unix_s, params));
     }
 
     /* Pass 2: T — per-bin κ-clip then slow decay. Each bin is processed
@@ -878,5 +889,174 @@ ants_error_t ants_reputation_bag_verify_inclusion(const ants_reputation_receipt_
     }
     *out_ok = (consumed * ANTS_REP_HASH_SIZE == path_len) &&
               (memcmp(derived, bag_root, ANTS_REP_HASH_SIZE) == 0);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Selective disclosure: proving A >= b over a revealed subset (RFC-0004    */
+/* §"Selective disclosure of receipts", steps 1-3)                          */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_reputation_bag_select_for_bound(const ants_reputation_receipt_t *receipts,
+                                                  size_t n,
+                                                  const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                                  uint64_t now_unix_s,
+                                                  const ants_reputation_params_t *params,
+                                                  uint64_t b,
+                                                  size_t *out_indices,
+                                                  size_t indices_cap,
+                                                  size_t *out_count,
+                                                  bool *out_reached)
+{
+    uint64_t acc = 0;
+    size_t count = 0;
+    size_t i;
+    bool ordered = false;
+    ants_error_t rc;
+
+    if (receipts == NULL || peer_id == NULL || params == NULL || out_indices == NULL ||
+        out_count == NULL || out_reached == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n == 0 || n > ANTS_REP_MAX_RECEIPTS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (params->bin_width_s == 0 || params->decay_ratio_a_q32 == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    rc = receipts_canonical_ordered(receipts, n, &ordered);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (!ordered) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+
+    *out_count = 0;
+    *out_reached = (b == 0);
+    if (b == 0) {
+        return ANTS_OK; /* trivially reached with the empty subset */
+    }
+
+    /* Most-recent-first: canonical order is timestamp ASC, so walk from the
+     * tail (recent receipts have decayed least → fewest revealed to reach b,
+     * RFC-0004 §"Selective disclosure" step 1). Only A-eligible receipts
+     * count: both sigs valid, this peer, not future-dated. */
+    for (i = n; i-- > 0;) {
+        const ants_reputation_receipt_t *r = &receipts[i];
+        bool ok = false;
+
+        rc = ants_reputation_receipt_verify(r, &ok);
+        if (rc != ANTS_OK) {
+            return rc; /* only INVALID_ARG */
+        }
+        if (!ok) {
+            continue;
+        }
+        if (memcmp(r->server, peer_id, ANTS_REP_PEER_ID_SIZE) != 0) {
+            continue;
+        }
+        if (r->timestamp_unix_s > now_unix_s) {
+            continue;
+        }
+        if (count == indices_cap) {
+            *out_count = count;
+            return ANTS_ERROR_BUFFER_TOO_SMALL;
+        }
+        out_indices[count++] = i;
+        acc = sat_add_u64(acc, receipt_a_contribution(r, now_unix_s, params));
+        if (acc >= b) {
+            *out_count = count;
+            *out_reached = true;
+            return ANTS_OK;
+        }
+    }
+
+    /* Exhausted all eligible receipts without reaching b: the peer's
+     * revealable A is below b. */
+    *out_count = count;
+    *out_reached = false;
+    return ANTS_OK;
+}
+
+ants_error_t ants_reputation_bag_verify_bound(const ants_reputation_bag_opening_t *openings,
+                                              size_t k,
+                                              size_t n,
+                                              const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                              const uint8_t bag_root[ANTS_REP_HASH_SIZE],
+                                              uint64_t now_unix_s,
+                                              const ants_reputation_params_t *params,
+                                              uint64_t b,
+                                              bool *out_ok)
+{
+    uint64_t acc = 0;
+    size_t i, j;
+    ants_error_t rc;
+
+    if (peer_id == NULL || bag_root == NULL || params == NULL || out_ok == NULL ||
+        (openings == NULL && k != 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (k > ANTS_REP_MAX_RECEIPTS || n > ANTS_REP_MAX_RECEIPTS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (params->bin_width_s == 0 || params->decay_ratio_a_q32 == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_ok = false;
+
+    /* The openings are UNTRUSTED input: any malformed or failing opening is a
+     * false verdict (reject), never a hard error. */
+    for (i = 0; i < k; i++) {
+        const ants_reputation_bag_opening_t *op = &openings[i];
+        bool sig_ok = false;
+        bool inc_ok = false;
+
+        if (op->index >= n) {
+            return ANTS_OK; /* index outside the bag → reject */
+        }
+        /* Distinct canonical index → no double-counting a receipt. */
+        for (j = 0; j < i; j++) {
+            if (openings[j].index == op->index) {
+                return ANTS_OK;
+            }
+        }
+
+        /* Countersignature integrity (both signatures over the body). */
+        rc = ants_reputation_receipt_verify(&op->receipt, &sig_ok);
+        if (rc != ANTS_OK) {
+            return rc; /* only INVALID_ARG; op->receipt is non-NULL */
+        }
+        if (!sig_ok) {
+            return ANTS_OK;
+        }
+        /* Must credit this peer, and not be future-dated. */
+        if (memcmp(op->receipt.server, peer_id, ANTS_REP_PEER_ID_SIZE) != 0) {
+            return ANTS_OK;
+        }
+        if (op->receipt.timestamp_unix_s > now_unix_s) {
+            return ANTS_OK;
+        }
+        /* Merkle inclusion against the committed bag_root (pre-check the path
+         * shape so a malformed proof is a reject, not an INVALID_ARG). */
+        if (op->path == NULL ||
+            op->path_len != rep_merkle_path_len(op->index, n) * ANTS_REP_HASH_SIZE) {
+            return ANTS_OK;
+        }
+        rc = ants_reputation_bag_verify_inclusion(
+            &op->receipt, op->index, n, op->path, op->path_len, peer_id, bag_root, &inc_ok);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (!inc_ok) {
+            return ANTS_OK; /* not in the committed bag → reject */
+        }
+
+        acc = sat_add_u64(acc, receipt_a_contribution(&op->receipt, now_unix_s, params));
+    }
+
+    /* Lower bound: the revealed subset's summed A must clear b. */
+    *out_ok = (acc >= b);
     return ANTS_OK;
 }

@@ -9,12 +9,11 @@
 # §"A reference sketch"), the A / T computation from a receipt bag, and
 # ants_reputation_compute_checked which zeroes a slashed peer's A and T via
 # a caller-supplied L1 slash predicate (canonically ants_crdt_is_slashed
-# over Component #7's G-Set), and the receipt-bag Merkle commitment +
-# inclusion proofs for selective disclosure of receipts. The
-# selective-disclosure A >= b subset recompute + compact summaries, and
-# wiring bond admission / the slash predicate into the real high-stakes-act
-# call sites, land in later PRs. (Bond accounting itself is Component #15,
-# economy/bond.)
+# over Component #7's G-Set), and the full receipt-bag selective disclosure
+# of receipts (the Merkle commitment + inclusion proofs + the A >= b subset
+# recompute). Compact summaries, and wiring bond admission / the slash
+# predicate into the real high-stakes-act call sites, land in later PRs.
+# (Bond accounting itself is Component #15, economy/bond.)
 
 add_library(ants_reputation STATIC
     src/reputation.c

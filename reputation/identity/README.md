@@ -2,7 +2,7 @@
 
 Identity & reputation service. Reputation & identity layer.
 
-**Status:** the (A, T, κ) spine + saturating `T_eff` + the L1 slash gate + the receipt-bag Merkle commitment & inclusion proofs (selective disclosure) implemented; the `A ≥ b` subset recompute + bond-admission wiring pending.
+**Status:** the (A, T, κ) spine + saturating `T_eff` + the L1 slash gate + the full receipt-bag selective disclosure (Merkle commitment, inclusion proofs, and the `A ≥ b` subset recompute) implemented; compact summaries + bond-admission wiring pending.
 **Effort:** 3 EM.
 **Spec:** [RFC-0004 v0.6 §Tenure + §Bond accounting + §Selective disclosure](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md); [RFC-0005 §Multi-vendor reputation weighting](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
 **Dependencies:** `foundation/crypto`, `foundation/cbor` — the library
@@ -89,13 +89,21 @@ Layer 1"):
   without revealing the rest of its history. Lower-bound soundness
   (revealing a subset understates, never overstates, `A`); fake receipts
   fail the separate countersignature check.
+- **`ants_reputation_bag_select_for_bound` / `_bag_verify_bound`** — the
+  `A ≥ b` proof (RFC-0004 §"Selective disclosure" steps 1-3): the prover
+  selects a minimal most-recent-first subset reaching `b`; the verifier
+  checks each revealed opening (countersignature + credits-this-peer +
+  not-future-dated + distinct index + Merkle inclusion) and confirms the
+  summed `A` contribution (the same decayed-value recipe as `compute`, so
+  the two agree bit-for-bit) `≥ b`. A lower bound — a peer can understate
+  but never overstate `A`.
 
 **Pending (later PRs):**
 
-- **Selective-disclosure `A ≥ b` recompute** + **compact summaries**
-  (RFC-0004 §"Selective disclosure of receipts"): the verifier's
-  subset-sum bound layered on the Merkle primitives above; bucketed
-  summaries for large bags.
+- **Compact summaries** (RFC-0004 §"Selective disclosure of receipts"):
+  signed `(time_bucket, Σ decayed_value)` hints for large bags, committed
+  via the same Merkle root — an optimization (challengeable into individual
+  receipts), not a security primitive.
 - **Bond-admission wiring** into the real high-stakes-act call sites
   (Tier-3 committee per RFC-0003; L2 committee / fork-recovery vote per
   RFC-0004 §Layer 2) + the `bond_admission` L1 gossip. (Bond accounting
