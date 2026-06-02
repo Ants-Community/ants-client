@@ -13,6 +13,30 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #6 (gossip overlay) — local reject accountability (rate-limit the sender) · 2026-06-02
+
+Invalid-proof spam (RFC-0004 W3) is bounded, not prevented: a relayer flooding
+unverifiable proofs costs every receiver an O(f) VERIFY per novel frame. The
+reference sketch's response is `rate_limit(sender_of(π))`. The engine now
+implements the **local** half of that defence:
+
+- **Per-peer reject tally.** Each inbound proof that fails VERIFY is counted
+  against its source — the transport-authenticated `from_peer` (QUIC mutual
+  auth) — in a fixed table (`ANTS_GOSSIP_REJECT_TABLE_SIZE`); when full, the
+  lowest-count slot is reused so a flood of one-off garbage from many peers
+  never evicts a persistent offender.
+- **Reject hook + query.** `ants_gossip_set_reject_handler` fires once per
+  reject with the running per-peer count; `ants_gossip_peer_reject_count` reads
+  it. The engine stays policy-free: the CALLER decides the threshold and acts
+  (transport disconnect, view eviction). A NULL `from_peer` is unattributable
+  and tallies in `stats.rejected` only — no hook, no per-peer entry.
+
+This is the local half only. A **globally-attributable, gossipable** fault proof
+against a garbage relayer is deliberately deferred: it needs the relayer to sign
+its forwards (a wire-format change) plus a fault class (RFC-0004 §DoS, "a relayer
+who signs forwards") — a protocol decision for RFC-0008/0004, in the same
+category as anti-eclipse peer sampling.
+
 ### network: Component #6 (gossip overlay) — T_prop propagation instrumentation · 2026-06-02
 
 The gossip engine now exposes the raw material to measure the **T_prop budget**.
