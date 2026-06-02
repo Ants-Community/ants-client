@@ -49,14 +49,19 @@
  *   - lazy-pull anti-entropy (IHAVE/IWANT): ants_gossip_announce advertises
  *     the local proof digest, a peer pulls what it lacks, and on_message
  *     serves the request — catch-up for proofs the eager push missed;
+ *   - propagation instrumentation: aggregate counters (ants_gossip_get_stats)
+ *     and a per-new-proof observation hook (ants_gossip_set_observer) that
+ *     timestamp when each proof is first seen — the raw material a testnet
+ *     correlates across nodes to check T_prop against the T_beacon budget;
  *   - the real-ants_transport binding (uni-stream push + inbound demux) at
  *     the foot of this header.
  *
- * Deliberately NOT here (later PRs): anti-eclipse peer SAMPLING from the DHT
- * (RFC-0005) — the view is still caller-managed; a persistent per-peer
- * gossip channel that reclaims outbound handles continuously; the
- * `T_prop < T_beacon` budget instrumentation; and turning a relay's reject
- * counter into an actual emitted fault proof.
+ * Deliberately NOT here (a later PR): anti-eclipse peer SAMPLING from the DHT
+ * (RFC-0005) — the view is still caller-managed — and turning a relay's
+ * reject counter into an actual emitted fault proof. (The persistent
+ * per-connection outbound channel and the `T_prop < T_beacon` budget
+ * instrumentation have since landed; see the transport binding below and
+ * §Instrumentation respectively.)
  *
  * WIRE FORMAT IS DRAFT, defined by this module pending formalisation in
  * RFC-0008 (the same status the DHT and cache wire formats carried before
@@ -336,6 +341,85 @@ ants_error_t ants_gossip_on_message(ants_gossip_t *g,
                                     size_t len,
                                     size_t *out_new,
                                     size_t *out_rejected);
+
+/* ------------------------------------------------------------------------ */
+/* Instrumentation — the T_prop budget (RFC-0004 v0.6 §"The propagation     */
+/* bound")                                                                  */
+/*                                                                          */
+/* Layer 1's security rests on a single timing budget: a fault proof must    */
+/* reach the honest subgraph FASTER than the verifier beacon rotates, i.e.   */
+/* `T_prop < T_beacon` (RFC-0004 §"The structural win"). The engine cannot   */
+/* know T_prop on its own — it is a network-wide quantity — but it can       */
+/* expose the raw material a testnet correlates across nodes to measure it,  */
+/* WITHOUT a wire-format change and WITHOUT a clock-sync assumption (no       */
+/* absolute timestamp ever crosses the wire):                                */
+/*   - aggregate counters (ants_gossip_stats_t): how many proofs this node    */
+/*     originated, learned new from a peer, dropped as duplicate, rejected,   */
+/*     and forwarded, plus the IHAVE/IWANT anti-entropy tallies;              */
+/*   - a per-new-proof observation hook: each time a proof is FIRST inserted  */
+/*     (locally or from a peer) the engine stamps its local monotonic clock   */
+/*     and calls the observer with the proof's content-id, that stamp, and    */
+/*     which path introduced it. A collector keyed by content-id — using the  */
+/*     per-node clock offsets it already tracks — reconstructs the end-to-end */
+/*     propagation distribution: the detector's LOCAL stamp is t0, every PEER */
+/*     stamp is an arrival, and T_prop is their spread.                       */
+/* Both are passive and optional: counters cost a few increments; the         */
+/* observer costs one content-id hash per new proof, and only when a hook is  */
+/* registered. The MEASUREMENT (clock alignment, percentiles, the budget      */
+/* check itself) is the harness's job — this is the INSTRUMENTATION.          */
+/* ------------------------------------------------------------------------ */
+
+/* Which path first introduced a proof, passed to the observation hook. */
+#define ANTS_GOSSIP_PROOF_ORIGIN_LOCAL 0 /* this node detected it (ants_gossip_submit)        */
+#define ANTS_GOSSIP_PROOF_ORIGIN_PEER  1 /* learned new from a peer (ants_gossip_on_message)  */
+
+/*
+ * Aggregate, monotone-increasing engine counters, all counting EVENTS since
+ * ants_gossip_init. A snapshot copy is returned by ants_gossip_get_stats; the
+ * engine never resets them.
+ */
+typedef struct {
+    uint64_t originated;     /* new proofs introduced locally (submit)        */
+    uint64_t received_new;   /* new proofs first learned from a peer (PUSH)   */
+    uint64_t duplicates;     /* inbound PUSH proofs already held (dedup stop) */
+    uint64_t rejected;       /* inbound PUSH proofs that failed VERIFY        */
+    uint64_t forwarded;      /* eager-push frames sent onward (fanout total)  */
+    uint64_t ihave_sent;     /* IHAVE digests sent (ants_gossip_announce)     */
+    uint64_t ihave_received; /* IHAVE digests handled                         */
+    uint64_t iwant_sent;     /* IWANT pull-requests sent (answering an IHAVE) */
+    uint64_t iwant_received; /* IWANT pull-requests handled                   */
+    uint64_t pulled_served;  /* PUSH frames sent in answer to an IWANT        */
+    uint64_t first_seen_us;  /* monotonic stamp of the FIRST new proof (0 until one is seen) */
+    uint64_t last_seen_us;   /* monotonic stamp of the most recent new proof  */
+} ants_gossip_stats_t;
+
+/*
+ * Copy the engine's current counters into *out.
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL g / out.
+ */
+ants_error_t ants_gossip_get_stats(const ants_gossip_t *g, ants_gossip_stats_t *out);
+
+/*
+ * Per-new-proof observation hook (see §Instrumentation above). Called once,
+ * synchronously, the first time a proof is inserted into the G-Set via this
+ * engine — NOT for duplicates and NOT for proofs that fail VERIFY. `content_id`
+ * aliases a stack buffer valid only for the call (copy it to retain).
+ * `first_seen_us` is this node's CLOCK_MONOTONIC reading at insert (microseconds,
+ * comparable only to this node's own stamps). `origin` is one of
+ * ANTS_GOSSIP_PROOF_ORIGIN_LOCAL / _PEER.
+ */
+typedef void (*ants_gossip_observe_fn)(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
+                                       uint64_t first_seen_us,
+                                       int origin,
+                                       void *ctx);
+
+/*
+ * Register (or clear) the observation hook. Optional; an engine with no
+ * observer skips the hook (and its content-id hash). fn == NULL disables it.
+ * Takes effect immediately for subsequent inserts.
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG if g is NULL.
+ */
+ants_error_t ants_gossip_set_observer(ants_gossip_t *g, ants_gossip_observe_fn fn, void *ctx);
 
 /* ------------------------------------------------------------------------ */
 /* Lazy-pull anti-entropy (IHAVE / IWANT)                                   */

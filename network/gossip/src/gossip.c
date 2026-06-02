@@ -16,6 +16,14 @@
  * RFC-0008 v0.5 §1.1 (canonical CBOR).
  */
 
+/* POSIX feature test — required on glibc to expose clock_gettime() /
+ * CLOCK_MONOTONIC / struct timespec from <time.h> for the propagation
+ * instrumentation clock. macOS exposes them by default; this define is benign
+ * there. Must precede every system header. Mirrors network/dht. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_gossip.h"
 
 #include "ants_cbor.h"
@@ -24,6 +32,26 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------------ */
+/* Clock — monotonic microseconds for the propagation instrumentation        */
+/* (first-seen / last-seen stamps + the per-new-proof observation hook). We   */
+/* compare only deltas, so CLOCK_MONOTONIC avoids NTP back-jumps; the         */
+/* CLOCK_REALTIME fallback is paranoia for unusual builds. Mirrors            */
+/* network/dht's dht_now_us().                                                */
+/* ------------------------------------------------------------------------ */
+
+static uint64_t gossip_now_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            return 0;
+        }
+    }
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Frame schema (DRAFT, defined here — see header). Every gossip frame is a  */
@@ -50,11 +78,15 @@ struct gossip_state {
     ants_crdt_t *gset; /* borrowed L1 G-Set; the dedup oracle      */
     ants_gossip_send_fn send_fn;
     void *send_ctx;
+    ants_gossip_observe_fn observe_fn; /* optional per-new-proof hook (NULL = off) */
+    void *observe_ctx;
     uint8_t self_id[ANTS_GOSSIP_PEER_ID_SIZE];
-    size_t fanout;          /* resolved (default applied)              */
-    size_t max_frame_bytes; /* resolved                               */
-    size_t n_view;          /* peers in the view                       */
-    size_t rotation;        /* cursor for deterministic fanout pick     */
+    size_t fanout;             /* resolved (default applied)              */
+    size_t max_frame_bytes;    /* resolved                               */
+    size_t n_view;             /* peers in the view                       */
+    size_t rotation;           /* cursor for deterministic fanout pick     */
+    bool seen_any;             /* gates stats.first_seen_us (the clock can read 0) */
+    ants_gossip_stats_t stats; /* propagation instrumentation (T_prop budget)      */
     uint8_t view[ANTS_GOSSIP_MAX_VIEW][ANTS_GOSSIP_PEER_ID_SIZE];
 };
 
@@ -438,6 +470,28 @@ size_t ants_gossip_peer_count(const ants_gossip_t *g)
     return ((const struct gossip_state *)(const void *)g->_opaque)->n_view;
 }
 
+ants_error_t ants_gossip_get_stats(const ants_gossip_t *g, ants_gossip_stats_t *out)
+{
+    if (g == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out = ((const struct gossip_state *)(const void *)g->_opaque)->stats;
+    return ANTS_OK;
+}
+
+ants_error_t ants_gossip_set_observer(ants_gossip_t *g, ants_gossip_observe_fn fn, void *ctx)
+{
+    struct gossip_state *s;
+
+    if (g == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    s = state_of(g);
+    s->observe_fn = fn;
+    s->observe_ctx = ctx;
+    return ANTS_OK;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Forwarding                                                                */
 /* ------------------------------------------------------------------------ */
@@ -500,6 +554,25 @@ static size_t forward_proof(struct gossip_state *s,
     return fanout_send(s, frame, frame_len, exclude);
 }
 
+/* Stamp + observe a proof the engine has just inserted as NEW — the single
+ * place first_seen/last_seen advance and the observer fires. `origin` is
+ * ANTS_GOSSIP_PROOF_ORIGIN_LOCAL or _PEER. */
+static void record_new_proof(struct gossip_state *s, const uint8_t *proof, size_t len, int origin)
+{
+    uint64_t now = gossip_now_us();
+    if (!s->seen_any) {
+        s->stats.first_seen_us = now;
+        s->seen_any = true;
+    }
+    s->stats.last_seen_us = now;
+    if (s->observe_fn != NULL) {
+        uint8_t cid[ANTS_CRDT_CONTENT_ID_SIZE];
+        if (ants_crdt_content_id(proof, len, cid) == ANTS_OK) {
+            s->observe_fn(cid, now, origin, s->observe_ctx);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* Dissemination engine                                                     */
 /* ------------------------------------------------------------------------ */
@@ -529,7 +602,11 @@ ants_gossip_submit(ants_gossip_t *g, const uint8_t *proof, size_t proof_len, siz
     }
     /* New proof we originated → forward to fanout (exclude nobody). */
     {
-        size_t fwd = forward_proof(s, proof, proof_len, NULL);
+        size_t fwd;
+        s->stats.originated++;
+        record_new_proof(s, proof, proof_len, ANTS_GOSSIP_PROOF_ORIGIN_LOCAL);
+        fwd = forward_proof(s, proof, proof_len, NULL);
+        s->stats.forwarded += fwd;
         if (out_forwarded != NULL) {
             *out_forwarded = fwd;
         }
@@ -597,6 +674,7 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent)
     }
     {
         size_t sent = fanout_send(s, frame, frame_len, NULL);
+        s->stats.ihave_sent += sent;
         if (out_sent != NULL) {
             *out_sent = sent;
         }
@@ -634,16 +712,20 @@ static ants_error_t handle_push(struct gossip_state *s,
          * attributable-fault hook) and drop it. The FRAME was well-formed,
          * so the call itself succeeds — a peer relaying a bad proof is a
          * per-proof event, not a transport error. */
+        s->stats.rejected++;
         if (out_rejected != NULL) {
             *out_rejected = 1;
         }
         return ANTS_OK;
     }
     if (!inserted) {
+        s->stats.duplicates++;
         return ANTS_OK; /* duplicate → epidemic terminates here */
     }
     /* New valid proof → forward onward, excluding the peer it came from. */
-    (void)forward_proof(s, proof, proof_len, from_peer);
+    s->stats.received_new++;
+    record_new_proof(s, proof, proof_len, ANTS_GOSSIP_PROOF_ORIGIN_PEER);
+    s->stats.forwarded += forward_proof(s, proof, proof_len, from_peer);
     if (out_new != NULL) {
         *out_new = 1;
     }
@@ -665,6 +747,7 @@ handle_ihave(struct gossip_state *s, const uint8_t *from_peer, const uint8_t *fr
     if (rc != ANTS_OK) {
         return rc;
     }
+    s->stats.ihave_received++;
     if (from_peer == NULL) {
         return ANTS_OK; /* cannot direct a reply at an unknown source */
     }
@@ -681,6 +764,7 @@ handle_ihave(struct gossip_state *s, const uint8_t *from_peer, const uint8_t *fr
         return rc;
     }
     s->send_fn(from_peer, frame_out, frame_len, s->send_ctx);
+    s->stats.iwant_sent++;
     return ANTS_OK;
 }
 
@@ -707,6 +791,7 @@ static bool serve_iwant_visit(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE
                 ants_gossip_push_encode(proof, len, c->frame, sizeof c->frame, &frame_len) ==
                     ANTS_OK) {
                 c->s->send_fn(c->target, c->frame, frame_len, c->s->send_ctx);
+                c->s->stats.pulled_served++;
             }
             break; /* this proof matched one wanted id; move on */
         }
@@ -727,6 +812,7 @@ handle_iwant(struct gossip_state *s, const uint8_t *from_peer, const uint8_t *fr
     if (rc != ANTS_OK) {
         return rc;
     }
+    s->stats.iwant_received++;
     if (from_peer == NULL) {
         return ANTS_OK;
     }

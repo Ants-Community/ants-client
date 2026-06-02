@@ -13,6 +13,36 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #6 (gossip overlay) — T_prop propagation instrumentation · 2026-06-02
+
+The gossip engine now exposes the raw material to measure the **T_prop budget**.
+Layer 1's security rests on a fault proof reaching the honest subgraph faster
+than the verifier beacon rotates (`T_prop < T_beacon`, RFC-0004 §"The structural
+win"). The engine cannot compute a network-wide T_prop alone, so it instruments
+what it *can* observe locally — with **no wire-format change and no clock-sync
+assumption** (no absolute timestamp ever crosses the wire):
+
+- **Aggregate counters** (`ants_gossip_stats_t` via `ants_gossip_get_stats`):
+  proofs originated, learned new from a peer, dropped as duplicate, rejected,
+  and forwarded, plus the IHAVE/IWANT anti-entropy tallies and a first/last
+  new-proof monotonic-clock window.
+- **A per-new-proof observation hook** (`ants_gossip_set_observer`): each time a
+  proof is first inserted — locally (`ANTS_GOSSIP_PROOF_ORIGIN_LOCAL`) or from a
+  peer (`_PEER`) — the engine stamps its monotonic clock and calls back with the
+  proof's content-id and that stamp. A collector keyed by content-id, using the
+  per-node clock offsets it already tracks, reconstructs the end-to-end
+  propagation distribution: the detector's local stamp is t0, each peer stamp an
+  arrival, and T_prop their spread. The hook fires once per new proof — never for
+  duplicates or VERIFY-rejects — and costs one content-id hash, only when one is
+  registered.
+
+The observer is wired via a setter, not `ants_gossip_config_t`, so it is
+optional and the init/config ABI is untouched. The *measurement* — clock
+alignment, percentiles, the budget check itself — is the harness's job; this is
+the instrumentation. Remaining Component #6 work: anti-eclipse peer sampling
+from the DHT (an architectural fork, founder decision pending) and turning a
+relay's reject counter into an emitted fault proof.
+
 ### network: Component #6 (gossip overlay) — lazy-pull anti-entropy + persistent per-connection channel · 2026-06-02
 
 Two refinements to the gossip overlay now that it disseminates on the real wire.
