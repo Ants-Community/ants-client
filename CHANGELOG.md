@@ -13,6 +13,45 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #6 (gossip overlay) — transport binding: L1 dissemination on the wire · 2026-06-02
+
+**Gossip leaves the in-process harness.** PR1 shipped the transport-agnostic
+dissemination engine behind a `send_fn` seam; this PR binds that seam to a real
+`ants_transport` so the L1 reputation path runs end to end over QUIC:
+detect → submit → unidirectional stream → inbound demux → VERIFY-insert → slash.
+
+A new translation unit `network/gossip/src/gossip_transport.c` (and a *Transport
+binding* section in `ants_gossip.h`) is the glue; the engine stays
+transport-agnostic, so the in-process epidemic tests are untouched.
+
+- **Outbound** — the engine's `send_fn` (`ants_gossip_transport_send`) maps a
+  fanout peer to a live connection and opens a **unidirectional** QUIC stream,
+  writing the push frame with FIN. RFC-0004 Layer 1 propagation is one-way, and
+  the transport reserves uni streams for exactly this; the per-message FIN
+  doubles as the receiver's frame boundary, so no length prefix is needed.
+- **Inbound** — `ants_gossip_transport_handle_event` accumulates a peer's pushed
+  uni stream until FIN and feeds the frame to `ants_gossip_on_message`,
+  delegated from the caller's single transport `event_fn` exactly like
+  `ants_dht_handle_transport_event`.
+- **Reactive discovery** — the binding learns `(peer_id → conn)` from CONN_READY
+  and never dials; the caller (bootstrap / DHT / a later anti-eclipse PR) owns
+  dialing. Gossip stays best-effort: a peer with no live connection, or an
+  exhausted outbound pool, drops the forward — the epidemic's redundancy and the
+  #7 late-joiner snapshot recover it.
+
+**Lifetime** — the transport leaves locally-opened stream handles to the caller
+and fires no completion event for a one-way stream, so a forwarded proof's
+uni-stream handle is retained until its connection closes (a bounded pool, drop
+beyond). Teardown destroys the transport before the binding so CONN_CLOSED frees
+those handles while picoquic still owns the connection — the same discipline the
+DHT follows. A persistent per-peer channel that reclaims continuously is a
+follow-up, alongside lazy-pull (IHAVE/IWANT) anti-entropy and anti-eclipse DHT
+peer sampling.
+
+Wire format unchanged from PR1 (**DRAFT**, pending RFC-0008). A real two-node
+QUIC end-to-end test joins `gossip_basic` (A originates a fault proof; B ingests
+it over a uni stream and slashes the subject); the suite stays 21/21 green.
+
 ### inference: Component #13 (inference orchestration) — surface 4 (serving runtime + audit), feature-complete at v0.x · 2026-06-02
 
 **The critical-path capstone closes.** Component #13's three primitive surfaces
