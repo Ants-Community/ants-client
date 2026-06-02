@@ -649,8 +649,11 @@ typedef union {
 /* rejected at init.                                                        */
 /* ------------------------------------------------------------------------ */
 
-/* Max vocabulary size V (logit-vector length). */
-#define ANTS_INFERENCE_REF_VOCAB_MAX 512
+/* Max vocabulary size V (logit-vector length). The reference model uses a
+ * byte vocabulary, so V <= 256 and every token id fits in one byte — which
+ * lets the answer envelope carry the generated answer as a compact byte
+ * string and keeps producer/auditor prefix reconstruction unambiguous. */
+#define ANTS_INFERENCE_REF_VOCAB_MAX 256
 /* Max hidden dimension d_model. */
 #define ANTS_INFERENCE_REF_DMODEL_MAX 64
 /* Max prefix length (tokens) a single forward pass accepts. */
@@ -716,17 +719,25 @@ ants_error_t ants_inference_init(ants_inference_t *ctx, const ants_inference_con
 ants_error_t ants_inference_destroy(ants_inference_t *ctx);
 
 /*
- * Serve one request: run inference under the requested tier and produce
- * the answer envelope, the commit-at-send object, and the producer's
- * signature over it. The audited path (Tier ≥ 2) generates per-position
- * canonical q24 distributions, Merkle-commits them, and records the audit
- * parameters (p, m, L) in the returned commit.
+ * Serve one request: run the reference model under the requested tier and
+ * produce the answer envelope, the commit-at-send object, and the producer's
+ * signature over it. The reference model greedily generates up to a bounded
+ * number of byte-vocabulary tokens (capped so the prefix stays within
+ * ANTS_INFERENCE_REF_SEQLEN_MAX); each generated position commits its
+ * canonical q24 distribution as a Merkle leaf, and the audit parameters
+ * (p via audit_threshold, m, L) are recorded in the returned commit. Tier 1
+ * sets a sampling p; Tier 2/3 set p = 1 (always auditable on request; Tier 3
+ * triangulation across peers is the caller's job). The answer envelope is a
+ * DRAFT canonical-CBOR document (input ‖ generated tokens ‖ per-position q24
+ * distributions) pinned in orchestration.c — the openings an auditor needs;
+ * ants_inference_audit consumes it.
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers or unknown tier;
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers, an uninitialized ctx, or unknown
+ *     tier;
  *   ANTS_ERROR_BUFFER_TOO_SMALL — answer_cap too small for the envelope;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase.
+ *   plus any error surfaced by the composed kernels / codec / signing.
  */
 ants_error_t ants_inference_serve(ants_inference_t *ctx,
                                   const ants_inference_request_t *req,
