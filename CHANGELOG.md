@@ -13,6 +13,54 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #9 (reputation/identity) — selective disclosure of receipts · 2026-06-02
+
+**A peer can now prove `A ≥ b` without revealing its whole interaction
+history.** RFC-0004 §"Selective disclosure of receipts": the receipt bag is
+committed as a Merkle tree, and a peer proves both that a receipt is in its
+committed bag and that its decayed active reputation clears a bond — revealing
+only a minimal recent subset. This is what bond admission consumes.
+
+The tree is the SAME domain-separated, promote-lone-trailing BLAKE3
+construction as `reputation/chain`'s `confirmed_proofs` root and
+`inference/orchestration`'s commit Merkle — one canonical tree across the
+codebase. Receipt-specific: each leaf is
+`BLAKE3(0x00 ‖ body ‖ server_sig ‖ client_sig)`, committing the whole receipt
+so a single leaf hash anchors both the inclusion proof and the
+countersignature check; canonical leaf order is (timestamp ASC, then
+leaf-hash ASC); and `bag_root = BLAKE3.derive_key("ants-v1-receipt-bag-root",
+peer_id ‖ merkle_root)` binds the tree to the committing peer, so a subtree
+cannot be replayed under another identity.
+
+- **Commitment + inclusion** (`ants_reputation_bag_root`, `_bag_prove`,
+  `_bag_verify_inclusion`) — commit a bag, produce an O(log n) inclusion path
+  for a receipt, and verify it against `bag_root`. The verify is the
+  structural Merkle + peer-binding check only; the countersignature stays in
+  `ants_reputation_receipt_verify` (both bind the same leaf bytes), so the two
+  checks compose at the verifier per the spec.
+- **The `A ≥ b` proof** (`ants_reputation_bag_select_for_bound`,
+  `_bag_verify_bound`) — the prover selects a minimal most-recent-first subset
+  reaching `b`; the verifier accepts iff every revealed opening is
+  countersignature-valid, credits this peer, is not future-dated, sits at a
+  distinct canonical index, and is Merkle-included against `bag_root`, AND the
+  summed `A` contribution `≥ b`. A **lower bound**: revealing a subset
+  understates, never overstates `A`, and a peer cannot inflate `A` because
+  every receipt is countersignature-checked and tree-bound. Openings are
+  untrusted input — a malformed/failing opening, or a sum below `b`, is a
+  false verdict, not an error.
+
+A single `receipt_a_contribution()` helper is now shared by
+`ants_reputation_compute`'s A pass and the bound verifier, so a verifier
+credits **bit-for-bit** exactly what `compute` would — the lower-bound
+equivalence is structural, not a duplicated formula.
+
+The receipt-bag Merkle scheme and the `bag_root` context are **DRAFT** pending
+RFC-0008 formalisation. The bound verify is cross-checked in tests against an
+independent hand-built Merkle reference (the fiddly promote-lone replay), and
+the suite stays 21/21 green. Remaining for #9 (lower priority): optional
+compact summaries, and wiring bond admission into the real high-stakes-act
+call sites.
+
 ### network: Component #6 (gossip overlay) — transport binding: L1 dissemination on the wire · 2026-06-02
 
 **Gossip leaves the in-process harness.** PR1 shipped the transport-agnostic
