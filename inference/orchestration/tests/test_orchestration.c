@@ -1649,9 +1649,172 @@ static void test_audit_contract(void)
                  &commit, answer, sizeof answer, beacon, dummy_ref_fn, NULL, &params, NULL),
              ANTS_ERROR_INVALID_ARG);
 
+    /* valid args but the answer is not a parseable envelope → MALFORMED. */
     CHECK_EQ(ants_inference_audit(
                  &commit, answer, sizeof answer, beacon, dummy_ref_fn, NULL, &params, &verdict),
-             ANTS_ERROR_NOT_IMPLEMENTED);
+             ANTS_ERROR_MALFORMED);
+}
+
+/* An honest verifier's reference callback: the canonical forward over the
+ * verifier's own (identical) model — its rerun matches the producer's commit
+ * to the bit. */
+static ants_error_t verifier_ref_fn(void *user,
+                                    const uint8_t *prefix,
+                                    size_t prefix_len,
+                                    uint64_t position,
+                                    ants_canon_q24_t *out_dist,
+                                    size_t out_dist_cap,
+                                    size_t *out_vocab)
+{
+    return ants_inference_reference_distribution(
+        (ants_inference_t *)user, prefix, prefix_len, position, out_dist, out_dist_cap, out_vocab);
+}
+
+/* A fraudulent-disagreement reference: returns a fixed near-one-hot
+ * distribution regardless of the prefix, so it disagrees strongly with the
+ * producer's committed (model) distribution at every position and drives the
+ * e-process to FRAUD. `user` points at the vocab to report. */
+static ants_error_t fraud_ref_fn(void *user,
+                                 const uint8_t *prefix,
+                                 size_t prefix_len,
+                                 uint64_t position,
+                                 ants_canon_q24_t *out_dist,
+                                 size_t out_dist_cap,
+                                 size_t *out_vocab)
+{
+    size_t vocab = *(const size_t *)user;
+    size_t i;
+    (void)prefix;
+    (void)prefix_len;
+    (void)position;
+    if (out_dist_cap < vocab) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    for (i = 0; i < vocab; i++) {
+        out_dist[i] = 0;
+    }
+    out_dist[0] = ants_canon_q24_from_f32(30.0f); /* a near one-hot at token 0 */
+    *out_vocab = vocab;
+    return ANTS_OK;
+}
+
+static void test_audit_behaviour(void)
+{
+    union {
+        uint64_t a;
+        uint8_t b[8192];
+    } blobu;
+    size_t len;
+    ants_inference_t ctx;
+    ants_inference_config_t config;
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    ants_inference_request_t req;
+    ants_inference_response_t resp;
+    uint8_t answer[8192];
+    const uint8_t input[] = "audit me carefully please";
+    uint8_t beacon[ANTS_INFERENCE_BEACON_SIZE];
+    ants_inference_eprocess_t ep;
+    ants_inference_verdict_t verdict;
+    size_t fraud_vocab = 64;
+    size_t i;
+
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(i + 11);
+    }
+    len = build_ref_model(blobu.b, sizeof blobu.b, 64, 8);
+    CHECK(len > 0);
+    memset(&config, 0, sizeof config);
+    config.model_weights = blobu.b;
+    config.model_weights_len = len;
+    config.producer_priv = priv;
+    /* one model serves as both producer and (identical) honest verifier. */
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+
+    memset(&req, 0, sizeof req);
+    memset(&resp, 0, sizeof resp);
+    req.input = input;
+    req.input_len = sizeof input - 1;
+    req.tier = ANTS_INFERENCE_TIER_2;
+    req.round = 3;
+    resp.answer_buf = answer;
+    resp.answer_cap = sizeof answer;
+    CHECK_EQ(ants_inference_serve(&ctx, &req, &resp), ANTS_OK);
+
+    for (i = 0; i < sizeof beacon; i++) {
+        beacon[i] = (uint8_t)(i * 7u + 1u);
+    }
+
+    /* (a) honest: the verifier reruns the same canonical model → every
+     * discrepancy is 0 → the capital never grows → CONTINUE (passed). */
+    CHECK_EQ(ants_inference_eprocess_init(&ep,
+                                          ANTS_INFERENCE_DEFAULT_ALPHA,
+                                          ANTS_INFERENCE_DEFAULT_MU0,
+                                          ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
+             ANTS_OK);
+    verdict = ANTS_INFERENCE_VERDICT_FRAUD;
+    CHECK_EQ(
+        ants_inference_audit(
+            &resp.commit, answer, resp.answer_len, beacon, verifier_ref_fn, &ctx, &ep, &verdict),
+        ANTS_OK);
+    CHECK(verdict == ANTS_INFERENCE_VERDICT_CONTINUE);
+
+    /* (b) not audited: audit_threshold 0 → CONTINUE without opening a single
+     * position (even with the fraud reference wired in). */
+    {
+        ants_inference_commit_t c0 = resp.commit;
+        c0.audit_threshold = 0;
+        CHECK_EQ(ants_inference_eprocess_init(&ep,
+                                              ANTS_INFERENCE_DEFAULT_ALPHA,
+                                              ANTS_INFERENCE_DEFAULT_MU0,
+                                              ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
+                 ANTS_OK);
+        verdict = ANTS_INFERENCE_VERDICT_FRAUD;
+        CHECK_EQ(
+            ants_inference_audit(
+                &c0, answer, resp.answer_len, beacon, fraud_ref_fn, &fraud_vocab, &ep, &verdict),
+            ANTS_OK);
+        CHECK(verdict == ANTS_INFERENCE_VERDICT_CONTINUE);
+    }
+
+    /* (c) tampered envelope: flipping a byte in a committed distribution makes
+     * the recomputed Merkle root disagree with the signed commit → MALFORMED. */
+    {
+        uint8_t tampered[8192];
+        size_t tlen = resp.answer_len;
+        memcpy(tampered, answer, tlen);
+        tampered[tlen - 1] ^= 0xFFu;
+        CHECK_EQ(ants_inference_eprocess_init(&ep,
+                                              ANTS_INFERENCE_DEFAULT_ALPHA,
+                                              ANTS_INFERENCE_DEFAULT_MU0,
+                                              ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
+                 ANTS_OK);
+        verdict = ANTS_INFERENCE_VERDICT_CONTINUE;
+        CHECK_EQ(ants_inference_audit(
+                     &resp.commit, tampered, tlen, beacon, verifier_ref_fn, &ctx, &ep, &verdict),
+                 ANTS_ERROR_MALFORMED);
+    }
+
+    /* (d) fraud: the reference disagrees strongly at every opened position, so
+     * the betting e-process crosses 1/alpha → FRAUD. A generous alpha (1e-3)
+     * lets the capital cross within the L (≤ 16) committed positions. */
+    {
+        CHECK_EQ(ants_inference_eprocess_init(
+                     &ep, 1e-3, ANTS_INFERENCE_DEFAULT_MU0, ANTS_INFERENCE_DEFAULT_LAMBDA_CAP),
+                 ANTS_OK);
+        verdict = ANTS_INFERENCE_VERDICT_CONTINUE;
+        CHECK_EQ(ants_inference_audit(&resp.commit,
+                                      answer,
+                                      resp.answer_len,
+                                      beacon,
+                                      fraud_ref_fn,
+                                      &fraud_vocab,
+                                      &ep,
+                                      &verdict),
+                 ANTS_OK);
+        CHECK(verdict == ANTS_INFERENCE_VERDICT_FRAUD);
+    }
+
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
 }
 
 int main(void)
@@ -1687,6 +1850,7 @@ int main(void)
     test_serve_contract();
     test_serve_behaviour();
     test_audit_contract();
+    test_audit_behaviour();
 
     if (failures > 0) {
         fprintf(stderr, "test_orchestration: %d failure(s)\n", failures);
