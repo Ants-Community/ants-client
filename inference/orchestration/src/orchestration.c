@@ -1,18 +1,19 @@
 /*
  * orchestration.c — Inference orchestration (Component #13).
  *
- * Per RFC-0003 v0.2 + RFC-0009 v0.5. Surface 1 (commit-at-send) is
- * implemented here; surfaces 2–4 are still stubs that validate their
- * arguments and return ANTS_ERROR_NOT_IMPLEMENTED, replaced by their
- * implementation PRs in turn:
+ * Per RFC-0003 v0.2 + RFC-0009 v0.5. Surfaces 1-3 are implemented; surface 4
+ * (the serving runtime) is landing incrementally — init + the reference-model
+ * forward pass are implemented here, with serve + the audit capstone still
+ * stubs that validate arguments and return ANTS_ERROR_NOT_IMPLEMENTED until
+ * their PRs:
  *
  *   1. Commit-at-send  — leaf hash, Merkle root/prove/verify, commit
  *                        encode/decode, Ed25519 sign/verify. IMPLEMENTED.
- *   2. Challenge       — the three beacon-bound PRF derivations.
- *   3. e-process       — init/update + discrepancy scoring.
- *   4. Serving runtime — init/destroy/serve + the audit capstone, once
- *                        the kernels/embedding/identity composition and a
- *                        model loader exist.
+ *   2. Challenge       — the three beacon-bound PRF derivations. IMPLEMENTED.
+ *   3. e-process       — init/update + discrepancy scoring. IMPLEMENTED.
+ *   4. Serving runtime — init + the DRAFT reference model (a canonical forward
+ *                        over the #12 kernels) + reference_distribution:
+ *                        IMPLEMENTED. serve + the audit capstone: pending.
  *
  * Discipline: caller-owned state, no internal allocation, no threads, no
  * global mutable state, no logging — matching foundation/, network/,
@@ -52,11 +53,32 @@ const char *const ANTS_INFERENCE_PRF_CONTEXT_AUD = "aud";
 
 struct ants_inference_state {
     uint32_t magic;
-    /* Populated when init/serve gain real logic: the loaded model's hash
-     * (bound into every commit) and the producer public key derived from
-     * the configured private key. */
+
+    /* Loaded reference-model dimensions (validated <= the REF_*_MAX caps at
+     * init). vocab = V (logit-vector length); d_model = D (hidden size). */
+    uint32_t vocab;
+    uint32_t d_model;
+
+    /* The loaded model's hash (bound into every commit) and the producer
+     * public key derived from the configured private key. */
     uint8_t model_hash[ANTS_INFERENCE_HASH_SIZE];
     uint8_t producer_pub[ANTS_INFERENCE_PUBKEY_SIZE];
+
+    /* FP32 tensor views into the caller-owned weight blob (never copied — the
+     * blob must outlive the context). Row-major; shapes in brackets. */
+    const float *embed;   /* E  [V x D] */
+    const float *w_q;     /* Wq [D x D] */
+    const float *w_k;     /* Wk [D x D] */
+    const float *w_v;     /* Wv [D x D] */
+    const float *w_o;     /* Wo [D x D] */
+    const float *unembed; /* U  [D x V] */
+
+    /* Per-request forward-pass scratch arena: the five [T x D] activation
+     * buffers (X, Q, K, V, attn-out) plus the [T x T] attention scratch,
+     * laid out contiguously and sized for the REF_*_MAX caps so a forward at
+     * any admissible (prefix_len, dims) fits with no allocation. */
+    float scratch[5u * ANTS_INFERENCE_REF_SEQLEN_MAX * ANTS_INFERENCE_REF_DMODEL_MAX +
+                  ANTS_INFERENCE_REF_SEQLEN_MAX * ANTS_INFERENCE_REF_SEQLEN_MAX];
 };
 
 /* The opaque buffer must be able to hold the internal state. Conservative
@@ -1004,8 +1026,119 @@ ants_error_t ants_inference_discrepancy(const ants_canon_q24_t *p_ref,
 /* 4. The serving runtime                                                   */
 /* ======================================================================== */
 
+/* ---- the v0.x reference model (DRAFT weight-blob format) ---------------- */
+/*
+ * The reference model is the small canonical next-token predictor described
+ * in ants_inference.h "The v0.x reference model". Its weight blob is, in
+ * little-endian byte order:
+ *
+ *   [0  .. 8)   magic            "ANTSMOD1"
+ *   [8  .. 12)  version          (= 1)
+ *   [12 .. 16)  vocab V          (1 .. ANTS_INFERENCE_REF_VOCAB_MAX)
+ *   [16 .. 20)  d_model D        (1 .. ANTS_INFERENCE_REF_DMODEL_MAX)
+ *   [20 .. )    FP32 tensors, row-major, in this order:
+ *                 E  [V x D]   token embedding
+ *                 Wq [D x D]   query projection
+ *                 Wk [D x D]   key projection
+ *                 Wv [D x D]   value projection
+ *                 Wo [D x D]   attention output projection
+ *                 U  [D x V]   unembedding (hidden -> logits)
+ *
+ * Tensor floats are native little-endian FP32. The blob base must be 4-byte
+ * aligned (init enforces it) so the kernels read well-aligned const float*
+ * views; the 20-byte header keeps every tensor 4-aligned. DRAFT pending an
+ * RFC-0009 reference-model appendix.
+ */
+#define ANTS_INFERENCE_MODEL_HEADER_LEN 20u
+#define ANTS_INFERENCE_MODEL_VERSION    1u
+static const uint8_t ANTS_INFERENCE_MODEL_MAGIC[8] = {'A', 'N', 'T', 'S', 'M', 'O', 'D', '1'};
+
+/* Little-endian 4-byte read of a u32 from the blob header. */
+static uint32_t read_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Canonical forward pass over a token prefix, producing the FP32 logit vector
+ * (length vocab) for the next position. Built entirely on the #12 kernels —
+ * strict-left-to-right matmul, the pinned causal attention recipe — so two
+ * honest peers compute byte-identical logits for the same prefix and weights.
+ *
+ *   X  = embed[token_i]                         (lookup, [T x D])
+ *   Q  = X * Wq,  K = X * Wk,  V = X * Wv        (FP32 matmul, [T x D])
+ *   A  = causal_attention(Q, K, V)              (single head, d_head = D)
+ *   h  = A[T-1] * Wo + X[T-1]                    (last-position proj + residual)
+ *   logits = h * U                               ([1 x D]*[D x V] -> [1 x V])
+ *
+ * T (= n_tokens) must be in [1, REF_SEQLEN_MAX]; `out_logits` holds vocab
+ * floats. Writes the ctx scratch arena (caller guarantees it is the live ctx).
+ */
+static ants_error_t
+forward_logits(struct ants_inference_state *st, const uint32_t *tokens, size_t T, float *out_logits)
+{
+    const size_t D = st->d_model;
+    const size_t V = st->vocab;
+    float *X = st->scratch;
+    float *Q = X + T * D;
+    float *K = Q + T * D;
+    float *Vv = K + T * D;
+    float *A = Vv + T * D;
+    float *att = A + T * D; /* [T x T] attention-scores scratch */
+    float hbuf[ANTS_INFERENCE_REF_DMODEL_MAX];
+    ants_error_t rc;
+    size_t i, d;
+
+    /* 1. token-embedding lookup */
+    for (i = 0; i < T; i++) {
+        memcpy(X + i * D, st->embed + (size_t)tokens[i] * D, D * sizeof(float));
+    }
+
+    /* 2. Q, K, V projections (canonical FP32 matmul, strict left-to-right) */
+    rc = ants_canon_matmul_fp32(X, st->w_q, Q, T, D, D);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_canon_matmul_fp32(X, st->w_k, K, T, D, D);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_canon_matmul_fp32(X, st->w_v, Vv, T, D, D);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* 3. single-head causal scaled-dot-product attention (d_head = D) */
+    rc = ants_canon_attention_fp32(Q, K, Vv, A, T, D, true, att, T * T);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* 4. output projection of the last position + residual: h = A[T-1]*Wo + X[T-1] */
+    rc = ants_canon_matmul_fp32(A + (T - 1) * D, st->w_o, hbuf, 1, D, D);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    for (d = 0; d < D; d++) {
+        hbuf[d] += X[(T - 1) * D + d];
+    }
+
+    /* 5. unembedding: logits = h * U */
+    return ants_canon_matmul_fp32(hbuf, st->unembed, out_logits, 1, D, V);
+}
+
 ants_error_t ants_inference_init(ants_inference_t *ctx, const ants_inference_config_t *config)
 {
+    const uint8_t *blob;
+    size_t len;
+    uint32_t v_vocab;
+    uint32_t v_dmodel;
+    size_t n_floats;
+    size_t expected;
+    const float *t;
+    struct ants_inference_state *st;
+    ants_error_t rc;
+
     if (ctx == NULL || config == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
@@ -1013,7 +1146,78 @@ ants_error_t ants_inference_init(ants_inference_t *ctx, const ants_inference_con
         config->producer_priv == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    blob = config->model_weights;
+    len = config->model_weights_len;
+
+    /* The blob base must be 4-byte aligned so the FP32 tensor views are
+     * well-aligned for the canonical kernels (they index const float*). */
+    if (((uintptr_t)blob & 3u) != 0u) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* Parse + validate the DRAFT header. */
+    if (len < ANTS_INFERENCE_MODEL_HEADER_LEN) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (memcmp(blob, ANTS_INFERENCE_MODEL_MAGIC, sizeof ANTS_INFERENCE_MODEL_MAGIC) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (read_le32(blob + 8) != ANTS_INFERENCE_MODEL_VERSION) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    v_vocab = read_le32(blob + 12);
+    v_dmodel = read_le32(blob + 16);
+    if (v_vocab == 0u || v_vocab > ANTS_INFERENCE_REF_VOCAB_MAX || v_dmodel == 0u ||
+        v_dmodel > ANTS_INFERENCE_REF_DMODEL_MAX) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Exact blob length. V, D <= caps, so every product fits well within
+     * size_t (max V*D = 512*64 = 32768; the largest term 4*D*D = 16384). */
+    n_floats = (size_t)v_vocab * v_dmodel         /* E  */
+               + 4u * (size_t)v_dmodel * v_dmodel /* Wq, Wk, Wv, Wo */
+               + (size_t)v_dmodel * v_vocab;      /* U  */
+    expected = ANTS_INFERENCE_MODEL_HEADER_LEN + n_floats * sizeof(float);
+    if (len != expected) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    st = (struct ants_inference_state *)(void *)ctx->_opaque;
+    memset(st, 0, sizeof *st);
+    st->vocab = v_vocab;
+    st->d_model = v_dmodel;
+
+    /* Bind the FP32 tensor views (offsets are 4-aligned: header is 20 bytes,
+     * blob base is 4-aligned). */
+    t = (const float *)(const void *)(blob + ANTS_INFERENCE_MODEL_HEADER_LEN);
+    st->embed = t;
+    t += (size_t)v_vocab * v_dmodel;
+    st->w_q = t;
+    t += (size_t)v_dmodel * v_dmodel;
+    st->w_k = t;
+    t += (size_t)v_dmodel * v_dmodel;
+    st->w_v = t;
+    t += (size_t)v_dmodel * v_dmodel;
+    st->w_o = t;
+    t += (size_t)v_dmodel * v_dmodel;
+    st->unembed = t;
+
+    /* Bind H(M) and the producer public key. On any failure leave the ctx
+     * uninitialized-looking (magic stays 0). */
+    rc = ants_blake3_hash(blob, len, st->model_hash);
+    if (rc != ANTS_OK) {
+        memset(st, 0, sizeof *st);
+        return rc;
+    }
+    rc = ants_ed25519_pubkey_from_priv(config->producer_priv, st->producer_pub);
+    if (rc != ANTS_OK) {
+        memset(st, 0, sizeof *st);
+        return rc;
+    }
+
+    st->magic = ANTS_INFERENCE_STATE_MAGIC;
+    return ANTS_OK;
 }
 
 ants_error_t ants_inference_destroy(ants_inference_t *ctx)
@@ -1048,6 +1252,59 @@ ants_error_t ants_inference_serve(ants_inference_t *ctx,
     return ANTS_ERROR_NOT_IMPLEMENTED;
 }
 
+ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
+                                                   const uint8_t *prefix,
+                                                   size_t prefix_len,
+                                                   uint64_t position,
+                                                   ants_canon_q24_t *out_dist,
+                                                   size_t out_dist_cap,
+                                                   size_t *out_vocab)
+{
+    struct ants_inference_state *st;
+    uint32_t tokens[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    float logits[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_error_t rc;
+    size_t i;
+
+    (void)position; /* reference model is position-agnostic (see header) */
+
+    if (ctx == NULL || prefix == NULL || out_dist == NULL || out_vocab == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    st = (struct ants_inference_state *)(void *)ctx->_opaque;
+    if (st->magic != ANTS_INFERENCE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (prefix_len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (prefix_len > ANTS_INFERENCE_REF_SEQLEN_MAX) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    if (out_dist_cap < st->vocab) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Byte vocabulary: token id = input byte mod vocab (deterministic for any
+     * admissible vocab; bytes are 0..255). */
+    for (i = 0; i < prefix_len; i++) {
+        tokens[i] = (uint32_t)prefix[i] % st->vocab;
+    }
+
+    rc = forward_logits(st, tokens, prefix_len, logits);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* Quantize the FP32 logits to canonical q24 (the committed leaf form). */
+    rc = ants_canon_q24_vec_from_f32(logits, out_dist, st->vocab);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_vocab = st->vocab;
+    return ANTS_OK;
+}
+
 ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
                                   const uint8_t *answer_buf,
                                   size_t answer_len,
@@ -1063,4 +1320,35 @@ ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
         return ANTS_ERROR_INVALID_ARG;
     }
     return ANTS_ERROR_NOT_IMPLEMENTED;
+}
+
+/* ======================================================================== */
+/* Test-only hooks                                                          */
+/*                                                                          */
+/* Non-static so the test binary can reach them; forward-declared just below */
+/* to satisfy -Wmissing-prototypes (the convention reputation/crdt and       */
+/* network/dht use for their __test_ hooks). Not part of the public API.     */
+/* ======================================================================== */
+
+ants_error_t ants_inference__test_get_identity(const ants_inference_t *ctx,
+                                               uint8_t out_model_hash[ANTS_INFERENCE_HASH_SIZE],
+                                               uint8_t out_pub[ANTS_INFERENCE_PUBKEY_SIZE]);
+
+/* Copy out the bound model hash + producer public key so the test can
+ * cross-check init against an independent BLAKE3 + Ed25519 derive. */
+ants_error_t ants_inference__test_get_identity(const ants_inference_t *ctx,
+                                               uint8_t out_model_hash[ANTS_INFERENCE_HASH_SIZE],
+                                               uint8_t out_pub[ANTS_INFERENCE_PUBKEY_SIZE])
+{
+    const struct ants_inference_state *st;
+    if (ctx == NULL || out_model_hash == NULL || out_pub == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    st = (const struct ants_inference_state *)(const void *)ctx->_opaque;
+    if (st->magic != ANTS_INFERENCE_STATE_MAGIC) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memcpy(out_model_hash, st->model_hash, ANTS_INFERENCE_HASH_SIZE);
+    memcpy(out_pub, st->producer_pub, ANTS_INFERENCE_PUBKEY_SIZE);
+    return ANTS_OK;
 }

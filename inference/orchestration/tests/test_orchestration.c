@@ -32,8 +32,13 @@
  * discrepancy is checked for identity == 0, symmetry, range, near-disjoint ≈ 1,
  * and a closed-form two-element value.
  *
- * Surface 4 (the serving runtime) is still a stub: its tests pin the API shape,
- * argument validation, and the ANTS_ERROR_NOT_IMPLEMENTED return until its PR.
+ * Surface 4 (the serving runtime) is landing incrementally: init loads the
+ * DRAFT reference model (header + FP32 tensors over the #12 kernels), binds
+ * H(M) and the producer key, and reference_distribution runs the canonical
+ * forward — tested for argument handling, malformed-blob rejection, identity
+ * binding (vs an independent BLAKE3 / Ed25519 derive), determinism, and
+ * prefix-dependence. serve and audit remain stubs (NOT_IMPLEMENTED) pending
+ * their PRs.
  *
  * The remaining checks pin protocol constants, distinct PRF tags, e-process
  * default ranges, and the opaque-context size.
@@ -1085,22 +1090,94 @@ static ants_error_t dummy_ref_fn(void *user,
     return ANTS_OK;
 }
 
+/* -- surface 4: the serving runtime ----------------------------------- */
+
+/* Test-only accessor (defined in orchestration.c): copy out the bound model
+ * hash and producer public key so the test can cross-check init against an
+ * independent BLAKE3 + Ed25519 derive. */
+extern ants_error_t ants_inference__test_get_identity(const ants_inference_t *ctx,
+                                                      uint8_t out_model_hash[32],
+                                                      uint8_t out_pub[32]);
+
+/* Little-endian u32 store (mirror of orchestration.c's read_le32). */
+static void wr_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+/* Deterministic small FP32 weight from an index (splitmix32-style), in
+ * [-0.5, 0.5). Gives the reference model varied, reproducible weights so its
+ * per-position distributions are non-degenerate and prefix-dependent. */
+static float ref_weight(uint32_t idx)
+{
+    uint32_t x = idx + 0x9E3779B9u;
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35u;
+    x ^= x >> 16;
+    return (float)((double)(x & 0xFFFFFFu) / (double)0x1000000) - 0.5f;
+}
+
+/* Build a valid DRAFT reference-model blob into the float-aligned buffer `buf`
+ * of capacity `cap` bytes (magic + version + dims + the six FP32 tensors).
+ * Returns the byte length, or 0 if it would overflow `cap`. */
+static size_t build_ref_model(uint8_t *buf, size_t cap, uint32_t vocab, uint32_t d_model)
+{
+    size_t n_floats =
+        (size_t)vocab * d_model + 4u * (size_t)d_model * d_model + (size_t)d_model * vocab;
+    size_t len = 20u + n_floats * sizeof(float);
+    float *t;
+    size_t i;
+    if (len > cap) {
+        return 0;
+    }
+    memcpy(buf, "ANTSMOD1", 8);
+    wr_le32(buf + 8, 1u);
+    wr_le32(buf + 12, vocab);
+    wr_le32(buf + 16, d_model);
+    t = (float *)(void *)(buf + 20);
+    for (i = 0; i < n_floats; i++) {
+        t[i] = ref_weight((uint32_t)i);
+    }
+    return len;
+}
+
 static void test_init_contract(void)
 {
+    union {
+        uint64_t a;
+        uint8_t b[4096];
+    } blobu;
+    uint8_t *blob = blobu.b;
+    size_t len;
     ants_inference_t ctx;
     ants_inference_config_t config;
-    uint8_t weights[16] = {0};
-    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE] = {0};
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    uint8_t exp_hash[32];
+    uint8_t exp_pub[32];
+    uint8_t got_hash[32];
+    uint8_t got_pub[32];
+    size_t i;
+
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(i + 1);
+    }
+
+    len = build_ref_model(blob, sizeof blobu.b, 32, 8);
+    CHECK(len > 0);
 
     memset(&config, 0, sizeof config);
-    config.model_weights = weights;
-    config.model_weights_len = sizeof weights;
+    config.model_weights = blob;
+    config.model_weights_len = len;
     config.producer_priv = priv;
 
+    /* argument validation (runs before any blob parse) */
     CHECK_EQ(ants_inference_init(NULL, &config), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_inference_init(&ctx, NULL), ANTS_ERROR_INVALID_ARG);
-
-    /* Missing required config fields. */
     {
         ants_inference_config_t bad = config;
         bad.model_weights = NULL;
@@ -1117,7 +1194,189 @@ static void test_init_contract(void)
         CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_INVALID_ARG);
     }
 
-    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_ERROR_NOT_IMPLEMENTED);
+    /* misaligned blob base → INVALID_ARG (kernels need 4-aligned float views) */
+    {
+        ants_inference_config_t bad = config;
+        bad.model_weights = blob + 1;
+        bad.model_weights_len = len - 1;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_INVALID_ARG);
+    }
+
+    /* malformed: shorter than the header */
+    {
+        ants_inference_config_t bad = config;
+        bad.model_weights_len = 8;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_MALFORMED);
+    }
+    /* malformed: wrong magic */
+    {
+        union {
+            uint64_t a;
+            uint8_t b[4096];
+        } bm;
+        ants_inference_config_t bad = config;
+        memcpy(bm.b, blob, len);
+        bm.b[0] = 'X';
+        bad.model_weights = bm.b;
+        bad.model_weights_len = len;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_MALFORMED);
+    }
+    /* malformed: unsupported version */
+    {
+        union {
+            uint64_t a;
+            uint8_t b[4096];
+        } bv;
+        ants_inference_config_t bad = config;
+        memcpy(bv.b, blob, len);
+        bv.b[8] = 2;
+        bad.model_weights = bv.b;
+        bad.model_weights_len = len;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_MALFORMED);
+    }
+    /* malformed: out-of-range vocab (header only) */
+    {
+        union {
+            uint64_t a;
+            uint8_t b[20];
+        } hdr;
+        ants_inference_config_t bad = config;
+        memcpy(hdr.b, "ANTSMOD1", 8);
+        wr_le32(hdr.b + 8, 1u);
+        wr_le32(hdr.b + 12, (uint32_t)ANTS_INFERENCE_REF_VOCAB_MAX + 1u);
+        wr_le32(hdr.b + 16, 8u);
+        bad.model_weights = hdr.b;
+        bad.model_weights_len = sizeof hdr.b;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_MALFORMED);
+    }
+    /* malformed: length inconsistent with dims (truncated by one float) */
+    {
+        ants_inference_config_t bad = config;
+        bad.model_weights_len = len - 4;
+        CHECK_EQ(ants_inference_init(&ctx, &bad), ANTS_ERROR_MALFORMED);
+    }
+
+    /* success — and the bound identity matches an independent BLAKE3 + Ed25519 */
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+    CHECK_EQ(ants_blake3_hash(blob, len, exp_hash), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv, exp_pub), ANTS_OK);
+    CHECK_EQ(ants_inference__test_get_identity(&ctx, got_hash, got_pub), ANTS_OK);
+    CHECK(memcmp(got_hash, exp_hash, 32) == 0);
+    CHECK(memcmp(got_pub, exp_pub, 32) == 0);
+
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
+}
+
+static void test_reference_distribution_contract(void)
+{
+    union {
+        uint64_t a;
+        uint8_t b[40000];
+    } blobu;
+    size_t len;
+    ants_inference_t ctx;
+    ants_inference_config_t config;
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    ants_canon_q24_t da[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_canon_q24_t db[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_canon_q24_t dc[ANTS_INFERENCE_REF_VOCAB_MAX];
+    size_t vocab_a = 0;
+    size_t vocab_b = 0;
+    size_t vocab_c = 0;
+    const uint8_t prefix1[] = "alpha beta gamma delta";
+    const uint8_t prefix2[] = "zeta eta theta iota kappa";
+    uint8_t toolong[ANTS_INFERENCE_REF_SEQLEN_MAX + 1];
+    double score;
+    size_t i;
+
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(i + 7);
+    }
+    /* vocab 256 (full byte range), d_model 16 */
+    len = build_ref_model(blobu.b, sizeof blobu.b, 256, 16);
+    CHECK(len > 0);
+
+    memset(&config, 0, sizeof config);
+    config.model_weights = blobu.b;
+    config.model_weights_len = len;
+    config.producer_priv = priv;
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+
+    /* argument validation */
+    CHECK_EQ(ants_inference_reference_distribution(
+                 NULL, prefix1, 4, 4, da, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_reference_distribution(
+                 &ctx, NULL, 4, 4, da, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_reference_distribution(
+                 &ctx, prefix1, 4, 4, NULL, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_reference_distribution(
+                 &ctx, prefix1, 4, 4, da, ANTS_INFERENCE_REF_VOCAB_MAX, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_reference_distribution(
+                 &ctx, prefix1, 0, 0, da, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* prefix longer than REF_SEQLEN_MAX → BUFFER_TOO_SMALL */
+    memset(toolong, 'a', sizeof toolong);
+    CHECK_EQ(ants_inference_reference_distribution(
+                 &ctx, toolong, sizeof toolong, 0, da, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    /* out_dist_cap < vocab (vocab 256, cap 16) → BUFFER_TOO_SMALL */
+    CHECK_EQ(ants_inference_reference_distribution(&ctx, prefix1, 4, 4, da, 16, &vocab_a),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    /* uninitialized ctx → INVALID_ARG */
+    {
+        ants_inference_t z;
+        memset(&z, 0, sizeof z);
+        CHECK_EQ(ants_inference_reference_distribution(
+                     &z, prefix1, 4, 4, da, ANTS_INFERENCE_REF_VOCAB_MAX, &vocab_a),
+                 ANTS_ERROR_INVALID_ARG);
+    }
+
+    /* determinism: same prefix → identical q24 vector + vocab */
+    CHECK_EQ(ants_inference_reference_distribution(&ctx,
+                                                   prefix1,
+                                                   sizeof prefix1 - 1,
+                                                   sizeof prefix1 - 1,
+                                                   da,
+                                                   ANTS_INFERENCE_REF_VOCAB_MAX,
+                                                   &vocab_a),
+             ANTS_OK);
+    CHECK_EQ(ants_inference_reference_distribution(&ctx,
+                                                   prefix1,
+                                                   sizeof prefix1 - 1,
+                                                   sizeof prefix1 - 1,
+                                                   db,
+                                                   ANTS_INFERENCE_REF_VOCAB_MAX,
+                                                   &vocab_b),
+             ANTS_OK);
+    CHECK(vocab_a == 256);
+    CHECK(vocab_b == 256);
+    CHECK(memcmp(da, db, vocab_a * sizeof(ants_canon_q24_t)) == 0);
+
+    /* identity discrepancy is exactly 0 (surface-3 cross-check) */
+    CHECK_EQ(ants_inference_discrepancy(da, db, vocab_a, &score), ANTS_OK);
+    CHECK(score == 0.0);
+
+    /* prefix-dependence: a clearly different prefix yields a different
+     * distribution and a strictly positive discrepancy */
+    CHECK_EQ(ants_inference_reference_distribution(&ctx,
+                                                   prefix2,
+                                                   sizeof prefix2 - 1,
+                                                   sizeof prefix2 - 1,
+                                                   dc,
+                                                   ANTS_INFERENCE_REF_VOCAB_MAX,
+                                                   &vocab_c),
+             ANTS_OK);
+    CHECK(vocab_c == 256);
+    CHECK(memcmp(da, dc, vocab_a * sizeof(ants_canon_q24_t)) != 0);
+    CHECK_EQ(ants_inference_discrepancy(da, dc, vocab_a, &score), ANTS_OK);
+    CHECK(score > 0.0);
+
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
 }
 
 static void test_destroy_contract(void)
@@ -1242,6 +1501,7 @@ int main(void)
     test_discrepancy_contract();
 
     test_init_contract();
+    test_reference_distribution_contract();
     test_destroy_contract();
     test_serve_contract();
     test_audit_contract();

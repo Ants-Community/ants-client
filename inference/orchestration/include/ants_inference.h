@@ -620,6 +620,42 @@ typedef union {
     uint64_t _align;
 } ants_inference_t;
 
+/* ------------------------------------------------------------------------ */
+/* The v0.x reference model (DRAFT)                                         */
+/*                                                                          */
+/* The serving runtime is model-agnostic glue, but it has to run *some*     */
+/* model to produce per-position logit distributions. The reference client  */
+/* ships a deliberately small, deterministic next-token predictor built     */
+/* entirely on the canonical kernels (#12): a byte-vocabulary causal-       */
+/* attention block (token embedding -> single-head causal scaled-dot-       */
+/* product attention -> output projection + residual -> unembedding) whose  */
+/* logits are quantized to canonical q24. Every step is a canonical-kernel  */
+/* call, so the output is bit-identical across honest peers — which is what */
+/* makes an honest verifier's rerun match the producer's commit to the last */
+/* bit (the property the whole scheme-C audit rests on).                    */
+/*                                                                          */
+/* This is the posture the embedding component (#11) already takes with its */
+/* pinned hashes: the RECIPE (a canonical forward over #12) is the          */
+/* deliverable; the weight VALUES are illustrative so the commit/audit      */
+/* machinery can be exercised end to end. A production deployment swaps in a */
+/* real quantized transformer behind the same reference-distribution seam;  */
+/* the protocol only requires producer and verifier to run the identical    */
+/* canonical recipe. The weight-blob wire layout is pinned in               */
+/* orchestration.c (magic + dims + FP32 tensors); it is DRAFT pending an     */
+/* RFC-0009 reference-model appendix.                                       */
+/*                                                                          */
+/* The dimensions are bounded so the per-request forward scratch fits the    */
+/* fixed opaque context with no allocation; a model exceeding any bound is   */
+/* rejected at init.                                                        */
+/* ------------------------------------------------------------------------ */
+
+/* Max vocabulary size V (logit-vector length). */
+#define ANTS_INFERENCE_REF_VOCAB_MAX 512
+/* Max hidden dimension d_model. */
+#define ANTS_INFERENCE_REF_DMODEL_MAX 64
+/* Max prefix length (tokens) a single forward pass accepts. */
+#define ANTS_INFERENCE_REF_SEQLEN_MAX 64
+
 /* Runtime configuration. All buffers are caller-owned and must outlive the
  * context; the library copies nothing large. */
 typedef struct {
@@ -695,6 +731,37 @@ ants_error_t ants_inference_destroy(ants_inference_t *ctx);
 ants_error_t ants_inference_serve(ants_inference_t *ctx,
                                   const ants_inference_request_t *req,
                                   ants_inference_response_t *resp);
+
+/*
+ * Recompute the canonical q24 logit distribution the loaded reference model
+ * emits at `position`, given the prefix tokens 0..prefix_len-1 (for the v0.x
+ * byte-vocabulary model, token id i = prefix[i] mod vocab). This is the
+ * producer/verifier-shared canonical forward pass: `ants_inference_serve` uses
+ * it to build each committed distribution, and a verifier wraps it in an
+ * `ants_inference_reference_fn` (passing the context as `user`) so its rerun
+ * is bit-identical to the producer's commit.
+ *
+ * Writes `vocab` q24 values into `out_dist` and the model's vocab into
+ * `*out_vocab`. The ctx is non-const because the forward pass uses its opaque
+ * scratch arena (no allocation). The reference model is position-agnostic —
+ * the prefix content fully determines the distribution — so `position` is
+ * accepted for signature compatibility with `ants_inference_reference_fn` and
+ * is otherwise unused.
+ *
+ * Returns:
+ *   ANTS_OK on success;
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers, an uninitialized ctx, or
+ *     prefix_len == 0;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — out_dist_cap < vocab, or prefix_len exceeds
+ *     ANTS_INFERENCE_REF_SEQLEN_MAX.
+ */
+ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
+                                                   const uint8_t *prefix,
+                                                   size_t prefix_len,
+                                                   uint64_t position,
+                                                   ants_canon_q24_t *out_dist,
+                                                   size_t out_dist_cap,
+                                                   size_t *out_vocab);
 
 /* Verifier-side reference-distribution callback. Given the answer's prefix
  * up to `position` (the tokens 0..position−1, as the verifier reconstructs
