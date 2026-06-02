@@ -13,6 +13,40 @@ the spec repo's
 
 ## Unreleased
 
+### network: Component #6 (gossip overlay) — lazy-pull anti-entropy + persistent per-connection channel · 2026-06-02
+
+Two refinements to the gossip overlay now that it disseminates on the real wire.
+
+**Lazy-pull anti-entropy (IHAVE/IWANT)** complements the eager push: a frame
+lost in flight, or a peer that joined the view after a proof swept through,
+leaves a gap the push will not refill on its own. A node periodically
+advertises a digest of the content-ids it holds (`ants_gossip_announce` →
+IHAVE); a receiver missing some replies with an IWANT naming exactly those; the
+advertiser answers each with an ordinary PUSH. `ants_gossip_on_message` now
+dispatches all three message types, and the IHAVE→IWANT / IWANT→PUSH replies go
+to the requesting peer only. The L1 G-Set is the oracle throughout
+(`ants_crdt_contains` finds what a peer lacks; `ants_crdt_enumerate` builds the
+digest and serves requested proofs). Each digest/request is bounded to
+`ANTS_GOSSIP_MAX_IDS`; bulk late-joiner sync remains the Component #7 G-Set
+snapshot.
+
+**Persistent per-connection outbound channel.** The transport binding
+previously opened a new unidirectional stream per forwarded proof and held the
+handle until the connection closed — the bounded pool filled under load and
+dropped further forwards. It now opens ONE persistent unidirectional stream per
+connection and reuses it, so retained handles are bounded by the connection
+count, not the proof volume. Because the stream is never FIN'd per message,
+frames are length-prefixed (2-byte big-endian); picoquic copies each send into
+its ordered queue whole-or-not-at-all, so no partial frame can corrupt the
+receiver's deframer. The inbound demux gained a deframer that drains complete
+frames as bytes arrive.
+
+The gossip frame CBOR (PUSH/IHAVE/IWANT) is unchanged; the stream framing
+(FIN-delimited → length-prefixed) is a binding-level change, **DRAFT** pending
+RFC-0008. `gossip_basic` exercises both: the lazy-pull cascade over the
+in-process harness, and a three-proof persistent-channel run over real QUIC;
+the suite stays 21/21 green.
+
 ### reputation: Component #9 (reputation/identity) — selective disclosure of receipts · 2026-06-02
 
 **A peer can now prove `A ≥ b` without revealing its whole interaction
