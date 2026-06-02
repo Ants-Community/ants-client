@@ -1509,6 +1509,86 @@ ants_error_t ants_inference_reference_distribution(ants_inference_t *ctx,
     return ANTS_OK;
 }
 
+/* Decoded view of a DRAFT answer envelope — pointers into the caller's buffer
+ * (no copy). `n` is the generated-position count (= tokens length = dist
+ * count = the committed length); dist[j] is the j-th per-position q24
+ * distribution, dist_len[j] bytes. */
+struct answer_env {
+    const uint8_t *input;
+    size_t input_len;
+    const uint8_t *tokens;
+    size_t n;
+    const uint8_t *dist[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    size_t dist_len[ANTS_INFERENCE_REF_SEQLEN_MAX];
+};
+
+/* Strictly decode the DRAFT answer envelope (map(3){0: input, 1: tokens,
+ * 2: array(L) of q24 distributions}). MALFORMED on any structural problem,
+ * NON_CANONICAL on a §4.2.1 violation. Requires tokens-length == dist-count
+ * <= REF_SEQLEN_MAX and every distribution the same non-zero multiple-of-4
+ * length. Same untrusted-input posture as the rest of the codec. */
+static ants_error_t answer_envelope_decode(const uint8_t *buf, size_t len, struct answer_env *out)
+{
+    ants_cbor_dec_t dec;
+    size_t npairs = 0;
+    size_t darr = 0;
+    size_t j;
+    ants_error_t rc;
+
+    rc = norm_decode_err(ants_cbor_dec_init(&dec, buf, len));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_map(&dec, &npairs));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (npairs != ANTS_INFERENCE_ENV_PAIRS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    rc = expect_key(&dec, ANTS_INFERENCE_ENV_KEY_INPUT);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_bytes(&dec, &out->input, &out->input_len));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = expect_key(&dec, ANTS_INFERENCE_ENV_KEY_TOKS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_bytes(&dec, &out->tokens, &out->n));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (out->n > ANTS_INFERENCE_REF_SEQLEN_MAX) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    rc = expect_key(&dec, ANTS_INFERENCE_ENV_KEY_DISTS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_array(&dec, &darr));
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (darr != out->n) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    for (j = 0; j < out->n; j++) {
+        rc = norm_decode_err(ants_cbor_dec_bytes(&dec, &out->dist[j], &out->dist_len[j]));
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (out->dist_len[j] == 0u || (out->dist_len[j] % 4u) != 0u ||
+            out->dist_len[j] != out->dist_len[0]) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+    return norm_decode_err(ants_cbor_dec_finalise(&dec));
+}
+
 ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
                                   const uint8_t *answer_buf,
                                   size_t answer_len,
@@ -1518,12 +1598,143 @@ ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
                                   const ants_inference_eprocess_t *eprocess_params,
                                   ants_inference_verdict_t *out_verdict)
 {
-    (void)ref_user;
+    struct answer_env env;
+    uint8_t leaves[ANTS_INFERENCE_REF_SEQLEN_MAX][ANTS_INFERENCE_MERKLE_LEAF_SIZE];
+    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
+    uint64_t positions[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    uint8_t prefix[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    ants_canon_q24_t ref_dist[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_canon_q24_t committed[ANTS_INFERENCE_REF_VOCAB_MAX];
+    ants_inference_eprocess_t ep;
+    size_t prompt_eff;
+    size_t n_pos = 0;
+    size_t si;
+    size_t j;
+    bool audited = false;
+    ants_error_t rc;
+
     if (commit == NULL || answer_buf == NULL || answer_len == 0 || beacon == NULL ||
         ref_fn == NULL || eprocess_params == NULL || out_verdict == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+
+    /* Decode + structurally validate the answer envelope. */
+    rc = answer_envelope_decode(answer_buf, answer_len, &env);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (env.n == 0u || env.n != commit->length) {
+        return ANTS_ERROR_MALFORMED; /* envelope inconsistent with the signed commit */
+    }
+
+    /* Integrity gate: recompute the Merkle root over the envelope's per-
+     * position distributions and require it to equal the committed root. This
+     * binds every opening to the signed commit in one check — any tampered or
+     * relocated distribution flips the root. */
+    for (j = 0; j < env.n; j++) {
+        rc = ants_inference_leaf_hash(env.dist[j], env.dist_len[j], (uint64_t)j, leaves[j]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    rc = ants_inference_merkle_root(leaves, env.n, root);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (memcmp(root, commit->root, ANTS_INFERENCE_MERKLE_ROOT_SIZE) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* audit? — public, deterministic, derived from the posterior beacon and
+     * the commit root (no verifier discretion). */
+    rc = ants_inference_challenge_is_audited(
+        beacon, commit->root, commit->audit_threshold, &audited);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (!audited) {
+        *out_verdict = ANTS_INFERENCE_VERDICT_CONTINUE; /* not audited this round */
+        return ANTS_OK;
+    }
+
+    /* The strided position set S. */
+    rc = ants_inference_challenge_positions(beacon,
+                                            commit->root,
+                                            commit->m,
+                                            commit->length,
+                                            positions,
+                                            ANTS_INFERENCE_REF_SEQLEN_MAX,
+                                            &n_pos);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* Reconstruct the producer's prompt truncation (same rule as serve). */
+    prompt_eff = env.input_len;
+    if (prompt_eff > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u) {
+        prompt_eff = (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u;
+    }
+
+    ep = *eprocess_params;
+
+    for (si = 0; si < n_pos; si++) {
+        size_t p = (size_t)positions[si];
+        size_t vocab_c;
+        size_t vocab_ref = 0;
+        size_t k;
+        double score;
+        ants_inference_verdict_t v;
+
+        if (p >= env.n || prompt_eff + p > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX) {
+            return ANTS_ERROR_MALFORMED; /* position inconsistent with the model bounds */
+        }
+
+        /* prefix(p) = input[0..prompt_eff-1] ‖ generated tokens[0..p-1]. */
+        for (k = 0; k < prompt_eff; k++) {
+            prefix[k] = env.input[k];
+        }
+        for (k = 0; k < p; k++) {
+            prefix[prompt_eff + k] = env.tokens[k];
+        }
+
+        /* The verifier's reference distribution at this position. */
+        rc = ref_fn(ref_user,
+                    prefix,
+                    prompt_eff + p,
+                    (uint64_t)p,
+                    ref_dist,
+                    ANTS_INFERENCE_REF_VOCAB_MAX,
+                    &vocab_ref);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+
+        /* The producer's committed distribution at this position (q24 LE). */
+        vocab_c = env.dist_len[p] / 4u;
+        if (vocab_c != vocab_ref || vocab_c > ANTS_INFERENCE_REF_VOCAB_MAX) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        for (k = 0; k < vocab_c; k++) {
+            committed[k] = (ants_canon_q24_t)read_le32(env.dist[p] + k * 4u);
+        }
+
+        /* Score the discrepancy and fold it into the betting e-process. */
+        rc = ants_inference_discrepancy(ref_dist, committed, vocab_c, &score);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        rc = ants_inference_eprocess_update(&ep, score, &v);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (v == ANTS_INFERENCE_VERDICT_FRAUD) {
+            *out_verdict = ANTS_INFERENCE_VERDICT_FRAUD; /* Ville: P(this | honest) <= alpha */
+            return ANTS_OK;
+        }
+    }
+
+    *out_verdict = ANTS_INFERENCE_VERDICT_CONTINUE; /* passed — not caught this round */
+    return ANTS_OK;
 }
 
 /* ======================================================================== */
