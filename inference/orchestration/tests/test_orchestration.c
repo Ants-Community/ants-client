@@ -32,13 +32,14 @@
  * discrepancy is checked for identity == 0, symmetry, range, near-disjoint ≈ 1,
  * and a closed-form two-element value.
  *
- * Surface 4 (the serving runtime) is landing incrementally: init loads the
- * DRAFT reference model (header + FP32 tensors over the #12 kernels), binds
- * H(M) and the producer key, and reference_distribution runs the canonical
- * forward — tested for argument handling, malformed-blob rejection, identity
- * binding (vs an independent BLAKE3 / Ed25519 derive), determinism, and
- * prefix-dependence. serve and audit remain stubs (NOT_IMPLEMENTED) pending
- * their PRs.
+ * Surface 4 (the serving runtime) is implemented: init loads the DRAFT
+ * reference model (header + FP32 tensors over the #12 kernels) and binds H(M)
+ * and the producer key; reference_distribution + serve run the canonical
+ * forward (tested for determinism, prefix-dependence, the signed commit, and
+ * an independent envelope/root/token reconstruction); and audit runs the full
+ * Tier-2 loop (honest → CONTINUE, tampered envelope → MALFORMED, a disagreeing
+ * reference → FRAUD, not-audited → CONTINUE), with malformed-blob and argument
+ * handling covered throughout.
  *
  * The remaining checks pin protocol constants, distinct PRF tags, e-process
  * default ranges, and the opaque-context size.

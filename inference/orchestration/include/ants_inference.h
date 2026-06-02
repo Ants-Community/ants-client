@@ -608,12 +608,14 @@ ants_error_t ants_inference_discrepancy(const ants_canon_q24_t *p_ref,
 /* reviewable as one artifact.                                              */
 /* ======================================================================== */
 
-/* Conservative oversize for ABI stability while the internal layout is in
- * flux (the runtime will hold a model handle plus audited-path scratch;
- * the bulk model weights stay in caller buffers, never copied here). The
- * .c file pins the true bound with the compile-time size-check idiom and
- * this constant is tightened once `serve` is implemented and measured. */
-#define ANTS_INFERENCE_CTX_SIZE 131072
+/* Sized to hold the serving runtime's state: the model layout plus the
+ * per-request forward-pass scratch arena (the bulk model weights stay in
+ * caller buffers, never copied here). The measured footprint for the v0.x
+ * reference model is ~98.4 KiB — the scratch arena dominates (24576 floats) —
+ * so this bound rounds up to 100 KiB with headroom. The .c file pins the true
+ * bound with the compile-time size-check idiom, so a layout change that
+ * overruns this is caught at compile time. */
+#define ANTS_INFERENCE_CTX_SIZE 102400
 
 typedef union {
     uint8_t _opaque[ANTS_INFERENCE_CTX_SIZE];
