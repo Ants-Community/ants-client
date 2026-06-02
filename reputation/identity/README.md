@@ -2,13 +2,15 @@
 
 Identity & reputation service. Reputation & identity layer.
 
-**Status:** PR1 (the (A, T, κ) spine) implemented; bonds + selective disclosure pending.
+**Status:** the (A, T, κ) spine + saturating `T_eff` + the L1 slash gate + the receipt-bag Merkle commitment & inclusion proofs (selective disclosure) implemented; the `A ≥ b` subset recompute + bond-admission wiring pending.
 **Effort:** 3 EM.
 **Spec:** [RFC-0004 v0.6 §Tenure + §Bond accounting + §Selective disclosure](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md); [RFC-0005 §Multi-vendor reputation weighting](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
-**Dependencies:** `foundation/crypto`, `foundation/cbor`. (Bonds + slash
-integration will additionally use `foundation/tee` + `reputation/crdt`
-once those are built; PR1 does not — it computes A/T from a verified
-receipt bag with nothing but crypto + cbor.)
+**Dependencies:** `foundation/crypto`, `foundation/cbor` — the library
+links nothing else. The L1 slash gate takes its slash source as a
+caller-supplied callback (canonically `reputation/crdt`'s
+`ants_crdt_is_slashed`), so even `compute_checked` adds no link; the bag
+Merkle uses only BLAKE3. Bond-admission and TEE attestation wiring will
+involve `economy/bond` (#15) and `foundation/tee` at the call sites.
 
 ## Scope
 
@@ -23,10 +25,12 @@ primitives the rest of the architecture depends on.
 - **Deterministic fixed-point decay** — the spec-mandated alternative to
   non-deterministic float `exp()` (RFC-0004 §"A reference sketch": "the
   production code uses a fixed-point decay table — see RFC-0009"). Decay
-  over k bins is `r^k` in q32 fixed-point, computed by binary
-  exponentiation (the exact multiply sequence is the pinned recipe, since
-  q32 multiply is not associative under truncation). Bit-identical across
-  platforms, so every honest peer computes the same `T_X`.
+  over k bins is `r^k` in q32 fixed-point, computed by **repeated
+  multiplication** (the exact multiply sequence is the pinned recipe, since
+  q32 multiply is not associative under truncation — binary exponentiation
+  would give a different bit result and split tenure across peers).
+  Bit-identical across platforms, so every honest peer computes the same
+  `T_X`.
 - **The (A, T) computation** (RFC-0004 §816 / §825): `A` = uncapped
   fast-decayed sum of verified receipts; `T` = per-bin, κ-clipped,
   slow-decayed sum. Invalid / wrong-server / future-dated receipts are
@@ -62,14 +66,40 @@ RFC-0004 §"The saturating T → T_eff transform"):**
   bit-stable across calls. `T_CAP` (`T_FORK_CHOICE_CAP`, RFC-0008 §7) is
   a DRAFT placeholder, b2-class like δ/κ.
 
+**Implemented — the L1 slash gate** (RFC-0004 §"How tenure interacts with
+Layer 1"):
+
+- **`ants_reputation_compute_checked`** zeroes a slashed peer's `A` AND `T`
+  (a slashed identity is globally dead, §110) via a caller-supplied slash
+  predicate — canonically `ants_crdt_is_slashed` over Component #7's live
+  L1 G-Set, or the L2 chain index (default-to-slashed) for a late joiner.
+  The library keeps no `crdt` dependency; the slash source is a callback.
+
+**Implemented — receipt-bag Merkle commitment + inclusion proofs**
+(RFC-0004 §"Selective disclosure of receipts"):
+
+- **`ants_reputation_bag_root` / `_bag_prove` / `_bag_verify_inclusion`** —
+  the receipt bag as a Merkle tree (the same domain-separated,
+  promote-lone-trailing BLAKE3 scheme as `reputation/chain` and
+  `inference/orchestration`). Each leaf commits a whole receipt (canonical
+  body ‖ both signatures); canonical leaf order is (timestamp ASC, then
+  leaf-hash ASC); `bag_root = derive_key("ants-v1-receipt-bag-root",
+  peer_id ‖ merkle_root)` binds the tree to the committing peer. A peer
+  proves a receipt is in its committed bag with an O(log n) inclusion path
+  without revealing the rest of its history. Lower-bound soundness
+  (revealing a subset understates, never overstates, `A`); fake receipts
+  fail the separate countersignature check.
+
 **Pending (later PRs):**
 
-- **Receipt-bag Merkle tree** + **selective disclosure** (RFC-0004
-  §"Selective disclosure of receipts"): inclusion proofs, lower-bound
-  property, positive/negative asymmetry.
-- **Bond accounting** + **race-safe admission** (RFC-0004 §"Bond
-  accounting model" / §Atomicity) — needs `reputation/crdt` for slash
-  integration.
+- **Selective-disclosure `A ≥ b` recompute** + **compact summaries**
+  (RFC-0004 §"Selective disclosure of receipts"): the verifier's
+  subset-sum bound layered on the Merkle primitives above; bucketed
+  summaries for large bags.
+- **Bond-admission wiring** into the real high-stakes-act call sites
+  (Tier-3 committee per RFC-0003; L2 committee / fork-recovery vote per
+  RFC-0004 §Layer 2) + the `bond_admission` L1 gossip. (Bond accounting
+  itself is Component #15, `economy/bond`.)
 - **Multi-vendor attestation lookups** via `foundation/tee` (RFC-0005).
 
 ## Good-first-contribution flag

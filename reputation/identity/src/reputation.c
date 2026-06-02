@@ -479,3 +479,404 @@ ants_error_t ants_reputation_compute_checked(const uint8_t server_id[ANTS_REP_PE
     return ants_reputation_compute(
         server_id, receipts, n_receipts, now_unix_s, params, out_a, out_t);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Selective disclosure: the receipt-bag Merkle tree (RFC-0004              */
+/* §"Selective disclosure of receipts")                                     */
+/*                                                                          */
+/* The SAME domain-separated, promote-lone-trailing BLAKE3 Merkle scheme as */
+/* reputation/chain's confirmed_proofs root and inference/orchestration's   */
+/* commit Merkle (leaf 0x00 / node 0x01 / empty 0x02), so the codebase has  */
+/* one canonical tree. Receipt-specific: the leaf commits the whole receipt */
+/* (canonical body ‖ both signatures), the canonical leaf order is          */
+/* (timestamp ASC, then leaf-hash ASC), and bag_root binds the tree root to */
+/* the peer-id via BLAKE3.derive_key. No malloc, no float; an O(log n)      */
+/* bounded peak stack, like chain.                                          */
+/* ------------------------------------------------------------------------ */
+
+#define REP_MERKLE_LEAF_PREFIX  0x00u
+#define REP_MERKLE_NODE_PREFIX  0x01u
+#define REP_MERKLE_EMPTY_PREFIX 0x02u
+
+/* leaf(R) = BLAKE3(0x00 ‖ body(R) ‖ server_sig ‖ client_sig). Streams the
+ * receipt into the hasher (no concatenation buffer beyond the <=128-byte
+ * canonical body). Binds the whole receipt — body and both signatures — so
+ * one leaf hash anchors both the inclusion proof and the countersignature
+ * integrity check. */
+static ants_error_t receipt_leaf_hash(const ants_reputation_receipt_t *r,
+                                      uint8_t out[ANTS_REP_HASH_SIZE])
+{
+    uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    size_t body_len = 0;
+    const uint8_t prefix = REP_MERKLE_LEAF_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_reputation_receipt_body_encode(r, body, sizeof body, &body_len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, body, body_len);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, r->server_sig, ANTS_REP_SIG_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, r->client_sig, ANTS_REP_SIG_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* node(L,R) = BLAKE3(0x01 ‖ L ‖ R). `out` may alias `left`/`right`: both
+ * inputs are consumed into the hasher before final writes out. */
+static ants_error_t rep_node_hash(const uint8_t left[ANTS_REP_HASH_SIZE],
+                                  const uint8_t right[ANTS_REP_HASH_SIZE],
+                                  uint8_t out[ANTS_REP_HASH_SIZE])
+{
+    const uint8_t prefix = REP_MERKLE_NODE_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, left, ANTS_REP_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, right, ANTS_REP_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* empty-bag root = BLAKE3(0x02). */
+static ants_error_t rep_empty_root(uint8_t out[ANTS_REP_HASH_SIZE])
+{
+    const uint8_t prefix = REP_MERKLE_EMPTY_PREFIX;
+    return ants_blake3_hash(&prefix, 1, out);
+}
+
+/* Merkle root over receipts[lo, hi) (requires hi > lo) under the
+ * promote-lone-trailing level scheme, computed with an O(log n) bounded
+ * peak stack and no allocation (the same online MMR build as
+ * reputation/chain). Leaves are hashed on push via receipt_leaf_hash. */
+static ants_error_t rep_subtree_root_range(const ants_reputation_receipt_t *receipts,
+                                           size_t lo,
+                                           size_t hi,
+                                           uint8_t out[ANTS_REP_HASH_SIZE])
+{
+    uint8_t stack[ANTS_REP_BAG_MERKLE_MAX_DEPTH + 2][ANTS_REP_HASH_SIZE];
+    int height[ANTS_REP_BAG_MERKLE_MAX_DEPTH + 2];
+    int top = 0;
+    ants_error_t rc;
+    size_t i;
+    int k;
+
+    for (i = lo; i < hi; i++) {
+        rc = receipt_leaf_hash(&receipts[i], stack[top]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        height[top] = 0;
+        top++;
+        while (top >= 2 && height[top - 1] == height[top - 2]) {
+            rc = rep_node_hash(stack[top - 2], stack[top - 1], stack[top - 2]);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            height[top - 2]++;
+            top--;
+        }
+    }
+
+    /* Bag the leftover peaks right-to-left (lone-trailing-node promotion),
+     * accumulating into the rightmost peak — identical to chain. */
+    for (k = top - 2; k >= 0; k--) {
+        rc = rep_node_hash(stack[k], stack[top - 1], stack[top - 1]);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+    memcpy(out, stack[top - 1], ANTS_REP_HASH_SIZE);
+    return ANTS_OK;
+}
+
+/* Number of sibling hashes on the path from leaf `index` to the root in a
+ * promote-lone-node tree of `n_leaves` (identical to chain/inference). */
+static size_t rep_merkle_path_len(size_t index, size_t n_leaves)
+{
+    size_t len = 0;
+    size_t idx = index;
+    size_t count = n_leaves;
+
+    while (count > 1) {
+        if ((idx & 1u) == 1u) {
+            len++; /* right child: always has a left sibling */
+        } else if (idx + 1 < count) {
+            len++; /* left child with a right sibling present */
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+    return len;
+}
+
+/* True (via *out_ok) iff the n >= 1 receipts are in canonical bag order:
+ * strictly ascending by (timestamp_unix_s, then leaf-hash). Strictness also
+ * rejects an exact-duplicate receipt (equal on both keys). Each leaf hash is
+ * computed once, carried as `prev` across the walk. A hashing failure is
+ * returned as an error (not a verdict). */
+static ants_error_t
+receipts_canonical_ordered(const ants_reputation_receipt_t *receipts, size_t n, bool *out_ok)
+{
+    uint8_t prev_leaf[ANTS_REP_HASH_SIZE];
+    uint8_t cur_leaf[ANTS_REP_HASH_SIZE];
+    ants_error_t rc;
+    size_t i;
+
+    *out_ok = false;
+    rc = receipt_leaf_hash(&receipts[0], prev_leaf);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    for (i = 1; i < n; i++) {
+        rc = receipt_leaf_hash(&receipts[i], cur_leaf);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (receipts[i].timestamp_unix_s < receipts[i - 1].timestamp_unix_s) {
+            return ANTS_OK; /* timestamps descend → not canonical */
+        }
+        if (receipts[i].timestamp_unix_s == receipts[i - 1].timestamp_unix_s &&
+            memcmp(cur_leaf, prev_leaf, ANTS_REP_HASH_SIZE) <= 0) {
+            return ANTS_OK; /* tie on timestamp, leaf not strictly greater */
+        }
+        memcpy(prev_leaf, cur_leaf, ANTS_REP_HASH_SIZE);
+    }
+    *out_ok = true;
+    return ANTS_OK;
+}
+
+/* bag_root = BLAKE3.derive_key(context, peer_id ‖ merkle_root). */
+static ants_error_t derive_bag_root(const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                    const uint8_t merkle_root[ANTS_REP_HASH_SIZE],
+                                    uint8_t out_root[ANTS_REP_HASH_SIZE])
+{
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init_derive(&h, ANTS_REP_BAG_ROOT_CONTEXT);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, peer_id, ANTS_REP_PEER_ID_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, merkle_root, ANTS_REP_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out_root);
+}
+
+ants_error_t ants_reputation_bag_root(const ants_reputation_receipt_t *receipts,
+                                      size_t n,
+                                      const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                      uint8_t out_root[ANTS_REP_HASH_SIZE])
+{
+    uint8_t merkle_root[ANTS_REP_HASH_SIZE];
+    ants_error_t rc;
+
+    if (out_root == NULL || peer_id == NULL || (receipts == NULL && n != 0)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n > ANTS_REP_MAX_RECEIPTS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    if (n == 0) {
+        rc = rep_empty_root(merkle_root);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    } else {
+        bool ordered = false;
+        rc = receipts_canonical_ordered(receipts, n, &ordered);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        if (!ordered) {
+            return ANTS_ERROR_NON_CANONICAL;
+        }
+        rc = rep_subtree_root_range(receipts, 0, n, merkle_root);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+    }
+
+    return derive_bag_root(peer_id, merkle_root, out_root);
+}
+
+ants_error_t ants_reputation_bag_prove(const ants_reputation_receipt_t *receipts,
+                                       size_t n,
+                                       size_t index,
+                                       uint8_t *out_path,
+                                       size_t path_cap,
+                                       size_t *out_path_len)
+{
+    size_t need_bytes;
+    size_t written = 0;
+    size_t idx;
+    size_t count;
+    int level = 0;
+    bool ordered = false;
+    ants_error_t rc;
+
+    if (receipts == NULL || n == 0 || index >= n || out_path == NULL || out_path_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n > ANTS_REP_MAX_RECEIPTS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    rc = receipts_canonical_ordered(receipts, n, &ordered);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (!ordered) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+
+    need_bytes = rep_merkle_path_len(index, n) * ANTS_REP_HASH_SIZE;
+    if (need_bytes > path_cap) {
+        *out_path_len = need_bytes;
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    idx = index;
+    count = n;
+    while (count > 1) {
+        bool has_sib = false;
+        size_t sib = 0;
+
+        if ((idx & 1u) == 1u) {
+            has_sib = true;
+            sib = idx - 1;
+        } else if (idx + 1 < count) {
+            has_sib = true;
+            sib = idx + 1;
+        }
+        if (has_sib) {
+            uint64_t lo64 = (uint64_t)sib << level;
+            uint64_t hi64 = ((uint64_t)sib + 1) << level;
+            if (hi64 > (uint64_t)n) {
+                hi64 = (uint64_t)n;
+            }
+            rc = rep_subtree_root_range(
+                receipts, (size_t)lo64, (size_t)hi64, out_path + written * ANTS_REP_HASH_SIZE);
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            written++;
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+        level++;
+    }
+
+    *out_path_len = written * ANTS_REP_HASH_SIZE;
+    return ANTS_OK;
+}
+
+ants_error_t ants_reputation_bag_verify_inclusion(const ants_reputation_receipt_t *receipt,
+                                                  size_t index,
+                                                  size_t n,
+                                                  const uint8_t *path,
+                                                  size_t path_len,
+                                                  const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                                  const uint8_t bag_root[ANTS_REP_HASH_SIZE],
+                                                  bool *out_ok)
+{
+    uint8_t cur[ANTS_REP_HASH_SIZE];
+    uint8_t derived[ANTS_REP_HASH_SIZE];
+    size_t consumed = 0;
+    size_t idx;
+    size_t count;
+    ants_error_t rc;
+
+    if (receipt == NULL || n == 0 || index >= n || path == NULL || peer_id == NULL ||
+        bag_root == NULL || out_ok == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n > ANTS_REP_MAX_RECEIPTS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (path_len != rep_merkle_path_len(index, n) * ANTS_REP_HASH_SIZE) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_ok = false;
+
+    rc = receipt_leaf_hash(receipt, cur);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    idx = index;
+    count = n;
+    while (count > 1) {
+        bool has_sib = false;
+        bool sib_on_left = false;
+
+        if ((idx & 1u) == 1u) {
+            has_sib = true;
+            sib_on_left = true;
+        } else if (idx + 1 < count) {
+            has_sib = true;
+            sib_on_left = false;
+        }
+        if (has_sib) {
+            const uint8_t *sib = path + consumed * ANTS_REP_HASH_SIZE;
+            if (sib_on_left) {
+                rc = rep_node_hash(sib, cur, cur);
+            } else {
+                rc = rep_node_hash(cur, sib, cur);
+            }
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            consumed++;
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+
+    /* cur is the recomputed Merkle root; bind it to peer_id and compare to
+     * the committed bag_root. (consumed == path_len/HASH is guaranteed by
+     * the entry check, kept as a belt-and-suspenders conjunct.) */
+    rc = derive_bag_root(peer_id, cur, derived);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_ok = (consumed * ANTS_REP_HASH_SIZE == path_len) &&
+              (memcmp(derived, bag_root, ANTS_REP_HASH_SIZE) == 0);
+    return ANTS_OK;
+}

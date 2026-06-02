@@ -36,20 +36,25 @@
  *     reference sketch already evaluates T's decay per bin, and applying
  *     the same quantisation to A keeps ONE deterministic step unit.
  *
- * Scope of THIS module (PR1 of Component #9 — the spine):
+ * Scope of THIS module (Component #9):
  *   - the countersigned NCS receipt (RFC-0004 §"The receipt that matters
  *     for tenure"): body + dual Ed25519 signatures, canonical-CBOR body,
  *     verification;
  *   - the deterministic fixed-point decay primitive;
  *   - ants_reputation_compute: A and T from a receipt bag, invalid
- *     receipts skipped (sketch §1398 "if not verify_receipt: continue").
+ *     receipts skipped (sketch §1398 "if not verify_receipt: continue");
+ *   - the saturating T_eff fork-choice transform (§"The saturating
+ *     T → T_eff transform");
+ *   - ants_reputation_compute_checked: the L1 slash gate (§"How tenure
+ *     interacts with Layer 1"), via a caller-supplied slash predicate;
+ *   - the receipt-bag Merkle commitment + inclusion proofs for selective
+ *     disclosure (§"Selective disclosure of receipts").
  *
- * Deliberately NOT here (later PRs, each its own RFC-0004 section): the
- * saturating T_eff fork-choice transform (§"T_eff"), bond accounting +
- * race-safe admission (§"Bond accounting model" / §Atomicity), selective
- * disclosure (§"Selective disclosure of receipts"), the receipt-bag
- * Merkle tree, and L1/L2 slash integration (needs reputation/crdt +
- * chain, not yet built).
+ * Deliberately NOT here (later work): the selective-disclosure A ≥ b subset
+ * recompute + compact summaries (layered on the Merkle primitives below);
+ * and wiring the slash predicate / bond admission into the live L1 G-Set +
+ * L2 chain at the real high-stakes-act call sites. (Bond accounting itself
+ * is Component #15, economy/bond.)
  *
  * STATUS OF THE NUMERIC CONSTANTS. The decay ratios, κ, and bin width are
  * **DRAFT placeholders, NOT calibrated** — RFC-0004 §835 makes δ and κ
@@ -415,6 +420,134 @@ ants_error_t ants_reputation_compute_checked(const uint8_t server_id[ANTS_REP_PE
                                              void *slash_ctx,
                                              uint64_t *out_a,
                                              uint64_t *out_t);
+
+/* ------------------------------------------------------------------------ */
+/* Selective disclosure: the receipt-bag Merkle tree (RFC-0004              */
+/* §"Selective disclosure of receipts")                                     */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A peer commits its receipt bag as a Merkle tree over the individual
+ * receipt leaves and publishes a single root, `bag_root`, when it
+ * participates in a high-stakes act. It can then prove "receipt R is in my
+ * committed bag" by revealing R plus an O(log n) inclusion path, WITHOUT
+ * revealing the rest of its interaction history (RFC-0004 §"Selective
+ * disclosure"; the ledger-is-private property of RFC-0001). Proving the
+ * actual bound A ≥ b over a revealed subset is the verifier's recompute
+ * step, layered on top of these primitives (a later PR).
+ *
+ * The tree is the SAME domain-separated, promote-lone-trailing BLAKE3
+ * construction as reputation/chain's confirmed_proofs root and
+ * inference/orchestration's commit Merkle — one canonical scheme across the
+ * codebase — with two receipt-specific points:
+ *
+ *   leaf(R)   = BLAKE3(0x00 ‖ body(R) ‖ server_sig(R) ‖ client_sig(R))
+ *   node(L,R) = BLAKE3(0x01 ‖ L ‖ R)        empty-bag root = BLAKE3(0x02)
+ *
+ * where body(R) is the canonical-CBOR receipt body
+ * (ants_reputation_receipt_body_encode). The leaf commits the WHOLE receipt
+ * — body AND both signatures — so one leaf hash anchors both the inclusion
+ * proof and the countersignature-integrity check to the same bytes.
+ *
+ * Canonical leaf order is (timestamp_unix_s ASC, then leaf-hash ASC): a
+ * total, deterministic order, so every honest peer builds the identical
+ * tree from the same bag (determinism is load-bearing, as for A/T). The
+ * caller passes receipts already in this order; out-of-order or duplicate
+ * receipts are rejected ANTS_ERROR_NON_CANONICAL (the same contract as
+ * reputation/chain's strictly-ascending content-ids).
+ *
+ * The published commitment binds the tree to the peer:
+ *   bag_root = BLAKE3.derive_key(ANTS_REP_BAG_ROOT_CONTEXT,
+ *                                peer_id ‖ merkle_root)
+ * so a subtree cannot be replayed as another identity's bag.
+ *
+ * DRAFT scheme pending RFC-0008 formalisation (alongside the receipt body
+ * and the L1 proof formats). Pure, deterministic, no float, no malloc.
+ */
+
+/* BLAKE3 digest size for the bag tree and bag_root. MUST equal
+ * ANTS_BLAKE3_HASH_SIZE; kept local so this header takes no crypto-header
+ * dependency (mirrors reputation/chain's ANTS_CHAIN_HASH_SIZE). */
+#define ANTS_REP_HASH_SIZE 32u
+
+/* Max depth of the receipt-bag tree (promote-lone-trailing over up to
+ * 2^DEPTH leaves). 32 matches reputation/chain; the bounded MMR peak stack
+ * is [DEPTH+2][HASH] (~1 KB), no allocation. The bag is itself capped at
+ * ANTS_REP_MAX_RECEIPTS leaves. */
+#define ANTS_REP_BAG_MERKLE_MAX_DEPTH 32u
+
+/* derive_key context binding the bag's Merkle root to the peer-id (RFC-0004
+ * §"Selective disclosure"; RFC-0008 §4.1 reserves this string). DRAFT. */
+#define ANTS_REP_BAG_ROOT_CONTEXT "ants-v1-receipt-bag-root"
+
+/*
+ * Compute `bag_root` over a receipt bag for `peer_id` at commit time.
+ *
+ * `receipts` MUST be in canonical order (timestamp ASC, then leaf-hash ASC);
+ * otherwise ANTS_ERROR_NON_CANONICAL. n == 0 is the empty bag (merkle_root =
+ * BLAKE3(0x02)). n is capped at ANTS_REP_MAX_RECEIPTS.
+ *
+ * @return ANTS_OK with *out_root set; ANTS_ERROR_INVALID_ARG on NULL
+ *         out_root/peer_id (or NULL receipts with n != 0) or n over the cap;
+ *         ANTS_ERROR_NON_CANONICAL if the bag is not in canonical order.
+ */
+ants_error_t ants_reputation_bag_root(const ants_reputation_receipt_t *receipts,
+                                      size_t n,
+                                      const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                      uint8_t out_root[ANTS_REP_HASH_SIZE]);
+
+/*
+ * Produce the Merkle inclusion path for the receipt at canonical position
+ * `index` in an n-receipt bag. The path is `*out_path_len` bytes — a whole
+ * number of ANTS_REP_HASH_SIZE-byte sibling hashes, bottom-up. `receipts`
+ * MUST be in canonical order (validated; NON_CANONICAL otherwise) so `index`
+ * names the same leaf the verifier will.
+ *
+ * If `path_cap` is too small, sets *out_path_len to the required size and
+ * returns ANTS_ERROR_BUFFER_TOO_SMALL (call again with a large-enough
+ * buffer). A bag of n leaves needs at most ceil(log2 n) hashes.
+ *
+ * @return ANTS_OK with the path written and *out_path_len set;
+ *         ANTS_ERROR_INVALID_ARG on NULL, index >= n, n == 0, or n over the
+ *         cap; ANTS_ERROR_NON_CANONICAL if out of order;
+ *         ANTS_ERROR_BUFFER_TOO_SMALL if path_cap is insufficient.
+ */
+ants_error_t ants_reputation_bag_prove(const ants_reputation_receipt_t *receipts,
+                                       size_t n,
+                                       size_t index,
+                                       uint8_t *out_path,
+                                       size_t path_cap,
+                                       size_t *out_path_len);
+
+/*
+ * Verify that `receipt` is the leaf at canonical position `index` of an
+ * n-leaf bag committed as `bag_root` for `peer_id`, given the inclusion
+ * `path` from ants_reputation_bag_prove.
+ *
+ * This is the STRUCTURAL check only: it recomputes the leaf hash from the
+ * receipt bytes, replays the promote-lone-trailing path to the Merkle root,
+ * binds it to peer_id via the bag_root derive_key, and compares. It does
+ * NOT verify the receipt's countersignatures — a complete acceptance also
+ * requires ants_reputation_receipt_verify (both checks bind to the same
+ * leaf bytes, RFC-0004 §"Selective disclosure" step 3). Keeping them
+ * separate lets the Merkle logic be tested in isolation and lets the
+ * verifier order the checks as it likes.
+ *
+ * @param out_ok  set true iff the inclusion proof is valid against bag_root.
+ *                An invalid proof is a *false verdict* (*out_ok = false,
+ *                return ANTS_OK), not an error.
+ * @return ANTS_OK with *out_ok set; ANTS_ERROR_INVALID_ARG on NULL,
+ *         index >= n, n == 0, n over the cap, or a path_len inconsistent
+ *         with (index, n).
+ */
+ants_error_t ants_reputation_bag_verify_inclusion(const ants_reputation_receipt_t *receipt,
+                                                  size_t index,
+                                                  size_t n,
+                                                  const uint8_t *path,
+                                                  size_t path_len,
+                                                  const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                                  const uint8_t bag_root[ANTS_REP_HASH_SIZE],
+                                                  bool *out_ok);
 
 #ifdef __cplusplus
 }

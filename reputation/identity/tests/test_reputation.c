@@ -569,6 +569,302 @@ static void test_compute_checked_args(void)
     CHECK(a == 0 && t == 0);
 }
 
+/* ---- selective disclosure: receipt-bag Merkle ---------------------- */
+
+/* Independent BLAKE3 leaf/node/derive recomputed BY HAND to cross-check the
+ * impl. The reference is a DIFFERENT construction (explicit pairing below,
+ * not the impl's MMR/range walk) and hardcodes the derive_key context, so a
+ * regression in the promote-lone replay, the leaf preimage, or the context
+ * string surfaces as a mismatch. */
+static void ref_receipt_leaf(const ants_reputation_receipt_t *r, uint8_t out[32])
+{
+    uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    size_t body_len = 0;
+    const uint8_t prefix = 0x00u;
+    ants_blake3_ctx_t h;
+    CHECK_EQ(ants_reputation_receipt_body_encode(r, body, sizeof body, &body_len), ANTS_OK);
+    CHECK_EQ(ants_blake3_init(&h), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, &prefix, 1), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, body, body_len), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, r->server_sig, 64), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, r->client_sig, 64), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&h, out), ANTS_OK);
+}
+
+static void ref_node(const uint8_t l[32], const uint8_t r[32], uint8_t out[32])
+{
+    const uint8_t prefix = 0x01u;
+    ants_blake3_ctx_t h;
+    CHECK_EQ(ants_blake3_init(&h), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, &prefix, 1), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, l, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, r, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&h, out), ANTS_OK);
+}
+
+/* bag_root reference: derive_key("ants-v1-receipt-bag-root", peer ‖ root)
+ * with the context literal hardcoded (independent of the impl's macro). */
+static void ref_bag_root(const uint8_t peer[32], const uint8_t merkle_root[32], uint8_t out[32])
+{
+    ants_blake3_ctx_t h;
+    CHECK_EQ(ants_blake3_init_derive(&h, "ants-v1-receipt-bag-root"), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, peer, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&h, merkle_root, 32), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&h, out), ANTS_OK);
+}
+
+static void test_bag_root_reference(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32];
+    ants_reputation_receipt_t r[5];
+    uint8_t leaf[5][32];
+    uint8_t got[32], want[32], mroot[32], n01[32], n23[32], c[32];
+    size_t i;
+
+    make_key(0x70, sp, su);
+    make_key(0x71, cp, cu);
+    memset(peer, 0x7E, sizeof peer); /* arbitrary commit identity */
+
+    /* Distinct, canonically-ordered receipts: strictly increasing timestamps
+     * so the timestamp key alone fixes the order (the leaf-hash tiebreak is
+     * covered by test_bag_canonical_order). */
+    for (i = 0; i < 5; i++) {
+        r[i] = make_receipt(sp, su, cp, cu, 1000 + i, 2000 + i, (uint8_t)(0x80 + i));
+        ref_receipt_leaf(&r[i], leaf[i]);
+    }
+
+    /* n == 0 → merkle_root = BLAKE3(0x02), bag_root = derive_key(peer ‖ root). */
+    {
+        const uint8_t empty_prefix = 0x02u;
+        CHECK_EQ(ants_blake3_hash(&empty_prefix, 1, mroot), ANTS_OK);
+        ref_bag_root(peer, mroot, want);
+        CHECK_EQ(ants_reputation_bag_root(NULL, 0, peer, got), ANTS_OK);
+        CHECK(memcmp(got, want, 32) == 0);
+    }
+    /* n == 1 → merkle_root = leaf0. */
+    ref_bag_root(peer, leaf[0], want);
+    CHECK_EQ(ants_reputation_bag_root(r, 1, peer, got), ANTS_OK);
+    CHECK(memcmp(got, want, 32) == 0);
+
+    /* n == 2 → node(leaf0, leaf1). */
+    ref_node(leaf[0], leaf[1], mroot);
+    ref_bag_root(peer, mroot, want);
+    CHECK_EQ(ants_reputation_bag_root(r, 2, peer, got), ANTS_OK);
+    CHECK(memcmp(got, want, 32) == 0);
+
+    /* n == 3 → node(node(leaf0,leaf1), leaf2) — lone trailing leaf promoted. */
+    ref_node(leaf[0], leaf[1], n01);
+    ref_node(n01, leaf[2], mroot);
+    ref_bag_root(peer, mroot, want);
+    CHECK_EQ(ants_reputation_bag_root(r, 3, peer, got), ANTS_OK);
+    CHECK(memcmp(got, want, 32) == 0);
+
+    /* n == 4 → node(node(leaf0,leaf1), node(leaf2,leaf3)). */
+    ref_node(leaf[0], leaf[1], n01);
+    ref_node(leaf[2], leaf[3], n23);
+    ref_node(n01, n23, mroot);
+    ref_bag_root(peer, mroot, want);
+    CHECK_EQ(ants_reputation_bag_root(r, 4, peer, got), ANTS_OK);
+    CHECK(memcmp(got, want, 32) == 0);
+
+    /* n == 5 → node(node(node(0,1),node(2,3)), leaf4) — promote at two levels. */
+    ref_node(leaf[0], leaf[1], n01);
+    ref_node(leaf[2], leaf[3], n23);
+    ref_node(n01, n23, c);
+    ref_node(c, leaf[4], mroot);
+    ref_bag_root(peer, mroot, want);
+    CHECK_EQ(ants_reputation_bag_root(r, 5, peer, got), ANTS_OK);
+    CHECK(memcmp(got, want, 32) == 0);
+
+    /* bag_root binds the peer-id: a different commit identity → different root. */
+    {
+        uint8_t peer2[32], got2[32];
+        memset(peer2, 0x3C, sizeof peer2);
+        CHECK_EQ(ants_reputation_bag_root(r, 5, peer2, got2), ANTS_OK);
+        CHECK(memcmp(got, got2, 32) != 0);
+    }
+}
+
+static void test_bag_prove_verify(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32];
+    ants_reputation_receipt_t r[8];
+    size_t i, n, idx;
+
+    make_key(0x72, sp, su);
+    make_key(0x73, cp, cu);
+    memset(peer, 0x5A, sizeof peer);
+    for (i = 0; i < 8; i++) {
+        r[i] = make_receipt(sp, su, cp, cu, 1000 + i, 3000 + i, (uint8_t)(0x90 + i));
+    }
+
+    for (n = 1; n <= 8; n++) {
+        uint8_t root[32];
+        CHECK_EQ(ants_reputation_bag_root(r, n, peer, root), ANTS_OK);
+
+        for (idx = 0; idx < n; idx++) {
+            uint8_t path[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+            size_t path_len = 0;
+            bool ok = false;
+
+            CHECK_EQ(ants_reputation_bag_prove(r, n, idx, path, sizeof path, &path_len), ANTS_OK);
+            CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                         &r[idx], idx, n, path, path_len, peer, root, &ok),
+                     ANTS_OK);
+            CHECK(ok == true);
+
+            /* Tamper the revealed receipt → leaf changes → false. */
+            {
+                ants_reputation_receipt_t bad = r[idx];
+                bad.ncs_value ^= 0x01u;
+                CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                             &bad, idx, n, path, path_len, peer, root, &ok),
+                         ANTS_OK);
+                CHECK(ok == false);
+            }
+            /* Wrong committing peer → bag_root binding fails → false. */
+            {
+                uint8_t bad_peer[32];
+                memset(bad_peer, 0xEE, sizeof bad_peer);
+                CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                             &r[idx], idx, n, path, path_len, bad_peer, root, &ok),
+                         ANTS_OK);
+                CHECK(ok == false);
+            }
+            /* Wrong committed root → false. */
+            {
+                uint8_t bad_root[32];
+                memcpy(bad_root, root, 32);
+                bad_root[0] ^= 0x01u;
+                CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                             &r[idx], idx, n, path, path_len, peer, bad_root, &ok),
+                         ANTS_OK);
+                CHECK(ok == false);
+            }
+            /* Flip a byte of the inclusion path (when there is one) → false. */
+            if (path_len > 0) {
+                uint8_t bad_path[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+                memcpy(bad_path, path, path_len);
+                bad_path[0] ^= 0x01u;
+                CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                             &r[idx], idx, n, bad_path, path_len, peer, root, &ok),
+                         ANTS_OK);
+                CHECK(ok == false);
+            }
+            /* Right receipt, WRONG position (a sibling's path) → false. */
+            if (n >= 2) {
+                size_t other = (idx == 0) ? 1 : idx - 1;
+                uint8_t opath[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+                size_t olen = 0;
+                CHECK_EQ(ants_reputation_bag_prove(r, n, other, opath, sizeof opath, &olen),
+                         ANTS_OK);
+                CHECK_EQ(ants_reputation_bag_verify_inclusion(
+                             &r[idx], other, n, opath, olen, peer, root, &ok),
+                         ANTS_OK);
+                CHECK(ok == false);
+            }
+        }
+    }
+}
+
+static void test_bag_canonical_order(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32], root[32];
+    uint8_t la[32], lb[32];
+    uint8_t path[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plen = 0;
+    ants_reputation_receipt_t a, b, ord[2], rev[2], desc[2], dup[2];
+
+    make_key(0x74, sp, su);
+    make_key(0x75, cp, cu);
+    memset(peer, 0x44, sizeof peer);
+
+    /* Two distinct receipts with the SAME timestamp: canonical order is by
+     * leaf-hash ASC. Order them so ord[0]'s leaf < ord[1]'s leaf. */
+    a = make_receipt(sp, su, cp, cu, 10, 5000, 0x01);
+    b = make_receipt(sp, su, cp, cu, 20, 5000, 0x02);
+    ref_receipt_leaf(&a, la);
+    ref_receipt_leaf(&b, lb);
+    if (memcmp(la, lb, 32) < 0) {
+        ord[0] = a;
+        ord[1] = b;
+    } else {
+        ord[0] = b;
+        ord[1] = a;
+    }
+    rev[0] = ord[1];
+    rev[1] = ord[0];
+
+    /* Canonical (timestamp tie broken by ascending leaf-hash) → accepted. */
+    CHECK_EQ(ants_reputation_bag_root(ord, 2, peer, root), ANTS_OK);
+    /* Reversed (leaf-hash descending at equal timestamp) → NON_CANONICAL. */
+    CHECK_EQ(ants_reputation_bag_root(rev, 2, peer, root), ANTS_ERROR_NON_CANONICAL);
+    /* prove rejects the same out-of-order input. */
+    CHECK_EQ(ants_reputation_bag_prove(rev, 2, 0, path, sizeof path, &plen),
+             ANTS_ERROR_NON_CANONICAL);
+
+    /* Timestamps descending → NON_CANONICAL. */
+    desc[0] = make_receipt(sp, su, cp, cu, 10, 6000, 0x03);
+    desc[1] = make_receipt(sp, su, cp, cu, 10, 5999, 0x04);
+    CHECK_EQ(ants_reputation_bag_root(desc, 2, peer, root), ANTS_ERROR_NON_CANONICAL);
+
+    /* Exact duplicate (identical bytes → tie on both keys) → NON_CANONICAL. */
+    dup[0] = make_receipt(sp, su, cp, cu, 10, 5000, 0x05);
+    dup[1] = dup[0];
+    CHECK_EQ(ants_reputation_bag_root(dup, 2, peer, root), ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_bag_args(void)
+{
+    uint8_t sp[32], su[32], cp[32], cu[32], peer[32], root[32];
+    uint8_t path[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plen = 0;
+    bool ok = false;
+    ants_reputation_receipt_t r[4];
+    size_t i;
+
+    make_key(0x76, sp, su);
+    make_key(0x77, cp, cu);
+    memset(peer, 0x11, sizeof peer);
+    for (i = 0; i < 4; i++) {
+        r[i] = make_receipt(sp, su, cp, cu, 1 + i, 7000 + i, (uint8_t)(0xA0 + i));
+    }
+
+    /* bag_root: NULL guards, over-cap, and the empty-bag exception. */
+    CHECK_EQ(ants_reputation_bag_root(r, 4, peer, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_root(r, 4, NULL, root), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_root(NULL, 4, peer, root), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_root(r, (size_t)ANTS_REP_MAX_RECEIPTS + 1, peer, root),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_root(NULL, 0, peer, root), ANTS_OK); /* empty bag OK */
+
+    /* bag_prove: index >= n, n == 0, NULL, and BUFFER_TOO_SMALL reporting. */
+    CHECK_EQ(ants_reputation_bag_prove(r, 4, 4, path, sizeof path, &plen), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_prove(r, 0, 0, path, sizeof path, &plen), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_prove(NULL, 4, 0, path, sizeof path, &plen),
+             ANTS_ERROR_INVALID_ARG);
+    /* path_cap 0 with a 4-leaf tree (needs 2 sibling hashes) → BUFFER_TOO_SMALL
+     * with *out_path_len set to the requirement. */
+    CHECK_EQ(ants_reputation_bag_prove(r, 4, 0, path, 0, &plen), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(plen == 2 * 32);
+
+    /* bag_verify_inclusion: real path, then break each arg. */
+    CHECK_EQ(ants_reputation_bag_prove(r, 4, 0, path, sizeof path, &plen), ANTS_OK);
+    CHECK_EQ(ants_reputation_bag_root(r, 4, peer, root), ANTS_OK);
+    CHECK_EQ(ants_reputation_bag_verify_inclusion(NULL, 0, 4, path, plen, peer, root, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_verify_inclusion(&r[0], 4, 4, path, plen, peer, root, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_verify_inclusion(&r[0], 0, 0, path, plen, peer, root, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_bag_verify_inclusion(&r[0], 0, 4, NULL, plen, peer, root, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    /* A path_len inconsistent with (index, n) is a hard INVALID_ARG, not a
+     * false verdict. */
+    CHECK_EQ(ants_reputation_bag_verify_inclusion(&r[0], 0, 4, path, plen - 1, peer, root, &ok),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -588,6 +884,11 @@ int main(void)
     test_compute_checked_slashed_zeroes_both();
     test_compute_checked_null_predicate_equals_unchecked();
     test_compute_checked_args();
+
+    test_bag_root_reference();
+    test_bag_prove_verify();
+    test_bag_canonical_order();
+    test_bag_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);
