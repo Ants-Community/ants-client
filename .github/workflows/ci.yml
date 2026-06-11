@@ -40,7 +40,7 @@ jobs:
             cc: clang
             build-type: Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Show compiler info
         run: |
@@ -62,7 +62,7 @@ jobs:
     name: build (ubuntu · clang · ThreadSanitizer)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure with TSan
         env:
@@ -79,7 +79,7 @@ jobs:
     name: clang-format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install clang-format
         run: |
