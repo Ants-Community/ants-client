@@ -13,6 +13,28 @@ the spec repo's
 
 ## Unreleased
 
+### tests: paced the QUIC tick spin-loops in `transport_basic` + `cache_basic` · 2026-06-11
+
+The two remaining macOS CI flakes are closed at the root. picoquic drives its
+handshake and retransmit timers off the wall clock, so an unpaced fixed-count
+tick loop can spin to exhaustion in a few milliseconds — before those timers
+fire. `transport_basic` and `cache_basic` had been failing intermittently on
+the macOS runners for weeks on exactly those loops (different assertion each
+run — the flake's signature — most recently twice in a row on main `693c1ac`).
+`dht_basic` stopped flaking when `test_dht.c` got `tick_pace()` (1 ms
+`nanosleep` per iteration, PR #43); PR #132 applies the same pacing to the five
+real-TLS two-endpoint loops in `test_transport.c` and the four two-node
+publish/query loops in `test_cache.c`. Green-path cost is negligible: every
+paced loop still breaks as soon as its predicate holds. Both files gained the
+`_POSIX_C_SOURCE 200809L` guard proactively (glibc hides `nanosleep` without
+it; a macOS-only build is a false green for the Linux jobs).
+
+### ci: `actions/checkout` v4 → v5 · 2026-06-11
+
+GitHub retires the Node 20 action runtime on 2026-06-16; `checkout@v4` targets
+it and every run had been warning. `checkout@v5` is the node24 release of the
+same action — workflow logic unchanged across the 7 jobs (PR #131).
+
 ### network: Component #5 (DHT) — anti-eclipse peer sampling (axis S1) · 2026-06-02
 
 RFC-0005 v0.2 §"Anti-eclipse peer sampling" decided the architecture: the
