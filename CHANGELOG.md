@@ -13,6 +13,45 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #8 (L2 PoUH chain) — drand beacon verification + VRF seed derivation · 2026-06-11
+
+The first runtime-wiring slice of Component #8: the chain can now verify the
+external-entropy beacon it is seeded by, and every verifier derives the same
+VRF seed from it (RFC-0008 §4.2-4.3). Two PRs:
+
+- **`ants_sha256`** (foundation/crypto, PR #134) — external-interop hashing
+  ONLY: a chained drand round signs `SHA-256(prev_signature || round_be64)`
+  and publishes `randomness = SHA-256(signature)`, both fixed by the external
+  drand protocol. A thin wrapper over blst's portable SHA-256 (already
+  vendored for BLS12-381 — no new dependency); the header is explicit that
+  all protocol-internal hashing remains BLAKE3. Tests pin FIPS 180 answers
+  cross-checked against two independent implementations, plus a real drand
+  round-1000 `sha256(signature) == randomness` vector.
+- **`ants_chain_beacon_verify` + `ants_chain_vrf_seed[_degraded]`**
+  (reputation/chain, PR #135) — verifies one CHAINED drand round against the
+  group public key from genesis config (RFC-0010 §drand); the drand default
+  chain (`pedersen-bls-chained`) is BLS12-381 in exactly the min-pubkey shape
+  `ants_bls_*` pins, same ciphersuite, so no new crypto. The beacon is
+  untrusted input → failed pairing / malformed point / lying randomness is a
+  *verdict* (`*out_ok=false`), not an error. `round < 2` is INVALID_ARG (round
+  1 signs the network genesis seed — a different shape; ANTS genesis pins
+  `initial_round` past it). The seed derivations pin the spec's
+  `"ants-v1-vrf-seed"` / `"ants-v1-vrf-seed-degraded"` BLAKE3 derive-key
+  contexts; the 30 s outage-timeout POLICY and the `degraded_seed` header
+  flag stay with the future block-production runtime. DRAFT precision pending
+  RFC-0008: `drand_round_value` = the round's 32-byte randomness, not the
+  96-byte signature. Tests verify REAL drand rounds 1000+1001 (fetched from
+  api.drand.sh 2026-06-11) against the real group key — empirically
+  confirming the chained payload derivation, ciphersuite match, and G1/G2
+  orientation — plus a tamper battery and an independent streaming
+  derive-key recompute for the seeds.
+
+Still deferred for #8 runtime: block proposal + proposer election (pure
+functions over the visible L1 set — RFC-0004's "mempool" IS the gossiped
+CRDT at cutoff, no separate queue), attestation collection on the wire, the
+`INVALID_TRANSITION` fault class, and the L2-confirmation → G-Set
+prune-cutoff feedback into Component #7.
+
 ### tests: paced the QUIC tick spin-loops in `transport_basic` + `cache_basic` · 2026-06-11
 
 The two remaining macOS CI flakes are closed at the root. picoquic drives its
