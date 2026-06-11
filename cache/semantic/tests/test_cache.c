@@ -16,6 +16,14 @@
  * the contract checks (constants, alignment, NULL safety) stay.
  */
 
+/* POSIX feature test — required on glibc to expose nanosleep() from
+ * <time.h>. macOS exposes it by default; this keeps the Linux CI jobs
+ * (gcc/clang) compiling without _GNU_SOURCE. Mirrors the same block in
+ * network/dht/tests/test_dht.c. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_cbor.h"
 #include "ants_common.h"
 #include "ants_crypto.h"
@@ -66,6 +74,22 @@ static int failures = 0;
                     (int)_a);                                                                      \
         }                                                                                          \
     } while (0)
+
+/* Pace a tick spin-loop. picoquic drives its handshake and retransmit
+ * timers off the wall clock, so spinning the transport/dht/cache tick
+ * functions with no delay can run a fixed-count loop to exhaustion in a
+ * few milliseconds — before those timers fire. That is the recurring
+ * macOS CI flake in this file (cache_basic intermittently timing out in
+ * the two-node publish/query round trips). A short sleep per iteration
+ * lets real time advance so the QUIC handshake and RPC round trips can
+ * progress; on the green path the loop still breaks as soon as its
+ * predicate holds, so passing runs stay fast. Mirrors
+ * network/dht/tests/test_dht.c. */
+static void tick_pace(void)
+{
+    struct timespec ts = {0, 1000000L}; /* 1 ms */
+    nanosleep(&ts, NULL);
+}
 
 static void test_protocol_constants(void)
 {
@@ -2854,6 +2878,7 @@ static void test_publish_end_to_end_one_peer(void)
     CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -2892,6 +2917,7 @@ static void test_publish_end_to_end_one_peer(void)
              ANTS_OK);
 
     for (int i = 0; i < 1000; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -3499,6 +3525,7 @@ static void test_query_end_to_end_one_peer(void)
     CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
 
     for (int i = 0; i < 500; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);
@@ -3548,6 +3575,7 @@ static void test_query_end_to_end_one_peer(void)
              ANTS_OK);
 
     for (int i = 0; i < 1000; i++) {
+        tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
         (void)ants_dht_tick(&da);

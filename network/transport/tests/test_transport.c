@@ -18,6 +18,14 @@
  * Same pattern as foundation/tee/tests/test_tee.c.
  */
 
+/* POSIX feature test — required on glibc to expose nanosleep() from
+ * <time.h>. macOS exposes it by default; this keeps the Linux CI jobs
+ * (gcc/clang) compiling without _GNU_SOURCE. Mirrors the same block in
+ * network/dht/tests/test_dht.c. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ants_common.h"
 #include "ants_crypto.h"
 #include "ants_transport.h"
@@ -27,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -54,6 +63,22 @@ static int failures = 0;
                     (int)_a);                                                                      \
         }                                                                                          \
     } while (0)
+
+/* Pace a tick spin-loop. picoquic drives its handshake and retransmit
+ * timers off the wall clock, so spinning ants_transport_tick() with no
+ * delay can run a fixed-count loop to exhaustion in a few milliseconds —
+ * before those timers fire. That is the long-standing macOS CI flake in
+ * this file (transport_basic intermittently failing on conn_ready /
+ * stream_opened / stream_readable, on different assertions each run). A
+ * short sleep per iteration lets real time advance so the QUIC handshake
+ * and stream delivery can progress; on the green path the loop still
+ * breaks as soon as its predicate holds, so passing runs stay fast.
+ * Mirrors network/dht/tests/test_dht.c. */
+static void tick_pace(void)
+{
+    struct timespec ts = {0, 1000000L}; /* 1 ms */
+    nanosleep(&ts, NULL);
+}
 
 static void test_pinned_constants(void)
 {
@@ -584,6 +609,7 @@ static void test_handshake_completes_with_real_keys(void)
      * needs only a handful of ticks; bound generously at 200 to absorb
      * any kernel-buffer scheduling variance under CI. */
     for (int i = 0; i < 200; i++) {
+        tick_pace();
         ants_transport_tick(&dialer);
         ants_transport_tick(&listener);
         if (dialer_rec.conn_ready > 0) {
@@ -659,6 +685,7 @@ static void test_inbound_conn_ready_on_listener(void)
      * verify_certificate callbacks fire and both event_fn's see
      * CONN_READY. */
     for (int i = 0; i < 200; i++) {
+        tick_pace();
         ants_transport_tick(&dialer);
         ants_transport_tick(&listener);
         if (dialer_rec.conn_ready >= 1 && listener_rec.conn_ready >= 1) {
@@ -730,6 +757,7 @@ static void test_handshake_rejects_wrong_expected_peer_id(void)
     CHECK_EQ(ants_transport_dial(&dialer, laddr, &wrong_peer_id, &conn), ANTS_OK);
 
     for (int i = 0; i < 200; i++) {
+        tick_pace();
         ants_transport_tick(&dialer);
         ants_transport_tick(&listener);
     }
@@ -794,6 +822,7 @@ static void test_loopback_byte_exchange(void)
 
     /* Drive the handshake to completion. */
     for (int i = 0; i < 200; i++) {
+        tick_pace();
         ants_transport_tick(&dialer);
         ants_transport_tick(&listener);
         if (dialer_rec.conn_ready >= 1 && listener_rec.conn_ready >= 1) {
@@ -811,6 +840,7 @@ static void test_loopback_byte_exchange(void)
 
     /* Drive until the listener observes the payload (or we give up). */
     for (int i = 0; i < 200; i++) {
+        tick_pace();
         ants_transport_tick(&dialer);
         ants_transport_tick(&listener);
         if (listener_rec.stream_readable >= 1) {
