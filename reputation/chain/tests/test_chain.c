@@ -907,6 +907,210 @@ static void test_fork_choice(void)
     CHECK_EQ(ants_chain_fork_choice(10, 10, 100, 1, 3, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ------------------------------------------------------------------------ */
+/* PR7 — drand beacon verification + VRF seed derivation                    */
+/* ------------------------------------------------------------------------ */
+
+/* Helper: convert a hex string to bytes. Returns the number of bytes
+ * written. Same convention as test_crypto.c. */
+static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t out_cap)
+{
+    size_t n = strlen(hex);
+    if (n % 2 != 0 || n / 2 > out_cap) {
+        return 0;
+    }
+    for (size_t i = 0; i < n / 2; i++) {
+        unsigned int byte = 0;
+        if (sscanf(hex + 2 * i, "%2x", &byte) != 1) {
+            return 0;
+        }
+        out[i] = (uint8_t)byte;
+    }
+    return n / 2;
+}
+
+/* drand default chain (scheme pedersen-bls-chained, chain hash
+ * 8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce):
+ * the group public key plus two consecutive real rounds, fetched from
+ * api.drand.sh on 2026-06-11. Real-world vectors: if beacon_verify's
+ * chained-payload derivation (SHA-256(prev_sig || round_be64)) were
+ * wrong in any byte, the BLS verification below would fail. */
+static const char *DRAND_PUBKEY_HEX =
+    "868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a5699"
+    "37c529eeda66c7293784a9402801af31";
+static const char *DRAND_R1000_PREV_HEX =
+    "af0d93299a363735fe847f5ea241442c65843dc1bd3a7b79646b3b10072e908b"
+    "f034d35cd69d378e3341f139100cd4cd03030399864ef8803a5a4f5e64fccc20"
+    "bbae36d1ca22a6ddc43d2630c41105e90598fab11e5c7456df3925d4b577b113";
+static const char *DRAND_R1000_SIG_HEX =
+    "99bf96de133c3d3937293cfca10c8152b18ab2d034ccecf115658db324d2edc0"
+    "0a16a2044cd04a8a38e2a307e5ecff3511315be8d282079faf24098f283e0ed2"
+    "c199663b334d2e84c55c032fe469b212c5c2087ebb83a5b25155c3283f5b79ac";
+static const char *DRAND_R1000_RAND_HEX =
+    "a40d3e0e7e3c71f28b7da2fd339f47f0bcf10910309f5253d7c323ec8cea3212";
+static const char *DRAND_R1001_SIG_HEX =
+    "b206bc0eae915ff9a8e89e48ff0ac5411b170ba20d92ea2880d9b9f0d6b6b870"
+    "d80689792995b97116bf5174c5c5408f052c93908ebabca91dddd5c8974d9e87"
+    "4b7d7854806dba75a08acffb029758f289712045ca7fb39b0fef9727a9a91b53";
+static const char *DRAND_R1001_RAND_HEX =
+    "bb5820c2a9dd740e5d90ab70950246b8881d7ec9b2ee8411a27e35b0372b2119";
+
+static void fill_beacon(ants_chain_beacon_t *b,
+                        uint64_t round,
+                        const char *rand_hex,
+                        const char *sig_hex,
+                        const char *prev_hex)
+{
+    memset(b, 0, sizeof *b);
+    b->round = round;
+    CHECK(hex_to_bytes(rand_hex, b->randomness, sizeof b->randomness) == 32);
+    CHECK(hex_to_bytes(sig_hex, b->signature, sizeof b->signature) == 96);
+    CHECK(hex_to_bytes(prev_hex, b->previous_signature, sizeof b->previous_signature) == 96);
+}
+
+static void test_beacon_verify_real_rounds(void)
+{
+    uint8_t pubkey[ANTS_CHAIN_DRAND_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(DRAND_PUBKEY_HEX, pubkey, sizeof pubkey) == 48);
+
+    /* Round 1000 verifies against the real group key. */
+    ants_chain_beacon_t b1000;
+    fill_beacon(&b1000, 1000, DRAND_R1000_RAND_HEX, DRAND_R1000_SIG_HEX, DRAND_R1000_PREV_HEX);
+    bool ok = false;
+    CHECK_EQ(ants_chain_beacon_verify(&b1000, pubkey, &ok), ANTS_OK);
+    CHECK(ok);
+
+    /* Round 1001 chains: its previous_signature IS round 1000's
+     * signature. */
+    ants_chain_beacon_t b1001;
+    fill_beacon(&b1001, 1001, DRAND_R1001_RAND_HEX, DRAND_R1001_SIG_HEX, DRAND_R1000_SIG_HEX);
+    ok = false;
+    CHECK_EQ(ants_chain_beacon_verify(&b1001, pubkey, &ok), ANTS_OK);
+    CHECK(ok);
+}
+
+static void test_beacon_verify_rejects(void)
+{
+    uint8_t pubkey[ANTS_CHAIN_DRAND_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(DRAND_PUBKEY_HEX, pubkey, sizeof pubkey) == 48);
+    ants_chain_beacon_t good;
+    fill_beacon(&good, 1000, DRAND_R1000_RAND_HEX, DRAND_R1000_SIG_HEX, DRAND_R1000_PREV_HEX);
+    bool ok = true;
+    ants_chain_beacon_t bad;
+
+    /* Tampered signature byte → verdict false (not an error). */
+    bad = good;
+    bad.signature[17] ^= 0x01u;
+    ok = true;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Wrong round number for this signature. */
+    bad = good;
+    bad.round = 1002;
+    ok = true;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Tampered previous_signature → different signed payload. */
+    bad = good;
+    bad.previous_signature[40] ^= 0x80u;
+    ok = true;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Signature valid but published randomness lies. */
+    bad = good;
+    bad.randomness[0] ^= 0x01u;
+    ok = true;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Corrupted group key (not a valid G1 point) → verdict false. */
+    uint8_t bad_pubkey[ANTS_CHAIN_DRAND_PUBKEY_SIZE];
+    memcpy(bad_pubkey, pubkey, sizeof bad_pubkey);
+    bad_pubkey[20] ^= 0xFFu;
+    ok = true;
+    CHECK_EQ(ants_chain_beacon_verify(&good, bad_pubkey, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Rounds 0 and 1 are out of the steady-state form. NULL guards. */
+    bad = good;
+    bad.round = 0;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_ERROR_INVALID_ARG);
+    bad.round = 1;
+    CHECK_EQ(ants_chain_beacon_verify(&bad, pubkey, &ok), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_beacon_verify(NULL, pubkey, &ok), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_beacon_verify(&good, NULL, &ok), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_beacon_verify(&good, pubkey, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_vrf_seed(void)
+{
+    uint8_t prev[ANTS_CHAIN_HASH_SIZE];
+    uint8_t randomness[ANTS_CHAIN_BEACON_RANDOMNESS_SIZE];
+    for (size_t i = 0; i < sizeof prev; i++) {
+        prev[i] = (uint8_t)(0xA0u + i);
+    }
+    CHECK(hex_to_bytes(DRAND_R1000_RAND_HEX, randomness, sizeof randomness) == 32);
+    const uint64_t height = 0x0102030405060708ULL;
+
+    /* Independent reference: recompute via the streaming derive-key
+     * API with the BE-64 height hand-rolled here — a different
+     * construction from the impl's one-shot derive over a packed
+     * buffer. */
+    uint8_t height_be[8];
+    height_be[0] = 0x01u;
+    height_be[1] = 0x02u;
+    height_be[2] = 0x03u;
+    height_be[3] = 0x04u;
+    height_be[4] = 0x05u;
+    height_be[5] = 0x06u;
+    height_be[6] = 0x07u;
+    height_be[7] = 0x08u;
+    ants_blake3_ctx_t ctx;
+    uint8_t want[ANTS_CHAIN_HASH_SIZE];
+    CHECK_EQ(ants_blake3_init_derive(&ctx, "ants-v1-vrf-seed"), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&ctx, prev, sizeof prev), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&ctx, height_be, sizeof height_be), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&ctx, randomness, sizeof randomness), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&ctx, want), ANTS_OK);
+
+    uint8_t seed[ANTS_CHAIN_HASH_SIZE];
+    CHECK_EQ(ants_chain_vrf_seed(prev, height, randomness, seed), ANTS_OK);
+    CHECK(memcmp(seed, want, sizeof seed) == 0);
+
+    /* Degraded seed: same independent recompute, shorter input, its
+     * own context string. */
+    CHECK_EQ(ants_blake3_init_derive(&ctx, "ants-v1-vrf-seed-degraded"), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&ctx, prev, sizeof prev), ANTS_OK);
+    CHECK_EQ(ants_blake3_update(&ctx, height_be, sizeof height_be), ANTS_OK);
+    CHECK_EQ(ants_blake3_final(&ctx, want), ANTS_OK);
+
+    uint8_t degraded[ANTS_CHAIN_HASH_SIZE];
+    CHECK_EQ(ants_chain_vrf_seed_degraded(prev, height, degraded), ANTS_OK);
+    CHECK(memcmp(degraded, want, sizeof degraded) == 0);
+
+    /* The two domains never collide, and every input matters. */
+    CHECK(memcmp(seed, degraded, sizeof seed) != 0);
+    uint8_t seed2[ANTS_CHAIN_HASH_SIZE];
+    CHECK_EQ(ants_chain_vrf_seed(prev, height + 1, randomness, seed2), ANTS_OK);
+    CHECK(memcmp(seed, seed2, sizeof seed) != 0);
+    randomness[31] ^= 0x01u;
+    CHECK_EQ(ants_chain_vrf_seed(prev, height, randomness, seed2), ANTS_OK);
+    CHECK(memcmp(seed, seed2, sizeof seed) != 0);
+    randomness[31] ^= 0x01u;
+    CHECK_EQ(ants_chain_vrf_seed(prev, height, randomness, seed2), ANTS_OK);
+    CHECK(memcmp(seed, seed2, sizeof seed) == 0);
+
+    /* Arg guards. */
+    CHECK_EQ(ants_chain_vrf_seed(NULL, height, randomness, seed), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_vrf_seed(prev, height, NULL, seed), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_vrf_seed(prev, height, randomness, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_vrf_seed_degraded(NULL, height, seed), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_vrf_seed_degraded(prev, height, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_constants();
@@ -926,6 +1130,10 @@ int main(void)
     test_finality();
     test_fork_weight();
     test_fork_choice();
+
+    test_beacon_verify_real_rounds();
+    test_beacon_verify_rejects();
+    test_vrf_seed();
 
     if (failures == 0) {
         printf("test_chain: all checks passed\n");

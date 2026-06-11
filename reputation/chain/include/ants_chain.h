@@ -47,6 +47,9 @@
  *   PR6  partition recovery: Σ T_eff fork choice (reusing the §"saturating
  *        T → T_eff" transform from reputation/identity) + the
  *        social-Schelling threshold + same-height equivocation detection.
+ *   PR7  drand beacon verification + VRF seed derivation (RFC-0008
+ *        §4.2-4.3): the external-entropy input behind PR4's `beacon`
+ *        parameter.
  *
  * WIRE FORMAT IS DRAFT. The byte layouts below (EpochSummary, Block, the
  * confirmed-proofs Merkle construction) are defined by this module pending
@@ -575,6 +578,89 @@ ants_error_t ants_chain_fork_choice(uint64_t weight_a,
                                     uint64_t theta_num,
                                     uint64_t theta_den,
                                     int *out_winner);
+
+/* ======================================================================== */
+/* PR7 — drand beacon verification + VRF seed derivation                    */
+/* ======================================================================== */
+
+/* drand group public key and round signature: BLS12-381 in the same
+ * min-pubkey-size shape ants_bls_* pins (48-byte compressed G1 pubkey,
+ * 96-byte G2 signature). The League of Entropy default chain (scheme
+ * "pedersen-bls-chained") is exactly this shape, with the same
+ * BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_ ciphersuite as RFC-0008
+ * §3.3. */
+#define ANTS_CHAIN_DRAND_PUBKEY_SIZE 48u
+#define ANTS_CHAIN_DRAND_SIG_SIZE    96u
+/* A round's published randomness: SHA-256(signature). */
+#define ANTS_CHAIN_BEACON_RANDOMNESS_SIZE 32u
+
+/*
+ * One drand round as consumed by the chain (RFC-0008 §4.2), in the
+ * CHAINED-scheme form: round N's signature signs
+ * SHA-256(previous_signature || round_be64), and the published
+ * randomness is SHA-256(signature). How the caller OBTAINS rounds
+ * (HTTP relay, gossip, a peer) is out of scope — the chain only
+ * verifies and consumes them; which round feeds which block is the
+ * block-production runtime's policy (RFC-0008 §4.3 leaves the exact
+ * mapping convention open).
+ */
+typedef struct {
+    uint64_t round; /* drand round number (>= 2; see beacon_verify) */
+    uint8_t randomness[ANTS_CHAIN_BEACON_RANDOMNESS_SIZE];
+    uint8_t signature[ANTS_CHAIN_DRAND_SIG_SIZE];
+    uint8_t previous_signature[ANTS_CHAIN_DRAND_SIG_SIZE];
+} ants_chain_beacon_t;
+
+/*
+ * Verify one chained drand round against the drand group public key
+ * (pinned in genesis config per RFC-0010 §drand): BLS-verify
+ * `signature` over SHA-256(previous_signature || round_be64), then
+ * check randomness == SHA-256(signature).
+ *
+ * The beacon is UNTRUSTED input: a failed pairing, a malformed point,
+ * or a randomness mismatch is a *verdict* (*out_ok = false, ANTS_OK),
+ * not an error — the same contract as bond admission.
+ *
+ * round < 2 is INVALID_ARG: round 1 of a chained drand network signs
+ * over the network's genesis seed (a different payload shape), and an
+ * ANTS genesis pins `initial_round` well past it (RFC-0010), so the
+ * steady-state form is the only one the chain consumes.
+ *
+ * @return ANTS_OK with *out_ok set; INVALID_ARG on NULL args or
+ *         round < 2.
+ */
+ants_error_t ants_chain_beacon_verify(const ants_chain_beacon_t *beacon,
+                                      const uint8_t drand_pubkey[ANTS_CHAIN_DRAND_PUBKEY_SIZE],
+                                      bool *out_ok);
+
+/*
+ * The VRF seed for a block (RFC-0008 §4.2):
+ * BLAKE3.derive_key("ants-v1-vrf-seed",
+ *     prev_block_hash || height_be64 || randomness).
+ * `randomness` is a VERIFIED round's 32-byte randomness — the
+ * "drand_round_value" of the spec text. (That the round value means
+ * the randomness rather than the 96-byte signature is a DRAFT
+ * precision pending RFC-0008: the randomness is the round's canonical
+ * public output, derived from the unforgeable signature.) The output
+ * feeds ants_chain_committee_select's `beacon` parameter.
+ */
+ants_error_t ants_chain_vrf_seed(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                 uint64_t height,
+                                 const uint8_t randomness[ANTS_CHAIN_BEACON_RANDOMNESS_SIZE],
+                                 uint8_t out_seed[ANTS_CHAIN_HASH_SIZE]);
+
+/*
+ * The degraded VRF seed (RFC-0008 §4.3, drand outage):
+ * BLAKE3.derive_key("ants-v1-vrf-seed-degraded",
+ *     prev_block_hash || height_be64).
+ * The outage POLICY (the 30-second hard floor before falling back, the
+ * `degraded_seed` block-header flag) belongs to the block-production
+ * runtime and its wire format — this is only the deterministic
+ * derivation every verifier must agree on.
+ */
+ants_error_t ants_chain_vrf_seed_degraded(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                          uint64_t height,
+                                          uint8_t out_seed[ANTS_CHAIN_HASH_SIZE]);
 
 #ifdef __cplusplus
 }

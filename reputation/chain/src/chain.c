@@ -1202,3 +1202,111 @@ ants_error_t ants_chain_fork_choice(uint64_t weight_a,
     }
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* PR7 — drand beacon verification + VRF seed derivation                    */
+/* ------------------------------------------------------------------------ */
+
+/* drand's chained payload uses big-endian rounds (read_be64 above reads
+ * the same order off keystream digests; this is its write twin, kept
+ * local to the beacon path). */
+static void write_be64(uint8_t out[8], uint64_t v)
+{
+    out[0] = (uint8_t)(v >> 56);
+    out[1] = (uint8_t)(v >> 48);
+    out[2] = (uint8_t)(v >> 40);
+    out[3] = (uint8_t)(v >> 32);
+    out[4] = (uint8_t)(v >> 24);
+    out[5] = (uint8_t)(v >> 16);
+    out[6] = (uint8_t)(v >> 8);
+    out[7] = (uint8_t)v;
+}
+
+ants_error_t ants_chain_beacon_verify(const ants_chain_beacon_t *beacon,
+                                      const uint8_t drand_pubkey[ANTS_CHAIN_DRAND_PUBKEY_SIZE],
+                                      bool *out_ok)
+{
+    uint8_t payload[ANTS_CHAIN_DRAND_SIG_SIZE + 8];
+    uint8_t digest[ANTS_SHA256_HASH_SIZE];
+    ants_error_t err;
+
+    if (beacon == NULL || drand_pubkey == NULL || out_ok == NULL || beacon->round < 2) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_ok = false;
+
+    /* The chained signing payload: SHA-256(previous_signature ||
+     * round_be64). */
+    memcpy(payload, beacon->previous_signature, ANTS_CHAIN_DRAND_SIG_SIZE);
+    write_be64(payload + ANTS_CHAIN_DRAND_SIG_SIZE, beacon->round);
+    err = ants_sha256(payload, sizeof payload, digest);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* The beacon is untrusted input: a malformed point or a failed
+     * pairing is a verdict, not an error. */
+    err = ants_bls_verify(drand_pubkey, digest, sizeof digest, beacon->signature);
+    if (err == ANTS_ERROR_MALFORMED) {
+        return ANTS_OK;
+    }
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* The published randomness must be SHA-256(signature). */
+    err = ants_sha256(beacon->signature, ANTS_CHAIN_DRAND_SIG_SIZE, digest);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (memcmp(digest, beacon->randomness, sizeof digest) != 0) {
+        return ANTS_OK;
+    }
+
+    *out_ok = true;
+    return ANTS_OK;
+}
+
+/* Shared derivation: key_material = prev_block_hash || height_be64
+ * [|| randomness]; the context string separates the live and degraded
+ * domains so the two can never collide. */
+static ants_error_t vrf_seed_derive(const char *context,
+                                    const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                    uint64_t height,
+                                    const uint8_t *randomness,
+                                    uint8_t out_seed[ANTS_CHAIN_HASH_SIZE])
+{
+    uint8_t km[ANTS_CHAIN_HASH_SIZE + 8 + ANTS_CHAIN_BEACON_RANDOMNESS_SIZE];
+    size_t len = 0;
+
+    memcpy(km + len, prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    len += ANTS_CHAIN_HASH_SIZE;
+    write_be64(km + len, height);
+    len += 8;
+    if (randomness != NULL) {
+        memcpy(km + len, randomness, ANTS_CHAIN_BEACON_RANDOMNESS_SIZE);
+        len += ANTS_CHAIN_BEACON_RANDOMNESS_SIZE;
+    }
+    return ants_blake3_derive_key(context, km, len, out_seed);
+}
+
+ants_error_t ants_chain_vrf_seed(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                 uint64_t height,
+                                 const uint8_t randomness[ANTS_CHAIN_BEACON_RANDOMNESS_SIZE],
+                                 uint8_t out_seed[ANTS_CHAIN_HASH_SIZE])
+{
+    if (prev_block_hash == NULL || randomness == NULL || out_seed == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return vrf_seed_derive("ants-v1-vrf-seed", prev_block_hash, height, randomness, out_seed);
+}
+
+ants_error_t ants_chain_vrf_seed_degraded(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                          uint64_t height,
+                                          uint8_t out_seed[ANTS_CHAIN_HASH_SIZE])
+{
+    if (prev_block_hash == NULL || out_seed == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return vrf_seed_derive("ants-v1-vrf-seed-degraded", prev_block_hash, height, NULL, out_seed);
+}
