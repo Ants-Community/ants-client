@@ -192,6 +192,63 @@ static void test_blake3_streaming_matches_one_shot(void)
     CHECK(memcmp(one_shot, streamed, ANTS_BLAKE3_HASH_SIZE) == 0);
 }
 
+static void test_sha256_rejects_invalid_args(void)
+{
+    uint8_t out[ANTS_SHA256_HASH_SIZE];
+    CHECK_EQ(ants_sha256(NULL, 1, out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_sha256((const uint8_t *)"x", 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_sha256_known_inputs(void)
+{
+    uint8_t out[ANTS_SHA256_HASH_SIZE];
+
+    /* FIPS 180 known answers; every value below cross-checked against
+     * two independent implementations (macOS shasum -a 256 and Python
+     * hashlib, 2026-06-11) rather than copied from one source. */
+    CHECK_EQ(ants_sha256(NULL, 0, out), ANTS_OK);
+    check_hash(
+        "sha256('')", out, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    CHECK_EQ(ants_sha256((const uint8_t *)"abc", 3, out), ANTS_OK);
+    check_hash(
+        "sha256('abc')", out, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    /* 104-byte pattern byte[i] = (i*7 + 3) mod 256 — crosses one
+     * 64-byte SHA-256 block boundary. Same two references. */
+    uint8_t pattern[104];
+    for (size_t i = 0; i < sizeof pattern; i++) {
+        pattern[i] = (uint8_t)(i * 7 + 3);
+    }
+    CHECK_EQ(ants_sha256(pattern, sizeof pattern, out), ANTS_OK);
+    check_hash("sha256(pattern 104B)",
+               out,
+               "5af877de0ea99d70bd0a547c967dbecd4525d6bba9ab2917d54d6aa742874687");
+}
+
+/* drand default chain (scheme pedersen-bls-chained, chain hash
+ * 8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce),
+ * round 1000, fetched from api.drand.sh on 2026-06-11. */
+static const char *DRAND_R1000_SIG =
+    "99bf96de133c3d3937293cfca10c8152b18ab2d034ccecf115658db324d2edc0"
+    "0a16a2044cd04a8a38e2a307e5ecff3511315be8d282079faf24098f283e0ed2"
+    "c199663b334d2e84c55c032fe469b212c5c2087ebb83a5b25155c3283f5b79ac";
+static const char *DRAND_R1000_RANDOMNESS =
+    "a40d3e0e7e3c71f28b7da2fd339f47f0bcf10910309f5253d7c323ec8cea3212";
+
+static void test_sha256_drand_randomness(void)
+{
+    /* Real-world vector: a drand round's published randomness is
+     * defined as SHA-256(signature) — the relation Component #8's
+     * beacon verification (RFC-0008 §4.2) relies on. The signature is
+     * a 96-byte BLS G2 point. */
+    uint8_t sig[96];
+    CHECK(hex_to_bytes(DRAND_R1000_SIG, sig, sizeof sig) == 96);
+    uint8_t out[ANTS_SHA256_HASH_SIZE];
+    CHECK_EQ(ants_sha256(sig, sizeof sig, out), ANTS_OK);
+    check_hash("sha256(drand round-1000 sig)", out, DRAND_R1000_RANDOMNESS);
+}
+
 /* RFC 8032 §7.1 TEST 1: empty message */
 static const char *RFC8032_T1_SEED =
     "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
@@ -735,6 +792,10 @@ int main(void)
     test_blake3_known_inputs();
     test_blake3_derive_key();
     test_blake3_streaming_matches_one_shot();
+
+    test_sha256_rejects_invalid_args();
+    test_sha256_known_inputs();
+    test_sha256_drand_randomness();
 
     test_ed25519_rejects_invalid_args();
     test_ed25519_rfc8032_test1_empty();

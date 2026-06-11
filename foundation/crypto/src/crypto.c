@@ -117,6 +117,25 @@ ants_error_t ants_blake3_final(ants_blake3_ctx_t *ctx, uint8_t out[ANTS_BLAKE3_H
 }
 
 /* ------------------------------------------------------------------------ */
+/* SHA-256                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Thin wrapper over blst's portable SHA-256 (deps/blst, exposed via
+ * blst_aux.h, already linked for BLS12-381). Kept here so callers never
+ * include vendored headers directly; see the header for the
+ * external-interop-only usage rule.
+ */
+ants_error_t ants_sha256(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA256_HASH_SIZE])
+{
+    if ((data == NULL && len > 0) || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    blst_sha256(out, data, len);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519                                                                  */
 /* ------------------------------------------------------------------------ */
 

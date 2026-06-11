@@ -101,6 +101,26 @@ ants_error_t ants_blake3_update(ants_blake3_ctx_t *ctx, const uint8_t *data, siz
 ants_error_t ants_blake3_final(ants_blake3_ctx_t *ctx, uint8_t out[ANTS_BLAKE3_HASH_SIZE]);
 
 /* ------------------------------------------------------------------------ */
+/* SHA-256 — external-interop hashing ONLY                                  */
+/*                                                                          */
+/* All protocol-internal hashing is BLAKE3 (above; RFC-0008 §2.1). SHA-256  */
+/* exists solely to verify artifacts whose format is fixed by an external   */
+/* protocol — concretely the drand randomness beacon (RFC-0008 §4.2): a     */
+/* chained drand round signs SHA-256(prev_signature || round_be64) and      */
+/* publishes randomness = SHA-256(signature). Do not use SHA-256 for        */
+/* anything ANTS-internal.                                                  */
+/* ------------------------------------------------------------------------ */
+
+/* Output size in bytes. */
+#define ANTS_SHA256_HASH_SIZE 32
+
+/*
+ * One-shot hash: SHA-256(data) -> 32-byte output. `data` may be NULL
+ * only when `len` is 0.
+ */
+ants_error_t ants_sha256(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA256_HASH_SIZE]);
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519 — Peer identity signatures                                       */
 /*                                                                          */
 /* Per RFC-0008 §3.1, all peer-to-peer signatures use Ed25519 (RFC 8032).   */
