@@ -13,6 +13,55 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #8 (L2 PoUH chain) — block proposal + proposer election · 2026-06-12
+
+The second runtime slice of Component #8 (PR #137): the pure mempool→block
+step and the rule for who takes it. With this, every deterministic piece of
+block production exists as a recomputable function — what remains for a
+live chain is I/O composition (the node daemon's loop, attestation
+collection on the wire), not protocol logic.
+
+- **`ants_chain_block_propose`** — composes a candidate block from the
+  proposer's view of Layer 1 at the epoch cutoff. RFC-0004's "mempool" is
+  NOT a queue: the candidate content IS the visible L1 CRDT state at
+  `cutoff_time`, so the function takes the enumerated view (ascending proof
+  content-ids + decoded fault events) and derives `confirmed_proofs` +
+  pattern findings into a filled block. The determinism pin: the pattern
+  engine runs with **now ≡ cutoff_time**, never a wall clock — a committee
+  member recomputing from the same visible set produces the byte-identical
+  block hash, and that recompute-and-compare IS proposal validation
+  (sign-only-on-match; view-lagged members abstain, 2/3 finality absorbs
+  them). Probe-sizing contract as the decoders; a scan emitting more than
+  `ANTS_CHAIN_MAX_PATTERN_FINDINGS` is the pathological split-the-epoch
+  case → INVALID_ARG, the same bound the summary encoder enforces.
+- **`ants_chain_proposer`** — DRAFT round-robin rule (RFC-0004 pins only
+  "deterministic within the committee"): position `height mod k` into the
+  canonical ascending committee from `ants_chain_committee_select`. Adds no
+  grinding surface — the committee SET is already beacon-seeded and
+  non-grindable. On finality timeout the runtime re-attempts with a NEW
+  committee (later beacon round), not a new position.
+- **`degraded_seed` block-header flag (WIRE change)** — the block is now
+  canonical CBOR map(4) `{1: height, 2: prev_block_hash, 3: degraded_seed,
+  4: summary}`. The §4.3 drand-outage claim sits INSIDE the signed bytes on
+  purpose: committee members attest to the degradation, not just the
+  summary; whether the fallback was legitimate (the 30 s hard floor) is the
+  runtime policy each member checks before signing. Wire format remains
+  DRAFT, defined by this module pending RFC-0008 formalisation; no deployed
+  network exists, so no compatibility shim.
+
+Tests: round-robin exactly-once over k consecutive heights; proposal field
+wiring against EXPECTED findings from the documented window/severity rules
+(not a parallel re-scan); the cutoff pin via boundary events (at-cutoff
+included, post-cutoff excluded); member-recompute hash equality under event
+reordering; degraded-seed hash sensitivity through both the codec and
+propose; the empty-mempool root recomputed independently (`BLAKE3(0x02)`);
+probe sizing; findings-overflow rejection; and the map(4) strict-decode
+battery re-pinned (`0xA4`).
+
+Still deferred for #8 runtime: attestation collection on the wire (awaits
+the node daemon), the `INVALID_TRANSITION` fault class, and the
+L2-confirmation → G-Set prune-cutoff feedback into Component #7.
+
 ### reputation: Component #8 (L2 PoUH chain) — drand beacon verification + VRF seed derivation · 2026-06-11
 
 The first runtime-wiring slice of Component #8: the chain can now verify the

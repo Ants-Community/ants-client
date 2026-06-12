@@ -50,6 +50,11 @@
  *   PR7  drand beacon verification + VRF seed derivation (RFC-0008
  *        §4.2-4.3): the external-entropy input behind PR4's `beacon`
  *        parameter.
+ *   PR8  block proposal + proposer election, the pure mempool→block step.
+ *        RFC-0004's "mempool" is NOT a queue — the candidate block content
+ *        IS the L1 CRDT state visible at the cutoff. Adds the
+ *        `degraded_seed` block-header wire flag (RFC-0008 §4.3 drand
+ *        outage), inside the signed bytes.
  *
  * WIRE FORMAT IS DRAFT. The byte layouts below (EpochSummary, Block, the
  * confirmed-proofs Merkle construction) are defined by this module pending
@@ -302,6 +307,13 @@ typedef struct {
 typedef struct {
     uint64_t height;
     uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE];
+    /* The proposer derived this block's committee from the DEGRADED VRF seed
+     * (ants_chain_vrf_seed_degraded) because drand was unavailable (RFC-0008
+     * §4.3). Part of the canonical encoding — committee members attest to the
+     * degradation claim when they sign the block hash; whether the fallback
+     * was legitimate (the 30-second hard floor) is the runtime policy each
+     * member checks before signing. */
+    bool degraded_seed;
     ants_chain_epoch_summary_t summary;
 } ants_chain_block_t;
 
@@ -661,6 +673,81 @@ ants_error_t ants_chain_vrf_seed(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_S
 ants_error_t ants_chain_vrf_seed_degraded(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
                                           uint64_t height,
                                           uint8_t out_seed[ANTS_CHAIN_HASH_SIZE]);
+
+/* ======================================================================== */
+/* PR8 — block proposal + proposer election                                  */
+/* ======================================================================== */
+
+/*
+ * Which committee member proposes the block at `height`: the POSITION
+ * height mod k into the canonical ascending committee list produced by
+ * ants_chain_committee_select (a position, NOT a population index — the
+ * caller looks up committee[*out_member]).
+ *
+ * DRAFT rule. RFC-0004 §"Consensus mechanism" requires only "deterministic
+ * within the committee" and leaves the rule unpinned; round-robin by height
+ * is the simplest candidate and adds no grinding surface, because the
+ * committee SET itself is already beacon-seeded and non-grindable — pinning
+ * WHICH member of an unpredictable set proposes gives an adversary nothing
+ * to grind toward. Over any k consecutive heights every position proposes
+ * exactly once. On a finality timeout the runtime re-attempts with a NEW
+ * committee (a later beacon round), not a new position: for a given
+ * (committee, height) the proposer is fixed.
+ *
+ * @return ANTS_OK with *out_member set; INVALID_ARG on NULL out_member,
+ *         k == 0, or k > ANTS_CHAIN_COMMITTEE_K_MAX.
+ */
+ants_error_t ants_chain_proposer(uint64_t height, size_t k, size_t *out_member);
+
+/*
+ * Compose a candidate block from the proposer's view of Layer 1 at the
+ * epoch cutoff — the pure mempool→block step. RFC-0004's "mempool" is not
+ * a queue: the candidate block content IS the L1 CRDT state visible at
+ * cutoff_time. The caller (the runtime) enumerates its G-Set once and
+ * passes that view down as the proofs' content-ids (STRICTLY ASCENDING,
+ * the confirmed_root canonical order) plus the decoded fault events; this
+ * function derives confirmed_proofs and the pattern findings and fills
+ * `*out_block`.
+ *
+ * DETERMINISM PIN: the pattern engine runs with now ≡ cutoff_time — never
+ * the proposer's wall clock — so a committee member recomputing from the
+ * same visible set produces the byte-identical block and hence the same
+ * block hash. That recompute-and-compare IS proposal validation: a member
+ * signs the proposer's block hash only if it matches its own recomputation
+ * (members whose G-Set view lags simply abstain; 2/3 finality absorbs the
+ * stragglers). `degraded_seed` is carried verbatim into the block's signed
+ * bytes (see ants_chain_block_t).
+ *
+ * Findings use the decode-style probe contract: call with findings_cap == 0
+ * to learn the count via BUFFER_TOO_SMALL + *out_n_findings, then size and
+ * call again. On success out_block->summary.findings aliases findings_buf.
+ *
+ * Which epoch and cutoff map to which height, and which verified beacon
+ * round seeded the committee, are the block-production runtime's policy
+ * (RFC-0008 §4.3 leaves the mapping convention open) — this function only
+ * makes the composition canonical.
+ *
+ * @return ANTS_OK with *out_block and *out_n_findings set; INVALID_ARG on
+ *         NULL prev_block_hash/out_block/out_n_findings, on NULL
+ *         content_ids/events with a nonzero count, or if the scan emits
+ *         more than ANTS_CHAIN_MAX_PATTERN_FINDINGS findings (a pathological
+ *         epoch the runtime must split — see that constant); NON_CANONICAL
+ *         if content_ids are not strictly ascending; BUFFER_TOO_SMALL if
+ *         findings_cap is short (*out_n_findings set to the count needed).
+ */
+ants_error_t ants_chain_block_propose(uint64_t height,
+                                      const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                      uint64_t epoch,
+                                      uint64_t cutoff_time,
+                                      bool degraded_seed,
+                                      const uint8_t (*content_ids)[ANTS_CHAIN_HASH_SIZE],
+                                      size_t n_ids,
+                                      const ants_chain_event_t *events,
+                                      size_t n_events,
+                                      ants_chain_pattern_finding_t *findings_buf,
+                                      size_t findings_cap,
+                                      size_t *out_n_findings,
+                                      ants_chain_block_t *out_block);
 
 #ifdef __cplusplus
 }

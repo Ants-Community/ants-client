@@ -17,6 +17,14 @@
  * (cross-checked against ants_reputation_t_eff) + the social-Schelling
  * fallback, incl. the overflow-safe θ threshold near UINT64_MAX. The protocol
  * constant invariants are asserted too.
+ *
+ * PR8 coverage: the round-robin proposer rule (exactly-once over k
+ * consecutive heights) and block proposal — field wiring with EXPECTED
+ * findings from the documented window/severity rules, the now ≡ cutoff_time
+ * determinism pin via boundary events (at-cutoff in, post-cutoff out),
+ * member-recompute hash equality under event reordering, degraded_seed hash
+ * sensitivity, the independently-recomputed empty-mempool root, probe
+ * sizing, and the findings-overflow INVALID_ARG.
  */
 
 #include "ants_cbor.h"
@@ -638,6 +646,7 @@ static void test_block(void)
     CHECK_EQ(ants_chain_block_decode(buf, len, &out, fout, 3, &out_n), ANTS_OK);
     CHECK(out.height == b.height);
     CHECK(memcmp(out.prev_block_hash, b.prev_block_hash, 32) == 0);
+    CHECK(out.degraded_seed == false);
     CHECK(out.summary.epoch == b.summary.epoch);
     CHECK(out.summary.cutoff_time == b.summary.cutoff_time);
     CHECK(memcmp(out.summary.confirmed_proofs, b.summary.confirmed_proofs, 32) == 0);
@@ -672,6 +681,21 @@ static void test_block(void)
         CHECK(memcmp(h1, h2, 32) != 0);
     }
 
+    /* degraded_seed: inside the signed bytes (flips the hash), still
+     * canonical, and round-trips. */
+    {
+        ants_chain_block_t b2 = b;
+        uint8_t buf3[ANTS_CHAIN_BLOCK_ENCODED_MAX];
+        size_t len3 = 0;
+        b2.degraded_seed = true;
+        CHECK_EQ(ants_chain_block_hash(&b2, h2), ANTS_OK);
+        CHECK(memcmp(h1, h2, 32) != 0);
+        CHECK_EQ(ants_chain_block_encode(&b2, buf3, sizeof buf3, &len3), ANTS_OK);
+        CHECK_EQ(ants_cbor_is_canonical(buf3, len3), ANTS_OK);
+        CHECK_EQ(ants_chain_block_decode(buf3, len3, &out, fout, 3, &out_n), ANTS_OK);
+        CHECK(out.degraded_seed == true);
+    }
+
     /* probe decode reports the findings count. */
     CHECK_EQ(ants_chain_block_decode(buf, len, &out, NULL, 0, &out_n), ANTS_ERROR_BUFFER_TOO_SMALL);
     CHECK(out_n == 3);
@@ -684,10 +708,10 @@ static void test_block(void)
     memcpy(buf2, buf, len);
     buf2[len] = 0x00;
     CHECK_EQ(ants_chain_block_decode(buf2, len + 1, &out, fout, 3, &out_n), ANTS_ERROR_MALFORMED);
-    /* wrong outer map size: map(3) 0xA3 → map(2) 0xA2. */
+    /* wrong outer map size: map(4) 0xA4 → map(3) 0xA3. */
     memcpy(buf2, buf, len);
-    CHECK(buf2[0] == 0xA3u);
-    buf2[0] = 0xA2u;
+    CHECK(buf2[0] == 0xA4u);
+    buf2[0] = 0xA3u;
     CHECK_EQ(ants_chain_block_decode(buf2, len, &out, fout, 3, &out_n), ANTS_ERROR_MALFORMED);
 
     /* invalid summary inside the block → INVALID_ARG (encode and hash). */
@@ -1111,6 +1135,216 @@ static void test_vrf_seed(void)
     CHECK_EQ(ants_chain_vrf_seed_degraded(prev, height, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- block proposal + proposer election ---------------------------------- */
+
+static void test_proposer(void)
+{
+    size_t member = 99;
+
+    /* The DRAFT round-robin rule: position = height mod k. */
+    CHECK_EQ(ants_chain_proposer(0, 4, &member), ANTS_OK);
+    CHECK(member == 0);
+    CHECK_EQ(ants_chain_proposer(7, 4, &member), ANTS_OK);
+    CHECK(member == 3);
+    CHECK_EQ(ants_chain_proposer(8, 4, &member), ANTS_OK);
+    CHECK(member == 0);
+    CHECK_EQ(ants_chain_proposer(5, 1, &member), ANTS_OK);
+    CHECK(member == 0);
+    CHECK_EQ(ants_chain_proposer(UINT64_MAX, 64, &member), ANTS_OK);
+    CHECK(member == (size_t)(UINT64_MAX % 64u));
+
+    /* Over k consecutive heights every position proposes exactly once. */
+    {
+        bool seen[8] = {false, false, false, false, false, false, false, false};
+        uint64_t h;
+        for (h = 100; h < 108; h++) {
+            CHECK_EQ(ants_chain_proposer(h, 8, &member), ANTS_OK);
+            CHECK(member < 8);
+            CHECK(!seen[member]);
+            seen[member] = true;
+        }
+    }
+
+    /* INVALID_ARG: k 0, k > K_MAX, NULL. */
+    CHECK_EQ(ants_chain_proposer(1, 0, &member), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_proposer(1, ANTS_CHAIN_COMMITTEE_K_MAX + 1, &member),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_proposer(1, 4, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_block_propose(void)
+{
+    uint64_t height = 9;
+    uint64_t epoch = 3;
+    uint64_t cutoff = 100000000ull;
+    uint8_t prev[32];
+    uint8_t ids[4][32];
+    ants_chain_event_t ev[8];
+    ants_chain_pattern_finding_t fnd[4];
+    ants_chain_block_t blk;
+    uint8_t h1[32];
+    uint8_t h2[32];
+    size_t out_n = 0;
+    size_t i;
+    size_t k = 0;
+
+    memset(prev, 0x5A, 32);
+    build_ascending_ids(ids, 4);
+
+    /* Subject 2: three in-window events (MEDIUM). Subject 1: one event AT
+     * the cutoff (in-window: now - ts == 0 < WINDOW) and one AFTER it
+     * (excluded) — the window is evaluated against cutoff_time, never a
+     * wall clock; a proposer including post-cutoff events would diverge. */
+    memset(ev, 0, sizeof ev);
+    for (i = 0; i < 3; i++) {
+        ev[k].subject[0] = 2;
+        ev[k].timestamp = cutoff - (i + 1) * 100;
+        k++;
+    }
+    ev[k].subject[0] = 1;
+    ev[k].timestamp = cutoff;
+    k++;
+    ev[k].subject[0] = 1;
+    ev[k].timestamp = cutoff + 1;
+    k++;
+
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, ids, 4, ev, k, fnd, 4, &out_n, &blk),
+             ANTS_OK);
+
+    /* Field wiring + the EXPECTED findings per the documented window/severity
+     * rules (not a parallel re-scan): subject 1 count 1 SOFT, subject 2
+     * count 3 MEDIUM, subject-ascending. */
+    CHECK(blk.height == height);
+    CHECK(memcmp(blk.prev_block_hash, prev, 32) == 0);
+    CHECK(blk.degraded_seed == false);
+    CHECK(blk.summary.epoch == epoch);
+    CHECK(blk.summary.cutoff_time == cutoff);
+    CHECK(out_n == 2);
+    CHECK(blk.summary.n_findings == 2);
+    CHECK(blk.summary.findings == fnd);
+    CHECK(fnd[0].subject[0] == 1);
+    CHECK(fnd[0].count == 1);
+    CHECK(fnd[0].severity == ANTS_CHAIN_SEVERITY_SOFT);
+    CHECK(fnd[1].subject[0] == 2);
+    CHECK(fnd[1].count == 3);
+    CHECK(fnd[1].severity == ANTS_CHAIN_SEVERITY_MEDIUM);
+
+    /* The proposed root is the canonical confirmed_root of the passed view. */
+    {
+        uint8_t want[32];
+        CHECK_EQ(ants_chain_confirmed_root(ids, 4, want), ANTS_OK);
+        CHECK(memcmp(blk.summary.confirmed_proofs, want, 32) == 0);
+    }
+
+    /* The proposal is a valid, canonical, hashable block. */
+    {
+        uint8_t buf[ANTS_CHAIN_BLOCK_ENCODED_MAX];
+        size_t len = 0;
+        CHECK_EQ(ants_chain_block_encode(&blk, buf, sizeof buf, &len), ANTS_OK);
+        CHECK_EQ(ants_cbor_is_canonical(buf, len), ANTS_OK);
+        CHECK_EQ(ants_chain_block_hash(&blk, h1), ANTS_OK);
+    }
+
+    /* Committee recomputation: a member running propose over the same view —
+     * with the events listed in a DIFFERENT order — produces the identical
+     * block hash. This is the sign-only-on-match validation path. */
+    {
+        ants_chain_event_t rev[8];
+        ants_chain_pattern_finding_t fnd2[4];
+        ants_chain_block_t blk2;
+        for (i = 0; i < k; i++) {
+            rev[i] = ev[k - 1 - i];
+        }
+        CHECK_EQ(ants_chain_block_propose(
+                     height, prev, epoch, cutoff, false, ids, 4, rev, k, fnd2, 4, &out_n, &blk2),
+                 ANTS_OK);
+        CHECK_EQ(ants_chain_block_hash(&blk2, h2), ANTS_OK);
+        CHECK(memcmp(h1, h2, 32) == 0);
+    }
+
+    /* degraded_seed reaches the signed bytes via propose too. */
+    {
+        ants_chain_pattern_finding_t fnd2[4];
+        ants_chain_block_t blk2;
+        CHECK_EQ(ants_chain_block_propose(
+                     height, prev, epoch, cutoff, true, ids, 4, ev, k, fnd2, 4, &out_n, &blk2),
+                 ANTS_OK);
+        CHECK(blk2.degraded_seed == true);
+        CHECK_EQ(ants_chain_block_hash(&blk2, h2), ANTS_OK);
+        CHECK(memcmp(h1, h2, 32) != 0);
+    }
+
+    /* Empty mempool (a legitimate quiet epoch): no proofs, no events — the
+     * documented empty root BLAKE3(0x02), recomputed independently. */
+    {
+        ants_chain_block_t blk2;
+        uint8_t e = 0x02u;
+        uint8_t want[32];
+        CHECK_EQ(ants_chain_block_propose(
+                     height, prev, epoch, cutoff, false, NULL, 0, NULL, 0, NULL, 0, &out_n, &blk2),
+                 ANTS_OK);
+        CHECK(out_n == 0);
+        CHECK(blk2.summary.n_findings == 0);
+        CHECK(blk2.summary.findings == NULL);
+        CHECK_EQ(ants_blake3_hash(&e, 1, want), ANTS_OK);
+        CHECK(memcmp(blk2.summary.confirmed_proofs, want, 32) == 0);
+        CHECK_EQ(ants_chain_block_hash(&blk2, h2), ANTS_OK);
+    }
+
+    /* Probe sizing: cap 0 reports the findings count. */
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, ids, 4, ev, k, NULL, 0, &out_n, &blk),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(out_n == 2);
+
+    /* A non-canonical (descending) view is rejected, not silently re-sorted:
+     * the canonical order is the caller's contract with confirmed_root. */
+    {
+        uint8_t bad[2][32];
+        memcpy(bad[0], ids[1], 32);
+        memcpy(bad[1], ids[0], 32);
+        CHECK_EQ(ants_chain_block_propose(
+                     height, prev, epoch, cutoff, false, bad, 2, ev, k, fnd, 4, &out_n, &blk),
+                 ANTS_ERROR_NON_CANONICAL);
+    }
+
+    /* More findings than one summary can carry → INVALID_ARG (the runtime
+     * splits pathological epochs; same bound the summary encoder enforces). */
+    {
+        static ants_chain_event_t evb[ANTS_CHAIN_MAX_PATTERN_FINDINGS + 1];
+        static ants_chain_pattern_finding_t fnb[ANTS_CHAIN_MAX_PATTERN_FINDINGS + 1];
+        size_t n = ANTS_CHAIN_MAX_PATTERN_FINDINGS + 1;
+        memset(evb, 0, sizeof evb);
+        for (i = 0; i < n; i++) {
+            evb[i].subject[0] = (uint8_t)i;
+            evb[i].subject[1] = (uint8_t)(i >> 8);
+            evb[i].timestamp = cutoff;
+        }
+        CHECK_EQ(ants_chain_block_propose(
+                     height, prev, epoch, cutoff, false, NULL, 0, evb, n, fnb, n, &out_n, &blk),
+                 ANTS_ERROR_INVALID_ARG);
+        CHECK(out_n == n);
+    }
+
+    /* NULL args. */
+    CHECK_EQ(ants_chain_block_propose(
+                 height, NULL, epoch, cutoff, false, ids, 4, ev, k, fnd, 4, &out_n, &blk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, ids, 4, ev, k, fnd, 4, &out_n, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, ids, 4, ev, k, fnd, 4, NULL, &blk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, NULL, 4, ev, k, fnd, 4, &out_n, &blk),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_chain_block_propose(
+                 height, prev, epoch, cutoff, false, ids, 4, NULL, k, fnd, 4, &out_n, &blk),
+             ANTS_ERROR_INVALID_ARG);
+}
+
 int main(void)
 {
     test_constants();
@@ -1134,6 +1368,9 @@ int main(void)
     test_beacon_verify_real_rounds();
     test_beacon_verify_rejects();
     test_vrf_seed();
+
+    test_proposer();
+    test_block_propose();
 
     if (failures == 0) {
         printf("test_chain: all checks passed\n");
