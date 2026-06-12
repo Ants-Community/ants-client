@@ -13,6 +13,61 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #9 — compact summaries close the lib surface · 2026-06-12
+
+`reputation/identity` (PR #145): the last lib-side piece of the
+reputation spine — RFC-0004 §"Compact summaries for large peers",
+encoded per RFC-0008 **v0.7** §11.9 (amendment `805a41e`, landed
+alongside): the signed `(bucket_index, total_decayed_value)` hint a
+large peer publishes to cut per-bond-admission verification cost, and
+the random-audit check that keeps it honest.
+
+- **`ants_reputation_summary_build`** buckets a canonically-ordered
+  bag at `eval_time` under exactly the A pass's eligibility filter
+  (both signatures valid, credits the peer, not future-dated), one
+  forward pass, zero-total buckets omitted — an honest summary is
+  substantiable receipt-for-receipt under audit by construction.
+- **Canonical-CBOR codec**: map(5) signed body (peer_id, bag_root,
+  eval_time, bucket_width, buckets) re-keyed as a map(6) full object
+  with the peer's single Ed25519 signature; strict decoder with the
+  house reject battery. **`ants_reputation_summary_verify`** checks
+  the signature over the canonical body; non-canonical structs and
+  bad signatures are false verdicts.
+- **`ants_reputation_summary_audit_bucket`** is the
+  `bag_verify_bound` loop with two audit pins — the opening must fall
+  in the audited bucket and must not postdate `eval_time` — and
+  `>=`-stated-total acceptance (exceeding it is the safe
+  understatement direction). A signed summary stating a bucket its
+  receipts cannot substantiate is equivocation against the peer's own
+  signature (the fault-proof packaging of a failed audit is
+  wire/daemon work).
+
+Two prose ambiguities in RFC-0004 are now pinned in RFC-0008 v0.7:
+"committed via the same Merkle root" means the signed body *includes*
+`bag_root` (a summary leaf inside the tree would make the root
+self-referential), and bucket totals are decayed **at the summary's
+own `eval_time`** with audits recomputing at that same instant — the
+q32 decay is a pinned repeated multiplication and is not associative,
+so re-decayed totals would drift from a fresh recompute; bit-exact-
+or-reject stands, and fresher numbers mean a fresher summary.
+
+With this, **Component #9's lib surface is complete**: what remains
+(wiring bond admission / the slash predicate into real
+high-stakes-act call sites) is daemon-side composition.
+
+### cache: server context declared as a C99 union, not a C11 anonymous union · 2026-06-12
+
+`cache/semantic` (PR #146): `ants_semantic_cache_server_t` was the
+one opaque context in the codebase declared as a struct wrapping an
+*anonymous* union — a C11 feature (a constraint violation in C99)
+that made every TU including the header warn under
+`-std=c99 -Wpedantic` on some toolchains. It now uses the
+codebase-wide top-level `typedef union { _opaque; _align; }` shape
+(the `ants_blake3_ctx_t` pattern the other three contexts in the same
+header already follow). No layout, size, alignment, or API change —
+member access and the `sizeof`-based compile-time size checks are
+byte-for-byte identical.
+
 ### network: Components #5/#6 — anti-eclipse axes S2 + S3 land in the DHT · 2026-06-12
 
 `network/dht` (PR #142): the two remaining lib-side axes of RFC-0005
