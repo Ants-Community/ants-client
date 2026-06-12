@@ -28,6 +28,17 @@
  * the same clock. */
 uint64_t dht_now_us(void);
 
+/* Insert (or refresh) a peer in the routing table — the cross-module
+ * production insert path (bootstrap promotion, pending-dial promotion,
+ * probe fold). Wraps kbucket_insert and fires ANTS_DHT_EV_PEER_DISCOVERED
+ * through the registered event_fn when the peer is genuinely new (NOT on
+ * refresh of an existing entry, and never for rejected inserts: self,
+ * full bucket). Defined in dht.c. */
+ants_error_t dht_routing_upsert(ants_dht_t *dht,
+                                const ants_dht_peer_t *peer,
+                                ants_transport_conn_t *conn,
+                                uint64_t now_us);
+
 /* ------------------------------------------------------------------------ */
 /* K-bucket entry + bucket head                                             */
 /*                                                                          */
@@ -211,7 +222,13 @@ struct ants_dht_lookup_state {
     /* true once a LOOKUP_COMPLETE / LOOKUP_TIMEOUT event has fired (so
      * late completions don't fire it again). */
     bool completed;
-    uint8_t _pad[6];
+    /* Probe mode (anti-eclipse axis S2, ants_dht_probe): on convergence
+     * the ANSWERED candidates are folded into the routing table and a
+     * TABLE_REFRESHED event fires instead of LOOKUP_COMPLETE — the
+     * result set of a random-target lookup is maintenance, not an
+     * answer, and must not reach shard-lookup consumers. */
+    bool is_probe;
+    uint8_t _pad[5];
     ants_dht_t *parent;
     ants_dht_shard_key_t target_key;
     /* BLAKE3(target_key_le_bytes) — the target in peer-id space. The DHT

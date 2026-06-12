@@ -46,16 +46,22 @@ extern "C" {
  * slot table, seeds the candidate set from the routing table, and
  * issues the first batch of RPCs.
  *
+ * `is_probe` selects the anti-eclipse axis-S2 completion semantics
+ * (ants_dht_probe): on convergence the ANSWERED candidates are folded
+ * into the routing table and TABLE_REFRESHED fires (with the probe's
+ * key in ev.shard_key) instead of LOOKUP_COMPLETE.
+ *
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_BUFFER_TOO_SMALL if all ANTS_DHT_MAX_ACTIVE_LOOKUPS
  *     slots are in use.
  *
  * On completion or timeout, LOOKUP_COMPLETE / LOOKUP_TIMEOUT events
- * fire via the DHT's registered event_fn. */
+ * fire via the DHT's registered event_fn (non-probe lookups only). */
 ants_error_t ants_dht_lookup_start(ants_dht_t *dht,
                                    ants_dht_shard_key_t target_key,
-                                   ants_dht_lookup_t *out_lookup);
+                                   ants_dht_lookup_t *out_lookup,
+                                   bool is_probe);
 
 /* Cancel an in-flight lookup. Invalidates all completion records and
  * marks the lookup completed (no events fire after cancellation).

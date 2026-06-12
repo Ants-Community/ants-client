@@ -297,6 +297,29 @@ static struct ants_dht_bucket_entry *find_entry_by_peer_id(struct ants_dht_state
     return NULL;
 }
 
+/* Cross-module production insert path (declared in dht_internal.h): wraps
+ * kbucket_insert and fires PEER_DISCOVERED when the peer is genuinely new.
+ * The header has promised that event for bootstrap- and lookup-discovered
+ * peers since phase 0; every production insert site routes through here so
+ * the promise holds uniformly (test hooks stay raw — silent by design). */
+ants_error_t dht_routing_upsert(ants_dht_t *dht,
+                                const ants_dht_peer_t *peer,
+                                ants_transport_conn_t *conn,
+                                uint64_t now_us)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    bool was_present = find_entry_by_peer_id(state, &peer->peer_id) != NULL;
+    ants_error_t err = kbucket_insert(state, peer, conn, now_us);
+    if (err == ANTS_OK && !was_present && state->event_fn != NULL) {
+        ants_dht_event_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.kind = ANTS_DHT_EV_PEER_DISCOVERED;
+        ev.peer = *peer;
+        (void)state->event_fn(&ev, state->event_ctx);
+    }
+    return err;
+}
+
 static void refresh_ping_completion(ants_error_t status, const void *resp, void *ctx)
 {
     (void)resp;
@@ -859,7 +882,16 @@ ants_dht_lookup(ants_dht_t *dht, ants_dht_shard_key_t shard_key, ants_dht_lookup
     if (dht == NULL || out_lookup == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    return ants_dht_lookup_start(dht, shard_key, out_lookup);
+    return ants_dht_lookup_start(dht, shard_key, out_lookup, false);
+}
+
+ants_error_t
+ants_dht_probe(ants_dht_t *dht, ants_dht_shard_key_t random_key, ants_dht_lookup_t *out_probe)
+{
+    if (dht == NULL || out_probe == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return ants_dht_lookup_start(dht, random_key, out_probe, true);
 }
 
 ants_error_t ants_dht_lookup_cancel(ants_dht_lookup_t *lookup)
@@ -898,14 +930,28 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
     return kbucket_enumerate(state, out_peers, cap, out_count);
 }
 
-/* Bucket-diverse sample: a round-robin sweep across all buckets, taking the
- * depth-th entry of each non-empty bucket per sweep (depth 0, then 1, ...)
- * until n_out is reached or the table is exhausted. Spreading one-per-bucket
- * before taking a second from any bucket maximises XOR distance-class diversity
- * (RFC-0005 §"Anti-eclipse peer sampling", axis S1) — a fat bucket cannot
- * dominate the sample. Each peer occupies exactly one bucket, so the result has
- * no duplicates. */
-static size_t kbucket_sample(const struct ants_dht_state *state, ants_dht_peer_t *out, size_t n_out)
+/* Bucket-diverse sample: a round-robin sweep across all buckets, taking one
+ * entry of each non-empty bucket per sweep (depth 0, then 1, ...) until n_out
+ * is reached or the table is exhausted. Spreading one-per-bucket before taking
+ * a second from any bucket maximises XOR distance-class diversity (RFC-0005
+ * §"Anti-eclipse peer sampling", axis S1) — a fat bucket cannot dominate the
+ * sample. Each peer occupies exactly one bucket, so the result has no
+ * duplicates.
+ *
+ * `rotation` (axis S3) shifts WHICH cross-section of the table the sweep
+ * returns: it rotates the bucket visit order (so a different region of the
+ * keyspace fills the sample first when n_out < table size) and the
+ * within-bucket start offset (so successive epochs draw different entries
+ * from a fat bucket). At depth d a bucket of `count` entries contributes
+ * entry (d + rotation mod count) mod count — a cyclic shift, so each depth
+ * still takes a distinct entry and rotation 0 degenerates to the plain
+ * head-order sweep (== axis S1 exactly). The rotation value is a plain
+ * counter, not a secret: churn is the defence (a static eclipse must keep
+ * re-winning the view), unpredictability is axis S2's job. */
+static size_t kbucket_sample(const struct ants_dht_state *state,
+                             uint64_t rotation,
+                             ants_dht_peer_t *out,
+                             size_t n_out)
 {
     size_t written = 0;
     size_t depth = 0;
@@ -913,12 +959,16 @@ static size_t kbucket_sample(const struct ants_dht_state *state, ants_dht_peer_t
 
     do {
         progress = 0;
-        for (size_t b = 0; b < ANTS_DHT_BUCKET_COUNT && written < n_out; b++) {
-            const struct ants_dht_bucket_entry *e = state->buckets[b].head;
-            size_t k = 0;
-            while (e != NULL && k < depth) {
+        for (size_t i = 0; i < ANTS_DHT_BUCKET_COUNT && written < n_out; i++) {
+            size_t b = (size_t)((rotation + i) % ANTS_DHT_BUCKET_COUNT);
+            const struct ants_dht_bucket *bucket = &state->buckets[b];
+            if (depth >= bucket->count) {
+                continue;
+            }
+            size_t idx = (depth + (size_t)(rotation % bucket->count)) % bucket->count;
+            const struct ants_dht_bucket_entry *e = bucket->head;
+            for (size_t k = 0; k < idx && e != NULL; k++) {
                 e = e->next;
-                k++;
             }
             if (e != NULL) {
                 out[written++] = e->peer;
@@ -932,11 +982,19 @@ static size_t kbucket_sample(const struct ants_dht_state *state, ants_dht_peer_t
 
 size_t ants_dht_sample_peers(const ants_dht_t *dht, ants_dht_peer_t *out_peers, size_t n_out)
 {
+    return ants_dht_sample_peers_rotated(dht, 0, out_peers, n_out);
+}
+
+size_t ants_dht_sample_peers_rotated(const ants_dht_t *dht,
+                                     uint64_t rotation,
+                                     ants_dht_peer_t *out_peers,
+                                     size_t n_out)
+{
     if (dht == NULL || out_peers == NULL || n_out == 0) {
         return 0;
     }
     const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
-    return kbucket_sample(state, out_peers, n_out);
+    return kbucket_sample(state, rotation, out_peers, n_out);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -970,12 +1028,13 @@ static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_ev
             continue;
         }
         /* Insert the bootstrap peer into the routing table with its
-         * live conn. (Skip self silently — kbucket_insert checks.) */
+         * live conn. (Skip self silently — kbucket_insert checks.)
+         * Fires PEER_DISCOVERED when new, per the event's contract. */
         ants_dht_peer_t peer;
         memset(&peer, 0, sizeof peer);
         peer.peer_id = event->peer_id;
         memcpy(peer.multiaddr, be->multiaddr, sizeof peer.multiaddr);
-        (void)kbucket_insert(state, &peer, be->conn, dht_now_us());
+        (void)dht_routing_upsert(dht, &peer, be->conn, dht_now_us());
         be->promoted = true;
 
         /* Seed nearby buckets by issuing FIND_NODE on our own peer_id. */
@@ -1041,7 +1100,7 @@ static void handle_pending_dial_conn_ready(ants_dht_t *dht, const ants_transport
         memset(&peer, 0, sizeof peer);
         peer.peer_id = pd->expected_peer_id;
         memcpy(peer.multiaddr, pd->multiaddr, sizeof peer.multiaddr);
-        (void)kbucket_insert(state, &peer, pd->conn, dht_now_us());
+        (void)dht_routing_upsert(dht, &peer, pd->conn, dht_now_us());
         ants_dht_lookup_promote_dialed_peer(dht, &pd->expected_peer_id, pd->conn);
         pd->promoted = true;
         /* Slot stays in_use until destroy frees pd->conn — same lazy
