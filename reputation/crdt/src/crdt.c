@@ -1,19 +1,20 @@
 /*
  * crdt.c — Layer 1: the consensus-free fault G-Set (Component #7,
- * RFC-0004 v0.6 §"Layer 1 — the consensus-free fault G-Set").
+ * RFC-0004 §"Layer 1 — the consensus-free fault G-Set").
  *
- * PR1: the self-authenticating fault proof. The canonical-CBOR wire
- * format (envelope + equivocation evidence), VERIFY(π) for the
- * equivocation fault class, and the BLAKE3 content-address.
+ * The self-authenticating fault proof: the canonical-CBOR wire format
+ * (envelope + per-class evidence), VERIFY(π) for the equivocation and
+ * invalid-transition fault classes, the BLAKE3 content-address, and the
+ * G-Set container with pruning + the late-joiner snapshot.
  *
- * The whole proof is ONE canonical CBOR document — the equivocation
- * evidence is a native nested array, not a byte-string wrapping a
- * sub-document — so encode is a single pass and the module needs no
- * scratch buffer and no malloc (the G-Set container, a later PR, is the
- * first allocator). The two statement BODIES carried inside the evidence
- * are themselves canonical-CBOR byte-strings: opaque at the envelope
- * level (so they are reproduced verbatim as the Ed25519 message), then
- * re-decoded as statements to read (domain, epoch, slot, payload).
+ * The whole proof is ONE canonical CBOR document — each evidence shape is
+ * a native nested array, not a byte-string wrapping a sub-document — so
+ * encode is a single pass and the codec needs no scratch buffer and no
+ * malloc (the G-Set container is the module's only allocator). The signed
+ * BODIES carried inside the evidence (equivocation statement bodies, the
+ * invalid-transition block) are themselves canonical-CBOR byte-strings:
+ * opaque at the envelope level (so they are reproduced verbatim as the
+ * Ed25519 message), then re-decoded to read their fields.
  *
  * VERIFY is pure, deterministic, context-free: given only the bytes it
  * returns the same verdict on every honest peer, with no external state.
@@ -42,15 +43,20 @@
 /* Equivocation evidence: array(2) of array(2) [ body(bytes), sig(bytes64) ] */
 /* Statement body: map(4), integer keys ascending                           */
 /*   0 domain(uint) 1 epoch(uint) 2 slot(uint) 3 payload(bytes)             */
+/* Invalid-transition evidence: array(6)                                    */
+/*   [ block(bytes), sig(bytes64), cited(bytes), index(uint),               */
+/*     n_leaves(uint), path(bytes) ]                                        */
 /* ------------------------------------------------------------------------ */
 
 enum { ENV_KEY_SUBJECT = 0, ENV_KEY_FAULT_TYPE = 1, ENV_KEY_EPOCH = 2, ENV_KEY_EVIDENCE = 3 };
 #define ENV_PAIRS 4
 
 enum { STMT_KEY_DOMAIN = 0, STMT_KEY_EPOCH = 1, STMT_KEY_SLOT = 2, STMT_KEY_PAYLOAD = 3 };
-#define STMT_PAIRS  4
-#define EQUIV_STMTS 2 /* an equivocation is exactly two statements */
-#define EQUIV_ELEMS 2 /* each statement element is [body, sig]     */
+#define STMT_PAIRS    4
+#define EQUIV_STMTS   2 /* an equivocation is exactly two statements */
+#define EQUIV_ELEMS   2 /* each statement element is [body, sig]     */
+
+#define IT_EVID_ELEMS 6 /* invalid-transition evidence element count */
 
 /* ------------------------------------------------------------------------ */
 /* Encode: statement body                                                   */
@@ -180,6 +186,95 @@ ants_error_t ants_crdt_equivocation_encode(const uint8_t subject[ANTS_CRDT_PEER_
         return rc;
     }
     if ((rc = enc_stmt_element(&enc, body_b, body_b_len, sig_b)) != ANTS_OK) {
+        return rc;
+    }
+
+    rc = ants_cbor_enc_finalise(&enc);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Encode: invalid-transition fault proof                                   */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_crdt_invalid_transition_encode(const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE],
+                                                 uint64_t epoch,
+                                                 const uint8_t *block,
+                                                 size_t block_len,
+                                                 const uint8_t sig[ANTS_CRDT_SIG_SIZE],
+                                                 const uint8_t *cited,
+                                                 size_t cited_len,
+                                                 uint64_t leaf_index,
+                                                 uint64_t n_leaves,
+                                                 const uint8_t *path,
+                                                 size_t path_len,
+                                                 uint8_t *buf,
+                                                 size_t cap,
+                                                 size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+
+    if (subject == NULL || block == NULL || sig == NULL || cited == NULL || buf == NULL ||
+        out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (block_len == 0 || cited_len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* An empty path is legitimate (a single-leaf confirmed set). */
+    if (path == NULL && path_len != 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (n_leaves == 0 || leaf_index >= n_leaves) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    rc = ants_cbor_enc_init(&enc, buf, cap);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_map(&enc, ENV_PAIRS);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, ENV_KEY_SUBJECT)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, subject, ANTS_CRDT_PEER_ID_SIZE)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, ENV_KEY_FAULT_TYPE)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, ANTS_FAULT_INVALID_TRANSITION)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, ENV_KEY_EPOCH)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, epoch)) != ANTS_OK) {
+        return rc;
+    }
+    /* key 3: evidence = array(6) [block, sig, cited, index, n_leaves, path]. */
+    if ((rc = ants_cbor_enc_uint(&enc, ENV_KEY_EVIDENCE)) != ANTS_OK ||
+        (rc = ants_cbor_enc_array(&enc, IT_EVID_ELEMS)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_bytes(&enc, block, block_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_bytes(&enc, sig, ANTS_CRDT_SIG_SIZE)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_bytes(&enc, cited, cited_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, leaf_index)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, n_leaves)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_bytes(&enc, path, path_len)) != ANTS_OK) {
         return rc;
     }
 
@@ -460,6 +555,443 @@ verify_equivocation(const uint8_t *buf, size_t len, const uint8_t *subject, uint
     return ANTS_OK;
 }
 
+/* ------------------------------------------------------------------------ */
+/* VERIFY: invalid-transition (fabrication made attributable)               */
+/*                                                                          */
+/* The fault: `subject` signed the hash of an L2 block whose epoch summary  */
+/* commits, in its confirmed_proofs Merkle root, bytes that are NOT a valid */
+/* fault proof (RFC-0004 v0.7 §"Why the committee cannot fabricate").       */
+/* Signer-attributable on purpose: committee membership and block finality  */
+/* are L2 context a context-free VERIFY cannot reach — and does not need.   */
+/* The signature over the block hash is itself the culpable act; an honest  */
+/* member never produces one, because its candidate block is recomputed     */
+/* from its own G-Set, whose every element passed VERIFY at insert.         */
+/*                                                                          */
+/* The Merkle helpers and the block walk below MUST mirror                  */
+/* reputation/chain's confirmed-proofs construction and DRAFT block wire    */
+/* shape bit-for-bit. They are restated rather than linked because the      */
+/* dependency direction is chain → crdt (the L2 witness builds on L1; see   */
+/* chain/CMakeLists.txt) — the L1 VERIFY core must not import the L2        */
+/* library. test_crdt links ants_chain and cross-checks the mirror against  */
+/* ants_chain_confirmed_{root,prove} and the real block codec.              */
+/* ------------------------------------------------------------------------ */
+
+/* Mirrors CHAIN_MERKLE_{LEAF,NODE}_PREFIX and ANTS_CHAIN_MERKLE_MAX_DEPTH. */
+#define CP_MERKLE_LEAF_PREFIX 0x00u
+#define CP_MERKLE_NODE_PREFIX 0x01u
+#define CP_MERKLE_MAX_DEPTH   32u
+
+/* Block wire shape (mirrors chain.c's CHAIN_BLOCK_* / CHAIN_SUMMARY_* /
+ * CHAIN_FINDING_*): block map(4) {1: height, 2: prev(b32), 3: degraded
+ * (bool), 4: summary(bytes)}; summary map(4) {1: epoch, 2: cutoff_time,
+ * 3: confirmed_proofs(b32), 4: findings array of map(5) {1: subject(b32),
+ * 2: rule_id, 3: window_s, 4: count, 5: severity}}. */
+enum {
+    L2_BLOCK_KEY_HEIGHT = 1,
+    L2_BLOCK_KEY_PREV = 2,
+    L2_BLOCK_KEY_DEGRADED = 3,
+    L2_BLOCK_KEY_SUMMARY = 4
+};
+enum {
+    L2_SUM_KEY_EPOCH = 1,
+    L2_SUM_KEY_CUTOFF = 2,
+    L2_SUM_KEY_CONFIRMED = 3,
+    L2_SUM_KEY_FINDINGS = 4
+};
+enum {
+    L2_FIND_KEY_SUBJECT = 1,
+    L2_FIND_KEY_RULE = 2,
+    L2_FIND_KEY_WINDOW = 3,
+    L2_FIND_KEY_COUNT = 4,
+    L2_FIND_KEY_SEVERITY = 5
+};
+#define L2_BLOCK_PAIRS 4u
+#define L2_SUM_PAIRS   4u
+#define L2_FIND_PAIRS  5u
+
+/* leaf(content_id) = BLAKE3(0x00 ‖ content_id). */
+static ants_error_t cp_leaf_hash(const uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE],
+                                 uint8_t out[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    const uint8_t prefix = CP_MERKLE_LEAF_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, id, ANTS_CRDT_CONTENT_ID_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* node(L,R) = BLAKE3(0x01 ‖ L ‖ R). `out` may alias either input. */
+static ants_error_t cp_node_hash(const uint8_t left[ANTS_CRDT_CONTENT_ID_SIZE],
+                                 const uint8_t right[ANTS_CRDT_CONTENT_ID_SIZE],
+                                 uint8_t out[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    const uint8_t prefix = CP_MERKLE_NODE_PREFIX;
+    ants_blake3_ctx_t h;
+    ants_error_t rc;
+
+    rc = ants_blake3_init(&h);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, &prefix, 1);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, left, ANTS_CRDT_CONTENT_ID_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_blake3_update(&h, right, ANTS_CRDT_CONTENT_ID_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    return ants_blake3_final(&h, out);
+}
+
+/* Sibling count on the path from leaf `index` to the root of a
+ * promote-lone-trailing-node tree with `n_leaves` leaves. */
+static size_t cp_path_len(uint64_t index, uint64_t n_leaves)
+{
+    size_t len = 0;
+    uint64_t idx = index;
+    uint64_t count = n_leaves;
+
+    while (count > 1) {
+        if ((idx & 1u) == 1u) {
+            len++; /* right child: always has a left sibling */
+        } else if (idx + 1 < count) {
+            len++; /* left child with a right sibling present */
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+    return len;
+}
+
+/* Fold `leaf_id` at (index, n_leaves) with the sibling `path` up to the
+ * root. The caller has already pinned path's length to cp_path_len. */
+static ants_error_t cp_fold_to_root(const uint8_t leaf_id[ANTS_CRDT_CONTENT_ID_SIZE],
+                                    uint64_t index,
+                                    uint64_t n_leaves,
+                                    const uint8_t *path,
+                                    uint8_t out_root[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    uint8_t cur[ANTS_CRDT_CONTENT_ID_SIZE];
+    size_t consumed = 0;
+    uint64_t idx = index;
+    uint64_t count = n_leaves;
+    ants_error_t rc;
+
+    rc = cp_leaf_hash(leaf_id, cur);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    while (count > 1) {
+        bool has_sib = false;
+        bool sib_on_left = false;
+
+        if ((idx & 1u) == 1u) {
+            has_sib = true;
+            sib_on_left = true;
+        } else if (idx + 1 < count) {
+            has_sib = true;
+            sib_on_left = false;
+        }
+        if (has_sib) {
+            const uint8_t *sib = path + consumed * ANTS_CRDT_CONTENT_ID_SIZE;
+            if (sib_on_left) {
+                rc = cp_node_hash(sib, cur, cur);
+            } else {
+                rc = cp_node_hash(cur, sib, cur);
+            }
+            if (rc != ANTS_OK) {
+                return rc;
+            }
+            consumed++;
+        }
+        idx /= 2;
+        count = (count + 1) / 2;
+    }
+    memcpy(out_root, cur, ANTS_CRDT_CONTENT_ID_SIZE);
+    return ANTS_OK;
+}
+
+/* Strict structural walk of a reputation/chain block: extracts the embedded
+ * summary's epoch and confirmed_proofs root. Shape violations and canonical
+ * violations are MALFORMED — at this level the block is evidence, and bytes
+ * that are not a canonical chain block simply are not this fault. A
+ * finding's severity VALUE is deliberately not range-checked: severities are
+ * append-only, and a future block must not flip an old build's verdict —
+ * shape is permanent, value ranges are not. */
+static ants_error_t parse_block_summary(const uint8_t *block,
+                                        size_t block_len,
+                                        uint64_t *out_epoch,
+                                        uint8_t out_root[ANTS_CRDT_CONTENT_ID_SIZE])
+{
+    ants_cbor_dec_t dec;
+    const uint8_t *sp;
+    const uint8_t *b;
+    size_t slen, blen, n, nf, i;
+    uint64_t tmp;
+    bool degraded;
+    ants_error_t rc;
+
+    if (ants_cbor_is_canonical(block, block_len) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_init(&dec, block, block_len) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_map(&dec, &n) != ANTS_OK || n != L2_BLOCK_PAIRS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if ((rc = dec_expect_key(&dec, L2_BLOCK_KEY_HEIGHT)) != ANTS_OK ||
+        (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_expect_key(&dec, L2_BLOCK_KEY_PREV)) != ANTS_OK ||
+        (rc = dec_bytes_val(&dec, &b, &blen)) != ANTS_OK) {
+        return rc;
+    }
+    if (blen != ANTS_CRDT_CONTENT_ID_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if ((rc = dec_expect_key(&dec, L2_BLOCK_KEY_DEGRADED)) != ANTS_OK) {
+        return rc;
+    }
+    if (ants_cbor_dec_bool(&dec, &degraded) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if ((rc = dec_expect_key(&dec, L2_BLOCK_KEY_SUMMARY)) != ANTS_OK ||
+        (rc = dec_bytes_val(&dec, &sp, &slen)) != ANTS_OK) {
+        return rc;
+    }
+    if (ants_cbor_dec_finalise(&dec) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* The embedded summary is its own complete canonical document. */
+    if (ants_cbor_is_canonical(sp, slen) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_init(&dec, sp, slen) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_map(&dec, &n) != ANTS_OK || n != L2_SUM_PAIRS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if ((rc = dec_expect_key(&dec, L2_SUM_KEY_EPOCH)) != ANTS_OK ||
+        (rc = dec_uint_val(&dec, out_epoch)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_expect_key(&dec, L2_SUM_KEY_CUTOFF)) != ANTS_OK ||
+        (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_expect_key(&dec, L2_SUM_KEY_CONFIRMED)) != ANTS_OK ||
+        (rc = dec_bytes_val(&dec, &b, &blen)) != ANTS_OK) {
+        return rc;
+    }
+    if (blen != ANTS_CRDT_CONTENT_ID_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(out_root, b, ANTS_CRDT_CONTENT_ID_SIZE);
+    if ((rc = dec_expect_key(&dec, L2_SUM_KEY_FINDINGS)) != ANTS_OK) {
+        return rc;
+    }
+    if (ants_cbor_dec_array(&dec, &nf) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    for (i = 0; i < nf; i++) {
+        size_t m;
+        if (ants_cbor_dec_map(&dec, &m) != ANTS_OK || m != L2_FIND_PAIRS) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        if ((rc = dec_expect_key(&dec, L2_FIND_KEY_SUBJECT)) != ANTS_OK ||
+            (rc = dec_bytes_val(&dec, &b, &blen)) != ANTS_OK) {
+            return rc;
+        }
+        if (blen != ANTS_CRDT_PEER_ID_SIZE) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        if ((rc = dec_expect_key(&dec, L2_FIND_KEY_RULE)) != ANTS_OK ||
+            (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+            return rc;
+        }
+        if ((rc = dec_expect_key(&dec, L2_FIND_KEY_WINDOW)) != ANTS_OK ||
+            (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+            return rc;
+        }
+        if ((rc = dec_expect_key(&dec, L2_FIND_KEY_COUNT)) != ANTS_OK ||
+            (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+            return rc;
+        }
+        if ((rc = dec_expect_key(&dec, L2_FIND_KEY_SEVERITY)) != ANTS_OK ||
+            (rc = dec_uint_val(&dec, &tmp)) != ANTS_OK) {
+            return rc;
+        }
+    }
+    if (ants_cbor_dec_finalise(&dec) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* Verify the invalid-transition evidence against `subject` at `env_epoch`.
+ * `evidence` is the envelope's evidence slice (already inside a document
+ * that passed the whole-proof canonical gate). */
+static ants_error_t verify_invalid_transition(const uint8_t *evidence,
+                                              size_t evidence_len,
+                                              const uint8_t *subject,
+                                              uint64_t env_epoch)
+{
+    ants_cbor_dec_t dec;
+    const uint8_t *block;
+    const uint8_t *sig;
+    const uint8_t *cited;
+    const uint8_t *path;
+    size_t block_len, sig_len, cited_len, path_len, n;
+    uint64_t leaf_index, n_leaves, sum_epoch;
+    uint8_t block_hash[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t root[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t leaf_id[ANTS_CRDT_CONTENT_ID_SIZE];
+    uint8_t folded[ANTS_CRDT_CONTENT_ID_SIZE];
+    ants_fault_proof_view_t cited_view;
+    ants_error_t rc;
+
+    /* evidence = array(6) [block, sig, cited, index, n_leaves, path]. */
+    if (ants_cbor_dec_init(&dec, evidence, evidence_len) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_dec_array(&dec, &n) != ANTS_OK || n != IT_EVID_ELEMS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if ((rc = dec_bytes_val(&dec, &block, &block_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_bytes_val(&dec, &sig, &sig_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_bytes_val(&dec, &cited, &cited_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_uint_val(&dec, &leaf_index)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_uint_val(&dec, &n_leaves)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = dec_bytes_val(&dec, &path, &path_len)) != ANTS_OK) {
+        return rc;
+    }
+    if (ants_cbor_dec_finalise(&dec) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    if (block_len == 0 || sig_len != ANTS_CRDT_SIG_SIZE || cited_len == 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* Tree-position sanity: the leaf count is bounded by the chain's max
+     * Merkle depth, the index must address a leaf, and the path must be
+     * exactly the siblings that (index, n_leaves) requires. */
+    if (n_leaves == 0 || n_leaves > ((uint64_t)1 << CP_MERKLE_MAX_DEPTH)) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (leaf_index >= n_leaves) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (path_len != cp_path_len(leaf_index, n_leaves) * ANTS_CRDT_CONTENT_ID_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* The block must be a canonical chain block; read (epoch, root). */
+    rc = parse_block_summary(block, block_len, &sum_epoch, root);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* The envelope's epoch is bound to the contested summary's epoch (it is
+     * what G-Set pruning orders this proof by). */
+    if (sum_epoch != env_epoch) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* The attested act: subject signed THIS block's hash — the exact
+     * message committee attestations sign (reputation/chain finality). */
+    if (ants_blake3_hash(block, block_len, block_hash) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_ed25519_verify(subject, block_hash, ANTS_CRDT_CONTENT_ID_SIZE, sig) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* The block really commits the cited bytes at (index, n_leaves). */
+    if (ants_crdt_content_id(cited, cited_len, leaf_id) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    rc = cp_fold_to_root(leaf_id, leaf_index, n_leaves, path, folded);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    if (memcmp(folded, root, ANTS_CRDT_CONTENT_ID_SIZE) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Judge the citation. Decode failure and class unknowability are
+     * SEPARATE sources of doubt with opposite permanence: bytes that do
+     * not even decode as a fault envelope under the pinned RFC-0008 §1.1
+     * canonical profile are PERMANENTLY invalid (the profile is the
+     * wire's foundation — every content-id and signature depends on it;
+     * it cannot grow without breaking canonicality everywhere), while a
+     * decodable envelope of an unassigned class may be valid to a future
+     * build (fault classes are append-only by design). */
+    rc = ants_crdt_fault_proof_decode(cited, cited_len, &cited_view);
+    if (rc != ANTS_OK) {
+        return ANTS_OK; /* not even an envelope — the fault stands          */
+    }
+    /* No nesting: a cited INVALID_TRANSITION is malformed evidence — the
+     * structural recursion bound, decided BEFORE the recursive verdict so
+     * the call below can never re-enter this function. */
+    if (cited_view.fault_type == ANTS_FAULT_INVALID_TRANSITION) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* An unassigned class is a typed "don't know" — fail closed, never a
+     * slash. No build ever admits a proof whose citation another build
+     * deems valid: a deployed class's rules never change, so a MALFORMED
+     * verdict below is permanent too. */
+    if (cited_view.fault_type >= ANTS_FAULT__RESERVED_MIN) {
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    }
+
+    rc = ants_crdt_verify(cited, cited_len);
+    switch (rc) {
+    case ANTS_OK:
+        return ANTS_ERROR_MALFORMED; /* the citation verifies — no fault   */
+    case ANTS_ERROR_MALFORMED:
+    case ANTS_ERROR_NON_CANONICAL:
+        return ANTS_OK; /* permanent invalidity — the fault stands          */
+    case ANTS_ERROR_UNSUPPORTED_TYPE:
+    case ANTS_ERROR_NOT_IMPLEMENTED:
+        /* Future-proofing: a known class this build verifies only
+         * partially. Same typed "don't know" as an unassigned class. */
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    default:
+        return ANTS_ERROR_MALFORMED; /* unreachable: cited_len > 0          */
+    }
+}
+
 ants_error_t ants_crdt_verify(const uint8_t *buf, size_t len)
 {
     ants_fault_proof_view_t view;
@@ -480,8 +1012,8 @@ ants_error_t ants_crdt_verify(const uint8_t *buf, size_t len)
     case ANTS_FAULT_EQUIVOCATION:
         return verify_equivocation(buf, len, view.subject, view.epoch);
     case ANTS_FAULT_INVALID_TRANSITION:
-        /* Defined, but verifying it needs the L2 chain (Component #8). */
-        return ANTS_ERROR_NOT_IMPLEMENTED;
+        return verify_invalid_transition(
+            view.evidence, view.evidence_len, view.subject, view.epoch);
     default:
         /* Unknown/unassigned class — fail closed, never a valid slash. */
         return ANTS_ERROR_UNSUPPORTED_TYPE;
