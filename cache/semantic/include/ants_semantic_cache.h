@@ -1146,11 +1146,9 @@ ants_error_t ants_semantic_cache_query_destroy(ants_semantic_cache_query_t *quer
  * 4 KiB is generous (16 slots × ~64 bytes ≈ 1 KiB; rest is headroom). */
 #define ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE 4096u
 
-typedef struct {
-    union {
-        uint8_t _opaque[ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE];
-        uint64_t _align;
-    };
+typedef union {
+    uint8_t _opaque[ANTS_SEMANTIC_CACHE_SERVER_CTX_SIZE];
+    uint64_t _align;
 } ants_semantic_cache_server_t;
 
 /*
