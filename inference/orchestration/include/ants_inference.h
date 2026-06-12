@@ -412,7 +412,8 @@ ants_error_t ants_inference_commit_verify_sig(const ants_inference_commit_t *com
  * Big-endian word reads match the "interpret the PRF output as a big-endian
  * integer" convention already used by audit_threshold. This pins the mixing
  * the scaffold left open, for byte-for-byte agreement with independent
- * implementations — DRAFT pending RFC-0003 / RFC-0008 formalization.
+ * implementations — formalised in RFC-0008 v0.6 §11.8 (the challenge
+ * keystream, superseding the reserved ants-v1-beacon-* contexts).
  */
 
 /*

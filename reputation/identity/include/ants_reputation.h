@@ -461,8 +461,9 @@ ants_error_t ants_reputation_compute_checked(const uint8_t server_id[ANTS_REP_PE
  *                                peer_id ‖ merkle_root)
  * so a subtree cannot be replayed as another identity's bag.
  *
- * DRAFT scheme pending RFC-0008 formalisation (alongside the receipt body
- * and the L1 proof formats). Pure, deterministic, no float, no malloc.
+ * Formalised in RFC-0008 v0.6 §11.9 "Receipts and selective disclosure"
+ * (alongside the receipt body; the L1 fault-proof formats are §11.5).
+ * Pure, deterministic, no float, no malloc.
  */
 
 /* BLAKE3 digest size for the bag tree and bag_root. MUST equal

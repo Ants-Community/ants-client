@@ -650,11 +650,10 @@ ants_error_t ants_chain_beacon_verify(const ants_chain_beacon_t *beacon,
  * BLAKE3.derive_key("ants-v1-vrf-seed",
  *     prev_block_hash || height_be64 || randomness).
  * `randomness` is a VERIFIED round's 32-byte randomness — the
- * "drand_round_value" of the spec text. (That the round value means
- * the randomness rather than the 96-byte signature is a DRAFT
- * precision pending RFC-0008: the randomness is the round's canonical
- * public output, derived from the unforgeable signature.) The output
- * feeds ants_chain_committee_select's `beacon` parameter.
+ * "drand_round_value" of the spec text, pinned in RFC-0008 v0.6 §4.2:
+ * the randomness, NOT the 96-byte signature (it is the round's
+ * canonical public output, derived from the unforgeable signature).
+ * The output feeds ants_chain_committee_select's `beacon` parameter.
  */
 ants_error_t ants_chain_vrf_seed(const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
                                  uint64_t height,

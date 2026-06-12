@@ -6,7 +6,7 @@
  * encode/decode functions. Each message is a single CBOR object,
  * canonically encoded per foundation/cbor's RFC 8949 §4.2.1 rules.
  *
- * Wire format (DRAFT — pending RFC-0008 §DHT formalisation):
+ * Wire format (formalised in RFC-0008 v0.6 §11.2 "DHT RPC"):
  *
  *   envelope = {
  *       0: uint,     ; type discriminator (1..8, see ants_dht_msg_type_t)

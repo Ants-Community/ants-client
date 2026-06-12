@@ -349,8 +349,8 @@ ants_error_t ants_chain_confirmed_verify(const uint8_t leaf_content_id[ANTS_CHAI
 /* EpochSummary canonical-CBOR codec                                          */
 /*                                                                            */
 /* A definite-length, float-free map(4) with ascending integer keys; the     */
-/* findings ride in key 4 as an array of fixed-shape map(5)s. DRAFT, defined  */
-/* by this module pending RFC-0008.                                           */
+/* findings ride in key 4 as an array of fixed-shape map(5)s. Formalised in   */
+/* RFC-0008 v0.6 §11.6 "Layer-2 chain objects".                               */
 /*                                                                            */
 /*   summary  1:epoch(u) 2:cutoff_time(u) 3:confirmed_proofs(bytes32)         */
 /*            4:findings(array of map(5))                                     */

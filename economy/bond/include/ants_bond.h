@@ -41,10 +41,11 @@
  * Numeric tunables (the dispute window, δ_admission, the formula risk
  * multipliers) are DRAFT b2-class — RFC-0008 §7; the recipes are the
  * deliverable, the values illustrative. The bond_admission wire format is
- * DRAFT pending RFC-0008.
+ * formalised in RFC-0008 v0.6 §11.10 "Bond admission".
  *
- * Spec: RFC-0004 v0.6 §"Bonds…" / §"Bond accounting model"; RFC-0008 v0.5
- * §6 (NCS as u64 μNCS), §1.1 (canonical CBOR), §2.1 (BLAKE3), §7 (constants).
+ * Spec: RFC-0004 v0.6 §"Bonds…" / §"Bond accounting model"; RFC-0008 v0.6
+ * §6 (NCS as u64 μNCS), §1.1 (canonical CBOR), §2.1 (BLAKE3), §7
+ * (constants), §11.10 (bond_admission encoding).
  * Component README: ants-client/economy/bond/README.md.
  */
 
