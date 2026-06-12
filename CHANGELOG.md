@@ -13,6 +13,37 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #8 (L2 chain) — chain_vectors test-vector emitter · 2026-06-12
+
+`reputation/chain/tools/chain_vectors.c` (PR #140): a small tool that
+emits the reputation/chain test-vector pack as JSON on stdout, with
+every pinned value produced by the **compiled** `ants_chain` library —
+never transcribed by hand, per RFC-0008 §8. Covers the confirmed-proofs
+Merkle roots (empty root, promote-lone shapes) with verified inclusion
+paths, the EpochSummary and Block canonical-CBOR encodings, the block
+hash with `degraded_seed` both ways, both VRF seed derivations, the
+proposer rule, and a pattern-scan worked example. Deterministic by
+construction (fixed repeated-byte inputs, no clock, no randomness, no
+floats); two runs emit identical bytes.
+
+The output is the first L2-object pack in `ants-test-vectors`
+(`vectors/pouh-blocks/chain.json`, generated at main `28cd4b8`) and the
+first pack produced by a committed generator tool — the RFC-0008 §8
+emission pattern future packs follow.
+
+Context: this session also shipped **RFC-0008 v0.6** (spec commit
+`13d558a`), which upstreamed every client wire format previously marked
+"DRAFT pending RFC-0008" into the new spec §11 (transport identity, DHT
+RPC, gossip frames, fault proofs, chain objects, drand verification,
+commit/challenge/envelope, receipts + receipt bag, bond admission). The
+direction of authority is now inverted: the spec owns the bytes, this
+client conforms. No client code changed for that — the spec was written
+to match the shipped, tested encodings, with the two historical
+spec-vs-impl divergences (derive_key Merkle/beacon contexts vs the
+implemented prefix-byte Merkle and challenge keystream) reconciled
+toward the implementation and the migration question left explicitly
+open in RFC-0008 §10.
+
 ### reputation: Component #7 (L1 fault G-Set) — invalid-transition fault class · 2026-06-12
 
 The reserved `ANTS_FAULT_INVALID_TRANSITION` (=1) Layer-1 fault class is
