@@ -54,11 +54,11 @@ static uint64_t gossip_now_us(void)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Frame schema (DRAFT, defined here — see header). Every gossip frame is a  */
-/* canonical-CBOR map(2): { 0: type(uint), 1: payload }. PUSH's payload is   */
-/* the fault-proof byte-string; IHAVE/IWANT's is an array of content-id      */
-/* byte-strings. GOSSIP_KEY_PROOF and GOSSIP_KEY_IDS are the same key (1),    */
-/* named per payload kind.                                                   */
+/* Frame schema (RFC-0008 v0.6 §11.3 "Gossip frames" — see header). Every    */
+/* gossip frame is a canonical-CBOR map(2): { 0: type(uint), 1: payload }.   */
+/* PUSH's payload is the fault-proof byte-string; IHAVE/IWANT's is an array  */
+/* of content-id byte-strings. GOSSIP_KEY_PROOF and GOSSIP_KEY_IDS are the   */
+/* same key (1), named per payload kind.                                     */
 /* ------------------------------------------------------------------------ */
 
 enum { GOSSIP_KEY_TYPE = 0, GOSSIP_KEY_PROOF = 1, GOSSIP_KEY_IDS = 1 };

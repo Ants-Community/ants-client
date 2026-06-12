@@ -68,15 +68,15 @@
  * have since landed; see the transport binding below, §Instrumentation, and
  * §Reject accountability respectively.)
  *
- * WIRE FORMAT IS DRAFT, defined by this module pending formalisation in
- * RFC-0008 (the same status the DHT and cache wire formats carried before
- * their spec sections existed). It MUST be upstreamed before two
- * independent implementations gossip to each other.
+ * WIRE FORMAT: formalised in RFC-0008 v0.6 §11.3 "Gossip frames" — the
+ * frame map(2), the length-prefixed persistent-uni-stream transport
+ * discipline, and the snapshot array. The spec owns the bytes; this
+ * module conforms.
  *
  * Caller-driven, no malloc, no threads, no hidden global state: the engine
  * state (including the peer view) lives in a caller-allocated opaque ctx,
- * exactly like ants_transport / ants_dht. Spec: RFC-0004 v0.6; RFC-0008
- * v0.5 §1.1. Component README: ants-client/network/gossip/README.md.
+ * exactly like ants_transport / ants_dht. Spec: RFC-0004 v0.7; RFC-0008
+ * v0.6 §1.1 + §11.3. Component README: ants-client/network/gossip/README.md.
  */
 
 #ifndef ANTS_GOSSIP_H

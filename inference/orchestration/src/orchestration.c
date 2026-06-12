@@ -203,14 +203,14 @@ static size_t merkle_path_len(size_t index, size_t n_leaves)
     return len;
 }
 
-/* ---- canonical CBOR commit scheme (DRAFT, defined by this PR) -----------
+/* ---- canonical CBOR commit scheme (RFC-0008 v0.6 §11.8) ------------------
  *
  * A definite-length CBOR map of 10 pairs with ascending integer keys 1..10
  * in struct-field order, float-free (the audit probability rides as the
  * integer `audit_threshold`). Keys 1..10 each encode to a single byte
  * (0x01..0x0a) and so are already in canonical bytewise-ascending order.
  * Documented here for byte-for-byte agreement with any independent
- * implementation, pending RFC-0003 / RFC-0008 formalization.
+ * implementation; formalised in RFC-0008 v0.6 §11.8 "Commit-at-send".
  *
  *   1 root[32]   2 model_hash[32]   3 input_hash[32]   4 req_nonce[32]
  *   5 agent_meas[32]   6 round(u64)   7 audit_threshold(u64)
@@ -704,8 +704,8 @@ static uint64_t read_be64(const uint8_t b[8])
 /* A counter-mode BLAKE3 keystream over seed = beacon ‖ root ‖ tag. BLAKE3 here
  * yields a 32-byte digest and no XOF, so an arbitrarily long stream is
  * block(i) = BLAKE3(seed ‖ LE64(i)), i = 0,1,2,…, read out as 64-bit
- * big-endian words. DRAFT scheme, pinned for byte-for-byte agreement with
- * independent implementations pending RFC-0003/RFC-0008 formalization. */
+ * big-endian words. Formalised in RFC-0008 v0.6 §11.8 (the challenge
+ * keystream). */
 typedef struct {
     const uint8_t *beacon;
     const uint8_t *root;
@@ -1156,8 +1156,8 @@ static ants_error_t forward_dist_q24(struct ants_inference_state *st,
  * It carries everything an auditor needs to open any committed position:
  * dist_j is the j-th array entry; the prefix at position j is
  * input ‖ tokens[0..j-1]; the Merkle leaf is recomputed from dist_j. The
- * vocab is implied (dist byte-length / 4). DRAFT pending an RFC-0008 §answer
- * appendix.
+ * vocab is implied (dist byte-length / 4). Formalised in RFC-0008 v0.6
+ * §11.8 (the answer envelope).
  */
 #define ANTS_INFERENCE_ENV_PAIRS     3
 #define ANTS_INFERENCE_ENV_KEY_INPUT 0
