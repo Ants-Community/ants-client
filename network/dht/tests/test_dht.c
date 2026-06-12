@@ -1157,9 +1157,13 @@ static void test_rpc_round_trip(void)
 typedef struct {
     int lookup_complete;
     int lookup_timeout;
+    int peer_discovered;
+    int table_refreshed;
     size_t last_peer_count;
     ants_dht_peer_t last_peers[ANTS_DHT_K];
     ants_dht_shard_key_t last_shard_key;
+    ants_dht_peer_t last_discovered;
+    ants_dht_shard_key_t last_refresh_key;
 } test_lookup_recorder_t;
 
 static ants_error_t test_lookup_event_fn(const ants_dht_event_t *ev, void *ctx)
@@ -1177,6 +1181,14 @@ static ants_error_t test_lookup_event_fn(const ants_dht_event_t *ev, void *ctx)
         break;
     case ANTS_DHT_EV_LOOKUP_TIMEOUT:
         r->lookup_timeout++;
+        break;
+    case ANTS_DHT_EV_PEER_DISCOVERED:
+        r->peer_discovered++;
+        r->last_discovered = ev->peer;
+        break;
+    case ANTS_DHT_EV_TABLE_REFRESHED:
+        r->table_refreshed++;
+        r->last_refresh_key = ev->shard_key;
         break;
     default:
         break;
@@ -2770,6 +2782,310 @@ static void test_sample_peers_args(void)
     CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
 }
 
+/* Axis S3 (RFC-0005 §Anti-eclipse): the rotated sampler returns a DIFFERENT
+ * cross-section of the table per rotation epoch — same diversity invariants,
+ * moving membership — and degenerates to the plain S1 draw at rotation 0. */
+static void test_sample_peers_rotated(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    ants_dht_t d = {{0}};
+    ants_dht_peer_t out[16];
+    ants_dht_peer_t out0[16];
+    size_t n, m, i, j;
+    uint64_t r;
+
+    CHECK_EQ(test_init_with_local(&d, local), ANTS_OK);
+
+    /* Same topology as the S1 test: a fat bucket (five peers in bucket 200)
+     * plus singletons in 100/120/150. */
+    for (i = 0; i < 5; i++) {
+        ants_dht_peer_t p;
+        make_peer_bucket_disc(200, (uint8_t)(1u << i), &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 1000 + i), ANTS_OK);
+    }
+    {
+        ants_dht_peer_t p;
+        make_peer_bucket_disc(100, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2000), ANTS_OK);
+        make_peer_bucket_disc(120, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2001), ANTS_OK);
+        make_peer_bucket_disc(150, 0, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&d, &p, 2002), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(&d) == 8);
+
+    /* rotation == 0 is bit-for-bit the S1 draw. */
+    n = ants_dht_sample_peers(&d, out0, 4);
+    m = ants_dht_sample_peers_rotated(&d, 0, out, 4);
+    CHECK(n == 4 && m == 4);
+    for (i = 0; i < 4; i++) {
+        CHECK(memcmp(out[i].peer_id.bytes, out0[i].peer_id.bytes, ANTS_PEER_ID_SIZE) == 0);
+    }
+
+    /* Invariants hold at every rotation: full sample, no duplicates, every
+     * returned peer is a table member (bucket-diversity is structural — one
+     * peer per bucket per sweep depth). */
+    for (r = 0; r < 10; r++) {
+        n = ants_dht_sample_peers_rotated(&d, r, out, 4);
+        CHECK(n == 4);
+        for (i = 0; i < n; i++) {
+            ants_dht__test_entry_state_t st;
+            ants_dht__test_get_entry_state(&d, &out[i].peer_id, &st);
+            CHECK(st.exists);
+            for (j = i + 1; j < n; j++) {
+                CHECK(memcmp(out[i].peer_id.bytes, out[j].peer_id.bytes, ANTS_PEER_ID_SIZE) != 0);
+            }
+        }
+    }
+
+    /* Churn: the fat bucket's representative cycles through ALL FIVE entries
+     * across rotations 0..4 (within-bucket offset = rotation mod count) — a
+     * static eclipse of the sampled view cannot lock in. */
+    ants_dht_peer_t fat_rep[5];
+    for (r = 0; r < 5; r++) {
+        size_t found = 0;
+        n = ants_dht_sample_peers_rotated(&d, r, out, 4);
+        CHECK(n == 4);
+        for (i = 0; i < n; i++) {
+            if (ants_dht__test_bucket_index(&d, &out[i].peer_id) == 200) {
+                fat_rep[r] = out[i];
+                found++;
+            }
+        }
+        CHECK(found == 1);
+    }
+    for (i = 0; i < 5; i++) {
+        for (j = i + 1; j < 5; j++) {
+            CHECK(memcmp(fat_rep[i].peer_id.bytes, fat_rep[j].peer_id.bytes, ANTS_PEER_ID_SIZE) !=
+                  0);
+        }
+    }
+
+    /* A table no bigger than the request is returned whole at EVERY rotation
+     * (rotation only bites when the table outgrows the view). */
+    for (r = 0; r < 6; r++) {
+        n = ants_dht_sample_peers_rotated(&d, r, out, 16);
+        CHECK(n == 8);
+        for (i = 0; i < n; i++) {
+            ants_dht__test_entry_state_t st;
+            ants_dht__test_get_entry_state(&d, &out[i].peer_id, &st);
+            CHECK(st.exists);
+            for (j = i + 1; j < n; j++) {
+                CHECK(memcmp(out[i].peer_id.bytes, out[j].peer_id.bytes, ANTS_PEER_ID_SIZE) != 0);
+            }
+        }
+    }
+
+    /* Arg guards mirror the S1 sampler. */
+    CHECK(ants_dht_sample_peers_rotated(NULL, 3, out, 4) == 0);
+    CHECK(ants_dht_sample_peers_rotated(&d, 3, NULL, 4) == 0);
+    CHECK(ants_dht_sample_peers_rotated(&d, 3, out, 0) == 0);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Axis S2 (RFC-0005 §Anti-eclipse): random-target probes                   */
+/* ------------------------------------------------------------------------ */
+
+/* A probe on an empty table converges on the first tick like a lookup, but
+ * completes SILENTLY for shard consumers: no LOOKUP_COMPLETE, one
+ * TABLE_REFRESHED carrying the probe key. Also pins the arg guards. */
+static void test_probe_completes_silently_on_empty_table(void)
+{
+    ants_transport_t dummy_transport = {{0}};
+    ants_dht_t d = {{0}};
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_lookup_event_fn;
+    cfg.event_ctx = &rec;
+    CHECK_EQ(ants_dht_init(&d, &cfg), ANTS_OK);
+
+    ants_dht_lookup_t probe = {{0}};
+    CHECK_EQ(ants_dht_probe(NULL, 1, &probe), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_dht_probe(&d, 1, NULL), ANTS_ERROR_INVALID_ARG);
+
+    CHECK_EQ(ants_dht_probe(&d, 0x5151AAAA2222CCCCULL, &probe), ANTS_OK);
+    (void)ants_dht_tick(&d);
+
+    CHECK(rec.lookup_complete == 0);
+    CHECK(rec.lookup_timeout == 0);
+    CHECK(rec.table_refreshed == 1);
+    CHECK(rec.last_refresh_key == 0x5151AAAA2222CCCCULL);
+
+    /* Completed and unregistered — a second tick must not re-fire. */
+    (void)ants_dht_tick(&d);
+    CHECK(rec.table_refreshed == 1);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+/* The load-bearing S2 property end-to-end over real QUIC: a probe toward a
+ * random key ENRICHES the prober's routing table with verified-reachable
+ * peers it did not know (A learns C from B, dials it, C answers — C joins
+ * A's table and PEER_DISCOVERED fires), while a peer merely NAMED in the
+ * response but never verified (D: no dialable address) stays OUT — an
+ * adversary answering probes cannot stuff the table with paper identities. */
+static void test_probe_enriches_routing_table(void)
+{
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t c_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t c_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0xA1, sizeof a_priv);
+    memset(b_priv, 0xB2, sizeof b_priv);
+    memset(c_priv, 0xC3, sizeof c_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(c_priv, c_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep, b_ep, c_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    memset(&b_ep, 0, sizeof b_ep);
+    memset(&c_ep, 0, sizeof c_ep);
+    test_lookup_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+
+    /* B and C listen; A is dialer-only. */
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t tc = {{0}};
+    ants_transport_config_t ccfg;
+    memset(&ccfg, 0, sizeof ccfg);
+    memcpy(ccfg.pub, c_pub, ANTS_ED25519_PUBKEY_SIZE);
+    ccfg.sign_fn = test_real_sign;
+    ccfg.sign_ctx = c_priv;
+    ccfg.event_fn = test_dht_endpoint_event;
+    ccfg.event_ctx = &c_ep;
+    ccfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tc, &ccfg), ANTS_OK);
+    char caddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tc, caddr, sizeof caddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_t dc = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &a_rec;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    dcfg.event_ctx = NULL;
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    dcfg.transport = &tc;
+    memcpy(dcfg.local_peer_id.bytes, c_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&dc, &dcfg), ANTS_OK);
+    c_ep.dht = &dc;
+
+    /* B knows C (verifiable: real listener addr) and D (paper identity:
+     * no address — the poisoning stand-in). A knows only B. */
+    ants_dht_peer_t c_peer;
+    memset(&c_peer, 0, sizeof c_peer);
+    memcpy(c_peer.peer_id.bytes, c_pub, ANTS_PEER_ID_SIZE);
+    snprintf(c_peer.multiaddr, sizeof c_peer.multiaddr, "%s", caddr);
+    CHECK_EQ(ants_dht__test_insert_peer(&db, &c_peer, ants_dht__test_now_us()), ANTS_OK);
+
+    ants_dht_peer_t d_peer;
+    test_make_peer(b_pub, 60, &d_peer);
+    d_peer.multiaddr[0] = '\0';
+    CHECK_EQ(ants_dht__test_insert_peer(&db, &d_peer, ants_dht__test_now_us()), ANTS_OK);
+
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    snprintf(b_peer.multiaddr, sizeof b_peer.multiaddr, "%s", baddr);
+    CHECK_EQ(ants_dht__test_insert_peer(&da, &b_peer, ants_dht__test_now_us()), ANTS_OK);
+    CHECK(ants_dht_routing_table_size(&da) == 1);
+
+    /* Probe toward a "random" key (fixed for determinism; production
+     * callers draw from a CSPRNG — see ants_dht_probe's contract). */
+    ants_dht_lookup_t probe = {{0}};
+    ants_dht_shard_key_t probe_key = 0x7777AAAA3333BBBBULL;
+    CHECK_EQ(ants_dht_probe(&da, probe_key, &probe), ANTS_OK);
+
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        ants_transport_tick(&tc);
+        (void)ants_dht_tick(&da);
+        (void)ants_dht_tick(&db);
+        (void)ants_dht_tick(&dc);
+        if (a_rec.table_refreshed >= 1) {
+            break;
+        }
+    }
+
+    /* Probe completed as maintenance, not as an answer. */
+    CHECK(a_rec.table_refreshed == 1);
+    CHECK(a_rec.last_refresh_key == probe_key);
+    CHECK(a_rec.lookup_complete == 0);
+    CHECK(a_rec.lookup_timeout == 0);
+
+    /* Enrichment: C (verified via dial + GET_PEERS answer) joined A's
+     * table and fired PEER_DISCOVERED; D (named, never verified) did not. */
+    CHECK(ants_dht_routing_table_size(&da) == 2);
+    CHECK(a_rec.peer_discovered == 1);
+    CHECK(memcmp(a_rec.last_discovered.peer_id.bytes, c_pub, ANTS_PEER_ID_SIZE) == 0);
+    {
+        ants_peer_id_t c_pid, d_pid;
+        memcpy(c_pid.bytes, c_pub, ANTS_PEER_ID_SIZE);
+        memcpy(d_pid.bytes, d_peer.peer_id.bytes, ANTS_PEER_ID_SIZE);
+        ants_dht__test_entry_state_t st;
+        ants_dht__test_get_entry_state(&da, &c_pid, &st);
+        CHECK(st.exists);
+        ants_dht__test_get_entry_state(&da, &d_pid, &st);
+        CHECK(!st.exists);
+    }
+
+    /* Teardown order: transports before DHTs (pending-dial conns are freed
+     * by dht_destroy after the transport is fully down — same convention as
+     * test_lookup_dial_promotes_null_conn_candidate). */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tc, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&dc), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -2786,6 +3102,7 @@ int main(void)
     test_destroy_frees_heap_entries();
     test_sample_peers_bucket_diverse();
     test_sample_peers_args();
+    test_sample_peers_rotated();
 
     test_wire_peek_type();
     test_wire_ping_roundtrip();
@@ -2820,6 +3137,9 @@ int main(void)
     test_lookup_dial_skipped_when_no_multiaddr();
 
     test_two_node_end_to_end();
+
+    test_probe_completes_silently_on_empty_table();
+    test_probe_enriches_routing_table();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

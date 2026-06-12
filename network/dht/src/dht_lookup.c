@@ -185,27 +185,59 @@ static void fire_lookup_complete(struct ants_dht_lookup_state *lookup)
     }
     lookup->completed = true;
 
-    /* Snapshot the K closest ANSWERED peers into a stack buffer. The
-     * candidate set is already sorted ascending by distance, so a single
-     * pass picks them up in order. */
-    ants_dht_peer_t result_peers[ANTS_DHT_K];
-    size_t result_count = 0;
-    for (size_t i = 0; i < lookup->candidate_count && result_count < ANTS_DHT_K; i++) {
-        if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_ANSWERED) {
-            result_peers[result_count++] = lookup->candidates[i].peer;
-        }
-    }
-
     struct ants_dht_state *state = dht_get_state(lookup->parent);
-    if (state->event_fn != NULL) {
-        ants_dht_event_t ev;
-        memset(&ev, 0, sizeof ev);
-        ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
-        ev.lookup = lookup_state_to_handle(lookup);
-        ev.peers = result_peers;
-        ev.peer_count = result_count;
-        ev.shard_key = lookup->target_key;
-        (void)state->event_fn(&ev, state->event_ctx);
+
+    if (lookup->is_probe) {
+        /* Anti-eclipse axis S2 (RFC-0005 §"Anti-eclipse peer sampling"):
+         * the probe's purpose is routing-table enrichment, not an answer.
+         * Fold every ANSWERED candidate into the routing table — ANSWERED
+         * means the peer was actually reached over the mutually-
+         * authenticated transport (seeded conn or lazy dial with
+         * expected_peer_id pinning) and answered a GET_PEERS, so the fold
+         * admits only verified-reachable identities; peers merely NAMED in
+         * responses never enter the table (poisoning a probe response does
+         * not poison the table). kbucket_insert never evicts on insert
+         * (full buckets reject), so probes enrich but cannot displace.
+         * New peers fire PEER_DISCOVERED via dht_routing_upsert; the
+         * completion fires TABLE_REFRESHED carrying the probe key instead
+         * of LOOKUP_COMPLETE — random-target results must not reach
+         * shard-lookup consumers as answers. */
+        uint64_t now_us = dht_now_us();
+        for (size_t i = 0; i < lookup->candidate_count; i++) {
+            struct ants_dht_lookup_candidate *cand = &lookup->candidates[i];
+            if (cand->state == (uint8_t)ANTS_DHT_LOOKUP_CAND_ANSWERED) {
+                (void)dht_routing_upsert(lookup->parent, &cand->peer, cand->conn, now_us);
+            }
+        }
+        if (state->event_fn != NULL) {
+            ants_dht_event_t ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind = ANTS_DHT_EV_TABLE_REFRESHED;
+            ev.shard_key = lookup->target_key;
+            (void)state->event_fn(&ev, state->event_ctx);
+        }
+    } else {
+        /* Snapshot the K closest ANSWERED peers into a stack buffer. The
+         * candidate set is already sorted ascending by distance, so a
+         * single pass picks them up in order. */
+        ants_dht_peer_t result_peers[ANTS_DHT_K];
+        size_t result_count = 0;
+        for (size_t i = 0; i < lookup->candidate_count && result_count < ANTS_DHT_K; i++) {
+            if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_ANSWERED) {
+                result_peers[result_count++] = lookup->candidates[i].peer;
+            }
+        }
+
+        if (state->event_fn != NULL) {
+            ants_dht_event_t ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
+            ev.lookup = lookup_state_to_handle(lookup);
+            ev.peers = result_peers;
+            ev.peer_count = result_count;
+            ev.shard_key = lookup->target_key;
+            (void)state->event_fn(&ev, state->event_ctx);
+        }
     }
 
     /* Invalidate inflight records — late-firing completions will no-op. */
@@ -426,7 +458,8 @@ static void lookup_advance(struct ants_dht_lookup_state *lookup)
 
 ants_error_t ants_dht_lookup_start(ants_dht_t *dht,
                                    ants_dht_shard_key_t target_key,
-                                   ants_dht_lookup_t *out_lookup)
+                                   ants_dht_lookup_t *out_lookup,
+                                   bool is_probe)
 {
     struct ants_dht_state *state = dht_get_state(dht);
 
@@ -447,6 +480,7 @@ ants_error_t ants_dht_lookup_start(ants_dht_t *dht,
     struct ants_dht_lookup_state *lookup = lookup_get_state(out_lookup);
     lookup->in_use = true;
     lookup->completed = false;
+    lookup->is_probe = is_probe;
     lookup->parent = dht;
     lookup->target_key = target_key;
 

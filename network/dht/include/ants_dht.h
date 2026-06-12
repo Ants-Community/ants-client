@@ -164,9 +164,10 @@ typedef struct {
 
 typedef int32_t ants_dht_event_kind_t;
 
-/* A new peer has been added to the routing table. The peer was either
- * discovered during a lookup, returned as an answer from another peer,
- * or seeded via ants_dht_bootstrap. */
+/* A new peer has been added to the routing table (ev.peer carries it).
+ * Fires from every production insert path: bootstrap promotion, lazy
+ * dial-promotion during a lookup, and the probe fold (ants_dht_probe).
+ * Refreshes of already-present peers do NOT re-fire it. */
 #define ANTS_DHT_EV_PEER_DISCOVERED ((ants_dht_event_kind_t)1)
 
 /* A peer has been evicted from the routing table (failed PING quorum,
@@ -190,9 +191,12 @@ typedef int32_t ants_dht_event_kind_t;
  * storer. ev.shard_key carries the announced key. */
 #define ANTS_DHT_EV_ANNOUNCE_CONFIRMED ((ants_dht_event_kind_t)5)
 
-/* Periodic maintenance just completed (bucket refresh, announcement
- * republish). No payload — observers use this to track the DHT's
- * "healthy heartbeat" cadence. */
+/* Maintenance completed. Fires (a) from the periodic refresh sweep
+ * (bucket refresh, announcement republish; ev.shard_key == 0) and (b)
+ * when a random-target probe converges (ants_dht_probe; ev.shard_key
+ * carries the probe key, letting the caller correlate and reuse the
+ * probe's lookup buffer). Observers use it to track the DHT's "healthy
+ * heartbeat" cadence. */
 #define ANTS_DHT_EV_TABLE_REFRESHED ((ants_dht_event_kind_t)6)
 
 typedef struct {
@@ -398,6 +402,42 @@ ants_dht_lookup(ants_dht_t *dht, ants_dht_shard_key_t shard_key, ants_dht_lookup
  */
 ants_error_t ants_dht_lookup_cancel(ants_dht_lookup_t *lookup);
 
+/*
+ * Random-target probe — anti-eclipse axis S2 (RFC-0005 §"Anti-eclipse peer
+ * sampling"). Runs the same iterative machinery as ants_dht_lookup toward
+ * `random_key`, but with maintenance completion semantics: on convergence
+ * the ANSWERED candidates are folded into the routing table (firing
+ * PEER_DISCOVERED for each genuinely new peer) and a TABLE_REFRESHED event
+ * fires with ev.shard_key == random_key; no LOOKUP_COMPLETE fires, so
+ * probe results never reach shard-lookup consumers as answers.
+ *
+ * Security contract:
+ *   - `random_key` MUST be unpredictable to an adversary (drawn from a
+ *     CSPRNG by the caller per refresh epoch). The lib deliberately has no
+ *     entropy source — unpredictability is the caller's contribution, and
+ *     tests get determinism for free. The lookup target is
+ *     BLAKE3(random_key as 8 LE bytes), uniform over the keyspace, so an
+ *     adversary cannot pre-position identities around a victim's future
+ *     probe targets.
+ *   - Only VERIFIED peers enter the table: ANSWERED means reached over the
+ *     mutually-authenticated transport (lazy dial pins expected_peer_id)
+ *     and answered a GET_PEERS. Peers merely NAMED in a response are never
+ *     folded — answering a probe cannot poison the table by listing Sybils.
+ *   - Probes enrich but never displace: inserts into full buckets are
+ *     rejected (eviction happens only via the liveness-PING dead-strike
+ *     path), so an adversary cannot use our own probes to flush honest
+ *     peers.
+ *
+ * Probes share the lookup slots (ANTS_DHT_MAX_ACTIVE_LOOKUPS), the RPC
+ * registry and the pending-dial slots with real lookups; callers SHOULD
+ * keep at most one probe in flight (one per view-refresh epoch is the
+ * intended cadence). Cancel with ants_dht_lookup_cancel like any lookup.
+ * Returns ANTS_OK, ANTS_ERROR_INVALID_ARG on NULL args, or
+ * ANTS_ERROR_BUFFER_TOO_SMALL when all lookup slots are busy.
+ */
+ants_error_t
+ants_dht_probe(ants_dht_t *dht, ants_dht_shard_key_t random_key, ants_dht_lookup_t *out_probe);
+
 /* ------------------------------------------------------------------------ */
 /* Transport event delegation                                               */
 /*                                                                          */
@@ -466,15 +506,43 @@ ants_error_t ants_dht_routing_table_enumerate(const ants_dht_t *dht,
  * in the nearest ones, so an adversary must surround a victim across the whole
  * keyspace, not just one neighbourhood. Returns the number of peers written
  * (<= n_out, <= routing-table size); 0 on NULL args, n_out == 0, or an empty
- * table.
+ * table. Equivalent to ants_dht_sample_peers_rotated with rotation == 0.
  *
  * Peers are returned regardless of live-connection state — reachability is the
- * caller's / transport's concern. This primitive is axis S1 only; the caller
- * composes the rest of the RFC's defence: rotation across refreshes (axis S3),
- * random-target probes to enrich the table before sampling (axis S2, via
- * ants_dht_lookup), and attestation-weighted selection (axis S4) is deferred.
+ * caller's / transport's concern.
  */
 size_t ants_dht_sample_peers(const ants_dht_t *dht, ants_dht_peer_t *out_peers, size_t n_out);
+
+/*
+ * Rotated bucket-diverse sample — anti-eclipse axis S3 (RFC-0005
+ * §"Anti-eclipse peer sampling"). Same diversity guarantees as
+ * ants_dht_sample_peers; `rotation` additionally shifts WHICH cross-section
+ * of the table fills the sample: the bucket visit order rotates (a different
+ * keyspace region fills first when n_out < table size) and the within-bucket
+ * start offset rotates (successive epochs draw different entries from a fat
+ * bucket). rotation == 0 is exactly the axis-S1 draw.
+ *
+ * `rotation` is a plain per-refresh counter, NOT a secret: S3's defence is
+ * churn — a static eclipse cannot lock in because the view keeps moving and
+ * the adversary must keep re-winning it — while unpredictability of new
+ * peer inflow is axis S2's job (ants_dht_probe). Rotation only bites when
+ * the table holds more peers than the view (otherwise every rotation
+ * returns the whole table); pair it with probes, which keep the table
+ * strictly larger than the view.
+ *
+ * The composed per-epoch refresh a conforming node runs (RFC-0005 wiring:
+ * sample in the DHT, view in the gossip engine, glue in the node):
+ *
+ *     ants_dht_probe(dht, csprng_u64(), &probe);        // S2: enrich
+ *     n = ants_dht_sample_peers_rotated(dht, epoch++,   // S1+S3: draw
+ *                                       view, VIEW_SIZE);
+ *     // diff `view` against the gossip engine's current peers:
+ *     // ants_gossip_remove_peer the departed, ants_gossip_add_peer the new
+ */
+size_t ants_dht_sample_peers_rotated(const ants_dht_t *dht,
+                                     uint64_t rotation,
+                                     ants_dht_peer_t *out_peers,
+                                     size_t n_out);
 
 #ifdef __cplusplus
 }
