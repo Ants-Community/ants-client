@@ -13,6 +13,56 @@ the spec repo's
 
 ## Unreleased
 
+### network: Components #5/#6 — anti-eclipse axes S2 + S3 land in the DHT · 2026-06-12
+
+`network/dht` (PR #142): the two remaining lib-side axes of RFC-0005
+v0.2 §"Anti-eclipse peer sampling" join the axis-S1 bucket-diverse
+sampler (PR #129):
+
+- **`ants_dht_probe` (axis S2, random-target probes)** — a lookup
+  toward a caller-supplied unpredictable key whose completion is
+  maintenance, not an answer: candidates that actually ANSWERED
+  (reached over the mutually-authenticated transport and responded to
+  GET_PEERS) are folded into the routing table; peers merely *named*
+  in responses never enter it, so answering a probe cannot stuff the
+  table with paper identities. Probes enrich but never displace (full
+  buckets reject; eviction remains exclusive to the liveness
+  dead-strike path). Completion fires `TABLE_REFRESHED` carrying the
+  probe key instead of `LOOKUP_COMPLETE`, keeping synthetic
+  random-target results away from shard-lookup consumers. The caller
+  supplies the entropy (a CSPRNG draw per refresh epoch) — the lib
+  deliberately has no entropy source, so tests stay deterministic.
+
+- **`ants_dht_sample_peers_rotated` (axis S3, rotation)** — the
+  bucket-diverse draw plus a rotation counter that shifts which
+  cross-section of the table fills the view: the bucket visit order
+  rotates, and so does the within-bucket start offset (a cyclic
+  shift, so every sweep depth still takes a distinct entry).
+  `rotation == 0` is bit-for-bit the S1 sample, and
+  `ants_dht_sample_peers` now delegates to it. Rotation is churn, not
+  secrecy: a static eclipse must keep re-winning a moving view, while
+  unpredictability of new peer inflow is S2's job.
+
+- **`PEER_DISCOVERED` finally fires** — bootstrap promotion, lazy
+  dial-promotion and the probe fold now share one production insert
+  path (`dht_routing_upsert`), which fires the event the public
+  header had promised since phase 0 — for genuinely new peers only;
+  refreshes stay silent.
+
+Why: RFC-0004's one-honest-path liveness assumption is only as strong
+as the victim's view diversity, and RFC-0005 places the
+security-critical selection in the DHT precisely so it is a tested
+library primitive rather than per-deployment glue. With S1+S2+S3
+shipped, what remains of the anti-eclipse defence is daemon wiring
+(compose the per-epoch probe + rotated sample into the gossip view on
+a refresh timer), the deferred axis S4 (attestation weighting), and
+the open RFC-0005 item of a provable eclipse bound.
+
+The load-bearing test runs the S2 property end-to-end over real QUIC:
+the prober learns a peer it did not know from a probe answer, dials it
+with pinned peer-id, verifies it, and folds it into the table — while
+an address-less peer named in the same answer stays out.
+
 ### reputation: Component #8 (L2 chain) — chain_vectors test-vector emitter · 2026-06-12
 
 `reputation/chain/tools/chain_vectors.c` (PR #140): a small tool that
