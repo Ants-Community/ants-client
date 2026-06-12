@@ -13,6 +13,56 @@ the spec repo's
 
 ## Unreleased
 
+### reputation: Component #7 (L1 fault G-Set) — invalid-transition fault class · 2026-06-12
+
+The reserved `ANTS_FAULT_INVALID_TRANSITION` (=1) Layer-1 fault class is
+implemented (PR #138), per RFC-0004 v0.7 §"Fabrication is attributable"
+(spec commit `77114e2`, which resolves the design fork recorded
+2026-06-12). The chain's load-bearing property — "the committee cannot
+fabricate" — is now an enforced economic fact, not just a detectability
+argument: fabrication costs the fabricators their identities the moment
+one honest peer sees the block, on the same one-honest-path propagation
+as every other fault proof.
+
+- **The fault, signer-attributable:** the subject signed the hash of an
+  L2 block whose epoch summary commits, in `confirmed_proofs`, bytes
+  that are not a valid fault proof. Neither committee membership nor
+  block finality is required — both need L2 context a context-free
+  VERIFY cannot reach, and neither is needed: the Ed25519 signature over
+  the block hash (the exact `reputation/chain` finality message) is the
+  culpable act, like an equivocation signature. Honest members are
+  structurally safe: their candidate blocks are recomputed from their
+  own VERIFY-gated G-Sets (recompute-and-compare is proposal
+  validation, PR #137).
+- **Wire (DRAFT pending RFC-0008):** evidence = native `array(6)`
+  `[block, sig(64), cited, index, n_leaves, path]` in the standard
+  envelope; new `ants_crdt_invalid_transition_encode` +
+  `ANTS_CRDT_INVALID_TRANSITION_OVERHEAD_MAX`.
+- **Cross-version safety:** a slash grounds only on PERMANENT
+  invalidity of the citation — decode failure under the pinned RFC-0008
+  §1.1 canonical profile (the wire's frozen foundation) or a deployed
+  class's MALFORMED/NON_CANONICAL verdict. A citation of an unassigned
+  class → NOT_IMPLEMENTED, a typed "don't know", never a slash: no
+  build ever admits a proof whose citation another build deems valid.
+  No nesting: a citation cannot itself be invalid-transition (the
+  structural recursion bound, decided before the recursive verdict so
+  VERIFY never re-enters itself); the narrow cost — committing an
+  *invalid* invalid-transition proof stays
+  detectable-but-not-attributable, like omission — is stated in the
+  spec.
+- **Layering:** the confirmed-proofs Merkle fold and block walk are
+  restated in crdt.c rather than linked (declared dependency direction
+  is chain → crdt; the L1 VERIFY core must not import the L2 library).
+  `test_crdt` now links `ants_chain` and pins the mirror bit-for-bit
+  against `ants_chain_confirmed_{root,prove}` and the real block codec:
+  every tree shape n=1..8 at every leaf position, plus end-to-end
+  fabrication / unfounded-accusation / subtle-citation / wrong-epoch /
+  bad-signature / wrong-path / no-nesting / unknown-class /
+  shape-violation batteries with real Ed25519 attestations. The
+  pre-existing dispatch test updated: an empty-evidence
+  invalid-transition is now MALFORMED (was NOT_IMPLEMENTED while
+  reserved).
+
 ### reputation: Component #8 (L2 PoUH chain) — block proposal + proposer election · 2026-06-12
 
 The second runtime slice of Component #8 (PR #137): the pure mempool→block
