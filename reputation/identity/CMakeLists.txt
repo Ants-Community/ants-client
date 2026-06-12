@@ -39,6 +39,17 @@ target_link_libraries(ants_reputation
 
 target_compile_features(ants_reputation PUBLIC c_std_99)
 
+# ---- Tools ---------------------------------------------------------------
+
+# identity_vectors — emits the receipt-bag / selective-disclosure test-vector
+# pack (JSON on stdout) from the COMPILED library, per RFC-0008 §8: vectors
+# are generated against the reference implementation, never transcribed by
+# hand. It signs real receipts and probes canonical CBOR, so it links crypto
+# and cbor explicitly (PRIVATE deps of the lib are not re-exported). Usage:
+#   ./build/reputation/identity/identity_vectors > .../vectors/receipt-bag/identity.json
+add_executable(identity_vectors tools/identity_vectors.c)
+target_link_libraries(identity_vectors PRIVATE ants_reputation ants_crypto ants_cbor)
+
 # ---- Tests ---------------------------------------------------------------
 
 if(BUILD_TESTING)
