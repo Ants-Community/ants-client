@@ -1,17 +1,23 @@
 /*
  * test_crdt.c — Tests for Layer 1, the consensus-free fault G-Set
- * (Component #7 PR1): the self-authenticating fault proof.
+ * (Component #7): the self-authenticating fault proof.
  *
- * Covers the statement + equivocation-proof canonical-CBOR codec, the
- * BLAKE3 content-address, and VERIFY(π) for the equivocation fault class.
- * Statements are signed with REAL Ed25519 keys so verification is
- * exercised end-to-end, not mocked. The negative paths assert the precise
- * typed verdict the header promises (a same-payload "proof" is MALFORMED,
- * an unknown class is UNSUPPORTED_TYPE, etc.), and a byte-flip sweep
- * asserts tamper-detection independently of the impl's internals.
+ * Covers the statement + fault-proof canonical-CBOR codecs, the BLAKE3
+ * content-address, VERIFY(π) for the equivocation and invalid-transition
+ * fault classes, and the G-Set container. Statements and block
+ * attestations are signed with REAL Ed25519 keys so verification is
+ * exercised end-to-end, not mocked; the invalid-transition tests build
+ * REAL L2 blocks with the reputation/chain encoders
+ * (ants_chain_confirmed_{root,prove}, the block codec), which is what
+ * pins crdt.c's restated Merkle/block mirror bit-for-bit against the L2
+ * implementation. The negative paths assert the precise typed verdict
+ * the header promises (a same-payload "proof" is MALFORMED, an unknown
+ * class is UNSUPPORTED_TYPE, etc.), and a byte-flip sweep asserts
+ * tamper-detection independently of the impl's internals.
  */
 
 #include "ants_cbor.h"
+#include "ants_chain.h"
 #include "ants_common.h"
 #include "ants_crdt.h"
 #include "ants_crypto.h"
@@ -322,11 +328,13 @@ static void test_fault_type_dispatch(void)
     size_t len = 0;
     make_key(0x42, subj_priv, subj_pub);
 
-    /* Defined-but-unimplemented class → NOT_IMPLEMENTED. */
+    /* INVALID_TRANSITION is implemented now: an empty evidence array is a
+     * shape violation of its array(6) schema → MALFORMED (it used to be
+     * NOT_IMPLEMENTED while the class was reserved). */
     CHECK_EQ(
         build_envelope_ftype(subj_pub, ANTS_FAULT_INVALID_TRANSITION, 100, env, sizeof env, &len),
         ANTS_OK);
-    CHECK_EQ(ants_crdt_verify(env, len), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_crdt_verify(env, len), ANTS_ERROR_MALFORMED);
 
     /* Unknown/unassigned class → UNSUPPORTED_TYPE (fail closed). */
     CHECK_EQ(build_envelope_ftype(subj_pub, 7, 100, env, sizeof env, &len), ANTS_OK);
@@ -820,6 +828,982 @@ static void test_gset_snapshot_rejects_bad(void)
     ants_crdt_destroy(set);
 }
 
+/* ===== invalid-transition: fabrication made attributable ================== */
+/* These tests build REAL L2 blocks with the reputation/chain encoders and
+ * REAL Ed25519 attestations over the block hash, so crdt.c's restated
+ * Merkle fold and block walk are cross-checked bit-for-bit against
+ * ants_chain_confirmed_{root,prove} and the chain block codec. */
+
+/* memcmp comparator over bare 32-byte content-ids (ascending — the
+ * confirmed_root canonical order). */
+static int cmp_content_id(const void *a, const void *b)
+{
+    return memcmp(a, b, ANTS_CRDT_CONTENT_ID_SIZE);
+}
+
+/* A junk leaf: preimage bytes + their content-id, sortable by id. */
+typedef struct {
+    uint8_t bytes[24];
+    uint8_t id[32];
+} it_leaf_t;
+
+static int cmp_it_leaf(const void *a, const void *b)
+{
+    return memcmp(((const it_leaf_t *)a)->id, ((const it_leaf_t *)b)->id, 32);
+}
+
+/* Build a REAL chain block committing `ids` (strictly ascending) under
+ * `epoch`, attest it with `signer_priv` (Ed25519 over the block hash — the
+ * exact reputation/chain finality message), and return the canonical block
+ * bytes + the attestation. Also pins block_hash == BLAKE3(block bytes), the
+ * equivalence crdt.c's verifier recomputes from the evidence side. */
+static void build_attested_block(const uint8_t (*ids)[32],
+                                 size_t n_ids,
+                                 uint64_t epoch,
+                                 bool degraded,
+                                 int with_finding,
+                                 const uint8_t signer_priv[32],
+                                 uint8_t *block,
+                                 size_t block_cap,
+                                 size_t *block_len,
+                                 uint8_t sig[64])
+{
+    ants_chain_block_t b;
+    ants_chain_pattern_finding_t f;
+    uint8_t bh[32], bh2[32];
+
+    memset(&b, 0, sizeof b);
+    b.height = 7;
+    memset(b.prev_block_hash, 0xAB, sizeof b.prev_block_hash);
+    b.degraded_seed = degraded;
+    b.summary.epoch = epoch;
+    b.summary.cutoff_time = 1234567;
+    CHECK_EQ(ants_chain_confirmed_root(ids, n_ids, b.summary.confirmed_proofs), ANTS_OK);
+    if (with_finding) {
+        memset(&f, 0, sizeof f);
+        memset(f.subject, 0x77, sizeof f.subject);
+        f.rule_id = ANTS_CHAIN_RULE_FAULT_COUNT_30D;
+        f.window_s = ANTS_CHAIN_PATTERN_WINDOW_S;
+        f.count = 3;
+        f.severity = ANTS_CHAIN_SEVERITY_MEDIUM;
+        b.summary.findings = &f;
+        b.summary.n_findings = 1;
+    }
+    CHECK_EQ(ants_chain_block_encode(&b, block, block_cap, block_len), ANTS_OK);
+    CHECK_EQ(ants_chain_block_hash(&b, bh), ANTS_OK);
+    CHECK_EQ(ants_blake3_hash(block, *block_len, bh2), ANTS_OK);
+    CHECK(memcmp(bh, bh2, sizeof bh) == 0);
+    CHECK_EQ(ants_ed25519_sign(signer_priv, bh, sizeof bh, sig), ANTS_OK);
+}
+
+/* Assemble a full invalid-transition proof citing `cited` as leaf
+ * `cited_idx` of the `ids` set, with the REAL chain inclusion path. */
+static size_t make_it_proof(const uint8_t signer_pub[32],
+                            uint64_t epoch,
+                            const uint8_t *block,
+                            size_t block_len,
+                            const uint8_t sig[64],
+                            const uint8_t (*ids)[32],
+                            size_t n_ids,
+                            size_t cited_idx,
+                            const uint8_t *cited,
+                            size_t cited_len,
+                            uint8_t *proof,
+                            size_t proof_cap)
+{
+    uint8_t path[8 * 32];
+    size_t path_len = 0, plen = 0;
+
+    CHECK_EQ(ants_chain_confirmed_prove(ids, n_ids, cited_idx, path, sizeof path, &path_len),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(signer_pub,
+                                                 epoch,
+                                                 block,
+                                                 block_len,
+                                                 sig,
+                                                 cited,
+                                                 cited_len,
+                                                 (uint64_t)cited_idx,
+                                                 (uint64_t)n_ids,
+                                                 path,
+                                                 path_len,
+                                                 proof,
+                                                 proof_cap,
+                                                 &plen),
+             ANTS_OK);
+    return plen;
+}
+
+/* Hand-roll an invalid-transition envelope with full control of the
+ * evidence values (the public encoder guards the obviously-invalid ones).
+ * `n_elems` truncates the evidence array to its first n elements. */
+static ants_error_t build_it_raw(const uint8_t subject[32],
+                                 uint64_t epoch,
+                                 size_t n_elems,
+                                 const uint8_t *block,
+                                 size_t block_len,
+                                 const uint8_t *sig,
+                                 size_t sig_len,
+                                 const uint8_t *cited,
+                                 size_t cited_len,
+                                 uint64_t index,
+                                 uint64_t n_leaves,
+                                 const uint8_t *path,
+                                 size_t path_len,
+                                 uint8_t *buf,
+                                 size_t cap,
+                                 size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+
+    if ((rc = ants_cbor_enc_init(&enc, buf, cap)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_map(&enc, 4)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 0)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, subject, 32)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 1)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, ANTS_FAULT_INVALID_TRANSITION)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 2)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, epoch)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_uint(&enc, 3)) != ANTS_OK ||
+        (rc = ants_cbor_enc_array(&enc, n_elems)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 1 && (rc = ants_cbor_enc_bytes(&enc, block, block_len)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 2 && (rc = ants_cbor_enc_bytes(&enc, sig, sig_len)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 3 && (rc = ants_cbor_enc_bytes(&enc, cited, cited_len)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 4 && (rc = ants_cbor_enc_uint(&enc, index)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 5 && (rc = ants_cbor_enc_uint(&enc, n_leaves)) != ANTS_OK) {
+        return rc;
+    }
+    if (n_elems >= 6 && (rc = ants_cbor_enc_bytes(&enc, path, path_len)) != ANTS_OK) {
+        return rc;
+    }
+    if ((rc = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return rc;
+    }
+    *out_len = ants_cbor_enc_size(&enc);
+    return ANTS_OK;
+}
+
+/* The full fabrication flow: a signer attests a block whose confirmed set
+ * commits junk bytes that are not a valid fault proof. The proof verifies,
+ * is insertable, and slashes the SIGNER (not the junk's nominal author). */
+static void test_invalid_transition_verifies(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], eq_priv[32], eq_pub[32];
+    uint8_t valid_eq[512];
+    uint8_t junk[24];
+    uint8_t jid[32];
+    uint8_t ids[2][32];
+    uint8_t block[512], sig[64], proof[1536];
+    size_t eq_len, block_len = 0, plen, junk_idx;
+    ants_fault_proof_view_t v;
+    ants_crdt_t *set = NULL;
+    bool inserted = false;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, eq_priv, eq_pub);
+
+    /* The committed set: one REAL equivocation proof + junk bytes. */
+    eq_len = make_valid_proof(eq_priv, eq_pub, 100, valid_eq);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(valid_eq, eq_len, ids[0]), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids[1]), ANTS_OK);
+    qsort(ids, 2, sizeof ids[0], cmp_content_id);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, jid), ANTS_OK);
+    junk_idx = (memcmp(ids[0], jid, 32) == 0) ? 0 : 1;
+
+    build_attested_block(ids, 2, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(signer_pub,
+                         500,
+                         block,
+                         block_len,
+                         sig,
+                         ids,
+                         2,
+                         junk_idx,
+                         junk,
+                         sizeof junk,
+                         proof,
+                         sizeof proof);
+
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+
+    /* The decoded view exposes the right envelope fields. */
+    CHECK_EQ(ants_crdt_fault_proof_decode(proof, plen, &v), ANTS_OK);
+    CHECK(v.fault_type == ANTS_FAULT_INVALID_TRANSITION);
+    CHECK(v.epoch == 500);
+    CHECK(memcmp(v.subject, signer_pub, 32) == 0);
+
+    /* Insertable into the G-Set; the SIGNER is the slashed subject. */
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &inserted), ANTS_OK);
+    CHECK(inserted == true);
+    CHECK(ants_crdt_is_slashed(set, signer_pub) == true);
+    CHECK(ants_crdt_is_slashed(set, eq_pub) == false);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &inserted), ANTS_OK);
+    CHECK(inserted == false); /* content-id dedupe */
+    ants_crdt_destroy(set);
+
+    /* A single-leaf set (empty Merkle path) in a degraded-seed block with a
+     * findings entry exercises the remaining wire shapes end-to-end. */
+    {
+        uint8_t ids1[1][32];
+        memcpy(ids1[0], jid, 32);
+        build_attested_block(
+            ids1, 1, 501, true, 1, signer_priv, block, sizeof block, &block_len, sig);
+        plen = make_it_proof(signer_pub,
+                             501,
+                             block,
+                             block_len,
+                             sig,
+                             ids1,
+                             1,
+                             0,
+                             junk,
+                             sizeof junk,
+                             proof,
+                             sizeof proof);
+        CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+    }
+}
+
+/* Citing a leaf whose bytes ARE a valid fault proof is no fabrication —
+ * the accusation itself is malformed. */
+static void test_invalid_transition_unfounded(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], eq_priv[32], eq_pub[32];
+    uint8_t valid_eq[512];
+    uint8_t junk[24];
+    uint8_t eqid[32];
+    uint8_t ids[2][32];
+    uint8_t block[512], sig[64], proof[1536];
+    size_t eq_len, block_len = 0, plen, eq_idx;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, eq_priv, eq_pub);
+
+    eq_len = make_valid_proof(eq_priv, eq_pub, 100, valid_eq);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(valid_eq, eq_len, ids[0]), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids[1]), ANTS_OK);
+    qsort(ids, 2, sizeof ids[0], cmp_content_id);
+    CHECK_EQ(ants_crdt_content_id(valid_eq, eq_len, eqid), ANTS_OK);
+    eq_idx = (memcmp(ids[0], eqid, 32) == 0) ? 0 : 1;
+
+    build_attested_block(ids, 2, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(signer_pub,
+                         500,
+                         block,
+                         block_len,
+                         sig,
+                         ids,
+                         2,
+                         eq_idx,
+                         valid_eq,
+                         eq_len,
+                         proof,
+                         sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+/* The realistic fabrications: a plausible-looking citation whose invalidity
+ * is subtle (a correctly-signed same-payload "equivocation") and a
+ * non-canonical one. Both are permanent invalidity → the fault stands. */
+static void test_invalid_transition_subtle_citations(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], eq_priv[32], eq_pub[32];
+    uint8_t body_a[256], body_b[256], sig_a[64], sig_b[64];
+    uint8_t subtle[512];
+    uint8_t block[512], sig[64], proof[1536];
+    uint8_t ids1[1][32];
+    size_t la = 0, lb = 0, slen = 0, block_len = 0, plen;
+    const uint8_t same[4] = {0x0F, 0x0E, 0x0D, 0x0C};
+    /* Non-shortest uint 23 (0x18 0x17): well-formed but non-canonical. */
+    const uint8_t noncanon[2] = {0x18, 0x17};
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, eq_priv, eq_pub);
+
+    /* Correctly signed, canonical, same payload — VERIFY says MALFORMED, so
+     * committing it as a "fault proof" is fabrication. */
+    sign_statement(9, 100, 3, same, sizeof same, eq_priv, body_a, &la, sig_a);
+    sign_statement(9, 100, 3, same, sizeof same, eq_priv, body_b, &lb, sig_b);
+    CHECK_EQ(ants_crdt_equivocation_encode(
+                 eq_pub, 100, body_a, la, sig_a, body_b, lb, sig_b, subtle, sizeof subtle, &slen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(subtle, slen), ANTS_ERROR_MALFORMED);
+
+    CHECK_EQ(ants_crdt_content_id(subtle, slen, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 600, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(
+        signer_pub, 600, block, block_len, sig, ids1, 1, 0, subtle, slen, proof, sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+
+    /* A non-canonical citation (NON_CANONICAL is also permanent). */
+    CHECK_EQ(ants_crdt_content_id(noncanon, sizeof noncanon, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 601, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(signer_pub,
+                         601,
+                         block,
+                         block_len,
+                         sig,
+                         ids1,
+                         1,
+                         0,
+                         noncanon,
+                         sizeof noncanon,
+                         proof,
+                         sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+}
+
+/* The envelope's epoch must equal the block summary's epoch. */
+static void test_invalid_transition_wrong_epoch(void)
+{
+    uint8_t signer_priv[32], signer_pub[32];
+    uint8_t junk[24];
+    uint8_t ids1[1][32];
+    uint8_t block[512], sig[64], proof[1536];
+    size_t block_len = 0, plen;
+
+    make_key(0x21, signer_priv, signer_pub);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids1[0]), ANTS_OK);
+
+    build_attested_block(ids1, 1, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    /* Envelope says 501, the attested summary says 500. */
+    plen = make_it_proof(
+        signer_pub, 501, block, block_len, sig, ids1, 1, 0, junk, sizeof junk, proof, sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+/* The attestation must be the subject's signature over THIS block's hash. */
+static void test_invalid_transition_bad_signature(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], other_priv[32], other_pub[32];
+    uint8_t junk[24];
+    uint8_t ids1[1][32];
+    uint8_t block[512], sig[64], proof[1536];
+    size_t block_len = 0, plen;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x66, other_priv, other_pub);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids1[0]), ANTS_OK);
+
+    /* Signed by OTHER, blamed on signer_pub → not the subject's act. */
+    build_attested_block(ids1, 1, 500, false, 0, other_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(
+        signer_pub, 500, block, block_len, sig, ids1, 1, 0, junk, sizeof junk, proof, sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* A flipped signature byte. */
+    build_attested_block(ids1, 1, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    sig[0] ^= 0x01u;
+    plen = make_it_proof(
+        signer_pub, 500, block, block_len, sig, ids1, 1, 0, junk, sizeof junk, proof, sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+/* The inclusion fold must reproduce the committed root. */
+static void test_invalid_transition_wrong_path(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], eq_priv[32], eq_pub[32];
+    uint8_t valid_eq[512];
+    uint8_t junk[24];
+    uint8_t jid[32];
+    uint8_t ids[2][32];
+    uint8_t block[512], sig[64], proof[1536];
+    uint8_t path[8 * 32];
+    size_t eq_len, block_len = 0, plen = 0, path_len = 0, junk_idx;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, eq_priv, eq_pub);
+    eq_len = make_valid_proof(eq_priv, eq_pub, 100, valid_eq);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(valid_eq, eq_len, ids[0]), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids[1]), ANTS_OK);
+    qsort(ids, 2, sizeof ids[0], cmp_content_id);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, jid), ANTS_OK);
+    junk_idx = (memcmp(ids[0], jid, 32) == 0) ? 0 : 1;
+
+    build_attested_block(ids, 2, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+
+    /* A REAL path with one flipped byte no longer folds to the root. */
+    CHECK_EQ(ants_chain_confirmed_prove(ids, 2, junk_idx, path, sizeof path, &path_len), ANTS_OK);
+    path[0] ^= 0x01u;
+    CHECK_EQ(ants_crdt_invalid_transition_encode(signer_pub,
+                                                 500,
+                                                 block,
+                                                 block_len,
+                                                 sig,
+                                                 junk,
+                                                 sizeof junk,
+                                                 (uint64_t)junk_idx,
+                                                 2,
+                                                 path,
+                                                 path_len,
+                                                 proof,
+                                                 sizeof proof,
+                                                 &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* The junk bytes presented at the OTHER leaf's position. */
+    plen = make_it_proof(signer_pub,
+                         500,
+                         block,
+                         block_len,
+                         sig,
+                         ids,
+                         2,
+                         1 - junk_idx,
+                         junk,
+                         sizeof junk,
+                         proof,
+                         sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+}
+
+/* No nesting: a cited proof of class INVALID_TRANSITION is malformed
+ * evidence regardless of its own validity — the structural recursion
+ * bound. (Its cost, stated honestly: committing an invalid
+ * invalid-transition proof is real fabrication this class cannot cite;
+ * that case stays detectable-but-not-attributable, like omission.) */
+static void test_invalid_transition_no_nesting(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], eq_priv[32], eq_pub[32];
+    uint8_t valid_eq[512];
+    uint8_t junk[24];
+    uint8_t jid[32];
+    uint8_t ids[2][32];
+    uint8_t ids1[1][32];
+    uint8_t block[512], sig[64];
+    uint8_t inner[1536], outer[2560];
+    uint8_t bad_it[128];
+    size_t eq_len, block_len = 0, inner_len, outer_len, bad_len = 0, junk_idx;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, eq_priv, eq_pub);
+
+    /* A VALID invalid-transition proof (same flow as the happy test). */
+    eq_len = make_valid_proof(eq_priv, eq_pub, 100, valid_eq);
+    memset(junk, 0xD7, sizeof junk);
+    CHECK_EQ(ants_crdt_content_id(valid_eq, eq_len, ids[0]), ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids[1]), ANTS_OK);
+    qsort(ids, 2, sizeof ids[0], cmp_content_id);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, jid), ANTS_OK);
+    junk_idx = (memcmp(ids[0], jid, 32) == 0) ? 0 : 1;
+    build_attested_block(ids, 2, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    inner_len = make_it_proof(signer_pub,
+                              500,
+                              block,
+                              block_len,
+                              sig,
+                              ids,
+                              2,
+                              junk_idx,
+                              junk,
+                              sizeof junk,
+                              inner,
+                              sizeof inner);
+    CHECK_EQ(ants_crdt_verify(inner, inner_len), ANTS_OK);
+
+    /* A second block commits the (valid) inner proof; citing it is
+     * MALFORMED by the nesting bound, not an admission. */
+    CHECK_EQ(ants_crdt_content_id(inner, inner_len, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 700, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    outer_len = make_it_proof(
+        signer_pub, 700, block, block_len, sig, ids1, 1, 0, inner, inner_len, outer, sizeof outer);
+    CHECK_EQ(ants_crdt_verify(outer, outer_len), ANTS_ERROR_MALFORMED);
+
+    /* Same bound when the cited invalid-transition proof is INVALID (an
+     * empty-evidence envelope): still MALFORMED, decided before any
+     * recursive verdict. */
+    CHECK_EQ(build_envelope_ftype(
+                 eq_pub, ANTS_FAULT_INVALID_TRANSITION, 700, bad_it, sizeof bad_it, &bad_len),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_content_id(bad_it, bad_len, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 700, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    outer_len = make_it_proof(
+        signer_pub, 700, block, block_len, sig, ids1, 1, 0, bad_it, bad_len, outer, sizeof outer);
+    CHECK_EQ(ants_crdt_verify(outer, outer_len), ANTS_ERROR_MALFORMED);
+}
+
+/* A cited class this build cannot judge is a typed "don't know" — never a
+ * slash, and the G-Set refuses the proof with the same verdict. */
+static void test_invalid_transition_unknown_cited_class(void)
+{
+    uint8_t signer_priv[32], signer_pub[32], some_pub[32], some_priv[32];
+    uint8_t future[128];
+    uint8_t ids1[1][32];
+    uint8_t block[512], sig[64], proof[1536];
+    size_t future_len = 0, block_len = 0, plen;
+    ants_crdt_t *set = NULL;
+    bool inserted = true;
+
+    make_key(0x21, signer_priv, signer_pub);
+    make_key(0x42, some_priv, some_pub);
+
+    /* A canonical envelope of unassigned class 7 — valid to a future build,
+     * unknowable to this one. */
+    CHECK_EQ(build_envelope_ftype(some_pub, 7, 800, future, sizeof future, &future_len), ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(future, future_len), ANTS_ERROR_UNSUPPORTED_TYPE);
+
+    CHECK_EQ(ants_crdt_content_id(future, future_len, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 800, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+    plen = make_it_proof(signer_pub,
+                         800,
+                         block,
+                         block_len,
+                         sig,
+                         ids1,
+                         1,
+                         0,
+                         future,
+                         future_len,
+                         proof,
+                         sizeof proof);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_NOT_IMPLEMENTED);
+
+    CHECK_EQ(ants_crdt_init(&set), ANTS_OK);
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &inserted), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK(inserted == false);
+    CHECK(ants_crdt_size(set) == 0);
+    ants_crdt_destroy(set);
+}
+
+/* Evidence shape violations are MALFORMED (each via the raw builder, with
+ * an otherwise-genuine block + attestation so only the probed field is
+ * wrong). */
+static void test_invalid_transition_evidence_shapes(void)
+{
+    uint8_t signer_priv[32], signer_pub[32];
+    uint8_t junk[24];
+    uint8_t ids1[1][32];
+    uint8_t block[512], sig[64], proof[1536];
+    uint8_t path32[32];
+    size_t block_len = 0, plen = 0;
+
+    make_key(0x21, signer_priv, signer_pub);
+    memset(junk, 0xD7, sizeof junk);
+    memset(path32, 0x11, sizeof path32);
+    CHECK_EQ(ants_crdt_content_id(junk, sizeof junk, ids1[0]), ANTS_OK);
+    build_attested_block(ids1, 1, 500, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+
+    /* Five evidence elements instead of six. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          5,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          0,
+                          1,
+                          NULL,
+                          0,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* A 63-byte signature. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          63,
+                          junk,
+                          sizeof junk,
+                          0,
+                          1,
+                          NULL,
+                          0,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* Empty cited bytes. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          0,
+                          0,
+                          1,
+                          NULL,
+                          0,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* n_leaves == 0. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          0,
+                          0,
+                          NULL,
+                          0,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* index >= n_leaves. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          2,
+                          2,
+                          path32,
+                          sizeof path32,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* n_leaves beyond the chain's max Merkle depth (2^32 + 1). */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          0,
+                          ((uint64_t)1 << 32) + 1,
+                          path32,
+                          sizeof path32,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* A path where (index 0, n 1) requires none. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          block,
+                          block_len,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          0,
+                          1,
+                          path32,
+                          sizeof path32,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* Bytes that are not a chain block at all. */
+    CHECK_EQ(build_it_raw(signer_pub,
+                          500,
+                          6,
+                          junk,
+                          sizeof junk,
+                          sig,
+                          64,
+                          junk,
+                          sizeof junk,
+                          0,
+                          1,
+                          NULL,
+                          0,
+                          proof,
+                          sizeof proof,
+                          &plen),
+             ANTS_OK);
+    CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+
+    /* Wrong element types: six uints. */
+    {
+        ants_cbor_enc_t enc;
+        size_t i;
+        CHECK_EQ(ants_cbor_enc_init(&enc, proof, sizeof proof), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_map(&enc, 4), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_bytes(&enc, signer_pub, 32), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, ANTS_FAULT_INVALID_TRANSITION), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 500), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_uint(&enc, 3), ANTS_OK);
+        CHECK_EQ(ants_cbor_enc_array(&enc, 6), ANTS_OK);
+        for (i = 0; i < 6; i++) {
+            CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
+        }
+        CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+        plen = ants_cbor_enc_size(&enc);
+        CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_ERROR_MALFORMED);
+    }
+}
+
+/* Encoder argument guards. */
+static void test_invalid_transition_encoder_guards(void)
+{
+    uint8_t subject[32], block[8], sig[64], cited[8], path[32], buf[256];
+    uint8_t small[16];
+    size_t out_len = 0;
+
+    memset(subject, 0x01, sizeof subject);
+    memset(block, 0x02, sizeof block);
+    memset(sig, 0x03, sizeof sig);
+    memset(cited, 0x04, sizeof cited);
+    memset(path, 0x05, sizeof path);
+
+    CHECK_EQ(ants_crdt_invalid_transition_encode(NULL,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 NULL,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 NULL,
+                                                 0,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 32,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 0,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 1,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 NULL,
+                                                 sizeof buf,
+                                                 &out_len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 buf,
+                                                 sizeof buf,
+                                                 NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_crdt_invalid_transition_encode(subject,
+                                                 1,
+                                                 block,
+                                                 sizeof block,
+                                                 sig,
+                                                 cited,
+                                                 sizeof cited,
+                                                 0,
+                                                 1,
+                                                 NULL,
+                                                 0,
+                                                 small,
+                                                 sizeof small,
+                                                 &out_len),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+/* Every small tree shape (incl. odd counts → promote-lone levels), every
+ * leaf position: a proof built with the REAL chain prover must verify
+ * against crdt.c's restated fold. This is the bit-for-bit pin between the
+ * two Merkle constructions. */
+static void test_invalid_transition_merkle_cross_check(void)
+{
+    uint8_t signer_priv[32], signer_pub[32];
+    uint8_t block[512], sig[64], proof[1536];
+    uint8_t ids[8][32];
+    it_leaf_t leaves[8];
+    size_t block_len = 0, n, i;
+
+    make_key(0x33, signer_priv, signer_pub);
+
+    for (n = 1; n <= 8; n++) {
+        for (i = 0; i < n; i++) {
+            memset(leaves[i].bytes, (int)(0x40u + i), sizeof leaves[i].bytes);
+            leaves[i].bytes[0] = (uint8_t)n; /* distinct across set sizes too */
+            CHECK_EQ(ants_crdt_content_id(leaves[i].bytes, sizeof leaves[i].bytes, leaves[i].id),
+                     ANTS_OK);
+        }
+        qsort(leaves, n, sizeof leaves[0], cmp_it_leaf);
+        for (i = 0; i < n; i++) {
+            memcpy(ids[i], leaves[i].id, 32);
+        }
+        build_attested_block(
+            ids, n, 900 + n, false, 0, signer_priv, block, sizeof block, &block_len, sig);
+        for (i = 0; i < n; i++) {
+            size_t plen = make_it_proof(signer_pub,
+                                        900 + n,
+                                        block,
+                                        block_len,
+                                        sig,
+                                        ids,
+                                        n,
+                                        i,
+                                        leaves[i].bytes,
+                                        sizeof leaves[i].bytes,
+                                        proof,
+                                        sizeof proof);
+            CHECK_EQ(ants_crdt_verify(proof, plen), ANTS_OK);
+        }
+    }
+}
+
 int main(void)
 {
     test_statement_encode_canonical();
@@ -834,6 +1818,18 @@ int main(void)
     test_malformed_and_noncanonical();
     test_null_and_empty_args();
     test_single_byte_tamper_rejected();
+
+    test_invalid_transition_verifies();
+    test_invalid_transition_unfounded();
+    test_invalid_transition_subtle_citations();
+    test_invalid_transition_wrong_epoch();
+    test_invalid_transition_bad_signature();
+    test_invalid_transition_wrong_path();
+    test_invalid_transition_no_nesting();
+    test_invalid_transition_unknown_cited_class();
+    test_invalid_transition_evidence_shapes();
+    test_invalid_transition_encoder_guards();
+    test_invalid_transition_merkle_cross_check();
 
     test_gset_init_insert_query();
     test_gset_rejects_invalid();

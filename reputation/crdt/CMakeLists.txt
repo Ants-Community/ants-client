@@ -2,12 +2,12 @@
 #
 # Spec: RFC-0004 v0.6 §"Layer 1 — the consensus-free fault G-Set".
 #
-# Status: PR1 — the self-authenticating fault proof. The canonical-CBOR
-# fault-proof wire format (envelope + equivocation evidence), VERIFY(π)
-# for the equivocation fault class (two Ed25519 checks + an inequality),
-# and the BLAKE3 content-address the G-Set dedupes on. The G-Set
-# container, the pruning + late-joiner protocol, gossip propagation, and
-# the other fault classes land in later PRs.
+# Status: the self-authenticating fault proof (canonical-CBOR envelope +
+# per-class evidence), VERIFY(π) for the equivocation and
+# invalid-transition fault classes, the BLAKE3 content-address the G-Set
+# dedupes on, and the G-Set container with pruning + the late-joiner
+# snapshot. Gossip propagation is Component #6; the remaining fault
+# classes land as the layers they depend on come online.
 
 add_library(ants_crdt STATIC
     src/crdt.c
@@ -36,8 +36,18 @@ target_compile_features(ants_crdt PUBLIC c_std_99)
 if(BUILD_TESTING)
     add_executable(test_crdt tests/test_crdt.c)
     # The test signs real statements (ants_ed25519_*), probes canonical
-    # CBOR, and needs ants_strerror, so it links crypto and cbor
-    # explicitly (PRIVATE deps of the lib are not re-exported).
-    target_link_libraries(test_crdt PRIVATE ants_crdt ants_crypto ants_cbor)
+    # CBOR, needs ants_strerror, and cross-checks the invalid-transition
+    # Merkle/block mirror against the REAL reputation/chain encoders
+    # (ants_chain_confirmed_{root,prove}, the block codec) — the test is
+    # what pins the two restated constructions bit-for-bit. crypto/cbor
+    # symbols resolve transitively through the static libs' PRIVATE deps,
+    # so we link only ants_crdt + ants_chain and add the include dirs the
+    # test references directly (PRIVATE deps don't export include dirs;
+    # linking them explicitly too would double them on the link line — the
+    # macOS ld "ignoring duplicate libraries" warning).
+    target_link_libraries(test_crdt PRIVATE ants_crdt ants_chain)
+    target_include_directories(test_crdt PRIVATE
+        ${CMAKE_SOURCE_DIR}/foundation/crypto/include
+        ${CMAKE_SOURCE_DIR}/foundation/cbor/include)
     add_test(NAME crdt_basic COMMAND test_crdt)
 endif()

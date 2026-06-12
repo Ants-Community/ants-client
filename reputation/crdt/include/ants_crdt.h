@@ -23,25 +23,31 @@
  * self-authenticating fact needs one honest gossip path, ever — not an
  * honest majority (RFC-0004 §"The structural win").
  *
- * Scope of THIS module (PR1 of Component #7):
+ * Scope of THIS module:
  *   - the canonical-CBOR fault-proof wire format (envelope + the
- *     equivocation evidence schema), float-free per RFC-0008 §1.1/§1.3;
+ *     per-class evidence schemas), float-free per RFC-0008 §1.1/§1.3;
  *   - VERIFY(π) for fault_type = equivocation — the gold-standard fault
  *     (RFC-0004 §"Partition recovery / Equivocation slashing"): two
  *     statements signed by the SAME subject over the SAME (domain, epoch,
  *     slot) with DIFFERENT payloads. Verification is two Ed25519 checks
  *     and an inequality — a few lines of obviously-correct code, exactly
  *     as the RFC intends;
- *   - the BLAKE3 content-address used by the G-Set to dedupe proofs.
+ *   - VERIFY(π) for fault_type = invalid-transition — fabrication made
+ *     attributable (RFC-0004 v0.7 §"Why the committee cannot fabricate"):
+ *     the subject signed an L2 block whose summary commits bytes that are
+ *     not a valid fault proof. One Ed25519 check over the block hash, a
+ *     Merkle inclusion fold, and the cited bytes' own VERIFY verdict;
+ *   - the BLAKE3 content-address used by the G-Set to dedupe proofs;
+ *   - the G-Set container, pruning, and the late-joiner snapshot.
  *
- * Deliberately NOT here (later PRs, each its own RFC-0004 section): the
- * G-Set container itself (insert/contains/merge/is_slashed), G-Set
- * pruning + the late-joiner protocol (§"G-Set pruning and late-joiner
- * protocol"), archive-node redundancy (§"Archive nodes"), gossip
- * propagation (Component #6), and the other fault types
- * (invalid-state-transition needs the L2 chain; bond-misadmission,
+ * Deliberately NOT here (later PRs, each its own RFC-0004 section):
+ * archive-node redundancy (§"Archive nodes"), gossip propagation
+ * (Component #6), and the remaining fault types (bond-misadmission,
  * selective-disclosure-forgery, vendor-revocation, key-rotation
- * equivocation land as the layers they depend on come online).
+ * equivocation land as the layers they depend on come online). The G-Set
+ * container, pruning + the late-joiner protocol, and the
+ * INVALID_TRANSITION fault class landed in later Component #7/#8 PRs and
+ * are part of this header now.
  *
  * WIRE FORMAT IS DRAFT. The byte layout below is defined by this module
  * pending formalisation in RFC-0008 (the same status the DHT and cache
@@ -97,10 +103,17 @@ extern "C" {
  *                        offline by anyone (RFC-0004 §"Legitimacy =
  *                        cryptographically-attributable enumerated
  *                        fault"). IMPLEMENTED here.
- *   INVALID_TRANSITION — the subject (an L2 committee member) attested an
- *                        invalid state transition. Reserved: verifying it
- *                        needs the L2 chain (Component #8), so VERIFY
- *                        returns ANTS_ERROR_NOT_IMPLEMENTED for now.
+ *   INVALID_TRANSITION — the subject signed (attested) an L2 block whose
+ *                        epoch summary commits, in its confirmed_proofs
+ *                        Merkle root, bytes that are NOT a valid Layer-1
+ *                        fault proof — fabrication (RFC-0004 v0.7 §"Why
+ *                        the committee cannot fabricate"). Deliberately
+ *                        SIGNER-attributable: neither committee membership
+ *                        nor block finality is required (or verifiable
+ *                        context-free) — the signature over the block hash
+ *                        is itself the culpable act, exactly like an
+ *                        equivocation signature. IMPLEMENTED here; see
+ *                        ants_crdt_verify for the conditions.
  *
  * Values >= ANTS_FAULT__RESERVED_MIN are unassigned; VERIFY rejects them
  * with ANTS_ERROR_UNSUPPORTED_TYPE (fail closed — an unknown fault class
@@ -131,6 +144,16 @@ extern "C" {
  * the byte-string headers. 256 is a safe ceiling.
  */
 #define ANTS_CRDT_EQUIVOCATION_OVERHEAD_MAX 256u
+
+/*
+ * An invalid-transition proof envelope wraps the attested block, the
+ * signature, the cited committed bytes, and the Merkle inclusion path.
+ * Framing overhead beyond (block_len + cited_len + path_len): the envelope
+ * map(4), the evidence array(6), the 66-byte signature byte-string, two
+ * <=9-byte uints (leaf index, leaf count) and the byte-string headers.
+ * 256 is a safe ceiling.
+ */
+#define ANTS_CRDT_INVALID_TRANSITION_OVERHEAD_MAX 256u
 
 /* ------------------------------------------------------------------------ */
 /* Statement encoding (the bytes a subject signs)                           */
@@ -212,6 +235,58 @@ ants_error_t ants_crdt_equivocation_encode(const uint8_t subject[ANTS_CRDT_PEER_
                                            size_t cap,
                                            size_t *out_len);
 
+/*
+ * Build an INVALID_TRANSITION fault proof: pack an attested L2 block, the
+ * subject's attestation signature, and the cited committed bytes (with
+ * their Merkle inclusion path) into the canonical envelope. Like the
+ * equivocation encoder, this serialises only — it does not sign and does
+ * not check anything cryptographic; VERIFY is the checker.
+ *
+ * Envelope is the same canonical CBOR map(4) (subject / fault_type /
+ * epoch / evidence) with fault_type = ANTS_FAULT_INVALID_TRANSITION and
+ * evidence a native array(6), elements in this fixed order:
+ *
+ *   0: block  (bytes)     the COMPLETE canonical block encoding (the
+ *                         reputation/chain wire form: map(4) {1: height,
+ *                         2: prev_block_hash, 3: degraded_seed,
+ *                         4: epoch-summary bytes}).
+ *   1: sig    (bytes 64)  the subject's Ed25519 signature over the
+ *                         32-byte block hash BLAKE3(block) — the exact
+ *                         message committee attestations sign
+ *                         (reputation/chain finality).
+ *   2: cited  (bytes)     the committed bytes the proof claims are not a
+ *                         valid fault proof.
+ *   3: index  (uint)      the cited leaf's position among the confirmed
+ *                         set's leaves.
+ *   4: n_leaves (uint)    the confirmed set's total leaf count (>= 1).
+ *   5: path   (bytes)     the Merkle sibling hashes from leaf to root, a
+ *                         whole number of 32-byte siblings (empty for a
+ *                         single-leaf set).
+ *
+ * `epoch` MUST equal the block's epoch-summary epoch for the proof to
+ * verify (the envelope epoch is what G-Set pruning orders by, so it is
+ * bound to the contested epoch). `path` may be NULL only if `path_len`
+ * is 0.
+ *
+ * @return ANTS_OK with *out_len set; INVALID_ARG on NULL (or empty block
+ *         / cited, n_leaves == 0, or index >= n_leaves); BUFFER_TOO_SMALL
+ *         if cap is insufficient (buf untouched).
+ */
+ants_error_t ants_crdt_invalid_transition_encode(const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE],
+                                                 uint64_t epoch,
+                                                 const uint8_t *block,
+                                                 size_t block_len,
+                                                 const uint8_t sig[ANTS_CRDT_SIG_SIZE],
+                                                 const uint8_t *cited,
+                                                 size_t cited_len,
+                                                 uint64_t leaf_index,
+                                                 uint64_t n_leaves,
+                                                 const uint8_t *path,
+                                                 size_t path_len,
+                                                 uint8_t *buf,
+                                                 size_t cap,
+                                                 size_t *out_len);
+
 /* ------------------------------------------------------------------------ */
 /* Fault-proof decoding (structural, no crypto)                             */
 /* ------------------------------------------------------------------------ */
@@ -266,19 +341,54 @@ ants_crdt_fault_proof_decode(const uint8_t *buf, size_t len, ants_fault_proof_vi
  *   - both signatures verify under `subject` over their respective body
  *     bytes (two Ed25519 checks).
  *
+ * For ANTS_FAULT_INVALID_TRANSITION, VERIFY returns ANTS_OK iff ALL hold:
+ *   - the evidence is a well-formed array(6) (see the encoder), with
+ *     index < n_leaves and the path length exactly matching the
+ *     (index, n_leaves) tree position;
+ *   - `block` decodes as a canonical reputation/chain block (map(4)
+ *     {height, prev_block_hash, degraded_seed, summary}) whose embedded
+ *     epoch summary is itself canonical — structural validation only; a
+ *     finding's severity VALUE is deliberately not range-checked, so a
+ *     future severity cannot make this build mis-verdict a future block;
+ *   - the envelope's epoch equals the summary's epoch;
+ *   - `sig` verifies under `subject` over the 32-byte block hash
+ *     BLAKE3(block) — the attested act;
+ *   - BLAKE3(cited), folded at (index, n_leaves) with `path`, reproduces
+ *     the summary's confirmed_proofs root — the block really commits the
+ *     cited bytes (the Merkle scheme mirrors reputation/chain
+ *     bit-for-bit);
+ *   - the cited bytes are NOT a valid fault proof, for a reason that is a
+ *     PERMANENT property of the bytes: either they fail to decode as a
+ *     fault envelope under the pinned RFC-0008 §1.1 canonical profile
+ *     (the profile is the wire's foundation — every content-id and
+ *     signature depends on it, so it cannot grow), or they decode to a
+ *     class this build implements whose VERIFY says MALFORMED or
+ *     NON_CANONICAL (a deployed class's rules never change). A cited
+ *     proof that VERIFIES is no fabrication (the accusation itself is
+ *     MALFORMED). A cited proof of class INVALID_TRANSITION is MALFORMED
+ *     evidence (no nesting — the structural recursion bound). A cited
+ *     envelope of a class this build cannot judge (unassigned, or a
+ *     class verdict of UNSUPPORTED_TYPE / NOT_IMPLEMENTED) yields
+ *     NOT_IMPLEMENTED for the whole proof: a typed "don't know", never a
+ *     slash — so no build ever admits a proof whose citation another
+ *     build deems valid.
+ *
  * @return ANTS_OK              π is a valid fault proof (VERIFY == true);
  *         ANTS_ERROR_INVALID_ARG    buf is NULL or len is 0;
  *         ANTS_ERROR_NON_CANONICAL  well-formed but non-canonical CBOR;
  *         ANTS_ERROR_UNSUPPORTED_TYPE  unknown/unassigned fault class
  *                                   (>= ANTS_FAULT__RESERVED_MIN) — fail
  *                                   closed, never a valid slash;
- *         ANTS_ERROR_NOT_IMPLEMENTED  a defined class this build cannot
- *                                   yet verify (ANTS_FAULT_INVALID_TRANSITION,
- *                                   pending the L2 chain);
+ *         ANTS_ERROR_NOT_IMPLEMENTED  this build cannot reach a definitive
+ *                                   verdict (an INVALID_TRANSITION proof
+ *                                   citing a fault class it cannot judge)
+ *                                   — fail closed, never a valid slash;
  *         ANTS_ERROR_MALFORMED  well-formed canonical CBOR but NOT a valid
  *                                   fault: wrong evidence shape, mismatched
  *                                   (domain/epoch/slot), identical payloads,
- *                                   wrong field lengths, or a bad signature.
+ *                                   wrong field lengths, a bad signature, a
+ *                                   Merkle path that does not reproduce the
+ *                                   root, or a cited proof that verifies.
  *
  * Insertable-into-the-G-Set ⟺ ants_crdt_verify(...) == ANTS_OK.
  */
