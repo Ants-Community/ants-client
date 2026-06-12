@@ -48,13 +48,15 @@
  *   - ants_reputation_compute_checked: the L1 slash gate (§"How tenure
  *     interacts with Layer 1"), via a caller-supplied slash predicate;
  *   - the receipt-bag Merkle commitment + inclusion proofs for selective
- *     disclosure (§"Selective disclosure of receipts").
+ *     disclosure (§"Selective disclosure of receipts"), the A ≥ b proof
+ *     (prover-side subset selection + verifier-side bound recompute), and
+ *     the signed compact summary with its per-bucket audit check
+ *     (§"Compact summaries for large peers").
  *
- * Deliberately NOT here (later work): the selective-disclosure A ≥ b subset
- * recompute + compact summaries (layered on the Merkle primitives below);
- * and wiring the slash predicate / bond admission into the live L1 G-Set +
- * L2 chain at the real high-stakes-act call sites. (Bond accounting itself
- * is Component #15, economy/bond.)
+ * Deliberately NOT here (later work): wiring the slash predicate / bond
+ * admission into the live L1 G-Set + L2 chain at the real high-stakes-act
+ * call sites — daemon-side composition, with the other interactive pieces.
+ * (Bond accounting itself is Component #15, economy/bond.)
  *
  * STATUS OF THE NUMERIC CONSTANTS. The decay ratios, κ, and bin width are
  * **DRAFT placeholders, NOT calibrated** — RFC-0004 §835 makes δ and κ
@@ -66,9 +68,9 @@
  * values fixed by b2 before peers compute interoperable T.
  *
  * No floats, no malloc, no threads, no hidden global state; caller-owned
- * arrays throughout. Spec: RFC-0004 v0.6; RFC-0008 v0.5 §1.1 (canonical
- * CBOR) + §6 (NCS as u64 μ-NCS). Component README:
- * ants-client/reputation/identity/README.md.
+ * arrays throughout. Spec: RFC-0004 v0.7; RFC-0008 v0.7 §1.1 (canonical
+ * CBOR) + §6 (NCS as u64 μ-NCS) + §11.9 (receipt body, bag, compact
+ * summary). Component README: ants-client/reputation/identity/README.md.
  */
 
 #ifndef ANTS_REPUTATION_H
@@ -628,6 +630,232 @@ ants_error_t ants_reputation_bag_verify_bound(const ants_reputation_bag_opening_
                                               const ants_reputation_params_t *params,
                                               uint64_t b,
                                               bool *out_ok);
+
+/* ------------------------------------------------------------------------ */
+/* Compact summaries (RFC-0004 §"Compact summaries for large peers";        */
+/* RFC-0008 v0.7 §11.9)                                                     */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A peer with a large bag may publish a COMPACT SUMMARY to cut
+ * per-bond-admission verification cost: a list of
+ * (bucket_index, total_decayed_value) pairs, signed by the peer, binding
+ * the SAME bag_root its receipts are committed under. RFC-0004's
+ * "committed via the same Merkle root" is realised by INCLUDING bag_root
+ * in the signed body — a summary leaf inside the tree would make the root
+ * self-referential.
+ *
+ * The summary is a HINT, not a security primitive: no A/T computation
+ * consumes it. A verifier may challenge any stated bucket at random; the
+ * peer substantiates it by selective disclosure of that bucket's receipts
+ * (ants_reputation_summary_audit_bucket below). A peer whose signed
+ * summary states a bucket it cannot substantiate has equivocated against
+ * its own signature — an attributable fault (RFC-0004 §"Compact summaries
+ * for large peers"; packaging a failed audit as an L1 fault proof is
+ * wire/daemon work, with the other interactive pieces).
+ *
+ * Bucket totals are decayed values AT THE SUMMARY'S OWN eval_time, by the
+ * same per-receipt recipe as ants_reputation_compute's A pass, and audits
+ * recompute at that SAME eval_time, so the comparison is bit-exact. The
+ * summary deliberately does NOT support re-decaying its totals to a later
+ * time: the q32 decay is a pinned repeated multiplication and is NOT
+ * associative — factor(a+b) != fp_mul(factor(a), factor(b)) in general —
+ * so a re-decayed total would drift from a fresh recompute by rounding,
+ * and bit-exact-or-reject is the only contract this codebase deals in. A
+ * consumer that wants fresher numbers asks the peer for a fresher summary.
+ *
+ * CANONICAL FORM of the bucket list: strictly ascending bucket_index (no
+ * duplicates), no zero totals (an empty bucket is OMITTED), bucket_width_s
+ * > 0 — exactly one encoding per content, the same discipline as the bag's
+ * canonical leaf order. Bucket granularity is a calibratable parameter
+ * (RFC-0004 §"What we have not figured out yet"); the default below is a
+ * DRAFT placeholder like the decay ratios.
+ */
+
+/* Hard cap on buckets per summary: bounds the encoding and the verifier's
+ * work. The producer picks bucket_width_s coarse enough that its bag spans
+ * at most this many buckets (256 day-wide buckets ≈ 8.5 months). */
+#define ANTS_REP_SUMMARY_MAX_BUCKETS 256u
+
+/* DRAFT placeholder bucket width: 1 day. Calibratable (b2-class). */
+#define ANTS_REP_SUMMARY_BUCKET_WIDTH_S 86400u
+
+/* Worst-case canonical encodings. Body = map(5) holding two 32-byte
+ * strings, two u64s, and a <= 256-element array of [u64, u64] pairs
+ * (<= 4959 bytes); the full object re-keys the body as map(6) and adds the
+ * 64-byte signature (<= 5026 bytes). */
+#define ANTS_REP_SUMMARY_BODY_ENCODED_MAX 5120u
+#define ANTS_REP_SUMMARY_ENCODED_MAX      5248u
+
+/* One summary bucket: the receipts whose timestamp_unix_s / bucket_width_s
+ * equals bucket_index, their A contributions at eval_time summed
+ * (saturating at UINT64_MAX, as everywhere in this module). */
+typedef struct {
+    uint64_t bucket_index;       /* timestamp_unix_s / bucket_width_s      */
+    uint64_t total_decayed_uncs; /* Σ decayed A contributions at eval_time */
+} ants_reputation_summary_bucket_t;
+
+/*
+ * A signed compact summary. `buckets` points at caller-owned memory of
+ * n_buckets entries that must outlive the struct's use (the same
+ * convention as ants_reputation_bag_opening_t.path). `sig` is the peer's
+ * Ed25519 signature over the canonical body encoding
+ * (ants_reputation_summary_body_encode) — single-signed: the summary is
+ * the peer's own statement about its own bag; there is no counterparty.
+ */
+typedef struct {
+    uint8_t peer_id[ANTS_REP_PEER_ID_SIZE];          /* whose bag (== signer pubkey) */
+    uint8_t bag_root[ANTS_REP_HASH_SIZE];            /* the bag commitment it binds  */
+    uint64_t eval_time_unix_s;                       /* decay evaluation time        */
+    uint64_t bucket_width_s;                         /* bucket granularity, > 0      */
+    const ants_reputation_summary_bucket_t *buckets; /* caller-owned        */
+    size_t n_buckets;                                /* <= ANTS_REP_SUMMARY_MAX_BUCKETS      */
+    uint8_t sig[ANTS_REP_SIG_SIZE];                  /* peer over the canonical body         */
+} ants_reputation_summary_t;
+
+/*
+ * Producer side: bucket a receipt bag at `eval_time_unix_s`. One forward
+ * pass over the canonically-ordered bag (timestamp ASC means bucket
+ * indices arrive non-decreasing); a receipt contributes iff it is
+ * A-eligible — both signatures valid, server == peer_id, timestamp <=
+ * eval_time — exactly ants_reputation_compute's filter, so an honest
+ * summary is substantiable receipt-for-receipt under audit. Buckets whose
+ * eligible contributions sum to zero are OMITTED (canonical form).
+ *
+ * The caller assembles the struct around the result (peer_id, the
+ * bag_root from ants_reputation_bag_root over the SAME bag, eval time,
+ * width, these buckets), then signs the body encoding.
+ *
+ * @return ANTS_OK with out_buckets[0..*out_n_buckets) filled (ascending);
+ *         ANTS_ERROR_INVALID_ARG on NULL (receipts may be NULL only when
+ *         n == 0; out_buckets only when buckets_cap == 0), n over
+ *         ANTS_REP_MAX_RECEIPTS, bucket_width_s == 0, or a degenerate
+ *         param; ANTS_ERROR_NON_CANONICAL if the bag is out of canonical
+ *         order; ANTS_ERROR_BUFFER_TOO_SMALL if the bag spans more
+ *         non-empty buckets than buckets_cap (or than the
+ *         ANTS_REP_SUMMARY_MAX_BUCKETS protocol cap — pick a coarser
+ *         bucket_width_s).
+ */
+ants_error_t ants_reputation_summary_build(const ants_reputation_receipt_t *receipts,
+                                           size_t n,
+                                           const uint8_t peer_id[ANTS_REP_PEER_ID_SIZE],
+                                           uint64_t eval_time_unix_s,
+                                           uint64_t bucket_width_s,
+                                           const ants_reputation_params_t *params,
+                                           ants_reputation_summary_bucket_t *out_buckets,
+                                           size_t buckets_cap,
+                                           size_t *out_n_buckets);
+
+/*
+ * Encode the summary BODY — the exact bytes the signature covers — as
+ * canonical CBOR (RFC-0008 §1.1): a definite-length map of 5 integer-keyed
+ * pairs in ascending key order,
+ *   1: peer_id (bytes 32)   2: bag_root (bytes 32)
+ *   3: eval_time (uint)     4: bucket_width (uint)
+ *   5: buckets (array of [bucket_index (uint), total (uint)] pairs).
+ * Float-free by construction.
+ *
+ * @return ANTS_OK with *out_len set; ANTS_ERROR_INVALID_ARG on NULL (or
+ *         NULL buckets with n_buckets != 0); ANTS_ERROR_NON_CANONICAL if
+ *         the bucket list violates the canonical form above;
+ *         ANTS_ERROR_BUFFER_TOO_SMALL if cap is insufficient.
+ */
+ants_error_t ants_reputation_summary_body_encode(const ants_reputation_summary_t *s,
+                                                 uint8_t *buf,
+                                                 size_t cap,
+                                                 size_t *out_len);
+
+/*
+ * Encode the FULL summary for the wire: the body's five pairs re-keyed
+ * into a map(6) plus  6: sig (bytes 64).  Same errors as the body encode.
+ */
+ants_error_t ants_reputation_summary_encode(const ants_reputation_summary_t *s,
+                                            uint8_t *buf,
+                                            size_t cap,
+                                            size_t *out_len);
+
+/*
+ * Strict decode of a full summary. Enforces the exact map(6) shape, key
+ * order, field types and widths, the bucket-list canonical form, and that
+ * the input is a single well-formed canonical CBOR item with no trailing
+ * bytes. On success out->buckets points at out_buckets (caller-owned).
+ * On any error *out is unspecified.
+ *
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL/empty input (out_buckets
+ *         may be NULL only when buckets_cap == 0);
+ *         ANTS_ERROR_BUFFER_TOO_SMALL if the summary holds more buckets
+ *         than buckets_cap; ANTS_ERROR_NON_CANONICAL for non-canonical
+ *         CBOR or a bucket-list canonical-form violation (out-of-order /
+ *         duplicate / zero-total buckets); ANTS_ERROR_MALFORMED for any
+ *         other structural violation (wrong map size, wrong key, wrong
+ *         type or width, zero bucket_width, over-cap bucket count,
+ *         truncation, trailing bytes).
+ */
+ants_error_t ants_reputation_summary_decode(const uint8_t *buf,
+                                            size_t len,
+                                            ants_reputation_summary_t *out,
+                                            ants_reputation_summary_bucket_t *out_buckets,
+                                            size_t buckets_cap);
+
+/*
+ * Verify a summary's signature: peer_id's Ed25519 signature over the
+ * canonical body encoding. A summary that is not in canonical form, or
+ * whose signature does not validate, is a *false verdict* (*out_ok =
+ * false, return ANTS_OK), not an error — summaries are untrusted input.
+ *
+ * This checks the SIGNATURE only. It deliberately does not (cannot)
+ * check the stated totals — that is the audit below — nor that bag_root
+ * matches any particular bag.
+ *
+ * @return ANTS_OK with *out_ok set; ANTS_ERROR_INVALID_ARG on NULL (or
+ *         NULL buckets with n_buckets != 0).
+ */
+ants_error_t ants_reputation_summary_verify(const ants_reputation_summary_t *s, bool *out_ok);
+
+/*
+ * The random-audit check (RFC-0004 §"Compact summaries for large peers":
+ * "the verifier may still require selective disclosure of individual
+ * receipts to confirm specific buckets at random"). The verifier names a
+ * bucket the summary STATES; the peer answers with openings (revealed
+ * receipts + inclusion proofs, as for ants_reputation_bag_verify_bound)
+ * from that bucket; this confirms the stated total is substantiated.
+ *
+ * Accepts (*out_ok = true) iff every opening
+ *   - is a receipt with both signatures valid,
+ *   - credits this peer (receipt.server == s->peer_id),
+ *   - is not dated after the summary's eval_time,
+ *   - falls in the audited bucket (timestamp / bucket_width == bucket_index),
+ *   - sits at a DISTINCT canonical index (no double-counting), and
+ *   - has a valid Merkle inclusion proof against s->bag_root;
+ * AND the openings' A contributions AT s->eval_time_unix_s (the bit-exact
+ * recompute — see the section comment) sum to >= the stated total.
+ * Revealing more than the stated total is fine (the summary understated —
+ * the safe direction); failing to reach it is a failed audit. Any failed
+ * opening, or a sum below the stated total, is a *false verdict* (*out_ok
+ * = false, return ANTS_OK) — openings are untrusted input.
+ *
+ * Does NOT verify s->sig (call ants_reputation_summary_verify first) and
+ * does not bound n_bag against the true bag size — both exactly as for
+ * ants_reputation_bag_verify_bound.
+ *
+ * @param bucket_index  the audited bucket. It MUST be one the summary
+ *                      states: auditing an absent bucket is
+ *                      ANTS_ERROR_INVALID_ARG (an omitted bucket claims
+ *                      nothing, so there is nothing to substantiate).
+ * @param n_bag         the bag leaf count the openings' proofs are against.
+ * @return ANTS_OK with *out_ok set; ANTS_ERROR_INVALID_ARG on NULL args
+ *         (openings with k != 0, buckets with n_buckets != 0), k or n_bag
+ *         over ANTS_REP_MAX_RECEIPTS, n_buckets over
+ *         ANTS_REP_SUMMARY_MAX_BUCKETS, zero s->bucket_width_s, a
+ *         degenerate param, or an absent bucket_index.
+ */
+ants_error_t ants_reputation_summary_audit_bucket(const ants_reputation_summary_t *s,
+                                                  uint64_t bucket_index,
+                                                  const ants_reputation_bag_opening_t *openings,
+                                                  size_t k,
+                                                  size_t n_bag,
+                                                  const ants_reputation_params_t *params,
+                                                  bool *out_ok);
 
 #ifdef __cplusplus
 }

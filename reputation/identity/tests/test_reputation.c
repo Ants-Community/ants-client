@@ -1111,6 +1111,555 @@ static void test_bag_bound_args(void)
              ANTS_ERROR_INVALID_ARG);
 }
 
+/* ---- compact summaries ---------------------------------------------- */
+
+/* Params used by every summary test: ratio_A = 0.5 per 3600 s bin, so the
+ * expected bucket totals are exact hand-computed shifts (an independent
+ * closed form, not a re-run of the implementation): a receipt aged k whole
+ * bins contributes ncs >> k, and ncs unchanged at age 0. */
+static ants_reputation_params_t summary_params(void)
+{
+    ants_reputation_params_t p;
+    CHECK_EQ(ants_reputation_params_default(&p), ANTS_OK);
+    p.decay_ratio_a_q32 = ANTS_REP_FP_ONE >> 1;
+    p.bin_width_s = 3600;
+    return p;
+}
+
+/* Bucket the bag, then assemble + sign the summary the way a producer
+ * would: bag_root over the SAME bag, body encoded, peer signs. */
+static ants_reputation_summary_t make_summary(const ants_reputation_receipt_t *bag,
+                                              size_t n,
+                                              const uint8_t s_priv[32],
+                                              const uint8_t s_pub[32],
+                                              uint64_t eval,
+                                              uint64_t width,
+                                              const ants_reputation_params_t *p,
+                                              ants_reputation_summary_bucket_t *buckets,
+                                              size_t buckets_cap)
+{
+    ants_reputation_summary_t s;
+    uint8_t body[ANTS_REP_SUMMARY_BODY_ENCODED_MAX];
+    size_t body_len = 0;
+    size_t n_buckets = 0;
+
+    memset(&s, 0, sizeof s);
+    CHECK_EQ(ants_reputation_summary_build(
+                 bag, n, s_pub, eval, width, p, buckets, buckets_cap, &n_buckets),
+             ANTS_OK);
+    memcpy(s.peer_id, s_pub, 32);
+    CHECK_EQ(ants_reputation_bag_root(bag, n, s_pub, s.bag_root), ANTS_OK);
+    s.eval_time_unix_s = eval;
+    s.bucket_width_s = width;
+    s.buckets = buckets;
+    s.n_buckets = n_buckets;
+    CHECK_EQ(ants_reputation_summary_body_encode(&s, body, sizeof body, &body_len), ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(s_priv, body, body_len, s.sig), ANTS_OK);
+    return s;
+}
+
+static void test_summary_build_buckets(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32], x_priv[32], x_pub[32];
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_receipt_t bag[6];
+    ants_reputation_summary_bucket_t buckets[8];
+    size_t n_buckets = 0;
+
+    make_key(1, s_priv, s_pub);
+    make_key(2, c_priv, c_pub);
+    make_key(3, x_priv, x_pub);
+
+    /* ts ASC: two creditable receipts in bucket 0 (width 86400), one with
+     * a broken signature, one crediting another server, one in bucket 1,
+     * one future-dated at eval (its bucket would also be 1). */
+    bag[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 0, 10);
+    bag[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 600, 11);
+    bag[2] = make_receipt(s_priv, s_pub, c_priv, c_pub, 5000, 700, 12);
+    bag[2].server_sig[0] ^= 0x01; /* invalid → skipped */
+    bag[3] = make_receipt(x_priv, x_pub, c_priv, c_pub, 7000, 800, 13);
+    bag[4] = make_receipt(s_priv, s_pub, c_priv, c_pub, 12345, 86400, 14);
+    bag[5] = make_receipt(s_priv, s_pub, c_priv, c_pub, 999, 100000, 15);
+
+    CHECK_EQ(ants_reputation_summary_build(bag, 6, s_pub, 86400, 86400, &p, buckets, 8, &n_buckets),
+             ANTS_OK);
+    /* Independent expectation: bucket 0 holds bag[0] aged 86400/3600 = 24
+     * bins → 2^30 >> 24 = 64, and bag[1] aged 85800/3600 = 23 bins →
+     * 2^30 >> 23 = 128; total 192. Bucket 1 holds bag[4] at age 0 → 12345.
+     * bag[2] (bad sig), bag[3] (other server), bag[5] (future) are out. */
+    CHECK(n_buckets == 2);
+    CHECK(buckets[0].bucket_index == 0 && buckets[0].total_decayed_uncs == 192);
+    CHECK(buckets[1].bucket_index == 1 && buckets[1].total_decayed_uncs == 12345);
+
+    /* At eval 3·86400 every creditable receipt has aged >= 44 bins, far
+     * past the 0.5^k q32 underflow at k = 33 → every contribution is 0 →
+     * every bucket is OMITTED: the empty summary. */
+    CHECK_EQ(
+        ants_reputation_summary_build(bag, 6, s_pub, 3 * 86400, 86400, &p, buckets, 8, &n_buckets),
+        ANTS_OK);
+    CHECK(n_buckets == 0);
+
+    /* Two non-empty buckets do not fit in a 1-slot output. */
+    CHECK_EQ(ants_reputation_summary_build(bag, 6, s_pub, 86400, 86400, &p, buckets, 1, &n_buckets),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+static void test_summary_build_args(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32];
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_params_t badp;
+    ants_reputation_receipt_t bag[2];
+    ants_reputation_receipt_t swapped[2];
+    ants_reputation_summary_bucket_t buckets[4];
+    size_t n_buckets = 77;
+
+    make_key(1, s_priv, s_pub);
+    make_key(2, c_priv, c_pub);
+    bag[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, 10, 1000, 20);
+    bag[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, 10, 2000, 21);
+
+    CHECK_EQ(ants_reputation_summary_build(NULL, 2, s_pub, 5000, 86400, &p, buckets, 4, &n_buckets),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_build(bag, 2, NULL, 5000, 86400, &p, buckets, 4, &n_buckets),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_build(bag, 2, s_pub, 5000, 0, &p, buckets, 4, &n_buckets),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_reputation_summary_build(bag, 2, s_pub, 5000, 86400, NULL, buckets, 4, &n_buckets),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_build(bag, 2, s_pub, 5000, 86400, &p, NULL, 4, &n_buckets),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_build(bag, 2, s_pub, 5000, 86400, &p, buckets, 4, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.bin_width_s = 0;
+    CHECK_EQ(
+        ants_reputation_summary_build(bag, 2, s_pub, 5000, 86400, &badp, buckets, 4, &n_buckets),
+        ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.decay_ratio_a_q32 = 0;
+    CHECK_EQ(
+        ants_reputation_summary_build(bag, 2, s_pub, 5000, 86400, &badp, buckets, 4, &n_buckets),
+        ANTS_ERROR_INVALID_ARG);
+
+    /* n == 0 → the empty summary; NULL receipts and a NULL 0-cap output
+     * buffer are both fine there. */
+    CHECK_EQ(ants_reputation_summary_build(NULL, 0, s_pub, 5000, 86400, &p, buckets, 4, &n_buckets),
+             ANTS_OK);
+    CHECK(n_buckets == 0);
+    CHECK_EQ(ants_reputation_summary_build(NULL, 0, s_pub, 5000, 86400, &p, NULL, 0, &n_buckets),
+             ANTS_OK);
+
+    /* Out-of-order bag → NON_CANONICAL. */
+    swapped[0] = bag[1];
+    swapped[1] = bag[0];
+    CHECK_EQ(
+        ants_reputation_summary_build(swapped, 2, s_pub, 5000, 86400, &p, buckets, 4, &n_buckets),
+        ANTS_ERROR_NON_CANONICAL);
+}
+
+static void test_summary_codec_round_trip(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32];
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_receipt_t bag[3];
+    ants_reputation_summary_bucket_t buckets[4];
+    ants_reputation_summary_t s;
+    ants_reputation_summary_t back;
+    ants_reputation_summary_bucket_t back_buckets[4];
+    uint8_t body1[ANTS_REP_SUMMARY_BODY_ENCODED_MAX];
+    uint8_t body2[ANTS_REP_SUMMARY_BODY_ENCODED_MAX];
+    uint8_t full[ANTS_REP_SUMMARY_ENCODED_MAX];
+    size_t len1 = 0, len2 = 0, full_len = 0;
+    size_t i;
+    bool ok = false;
+
+    make_key(1, s_priv, s_pub);
+    make_key(2, c_priv, c_pub);
+    bag[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 0, 30);
+    bag[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 600, 31);
+    bag[2] = make_receipt(s_priv, s_pub, c_priv, c_pub, 12345, 86400, 32);
+    s = make_summary(bag, 3, s_priv, s_pub, 86400, 86400, &p, buckets, 4);
+    CHECK(s.n_buckets == 2);
+
+    /* Deterministic body; both encodings are canonical CBOR. */
+    CHECK_EQ(ants_reputation_summary_body_encode(&s, body1, sizeof body1, &len1), ANTS_OK);
+    CHECK_EQ(ants_reputation_summary_body_encode(&s, body2, sizeof body2, &len2), ANTS_OK);
+    CHECK(len1 == len2 && memcmp(body1, body2, len1) == 0);
+    CHECK_EQ(ants_cbor_is_canonical(body1, len1), ANTS_OK);
+    CHECK_EQ(ants_reputation_summary_encode(&s, full, sizeof full, &full_len), ANTS_OK);
+    CHECK_EQ(ants_cbor_is_canonical(full, full_len), ANTS_OK);
+
+    /* Round-trip every field. */
+    memset(&back, 0, sizeof back);
+    CHECK_EQ(ants_reputation_summary_decode(full, full_len, &back, back_buckets, 4), ANTS_OK);
+    CHECK(memcmp(back.peer_id, s.peer_id, 32) == 0);
+    CHECK(memcmp(back.bag_root, s.bag_root, 32) == 0);
+    CHECK(back.eval_time_unix_s == s.eval_time_unix_s);
+    CHECK(back.bucket_width_s == s.bucket_width_s);
+    CHECK(back.n_buckets == s.n_buckets);
+    CHECK(back.buckets == back_buckets);
+    for (i = 0; i < s.n_buckets; i++) {
+        CHECK(back_buckets[i].bucket_index == buckets[i].bucket_index);
+        CHECK(back_buckets[i].total_decayed_uncs == buckets[i].total_decayed_uncs);
+    }
+    CHECK(memcmp(back.sig, s.sig, 64) == 0);
+
+    /* The decoded summary verifies against the peer's key. */
+    CHECK_EQ(ants_reputation_summary_verify(&back, &ok), ANTS_OK);
+    CHECK(ok);
+
+    /* An undersized encode buffer is BUFFER_TOO_SMALL. */
+    CHECK_EQ(ants_reputation_summary_encode(&s, full, 10, &full_len), ANTS_ERROR_BUFFER_TOO_SMALL);
+}
+
+static void test_summary_codec_rejects(void)
+{
+    uint8_t s_priv[32], s_pub[32];
+    ants_reputation_summary_bucket_t bks[2];
+    ants_reputation_summary_bucket_t bad_bks[2];
+    ants_reputation_summary_t s;
+    ants_reputation_summary_t bad;
+    ants_reputation_summary_t back;
+    ants_reputation_summary_bucket_t back_bks[4];
+    uint8_t full[ANTS_REP_SUMMARY_ENCODED_MAX];
+    uint8_t tmp[ANTS_REP_SUMMARY_ENCODED_MAX + 1];
+    size_t full_len = 0;
+    size_t out_len = 0;
+    size_t i;
+
+    /* A small fixed summary whose every encoded value fits a single CBOR
+     * byte, so the byte-patch offsets below are stable; the layout is
+     * pinned by the full_len check. The signature is garbage on purpose —
+     * the codec neither computes nor checks it. */
+    make_key(1, s_priv, s_pub);
+    memset(&s, 0, sizeof s);
+    memcpy(s.peer_id, s_pub, 32);
+    CHECK_EQ(ants_reputation_bag_root(NULL, 0, s_pub, s.bag_root), ANTS_OK);
+    s.eval_time_unix_s = 5;
+    s.bucket_width_s = 9;
+    bks[0].bucket_index = 3;
+    bks[0].total_decayed_uncs = 7;
+    bks[1].bucket_index = 8;
+    bks[1].total_decayed_uncs = 9;
+    s.buckets = bks;
+    s.n_buckets = 2;
+    memset(s.sig, 0xAB, sizeof s.sig);
+
+    CHECK_EQ(ants_reputation_summary_encode(&s, full, sizeof full, &full_len), ANTS_OK);
+    CHECK(full_len == 150);
+
+    /* The encoder rejects non-canonical bucket lists outright. */
+    bad = s;
+    bad_bks[0] = bks[1];
+    bad_bks[1] = bks[0]; /* descending */
+    bad.buckets = bad_bks;
+    CHECK_EQ(ants_reputation_summary_encode(&bad, tmp, sizeof tmp, &out_len),
+             ANTS_ERROR_NON_CANONICAL);
+    bad_bks[0] = bks[0];
+    bad_bks[1] = bks[0]; /* duplicate index */
+    CHECK_EQ(ants_reputation_summary_encode(&bad, tmp, sizeof tmp, &out_len),
+             ANTS_ERROR_NON_CANONICAL);
+    bad_bks[1] = bks[1];
+    bad_bks[1].total_decayed_uncs = 0; /* zero total */
+    CHECK_EQ(ants_reputation_summary_encode(&bad, tmp, sizeof tmp, &out_len),
+             ANTS_ERROR_NON_CANONICAL);
+    bad = s;
+    bad.bucket_width_s = 0;
+    CHECK_EQ(ants_reputation_summary_body_encode(&bad, tmp, sizeof tmp, &out_len),
+             ANTS_ERROR_NON_CANONICAL);
+
+    /* Every strict prefix fails to decode; so does a trailing byte. */
+    for (i = 1; i < full_len; i++) {
+        memcpy(tmp, full, i);
+        CHECK(ants_reputation_summary_decode(tmp, i, &back, back_bks, 4) != ANTS_OK);
+    }
+    memcpy(tmp, full, full_len);
+    tmp[full_len] = 0x00;
+    CHECK(ants_reputation_summary_decode(tmp, full_len + 1, &back, back_bks, 4) != ANTS_OK);
+
+    /* Wrong pair count: map(6) → map(5). */
+    memcpy(tmp, full, full_len);
+    tmp[0] = 0xa5;
+    CHECK_EQ(ants_reputation_summary_decode(tmp, full_len, &back, back_bks, 4),
+             ANTS_ERROR_MALFORMED);
+
+    /* Zero bucket width. */
+    memcpy(tmp, full, full_len);
+    CHECK(tmp[74] == 0x09);
+    tmp[74] = 0x00;
+    CHECK_EQ(ants_reputation_summary_decode(tmp, full_len, &back, back_bks, 4),
+             ANTS_ERROR_MALFORMED);
+
+    /* Descending, then duplicate, second bucket index. */
+    memcpy(tmp, full, full_len);
+    CHECK(tmp[81] == 0x08);
+    tmp[81] = 0x02;
+    CHECK_EQ(ants_reputation_summary_decode(tmp, full_len, &back, back_bks, 4),
+             ANTS_ERROR_NON_CANONICAL);
+    tmp[81] = 0x03;
+    CHECK_EQ(ants_reputation_summary_decode(tmp, full_len, &back, back_bks, 4),
+             ANTS_ERROR_NON_CANONICAL);
+
+    /* Zero total in the second bucket. */
+    memcpy(tmp, full, full_len);
+    CHECK(tmp[82] == 0x09);
+    tmp[82] = 0x00;
+    CHECK_EQ(ants_reputation_summary_decode(tmp, full_len, &back, back_bks, 4),
+             ANTS_ERROR_NON_CANONICAL);
+
+    /* The good encoding needs 2 bucket slots. */
+    CHECK_EQ(ants_reputation_summary_decode(full, full_len, &back, back_bks, 1),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+
+    /* NULL / empty argument guards. */
+    CHECK_EQ(ants_reputation_summary_decode(NULL, full_len, &back, back_bks, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_decode(full, 0, &back, back_bks, 4), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_decode(full, full_len, NULL, back_bks, 4),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_decode(full, full_len, &back, NULL, 4),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_summary_verify_negatives(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32], x_priv[32], x_pub[32];
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_receipt_t bag[3];
+    ants_reputation_summary_bucket_t buckets[4];
+    ants_reputation_summary_bucket_t tb[4];
+    ants_reputation_summary_t s;
+    ants_reputation_summary_t t;
+    bool ok = true;
+
+    make_key(1, s_priv, s_pub);
+    make_key(2, c_priv, c_pub);
+    make_key(3, x_priv, x_pub);
+    bag[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 0, 35);
+    bag[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 600, 36);
+    bag[2] = make_receipt(s_priv, s_pub, c_priv, c_pub, 12345, 86400, 37);
+    s = make_summary(bag, 3, s_priv, s_pub, 86400, 86400, &p, buckets, 4);
+    CHECK(s.n_buckets == 2);
+    CHECK_EQ(ants_reputation_summary_verify(&s, &ok), ANTS_OK);
+    CHECK(ok);
+
+    /* A tampered bucket total breaks the signature. */
+    t = s;
+    memcpy(tb, buckets, sizeof tb);
+    tb[0].total_decayed_uncs += 1;
+    t.buckets = tb;
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* A tampered bag_root breaks the signature. */
+    t = s;
+    t.bag_root[0] ^= 0x01;
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Another identity cannot claim the summary (peer_id is the verify
+     * key, and it is inside the signed body). */
+    t = s;
+    memcpy(t.peer_id, x_pub, 32);
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Non-canonical structs are false verdicts, not errors. */
+    t = s;
+    tb[0] = buckets[1];
+    tb[1] = buckets[0]; /* descending */
+    t.buckets = tb;
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+    tb[0] = buckets[0];
+    tb[1] = buckets[1];
+    tb[1].total_decayed_uncs = 0; /* zero total */
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+    t = s;
+    t.bucket_width_s = 0;
+    CHECK_EQ(ants_reputation_summary_verify(&t, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* NULL guards. */
+    CHECK_EQ(ants_reputation_summary_verify(NULL, &ok), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_verify(&s, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_summary_audit_bucket(void)
+{
+    uint8_t s_priv[32], s_pub[32], c_priv[32], c_pub[32], x_priv[32], x_pub[32];
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_receipt_t bag[4];
+    ants_reputation_summary_bucket_t buckets[4];
+    ants_reputation_summary_bucket_t lb[4];
+    ants_reputation_summary_t s;
+    ants_reputation_summary_t low;
+    uint8_t paths[3][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t plens[3];
+    ants_reputation_bag_opening_t ops[3];
+    uint8_t bent_path[ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+    size_t idx2[2];
+    bool ok = false;
+
+    make_key(1, s_priv, s_pub);
+    make_key(2, c_priv, c_pub);
+    make_key(3, x_priv, x_pub);
+
+    /* Bucket 0 (width 86400): bag[0] → 64 and bag[1] → 128 at eval 86400;
+     * bag[2] credits ANOTHER server (committed in the tree, not
+     * creditable); bucket 1: bag[3] → 12345 at age 0. */
+    bag[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 0, 40);
+    bag[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, (uint64_t)1 << 30, 600, 41);
+    bag[2] = make_receipt(x_priv, x_pub, c_priv, c_pub, 7777, 800, 42);
+    bag[3] = make_receipt(s_priv, s_pub, c_priv, c_pub, 12345, 86400, 43);
+
+    s = make_summary(bag, 4, s_priv, s_pub, 86400, 86400, &p, buckets, 4);
+    CHECK(s.n_buckets == 2);
+    CHECK(buckets[0].bucket_index == 0 && buckets[0].total_decayed_uncs == 192);
+    CHECK(buckets[1].bucket_index == 1 && buckets[1].total_decayed_uncs == 12345);
+    CHECK_EQ(ants_reputation_summary_verify(&s, &ok), ANTS_OK);
+    CHECK(ok);
+
+    /* Honest audit of bucket 0: both creditable receipts, real proofs. */
+    idx2[0] = 0;
+    idx2[1] = 1;
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(ok);
+
+    /* One receipt withheld: 64 < 192 → failed audit. */
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 1, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* An opening from the WRONG bucket rejects the whole audit. */
+    idx2[1] = 3; /* bag[3] lives in bucket 1 */
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* A wrong-server opening rejects, even though it IS in the tree. */
+    idx2[1] = 2; /* bag[2]: other server, bucket 0 */
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* A duplicated index rejects (no double-counting). */
+    idx2[1] = 1;
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    ops[1] = ops[0];
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* A corrupted inclusion path rejects. */
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    memcpy(bent_path, ops[1].path, ops[1].path_len);
+    bent_path[0] ^= 0x01;
+    ops[1].path = bent_path;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* An UNDERSTATED bucket passes (>= is the safe direction); an
+     * OVERSTATED one cannot be substantiated. The audit does not check the
+     * signature (summary_verify does), so the locally edited copies stand
+     * in for what a lying peer would have signed. */
+    bag_build_openings(bag, 4, idx2, 2, ops, paths, plens);
+    low = s;
+    memcpy(lb, buckets, sizeof lb);
+    lb[0].total_decayed_uncs = 100;
+    low.buckets = lb;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&low, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(ok);
+    lb[0].total_decayed_uncs = 193;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&low, 0, ops, 2, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+
+    /* Auditing a bucket the summary does not state is a caller error. */
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 7, ops, 2, 4, &p, &ok),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* A future-dated opening rejects: it shares the audited bucket but
+     * postdates eval_time, so build never counted it. */
+    {
+        ants_reputation_receipt_t bag2[2];
+        ants_reputation_summary_bucket_t b2[2];
+        ants_reputation_summary_t s2;
+        uint8_t paths2[2][ANTS_REP_BAG_MERKLE_MAX_DEPTH * 32];
+        size_t plens2[2];
+        ants_reputation_bag_opening_t o2[2];
+        size_t idxb[2];
+
+        bag2[0] = make_receipt(s_priv, s_pub, c_priv, c_pub, 12345, 86400, 50);
+        bag2[1] = make_receipt(s_priv, s_pub, c_priv, c_pub, 999, 100000, 51);
+        s2 = make_summary(bag2, 2, s_priv, s_pub, 86400, 86400, &p, b2, 2);
+        CHECK(s2.n_buckets == 1);
+        CHECK(b2[0].bucket_index == 1 && b2[0].total_decayed_uncs == 12345);
+
+        idxb[0] = 0;
+        idxb[1] = 1;
+        bag_build_openings(bag2, 2, idxb, 2, o2, paths2, plens2);
+        CHECK_EQ(ants_reputation_summary_audit_bucket(&s2, 1, o2, 1, 2, &p, &ok), ANTS_OK);
+        CHECK(ok);
+        CHECK_EQ(ants_reputation_summary_audit_bucket(&s2, 1, o2, 2, 2, &p, &ok), ANTS_OK);
+        CHECK(!ok);
+    }
+}
+
+static void test_summary_audit_args(void)
+{
+    ants_reputation_params_t p = summary_params();
+    ants_reputation_params_t badp;
+    ants_reputation_summary_bucket_t bks[1];
+    ants_reputation_summary_t s;
+    ants_reputation_summary_t bad;
+    ants_reputation_bag_opening_t ops[1];
+    bool ok = true;
+
+    /* A minimal stated summary; the audit never touches the signature. */
+    memset(&s, 0, sizeof s);
+    s.eval_time_unix_s = 5000;
+    s.bucket_width_s = 9;
+    bks[0].bucket_index = 0;
+    bks[0].total_decayed_uncs = 5;
+    s.buckets = bks;
+    s.n_buckets = 1;
+    memset(ops, 0, sizeof ops);
+
+    CHECK_EQ(ants_reputation_summary_audit_bucket(NULL, 0, NULL, 0, 0, &p, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, NULL, 1, 4, &p, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 1, 4, NULL, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 1, 4, &p, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_reputation_summary_audit_bucket(&s, 0, ops, ANTS_REP_MAX_RECEIPTS + 1, 4, &p, &ok),
+        ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(
+        ants_reputation_summary_audit_bucket(&s, 0, ops, 1, ANTS_REP_MAX_RECEIPTS + 1, &p, &ok),
+        ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.bin_width_s = 0;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 1, 4, &badp, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    badp = p;
+    badp.decay_ratio_a_q32 = 0;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, ops, 1, 4, &badp, &ok),
+             ANTS_ERROR_INVALID_ARG);
+    bad = s;
+    bad.bucket_width_s = 0;
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&bad, 0, ops, 1, 4, &p, &ok),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* k == 0 is a legal (vacuous) answer: nothing substantiated, so a
+     * stated nonzero bucket fails its audit. */
+    CHECK_EQ(ants_reputation_summary_audit_bucket(&s, 0, NULL, 0, 4, &p, &ok), ANTS_OK);
+    CHECK(!ok);
+}
+
 int main(void)
 {
     test_fp_mul_identities();
@@ -1138,6 +1687,14 @@ int main(void)
     test_bag_bound_select_and_verify();
     test_bag_bound_negatives();
     test_bag_bound_args();
+
+    test_summary_build_buckets();
+    test_summary_build_args();
+    test_summary_codec_round_trip();
+    test_summary_codec_rejects();
+    test_summary_verify_negatives();
+    test_summary_audit_bucket();
+    test_summary_audit_args();
 
     if (failures > 0) {
         fprintf(stderr, "test_reputation: %d failure(s)\n", failures);
