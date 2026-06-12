@@ -9,7 +9,10 @@
  *   - VRF committee selection (deterministic, beacon-seeded, distinct);
  *   - block hashing + 2/3 finality over Ed25519 committee signatures;
  *   - Sigma T_eff fork choice + the social-Schelling fallback (partition
- *     recovery), reusing reputation/identity's saturating T_eff transform.
+ *     recovery), reusing reputation/identity's saturating T_eff transform;
+ *   - drand beacon verification + VRF seed derivation (live and degraded);
+ *   - block proposal (the pure mempool->block step; the "mempool" IS the
+ *     visible L1 CRDT at the cutoff) + round-robin proposer election.
  * Pure functions over bytes — no I/O, no malloc, no threads, and no floats
  * on any path a second peer must reproduce (determinism is load-bearing).
  *
@@ -918,15 +921,17 @@ ants_error_t ants_chain_committee_select(const uint8_t prev_block_hash[ANTS_CHAI
 /* PR5 — block hashing + encoding (finality_verify below remains a stub)     */
 /* ======================================================================== */
 
-/* A block is canonical CBOR map(3): {1: height, 2: prev_block_hash(32),
- * 3: summary}. The epoch summary rides as a byte-string holding its own
- * complete canonical encoding — the same "embed a sub-document as bytes"
- * shape reputation/crdt uses for signed statement bodies — so the block
- * codec composes ants_chain_epoch_summary_{encode,decode} without
- * duplicating the summary wire format. */
-#define CHAIN_BLOCK_PAIRS 3u
+/* A block is canonical CBOR map(4): {1: height, 2: prev_block_hash(32),
+ * 3: degraded_seed(bool), 4: summary}. The epoch summary rides as a
+ * byte-string holding its own complete canonical encoding — the same "embed
+ * a sub-document as bytes" shape reputation/crdt uses for signed statement
+ * bodies — so the block codec composes ants_chain_epoch_summary_{encode,
+ * decode} without duplicating the summary wire format. degraded_seed sits
+ * inside the signed bytes on purpose: the committee attests to the drand
+ * outage claim, not just to the summary (RFC-0008 §4.3). */
+#define CHAIN_BLOCK_PAIRS 4u
 
-enum { BLOCK_KEY_HEIGHT = 1, BLOCK_KEY_PREV = 2, BLOCK_KEY_SUMMARY = 3 };
+enum { BLOCK_KEY_HEIGHT = 1, BLOCK_KEY_PREV = 2, BLOCK_KEY_DEGRADED = 3, BLOCK_KEY_SUMMARY = 4 };
 
 size_t ants_chain_block_bound(const ants_chain_block_t *b)
 {
@@ -970,6 +975,14 @@ ants_chain_block_encode(const ants_chain_block_t *b, uint8_t *buf, size_t cap, s
         return rc;
     }
     rc = enc_kv_bytes(&enc, BLOCK_KEY_PREV, b->prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_uint(&enc, BLOCK_KEY_DEGRADED);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = ants_cbor_enc_bool(&enc, b->degraded_seed);
     if (rc != ANTS_OK) {
         return rc;
     }
@@ -1039,6 +1052,14 @@ ants_error_t ants_chain_block_decode(const uint8_t *buf,
         return rc;
     }
     rc = decode_bytes_field(&dec, BLOCK_KEY_PREV, out_block->prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = expect_key(&dec, BLOCK_KEY_DEGRADED);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    rc = norm_decode_err(ants_cbor_dec_bool(&dec, &out_block->degraded_seed));
     if (rc != ANTS_OK) {
         return rc;
     }
@@ -1309,4 +1330,80 @@ ants_error_t ants_chain_vrf_seed_degraded(const uint8_t prev_block_hash[ANTS_CHA
         return ANTS_ERROR_INVALID_ARG;
     }
     return vrf_seed_derive("ants-v1-vrf-seed-degraded", prev_block_hash, height, NULL, out_seed);
+}
+
+/* ======================================================================== */
+/* PR8 — block proposal + proposer election                                  */
+/* ======================================================================== */
+
+ants_error_t ants_chain_proposer(uint64_t height, size_t k, size_t *out_member)
+{
+    if (out_member == NULL || k == 0 || k > ANTS_CHAIN_COMMITTEE_K_MAX) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* DRAFT round-robin (the header's rationale): the position height mod k
+     * into the canonical ascending committee. k <= K_MAX = 64 so the result
+     * always fits a size_t. */
+    *out_member = (size_t)(height % (uint64_t)k);
+    return ANTS_OK;
+}
+
+ants_error_t ants_chain_block_propose(uint64_t height,
+                                      const uint8_t prev_block_hash[ANTS_CHAIN_HASH_SIZE],
+                                      uint64_t epoch,
+                                      uint64_t cutoff_time,
+                                      bool degraded_seed,
+                                      const uint8_t (*content_ids)[ANTS_CHAIN_HASH_SIZE],
+                                      size_t n_ids,
+                                      const ants_chain_event_t *events,
+                                      size_t n_events,
+                                      ants_chain_pattern_finding_t *findings_buf,
+                                      size_t findings_cap,
+                                      size_t *out_n_findings,
+                                      ants_chain_block_t *out_block)
+{
+    uint8_t root[ANTS_CHAIN_HASH_SIZE];
+    size_t n_findings = 0;
+    ants_error_t rc;
+
+    if (prev_block_hash == NULL || out_block == NULL || out_n_findings == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* NULL content_ids with n_ids != 0, NULL events with n_events != 0, and
+     * NULL findings_buf with findings_cap != 0 are rejected by the two
+     * composed functions below. */
+
+    /* confirmed_proofs = MerkleRoot(visible proofs at the cutoff). Computed
+     * into a local first so *out_block is only written from a view that
+     * passed canonical-order validation. */
+    rc = ants_chain_confirmed_root(content_ids, n_ids, root);
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+
+    /* The pattern findings, with now ≡ cutoff_time — THE determinism pin:
+     * every committee member recomputing from the same visible set windows
+     * the events against the same instant and emits the byte-identical
+     * findings, never its own wall clock. */
+    rc = ants_chain_pattern_scan(
+        events, n_events, cutoff_time, findings_buf, findings_cap, &n_findings);
+    *out_n_findings = n_findings;
+    if (rc != ANTS_OK) {
+        return rc;
+    }
+    /* More findings than one summary can carry: a pathological epoch the
+     * runtime must split (the same bound epoch_summary_encode enforces). */
+    if (n_findings > ANTS_CHAIN_MAX_PATTERN_FINDINGS) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    out_block->height = height;
+    memcpy(out_block->prev_block_hash, prev_block_hash, ANTS_CHAIN_HASH_SIZE);
+    out_block->degraded_seed = degraded_seed;
+    out_block->summary.epoch = epoch;
+    out_block->summary.cutoff_time = cutoff_time;
+    memcpy(out_block->summary.confirmed_proofs, root, ANTS_CHAIN_HASH_SIZE);
+    out_block->summary.findings = n_findings > 0 ? findings_buf : NULL;
+    out_block->summary.n_findings = n_findings;
+    return ANTS_OK;
 }
