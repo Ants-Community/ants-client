@@ -44,6 +44,15 @@ target_link_libraries(ants_chain
 
 target_compile_features(ants_chain PUBLIC c_std_99)
 
+# ---- Tools ---------------------------------------------------------------
+
+# chain_vectors — emits the reputation/chain test-vector pack (JSON on
+# stdout) from the COMPILED library, per RFC-0008 §8: vectors are generated
+# against the reference implementation, never transcribed by hand. Usage:
+#   ./build/reputation/chain/chain_vectors > .../vectors/chain/chain.json
+add_executable(chain_vectors tools/chain_vectors.c)
+target_link_libraries(chain_vectors PRIVATE ants_chain)
+
 # ---- Tests ---------------------------------------------------------------
 
 if(BUILD_TESTING)
