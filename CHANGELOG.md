@@ -13,6 +13,29 @@ the spec repo's
 
 ## Unreleased
 
+### network/dht: phase 6 — full-bucket LRU eviction · 2026-06-13
+
+`network/dht` (PR #150): completes the deferred phase-6 routing
+behaviour. A full k-bucket used to reject newcomers outright, so a
+routing table could calcify around its earliest occupants and never make
+room for fresher, reachable peers. Now, per Kademlia / BEP-5, a peer that
+would land in a full bucket is parked in a small replacement cache and
+the bucket's least-recently-seen *reachable* entry is liveness-probed; if
+that entry fails its probe and is evicted, the parked peer is promoted
+into the freed slot (`PEER_DISCOVERED`). A live entry keeps its place —
+the eviction-resistance that makes Kademlia tables hard to poison.
+
+- Strike/eviction bookkeeping was lifted out of `refresh_ping_completion`
+  into a shared `dht_apply_ping_result`, so the full-bucket probe path
+  and the periodic refresh sweep drive identical logic.
+- The cache is a global pool of 8 borrowed-conn slots, one standing
+  replacement per bucket (newest wins), within the existing context
+  budget; a parked replacement whose conn closes is dropped in
+  `CONN_CLOSED`, so a dead link is never promoted.
+- `dht_routing_upsert` still returns `BUFFER_TOO_SMALL` on a full
+  bucket — no public API, context-size, or caller change. Six tests
+  (five deterministic hook-driven, one end-to-end over real QUIC).
+
 ### reputation: identity_vectors — the §11.9 vector pack ships from the artifact · 2026-06-12
 
 `reputation/identity` (PR #148): the receipt-bag / selective-disclosure
