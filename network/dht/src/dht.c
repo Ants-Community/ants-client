@@ -297,6 +297,15 @@ static struct ants_dht_bucket_entry *find_entry_by_peer_id(struct ants_dht_state
     return NULL;
 }
 
+/* Phase 6 replacement-cache helpers, defined after issue_refresh_ping
+ * (which dht_bucket_full_admit calls). Forward-declared here because the
+ * production insert path and the PING completion sit above them. */
+static void dht_bucket_full_admit(ants_dht_t *dht,
+                                  const ants_dht_peer_t *peer,
+                                  ants_transport_conn_t *conn,
+                                  uint32_t bidx);
+static void dht_apply_ping_result(ants_dht_t *dht, const ants_peer_id_t *peer_id, bool ok);
+
 /* Cross-module production insert path (declared in dht_internal.h): wraps
  * kbucket_insert and fires PEER_DISCOVERED when the peer is genuinely new.
  * The header has promised that event for bootstrap- and lookup-discovered
@@ -316,6 +325,15 @@ ants_error_t dht_routing_upsert(ants_dht_t *dht,
         ev.kind = ANTS_DHT_EV_PEER_DISCOVERED;
         ev.peer = *peer;
         (void)state->event_fn(&ev, state->event_ctx);
+    } else if (err == ANTS_ERROR_BUFFER_TOO_SMALL) {
+        /* Phase 6: the bucket is full. Park the newcomer and probe the
+         * least-recently-seen entry so a dead node can be replaced. The
+         * peer is not in the active table yet, so the return stays
+         * BUFFER_TOO_SMALL and PEER_DISCOVERED is deferred to promotion. */
+        uint32_t bidx = bucket_index_for_peer(state, &peer->peer_id);
+        if (bidx != UINT32_MAX) {
+            dht_bucket_full_admit(dht, peer, conn, bidx);
+        }
     }
     return err;
 }
@@ -327,34 +345,11 @@ static void refresh_ping_completion(ants_error_t status, const void *resp, void 
     if (rctx == NULL) {
         return;
     }
-    struct ants_dht_state *state = (struct ants_dht_state *)(void *)rctx->dht->_opaque;
-    struct ants_dht_bucket_entry *entry = find_entry_by_peer_id(state, &rctx->peer_id);
-    if (entry == NULL) {
-        /* Entry was removed (e.g. by CONN_CLOSED) between issuing the
-         * PING and observing its completion. Nothing to update. */
-        free(rctx);
-        return;
-    }
-    entry->ping_in_flight = false;
-    if (status == ANTS_OK) {
-        entry->dead_strikes = 0;
-        entry->last_seen_us = dht_now_us();
-        free(rctx);
-        return;
-    }
-    /* Failure path. Bump strike count; evict on threshold. */
-    entry->dead_strikes++;
-    if (entry->dead_strikes >= ANTS_DHT_DEAD_STRIKE_THRESHOLD) {
-        ants_dht_peer_t evicted = entry->peer;
-        (void)kbucket_remove(state, &rctx->peer_id);
-        if (state->event_fn != NULL) {
-            ants_dht_event_t ev;
-            memset(&ev, 0, sizeof ev);
-            ev.kind = ANTS_DHT_EV_PEER_EVICTED;
-            ev.peer = evicted;
-            (void)state->event_fn(&ev, state->event_ctx);
-        }
-    }
+    /* All strike/eviction bookkeeping lives in dht_apply_ping_result so the
+     * full-bucket probe path (phase 6) and the periodic refresh sweep drive
+     * exactly the same logic — and so tests can exercise it deterministically
+     * without a live transport. */
+    dht_apply_ping_result(rctx->dht, &rctx->peer_id, status == ANTS_OK);
     free(rctx);
 }
 
@@ -380,6 +375,146 @@ static void issue_refresh_ping(ants_dht_t *dht, struct ants_dht_bucket_entry *en
          * next sweep can retry. */
         entry->ping_in_flight = false;
         free(rctx);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Phase 6 — full-bucket replacement cache                                  */
+/*                                                                          */
+/* When a peer would land in a full bucket, dht_routing_upsert parks it     */
+/* here (dht_bucket_full_admit) and probes the bucket's least-recently-seen */
+/* reachable entry. If that entry later fails its liveness probe and is     */
+/* evicted, dht_apply_ping_result promotes the parked peer into the freed   */
+/* slot. A live entry keeps its place — that is Kademlia's eviction-        */
+/* resistance, and the reason a parked peer is held rather than admitted    */
+/* eagerly.                                                                 */
+/* ------------------------------------------------------------------------ */
+
+/* The entry in `bucket` that is least-recently-seen AND reachable (has a
+ * live conn we can PING). Returns NULL if the bucket has no reachable
+ * entry — an undialed (conn == NULL) entry cannot be liveness-probed, so
+ * it is never picked. "Least-recently-seen" is by last_seen_us, not list
+ * position: a successful refresh PING bumps last_seen_us without moving the
+ * entry, so last_seen_us is the truthful recency signal. */
+static struct ants_dht_bucket_entry *bucket_find_lru_conn_entry(struct ants_dht_bucket *bucket)
+{
+    struct ants_dht_bucket_entry *lru = NULL;
+    for (struct ants_dht_bucket_entry *e = bucket->head; e != NULL; e = e->next) {
+        if (e->conn == NULL) {
+            continue;
+        }
+        if (lru == NULL || e->last_seen_us < lru->last_seen_us) {
+            lru = e;
+        }
+    }
+    return lru;
+}
+
+/* Park `peer` as the standing replacement for bucket `bidx`. One slot per
+ * bucket (newest pending wins); if the bucket already has a parked peer it
+ * is overwritten. If the global pool is exhausted the newcomer is dropped
+ * silently — it will be re-offered by the next lookup/gossip that names it. */
+static void dht_park_replacement(struct ants_dht_state *state,
+                                 const ants_dht_peer_t *peer,
+                                 ants_transport_conn_t *conn,
+                                 uint32_t bidx)
+{
+    struct ants_dht_replacement *free_slot = NULL;
+    for (size_t i = 0; i < ANTS_DHT_MAX_REPLACEMENTS; i++) {
+        struct ants_dht_replacement *r = &state->replacements[i];
+        if (r->in_use) {
+            if (bucket_index_for_peer(state, &r->peer.peer_id) == bidx) {
+                r->peer = *peer;
+                r->conn = conn;
+                return;
+            }
+        } else if (free_slot == NULL) {
+            free_slot = r;
+        }
+    }
+    if (free_slot == NULL) {
+        return;
+    }
+    free_slot->in_use = true;
+    free_slot->peer = *peer;
+    free_slot->conn = conn;
+}
+
+/* Promote the peer parked for bucket `bidx` (if any) into the routing
+ * table — called right after an entry in that bucket is evicted, so a slot
+ * is free. Fires PEER_DISCOVERED for the promoted peer. At most one
+ * promotion per freed slot. */
+static void dht_promote_replacement(ants_dht_t *dht, uint32_t bidx)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    for (size_t i = 0; i < ANTS_DHT_MAX_REPLACEMENTS; i++) {
+        struct ants_dht_replacement *r = &state->replacements[i];
+        if (!r->in_use || bucket_index_for_peer(state, &r->peer.peer_id) != bidx) {
+            continue;
+        }
+        ants_dht_peer_t peer = r->peer;
+        ants_transport_conn_t *conn = r->conn;
+        r->in_use = false;
+        ants_error_t err = kbucket_insert(state, &peer, conn, dht_now_us());
+        if (err == ANTS_OK && state->event_fn != NULL) {
+            ants_dht_event_t ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind = ANTS_DHT_EV_PEER_DISCOVERED;
+            ev.peer = peer;
+            (void)state->event_fn(&ev, state->event_ctx);
+        }
+        return;
+    }
+}
+
+/* Full-bucket admit (phase 6): park the newcomer and ensure the bucket's
+ * least-recently-seen reachable entry is being liveness-probed. If a probe
+ * is already in flight for that entry, it suffices. */
+static void dht_bucket_full_admit(ants_dht_t *dht,
+                                  const ants_dht_peer_t *peer,
+                                  ants_transport_conn_t *conn,
+                                  uint32_t bidx)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    dht_park_replacement(state, peer, conn, bidx);
+    struct ants_dht_bucket_entry *lru = bucket_find_lru_conn_entry(&state->buckets[bidx]);
+    if (lru != NULL && !lru->ping_in_flight) {
+        issue_refresh_ping(dht, lru);
+    }
+}
+
+/* Apply the outcome of a liveness PING to its routing entry — shared by the
+ * refresh sweep and (via the test hook) phase-6 tests. On success: reset
+ * dead_strikes, bump last_seen_us. On failure: bump dead_strikes and, on
+ * reaching the threshold, evict the entry (PEER_EVICTED) and promote any
+ * peer parked for that bucket (PEER_DISCOVERED). A no-op if the entry was
+ * already removed (e.g. by CONN_CLOSED) between PING issue and completion. */
+static void dht_apply_ping_result(ants_dht_t *dht, const ants_peer_id_t *peer_id, bool ok)
+{
+    struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    struct ants_dht_bucket_entry *entry = find_entry_by_peer_id(state, peer_id);
+    if (entry == NULL) {
+        return;
+    }
+    entry->ping_in_flight = false;
+    if (ok) {
+        entry->dead_strikes = 0;
+        entry->last_seen_us = dht_now_us();
+        return;
+    }
+    entry->dead_strikes++;
+    if (entry->dead_strikes >= ANTS_DHT_DEAD_STRIKE_THRESHOLD) {
+        uint32_t bidx = bucket_index_for_peer(state, peer_id);
+        ants_dht_peer_t evicted = entry->peer;
+        (void)kbucket_remove(state, peer_id);
+        if (state->event_fn != NULL) {
+            ants_dht_event_t ev;
+            memset(&ev, 0, sizeof ev);
+            ev.kind = ANTS_DHT_EV_PEER_EVICTED;
+            ev.peer = evicted;
+            (void)state->event_fn(&ev, state->event_ctx);
+        }
+        dht_promote_replacement(dht, bidx);
     }
 }
 
@@ -1069,6 +1204,14 @@ static void handle_bootstrap_conn_closed(ants_dht_t *dht, const ants_transport_e
             }
         }
     }
+    /* Phase 6: drop any parked replacement reached through the closed conn.
+     * The newcomer was worth holding only because we had a live link to it;
+     * promoting it with a dead conn would seed the table with a stale entry. */
+    for (size_t i = 0; i < ANTS_DHT_MAX_REPLACEMENTS; i++) {
+        if (state->replacements[i].in_use && state->replacements[i].conn == event->conn) {
+            state->replacements[i].in_use = false;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1336,4 +1479,47 @@ void ants_dht__test_get_entry_state(const ants_dht_t *dht,
 uint64_t ants_dht__test_now_us(void)
 {
     return dht_now_us();
+}
+
+/* Phase 6 test hooks. Drive the production insert path and the strike/
+ * eviction/promotion machinery directly so the replacement-cache state
+ * machine can be exercised deterministically without a live transport. */
+ants_error_t ants_dht__test_routing_upsert(ants_dht_t *dht,
+                                           const ants_dht_peer_t *peer,
+                                           ants_transport_conn_t *conn,
+                                           uint64_t now_us);
+ants_error_t ants_dht__test_routing_upsert(ants_dht_t *dht,
+                                           const ants_dht_peer_t *peer,
+                                           ants_transport_conn_t *conn,
+                                           uint64_t now_us)
+{
+    if (dht == NULL || peer == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return dht_routing_upsert(dht, peer, conn, now_us);
+}
+
+void ants_dht__test_apply_ping_result(ants_dht_t *dht, const ants_peer_id_t *peer_id, bool ok);
+void ants_dht__test_apply_ping_result(ants_dht_t *dht, const ants_peer_id_t *peer_id, bool ok)
+{
+    if (dht == NULL || peer_id == NULL) {
+        return;
+    }
+    dht_apply_ping_result(dht, peer_id, ok);
+}
+
+size_t ants_dht__test_replacement_count(const ants_dht_t *dht);
+size_t ants_dht__test_replacement_count(const ants_dht_t *dht)
+{
+    if (dht == NULL) {
+        return 0;
+    }
+    const struct ants_dht_state *state = (const struct ants_dht_state *)(const void *)dht->_opaque;
+    size_t n = 0;
+    for (size_t i = 0; i < ANTS_DHT_MAX_REPLACEMENTS; i++) {
+        if (state->replacements[i].in_use) {
+            n++;
+        }
+    }
+    return n;
 }

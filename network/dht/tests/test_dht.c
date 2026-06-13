@@ -257,6 +257,19 @@ extern uint64_t ants_dht__test_now_us(void);
 extern size_t ants_dht__test_server_announce_count(const ants_dht_t *dht,
                                                    ants_dht_shard_key_t shard_key);
 
+/* Phase 6 full-bucket replacement-cache hooks. test_routing_upsert drives
+ * the production insert path (parks on a full bucket); test_apply_ping_result
+ * drives the strike/eviction/promotion machinery directly so the cache state
+ * machine is exercised without a live transport; test_replacement_count
+ * reports how many peers are currently parked. */
+extern ants_error_t ants_dht__test_routing_upsert(ants_dht_t *dht,
+                                                  const ants_dht_peer_t *peer,
+                                                  ants_transport_conn_t *conn,
+                                                  uint64_t now_us);
+extern void
+ants_dht__test_apply_ping_result(ants_dht_t *dht, const ants_peer_id_t *peer_id, bool ok);
+extern size_t ants_dht__test_replacement_count(const ants_dht_t *dht);
+
 /* Helper: zero-init a dht with a deterministic local pubkey. */
 static ants_error_t test_init_with_local(ants_dht_t *d,
                                          const uint8_t local_pub[ANTS_ED25519_PUBKEY_SIZE])
@@ -3086,6 +3099,362 @@ static void test_probe_enriches_routing_table(void)
     CHECK_EQ(ants_dht_destroy(&dc), ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase 6: full-bucket LRU eviction + replacement cache                    */
+/* ------------------------------------------------------------------------ */
+
+/* Records the two events the replacement-cache tests care about. */
+typedef struct {
+    int discovered;
+    int evicted;
+    ants_dht_peer_t last_discovered;
+    ants_dht_peer_t last_evicted;
+} test_repl_recorder_t;
+
+static ants_error_t test_repl_event_fn(const ants_dht_event_t *ev, void *ctx)
+{
+    test_repl_recorder_t *r = (test_repl_recorder_t *)ctx;
+    if (ev->kind == ANTS_DHT_EV_PEER_DISCOVERED) {
+        r->discovered++;
+        r->last_discovered = ev->peer;
+    } else if (ev->kind == ANTS_DHT_EV_PEER_EVICTED) {
+        r->evicted++;
+        r->last_evicted = ev->peer;
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t test_init_with_recorder(ants_dht_t *d,
+                                            const uint8_t local_pub[ANTS_ED25519_PUBKEY_SIZE],
+                                            test_repl_recorder_t *rec)
+{
+    ants_dht_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    static ants_transport_t dummy_transport = {{0}};
+    cfg.transport = &dummy_transport;
+    cfg.event_fn = test_repl_event_fn;
+    cfg.event_ctx = rec;
+    memcpy(cfg.local_peer_id.bytes, local_pub, ANTS_ED25519_PUBKEY_SIZE);
+    return ants_dht_init(d, &cfg);
+}
+
+/* Build a distinct peer that lands in bucket `bidx` relative to `local`.
+ * Flips bit `bidx` of local (so XOR's MSB is at bidx) and stamps `disc`
+ * into the lowest byte for uniqueness. Requires bidx >= 8 so the flip and
+ * the discriminator never share a byte. */
+static void test_make_repl_peer(const uint8_t local[ANTS_ED25519_PUBKEY_SIZE],
+                                uint32_t bidx,
+                                uint8_t disc,
+                                ants_dht_peer_t *out)
+{
+    memset(out, 0, sizeof *out);
+    memcpy(out->peer_id.bytes, local, ANTS_ED25519_PUBKEY_SIZE);
+    uint32_t byte_idx = (uint32_t)ANTS_PEER_ID_SIZE - 1 - bidx / 8;
+    out->peer_id.bytes[byte_idx] ^= (uint8_t)(1u << (bidx % 8));
+    out->peer_id.bytes[ANTS_PEER_ID_SIZE - 1] = disc;
+    snprintf(out->multiaddr,
+             sizeof out->multiaddr,
+             "/ip4/127.0.0.1/udp/%u/quic-v1",
+             (unsigned)(disc + 1));
+}
+
+/* Fill bucket 255 (local all-zero) to capacity with K conn-less peers,
+ * disc = 0..K-1, last_seen = 1000+i. */
+static void test_fill_bucket255(ants_dht_t *d, const uint8_t local[ANTS_ED25519_PUBKEY_SIZE])
+{
+    for (size_t i = 0; i < ANTS_DHT_K; i++) {
+        ants_dht_peer_t p;
+        test_make_repl_peer(local, 255, (uint8_t)i, &p);
+        CHECK_EQ(ants_dht__test_insert_peer(d, &p, 1000 + i), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(d) == ANTS_DHT_K);
+}
+
+static void test_repl_parks_newcomer_on_full_bucket(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    test_repl_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_recorder(&d, local, &rec), ANTS_OK);
+    test_fill_bucket255(&d, local);
+
+    /* A newcomer into the full bucket is parked, not inserted: the call
+     * still reports BUFFER_TOO_SMALL, the table size is unchanged, no
+     * PEER_DISCOVERED fires, and exactly one slot is now occupied. */
+    ants_dht_peer_t newcomer;
+    test_make_repl_peer(local, 255, 0xFF, &newcomer);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &newcomer, NULL, 5000), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht_routing_table_size(&d) == ANTS_DHT_K);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+    CHECK(rec.discovered == 0);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&d, &newcomer.peer_id, &st);
+    CHECK(!st.exists); /* parked, not in the active table */
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_repl_promoted_on_eviction(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    test_repl_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_recorder(&d, local, &rec), ANTS_OK);
+    test_fill_bucket255(&d, local);
+
+    ants_dht_peer_t newcomer;
+    test_make_repl_peer(local, 255, 0xFF, &newcomer);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &newcomer, NULL, 5000), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+
+    /* Drive one bucket entry (disc 0) to the dead-strike threshold. The
+     * first two failures only bump the strike count; the third evicts it
+     * AND promotes the parked newcomer into the freed slot. */
+    ants_dht_peer_t victim;
+    test_make_repl_peer(local, 255, 0, &victim);
+    ants_dht__test_apply_ping_result(&d, &victim.peer_id, false);
+    ants_dht__test_apply_ping_result(&d, &victim.peer_id, false);
+    CHECK(rec.evicted == 0 && rec.discovered == 0); /* not yet */
+    ants_dht__test_apply_ping_result(&d, &victim.peer_id, false);
+
+    CHECK(rec.evicted == 1);
+    CHECK(memcmp(rec.last_evicted.peer_id.bytes, victim.peer_id.bytes, ANTS_PEER_ID_SIZE) == 0);
+    CHECK(rec.discovered == 1);
+    CHECK(memcmp(rec.last_discovered.peer_id.bytes, newcomer.peer_id.bytes, ANTS_PEER_ID_SIZE) ==
+          0);
+    /* Table is back to K; victim gone, newcomer in; cache emptied. */
+    CHECK(ants_dht_routing_table_size(&d) == ANTS_DHT_K);
+    CHECK(ants_dht__test_replacement_count(&d) == 0);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&d, &victim.peer_id, &st);
+    CHECK(!st.exists);
+    ants_dht__test_get_entry_state(&d, &newcomer.peer_id, &st);
+    CHECK(st.exists);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_repl_survives_when_lru_responds(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    test_repl_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_recorder(&d, local, &rec), ANTS_OK);
+    test_fill_bucket255(&d, local);
+
+    ants_dht_peer_t newcomer;
+    test_make_repl_peer(local, 255, 0xFF, &newcomer);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &newcomer, NULL, 5000), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+
+    /* A live entry wins its probe: strikes reset, nothing is evicted, and
+     * the newcomer stays parked (a standing replacement, Kademlia-style). */
+    ants_dht_peer_t entry;
+    test_make_repl_peer(local, 255, 0, &entry);
+    ants_dht__test_apply_ping_result(&d, &entry.peer_id, false);
+    ants_dht__test_apply_ping_result(&d, &entry.peer_id, true); /* recovered */
+
+    CHECK(rec.evicted == 0);
+    CHECK(rec.discovered == 0);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+    CHECK(ants_dht_routing_table_size(&d) == ANTS_DHT_K);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&d, &entry.peer_id, &st);
+    CHECK(st.exists && st.dead_strikes == 0);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_repl_newest_pending_wins(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    test_repl_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_recorder(&d, local, &rec), ANTS_OK);
+    test_fill_bucket255(&d, local);
+
+    /* Two newcomers compete for the same full bucket: one slot, newest
+     * wins. Promotion then yields the second. */
+    ants_dht_peer_t n1, n2;
+    test_make_repl_peer(local, 255, 0xFE, &n1);
+    test_make_repl_peer(local, 255, 0xFD, &n2);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &n1, NULL, 5000), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &n2, NULL, 5001), ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+
+    ants_dht_peer_t victim;
+    test_make_repl_peer(local, 255, 0, &victim);
+    for (int i = 0; i < ANTS_DHT_DEAD_STRIKE_THRESHOLD; i++) {
+        ants_dht__test_apply_ping_result(&d, &victim.peer_id, false);
+    }
+    CHECK(rec.discovered == 1);
+    CHECK(memcmp(rec.last_discovered.peer_id.bytes, n2.peer_id.bytes, ANTS_PEER_ID_SIZE) == 0);
+    ants_dht__test_entry_state_t st;
+    ants_dht__test_get_entry_state(&d, &n2.peer_id, &st);
+    CHECK(st.exists);
+    ants_dht__test_get_entry_state(&d, &n1.peer_id, &st);
+    CHECK(!st.exists);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_repl_dropped_on_conn_closed(void)
+{
+    uint8_t local[ANTS_ED25519_PUBKEY_SIZE] = {0};
+    test_repl_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+    ants_dht_t d = {{0}};
+    CHECK_EQ(test_init_with_recorder(&d, local, &rec), ANTS_OK);
+    test_fill_bucket255(&d, local);
+
+    /* Park a newcomer reached over a specific (fake) conn, then close that
+     * conn: the parked replacement must be dropped, since promoting it with
+     * a dead link would seed the table with an unreachable entry. */
+    ants_transport_conn_t fake_conn = {{0}};
+    ants_dht_peer_t newcomer;
+    test_make_repl_peer(local, 255, 0xFF, &newcomer);
+    CHECK_EQ(ants_dht__test_routing_upsert(&d, &newcomer, &fake_conn, 5000),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht__test_replacement_count(&d) == 1);
+
+    ants_transport_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    ev.kind = ANTS_TRANSPORT_EV_CONN_CLOSED;
+    ev.conn = &fake_conn;
+    CHECK_EQ(ants_dht_handle_transport_event(&d, &ev), ANTS_OK);
+    CHECK(ants_dht__test_replacement_count(&d) == 0);
+
+    CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+/* End-to-end: a full bucket probes its least-recently-seen reachable entry
+ * over the real wire; when that entry dies, the parked newcomer is promoted.
+ * Mirrors test_refresh_evicts_after_threshold's scaffolding (B resets every
+ * stream, so A's PINGs fail), but B sits in a full bucket with a parked
+ * replacement behind it. */
+static void test_repl_full_bucket_promotes_over_wire(void)
+{
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x55, sizeof a_priv);
+    memset(b_priv, 0xAA, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_reset_server_t b_srv;
+    memset(&b_srv, 0, sizeof b_srv);
+    test_repl_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_reset_server_event;
+    bcfg.event_ctx = &b_srv;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_repl_event_fn;
+    dcfg.event_ctx = &a_rec;
+    dcfg.refresh_interval_ms = 50;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready >= 1);
+
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    uint32_t bidx = ants_dht__test_bucket_index(&da, &b_pid);
+    CHECK(bidx != UINT32_MAX);
+    CHECK(bidx >= 8); /* need a byte of low-bit room to craft same-bucket peers */
+
+    /* B is the only reachable entry and the least-recently-seen (stale). */
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    memcpy(b_peer.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE);
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, 1 /* stale */), ANTS_OK);
+    /* Fill the rest of B's bucket with fresher, unreachable (conn-less)
+     * entries, so the bucket is full and B remains the probe target. */
+    for (size_t i = 0; i < (size_t)ANTS_DHT_K - 1; i++) {
+        ants_dht_peer_t p;
+        test_make_repl_peer(a_pub, bidx, (uint8_t)(i + 1), &p);
+        CHECK_EQ(ants_dht__test_insert_peer(&da, &p, 1000 + i), ANTS_OK);
+    }
+    CHECK(ants_dht_routing_table_size(&da) == ANTS_DHT_K);
+
+    /* Offer a newcomer into the full bucket: it is parked, and the full-
+     * bucket admit path probes B over the wire. */
+    ants_dht_peer_t newcomer;
+    test_make_repl_peer(a_pub, bidx, 0xFF, &newcomer);
+    CHECK_EQ(ants_dht__test_routing_upsert(&da, &newcomer, NULL, ants_dht__test_now_us()),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+    CHECK(ants_dht__test_replacement_count(&da) == 1);
+
+    /* Drive ticks: B's PINGs hit STREAM_RESET, three strikes evict B, and
+     * the parked newcomer is promoted with a PEER_DISCOVERED. */
+    for (int i = 0; i < 600; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+        if (a_rec.discovered >= 1) {
+            break;
+        }
+    }
+    CHECK(a_rec.evicted == 1);
+    CHECK(memcmp(a_rec.last_evicted.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
+    CHECK(a_rec.discovered == 1);
+    CHECK(memcmp(a_rec.last_discovered.peer_id.bytes, newcomer.peer_id.bytes, ANTS_PEER_ID_SIZE) ==
+          0);
+    CHECK(ants_dht__test_replacement_count(&da) == 0);
+    CHECK(ants_dht_routing_table_size(&da) == ANTS_DHT_K);
+    ants_dht__test_entry_state_t nst;
+    ants_dht__test_get_entry_state(&da, &newcomer.peer_id, &nst);
+    CHECK(nst.exists);
+
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+}
+
 int main(void)
 {
     test_pinned_constants();
@@ -3128,6 +3497,13 @@ int main(void)
     test_refresh_pings_stale_peer();
     test_refresh_evicts_after_threshold();
     test_refresh_no_ping_when_fresh();
+
+    test_repl_parks_newcomer_on_full_bucket();
+    test_repl_promoted_on_eviction();
+    test_repl_survives_when_lru_responds();
+    test_repl_newest_pending_wins();
+    test_repl_dropped_on_conn_closed();
+    test_repl_full_bucket_promotes_over_wire();
 
     test_republish_propagates_to_closest_peer();
     test_republish_fires_announce_confirmed();

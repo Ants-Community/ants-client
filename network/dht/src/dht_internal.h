@@ -32,8 +32,13 @@ uint64_t dht_now_us(void);
  * production insert path (bootstrap promotion, pending-dial promotion,
  * probe fold). Wraps kbucket_insert and fires ANTS_DHT_EV_PEER_DISCOVERED
  * through the registered event_fn when the peer is genuinely new (NOT on
- * refresh of an existing entry, and never for rejected inserts: self,
- * full bucket). Defined in dht.c. */
+ * refresh of an existing entry, and never for a self-insert).
+ *
+ * Phase 6: a full bucket no longer drops the peer. It is parked in the
+ * replacement cache and the least-recently-seen entry is probed; the
+ * call still returns ANTS_ERROR_BUFFER_TOO_SMALL (the peer is not in the
+ * active table yet) and PEER_DISCOVERED is deferred until the peer is
+ * actually promoted into a freed slot. Defined in dht.c. */
 ants_error_t dht_routing_upsert(ants_dht_t *dht,
                                 const ants_dht_peer_t *peer,
                                 ants_transport_conn_t *conn,
@@ -77,6 +82,36 @@ struct ants_dht_bucket_entry {
 struct ants_dht_bucket {
     struct ants_dht_bucket_entry *head;
     size_t count;
+};
+
+/* ------------------------------------------------------------------------ */
+/* Replacement cache (phase 6 — full-bucket LRU eviction)                   */
+/*                                                                          */
+/* Kademlia / BEP-5 behaviour: when a peer would be inserted into a full    */
+/* bucket, it is parked here instead of being dropped, and the bucket's     */
+/* least-recently-seen reachable entry is liveness-probed. If that entry    */
+/* later fails its probe (dead-strike threshold) and is evicted, the freed  */
+/* slot is filled from this cache and PEER_DISCOVERED fires for the parked  */
+/* peer. A live least-recently-seen entry keeps its slot — long-lived peers */
+/* resist eviction, which is the property that makes Kademlia routing       */
+/* tables hard to poison.                                                   */
+/*                                                                          */
+/* One standing replacement per bucket (newest pending wins); a global pool */
+/* of ANTS_DHT_MAX_REPLACEMENTS slots bounds the total. The pool is small   */
+/* because only the few buckets near the local id ever fill. The parked     */
+/* conn is borrowed (owned by bootstrap_entries[] / pending_dials[]); a     */
+/* parked replacement whose conn closes is dropped in CONN_CLOSED. A richer */
+/* multi-entry-per-bucket cache is a phase 6.1+ refinement.                 */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_REPLACEMENTS 8
+
+struct ants_dht_replacement {
+    bool in_use;
+    uint8_t _pad[7];
+    /* Borrowed connection to the parked peer (NOT owned here). */
+    ants_transport_conn_t *conn;
+    ants_dht_peer_t peer;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -398,6 +433,9 @@ struct ants_dht_state {
     uint32_t next_txid;
     /* 256-bucket routing table. */
     struct ants_dht_bucket buckets[ANTS_DHT_BUCKET_COUNT];
+    /* Full-bucket replacement cache (phase 6). Peers that would land in a
+     * full bucket are parked here and promoted when an entry is evicted. */
+    struct ants_dht_replacement replacements[ANTS_DHT_MAX_REPLACEMENTS];
     /* In-flight RPC registry. Scanned linearly on every transport
      * event (O(64)) — overhead negligible vs. CBOR decode cost. */
     struct ants_dht_pending_rpc pending[ANTS_DHT_MAX_PENDING_RPCS];
