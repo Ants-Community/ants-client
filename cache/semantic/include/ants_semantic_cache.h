@@ -619,14 +619,16 @@ ants_error_t ants_semantic_cache_get_topk(ants_semantic_cache_t *cache,
 
 /*
  * Handle an inbound cache-entry write: decode the CBOR record per
- * step 4, validate the producer signature (currently a TODO — step
- * 7b+ wires in Ed25519 verify via ants_crypto), and persist the
- * full record into the local shard via put_record.
+ * step 4, verify the producer's Ed25519 signature over the canonical
+ * signing payload (fields 1..9) BEFORE the record touches the local
+ * shard, and — only on a valid signature — persist the full record via
+ * put_record. A forged or tampered record is rejected and never stored.
  *
  * Returns:
  *   ANTS_OK                  — entry admitted;
  *   ANTS_ERROR_INVALID_ARG   — NULL args or zero-length buffer;
- *   ANTS_ERROR_MALFORMED     — CBOR parse failure or malloc failure;
+ *   ANTS_ERROR_MALFORMED     — CBOR parse failure, malloc failure, or
+ *                              an invalid producer signature;
  *   ANTS_ERROR_NON_CANONICAL — wrong fixed-length field or wrong
  *                              CBOR ordering on the wire.
  */
