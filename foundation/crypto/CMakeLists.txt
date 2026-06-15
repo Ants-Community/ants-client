@@ -32,6 +32,11 @@ target_link_libraries(ants_crypto PRIVATE ed25519_sodium)
 # portable C path via __BLST_NO_ASM__).
 target_link_libraries(ants_crypto PRIVATE blst)
 
+# Vendored p256-m (deps/p256-m, upstream 44af59e) — ECDSA P-256 verify only,
+# for TEE attestation signature chains (RFC-0005). crypto.c supplies the
+# p256_generate_random fail-stub since we never sign/keygen with P-256.
+target_link_libraries(ants_crypto PRIVATE p256m)
+
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
 # ECVRF-ELL2 needs direct access to libsodium's ref10 fe/ge/sc

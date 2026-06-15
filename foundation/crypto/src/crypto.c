@@ -13,6 +13,8 @@
 
 #include "blake3.h"
 #include "blst.h"
+#include "p256-m.h"
+
 #include "crypto_hash_sha512.h"
 #include "crypto_sign_ed25519.h"
 #include "private/ed25519_ref10.h"
@@ -831,5 +833,48 @@ ants_error_t ants_vrf_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
 
     /* 8. beta = proof_to_hash(pi). */
     vrf_proof_to_hash(&Gamma_p3, out_beta);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-256 — TEE attestation signature verification (verify-only)       */
+/*                                                                          */
+/* Implemented via vendored deps/p256-m (Apache-2.0, single-file,           */
+/* constant-time). Verifies the vendor signature chains in TEE attestation  */
+/* quotes (RFC-0005): Intel TDX is P-256; AMD SEV-SNP uses P-384, a later   */
+/* sibling primitive.                                                       */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * p256-m declares `p256_generate_random` as an extern for the caller to
+ * supply; it is referenced only on the sign/keygen code paths. ANTS uses
+ * P-256 for attestation *verification* only — peer identity is Ed25519 and
+ * we never produce a P-256 signature — so this is a deliberate fail-stub.
+ * `p256_ecdsa_verify` never calls it; were a sign/keygen path ever reached
+ * it fails closed (P256_RANDOM_FAILED) rather than emit a key from a
+ * non-CSPRNG. Returning non-zero is the documented "RNG failed" contract.
+ */
+int p256_generate_random(uint8_t *output, unsigned output_size)
+{
+    (void)output;
+    (void)output_size;
+    return P256_RANDOM_FAILED;
+}
+
+ants_error_t ants_ecdsa_p256_verify(const uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZE],
+                                    const uint8_t *hash,
+                                    size_t hash_len,
+                                    const uint8_t sig[ANTS_ECDSA_P256_SIG_SIZE])
+{
+    if (pub == NULL || (hash == NULL && hash_len > 0) || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* p256-m verifies (sig, pub, hash, hlen) and returns P256_SUCCESS,
+     * P256_INVALID_SIGNATURE, or P256_INVALID_PUBKEY. The latter two both
+     * mean the attestation signature did not verify — map to MALFORMED,
+     * matching the ants_ed25519_verify convention. */
+    if (p256_ecdsa_verify(sig, pub, hash, hash_len) != P256_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
     return ANTS_OK;
 }
