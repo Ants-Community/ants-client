@@ -75,3 +75,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_crypto PRIVATE ants_crypto)
     add_test(NAME crypto_basic COMMAND test_crypto)
 endif()
+
+# ecdsa_p256_vectors — emits the ecdsa-p256.verify test-vector pack (JSON on
+# stdout, the ants-test-vectors house format). Vectors are sourced from
+# Project Wycheproof; every verdict is confirmed against the compiled
+# ants_ecdsa_p256_verify before emission.
+#   ./build/foundation/crypto/ecdsa_p256_vectors > .../vectors/ecdsa-p256/ecdsa-p256.json
+add_executable(ecdsa_p256_vectors tools/ecdsa_p256_vectors.c)
+target_link_libraries(ecdsa_p256_vectors PRIVATE ants_crypto)
