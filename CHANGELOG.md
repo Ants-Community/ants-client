@@ -13,6 +13,24 @@ the spec repo's
 
 ## Unreleased
 
+### cache/embedding: O(n²) → O(n) tokenizer.json parse (jsmn parent links) · 2026-06-15
+
+`cache/embedding` (PR #153): the HuggingFace `tokenizer.json` loader
+included jsmn without `JSMN_PARENT_LINKS`, so jsmn closed every `}` / `]`
+by scanning backwards over every token emitted so far — O(n) per close,
+O(n²) over the file. On the real 250 002-entry XLM-R / BGE-M3 vocab
+(~750 000 JSON tokens) that quadratic scan turned a sub-second parse into
+a multi-minute hang inside `ants_embed_init`; the tiny test fixtures never
+reached the scale that exposes it.
+
+- The fix is one `#define JSMN_PARENT_LINKS` before the jsmn include —
+  jsmn then records each token's parent index and closes containers in
+  O(1). Parse of the real vocab drops from a multi-minute hang to
+  ~750 ms.
+- New 40 000-entry scale regression in `test_tokenizer_json.c`: parses in
+  tens of ms with the fix; an O(n²) regression hangs it for tens of
+  seconds (and trips the CI timeout).
+
 ### network/dht: phase 6 — full-bucket LRU eviction · 2026-06-13
 
 `network/dht` (PR #150): completes the deferred phase-6 routing

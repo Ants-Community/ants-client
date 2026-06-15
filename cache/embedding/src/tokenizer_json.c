@@ -37,6 +37,13 @@
 
 #include "ants_tokenizer.h"
 
+/* JSMN_PARENT_LINKS makes jsmn store each token's parent index and resolve
+ * containers in O(1). Without it, jsmn closes every '}'/']' by scanning
+ * backwards over all tokens emitted so far — O(n) per close, O(n^2) over
+ * the whole file. On a real 250K-entry XLM-R/BGE-M3 vocab (~750K tokens)
+ * that backward scan turns a sub-second parse into a multi-minute hang;
+ * the tiny test fixtures never reach the scale that exposes it. */
+#define JSMN_PARENT_LINKS
 #define JSMN_STATIC
 #include "jsmn.h"
 
