@@ -50,8 +50,18 @@
 const char *const ANTS_EMBED_MODEL_ID = "ants-embed-v1";
 const char *const ANTS_EMBED_MODEL_ARCH = "bge-m3";
 
-const uint8_t ANTS_EMBED_WEIGHTS_HASH_PINNED[32] = {0};
-const uint8_t ANTS_EMBED_TOKENIZER_HASH_PINNED[32] = {0};
+/* ants-embed-v1 pinned BLAKE3 hashes (RFC-0008 §5.1). No longer placeholders:
+ *   weights   = BLAKE3 of the canonical BGE-M3 F32 GGUF (2 273 655 072 bytes)
+ *   tokenizer = BLAKE3 of the canonical BAAI/bge-m3 tokenizer.json (17 098 108 B)
+ * With these non-zero, ants_embed_init strictly verifies both buffers and
+ * rejects (NON_CANONICAL) anything that does not hash to them — no "close
+ * enough". See RFC-0008 §5 for provenance and how to obtain the exact files. */
+const uint8_t ANTS_EMBED_WEIGHTS_HASH_PINNED[32] = {
+    0x30, 0x55, 0xcf, 0x6c, 0x5e, 0xc0, 0xb4, 0x1d, 0xa5, 0xc8, 0x67, 0xcf, 0x0c, 0xa0, 0xb1, 0x83,
+    0x1a, 0x98, 0x51, 0x68, 0xdf, 0x83, 0x52, 0x64, 0x5b, 0x04, 0xdc, 0xb8, 0x5b, 0x0d, 0x26, 0xe6};
+const uint8_t ANTS_EMBED_TOKENIZER_HASH_PINNED[32] = {
+    0xa0, 0x85, 0x38, 0x5b, 0x8b, 0x6f, 0x4a, 0x3f, 0x16, 0xa3, 0x49, 0x3c, 0x18, 0x0e, 0x69, 0x4f,
+    0x92, 0x89, 0x7e, 0x91, 0x9d, 0x00, 0xaa, 0x9b, 0x3c, 0xd7, 0xfb, 0xff, 0xe1, 0x26, 0x9c, 0xee};
 
 /* ------------------------------------------------------------------------ */
 /* Internal state                                                           */
@@ -88,9 +98,11 @@ typedef char ants_embed_state_size_check
     [(sizeof(struct ants_embed_state) <= sizeof(((ants_embed_t *)0)->_opaque)) ? 1 : -1];
 
 /* ------------------------------------------------------------------------ */
-/* Hash verification (unchanged from the stub PR; verify path exposed as
- * a test hook so the strict path stays covered while the public pinned
- * constants are still placeholder zeros).                                  */
+/* Hash verification. ants_embed__test_verify is the shared check: an all-zero
+ * (placeholder) pinned value skips — used only by unit tests passing explicit
+ * zeros — while a real pinned value (the v1 constants above) BLAKE3-compares
+ * bit-exactly. ants_embed_init runs it against the pinned constants before
+ * touching ggml.                                                            */
 /* ------------------------------------------------------------------------ */
 
 static bool pinned_is_placeholder(const uint8_t pinned[32])
@@ -150,7 +162,9 @@ static void tear_down(struct ants_embed_state *state)
     }
 }
 
-ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *config)
+/* Argument validation shared by the checked and unchecked init paths. */
+static ants_error_t embed_validate_config(const ants_embed_t *ctx,
+                                          const ants_embed_config_t *config)
 {
     if (ctx == NULL || config == NULL) {
         return ANTS_ERROR_INVALID_ARG;
@@ -161,20 +175,15 @@ ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *confi
     if (config->tokenizer == NULL || config->tokenizer_len == 0) {
         return ANTS_ERROR_INVALID_ARG;
     }
+    return ANTS_OK;
+}
 
-    /* Hash-verify both buffers up front. Mismatch (against a non-zero
-     * pinned hash) refuses initialisation before we touch ggml. */
-    ants_error_t err = ants_embed__test_verify(
-        config->weights, config->weights_len, ANTS_EMBED_WEIGHTS_HASH_PINNED);
-    if (err != ANTS_OK) {
-        return err;
-    }
-    err = ants_embed__test_verify(
-        config->tokenizer, config->tokenizer_len, ANTS_EMBED_TOKENIZER_HASH_PINNED);
-    if (err != ANTS_OK) {
-        return err;
-    }
-
+/* Bring the model up: parse GGUF, bind tensors, dim-check, load + init the
+ * tokenizer. Assumes config is already validated. Does NOT hash-verify — the
+ * caller decides whether to gate on the pinned hashes. On any failure all
+ * partial allocations are released and the ctx is left zeroed. */
+static ants_error_t embed_bring_up(ants_embed_t *ctx, const ants_embed_config_t *config)
+{
     memset(ctx->_opaque, 0, sizeof ctx->_opaque);
     struct ants_embed_state *state = (struct ants_embed_state *)(void *)ctx->_opaque;
     state->weights = config->weights;
@@ -183,7 +192,7 @@ ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *confi
     state->tokenizer_len = config->tokenizer_len;
 
     /* Parse GGUF + bind the model. */
-    err = embed_gguf_load(config->weights, config->weights_len, &state->gguf_loader);
+    ants_error_t err = embed_gguf_load(config->weights, config->weights_len, &state->gguf_loader);
     if (err != ANTS_OK) {
         tear_down(state);
         return err;
@@ -220,6 +229,43 @@ ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *confi
 
     state->magic = ANTS_EMBED_STATE_MAGIC;
     return ANTS_OK;
+}
+
+ants_error_t ants_embed_init(ants_embed_t *ctx, const ants_embed_config_t *config)
+{
+    ants_error_t err = embed_validate_config(ctx, config);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Hash-verify both buffers against the pinned v1 values before we touch
+     * ggml. The pinned constants are non-zero, so a mismatch refuses init. */
+    err = ants_embed__test_verify(
+        config->weights, config->weights_len, ANTS_EMBED_WEIGHTS_HASH_PINNED);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = ants_embed__test_verify(
+        config->tokenizer, config->tokenizer_len, ANTS_EMBED_TOKENIZER_HASH_PINNED);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    return embed_bring_up(ctx, config);
+}
+
+/* Test hook: bring the model up WITHOUT the pinned-hash gate. The unit tests
+ * run against a tiny synthetic GGUF that cannot hash to the canonical v1 value,
+ * so they need a way past the gate to exercise the forward path; production
+ * code must always use ants_embed_init. Declared via extern in the test TU. */
+ants_error_t ants_embed__test_init_unchecked(ants_embed_t *ctx, const ants_embed_config_t *config);
+ants_error_t ants_embed__test_init_unchecked(ants_embed_t *ctx, const ants_embed_config_t *config)
+{
+    ants_error_t err = embed_validate_config(ctx, config);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    return embed_bring_up(ctx, config);
 }
 
 ants_error_t ants_embed_destroy(ants_embed_t *ctx)

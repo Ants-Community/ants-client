@@ -64,7 +64,7 @@ extern "C" {
 /*                                                                          */
 /* These constants are the cross-peer agreement object. Every peer claiming */
 /* support for `ANTS_EMBED_MODEL_ID` MUST be running a model whose          */
-/* safetensors-encoded weights hash to ANTS_EMBED_WEIGHTS_HASH_PINNED and   */
+/* GGUF-format weights hash to ANTS_EMBED_WEIGHTS_HASH_PINNED and           */
 /* whose tokenizer JSON hashes to ANTS_EMBED_TOKENIZER_HASH_PINNED.         */
 /* ------------------------------------------------------------------------ */
 
@@ -83,18 +83,15 @@ extern const char *const ANTS_EMBED_MODEL_ID;
  * cross-peer compatibility chatter at handshake time. */
 extern const char *const ANTS_EMBED_MODEL_ARCH;
 
-/* Pinned hashes (32-byte BLAKE3) of the canonical-model artifacts.
+/* Pinned hashes (32-byte BLAKE3) of the canonical-model artifacts, set to the
+ * v1 values (RFC-0008 §5.1):
+ *   ANTS_EMBED_WEIGHTS_HASH_PINNED   = BLAKE3 of the canonical BGE-M3 F32 GGUF
+ *   ANTS_EMBED_TOKENIZER_HASH_PINNED = BLAKE3 of the BAAI/bge-m3 tokenizer.json
  *
- * v0.x scaffold: both are 0x000...000 placeholders. They are populated
- * with the real BLAKE3 of the chosen BGE-M3 checkpoint + tokenizer when
- * the reference client publishes the v1 canonical bundle (per RFC-0008
- * §5: "the specific 32-byte values for v1 will be set when the reference
- * client is published").
- *
- * Treat any non-zero value here as the protocol-version-pinned canonical
- * hash. Treat all-zero as "v1 hash not yet pinned" — `ants_embed_init`
- * declines initialization in that state to prevent accidentally shipping
- * a peer with the wrong weights. */
+ * `ants_embed_init` BLAKE3-hashes the caller's weights + tokenizer buffers and
+ * compares against these — bit-exact match or ANTS_ERROR_NON_CANONICAL, no
+ * "close enough". (An all-zero value means "not yet pinned" and skips the
+ * check; the v1 constants are non-zero, so the check is live.) */
 extern const uint8_t ANTS_EMBED_WEIGHTS_HASH_PINNED[32];
 extern const uint8_t ANTS_EMBED_TOKENIZER_HASH_PINNED[32];
 
@@ -125,14 +122,14 @@ typedef union {
 /*                                                                          */
 /* `weights` and `tokenizer` point at caller-owned memory that MUST remain  */
 /* valid for the lifetime of the ants_embed_t — the library does not copy   */
-/* them. The buffers are the *exact* safetensors and tokenizer-JSON bytes;  */
+/* them. The buffers are the *exact* GGUF and tokenizer-JSON bytes;         */
 /* `ants_embed_init` BLAKE3-hashes each and compares against the pinned    */
 /* values, refusing with ANTS_ERROR_NON_CANONICAL on mismatch (per          */
 /* RFC-0002: "no close enough, bit-exact match or rejection").              */
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    /* In-memory safetensors weights blob. Must hash to
+    /* In-memory canonical GGUF weights blob (BGE-M3 F32). Must hash to
      * ANTS_EMBED_WEIGHTS_HASH_PINNED under BLAKE3. Typically loaded from
      * a pinned file on disk (the caller owns the file I/O). */
     const uint8_t *weights;
@@ -155,10 +152,10 @@ typedef struct {
  * Returns:
  *   ANTS_OK on success;
  *   ANTS_ERROR_INVALID_ARG — NULL ctx/config or zero-length buffer;
- *   ANTS_ERROR_NON_CANONICAL — weights or tokenizer hash mismatch
- *     against the pinned value;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase (hashes are placeholders
- *     and/or ggml integration hasn't landed yet).
+ *   ANTS_ERROR_NON_CANONICAL — weights or tokenizer hash mismatch against the
+ *     pinned value, or the model declares a non-1024 embedding dimension;
+ *   ANTS_ERROR_MALFORMED — the weights are not a parseable GGUF, or the model
+ *     metadata / tokenizer JSON is malformed.
  *
  * On success the ctx is ready for ants_embed() calls. The weights and
  * tokenizer pointers must remain valid until ants_embed_destroy().
@@ -180,19 +177,23 @@ ants_error_t ants_embed_destroy(ants_embed_t *ctx);
 
 /*
  * Embed `input_bytes` (a UTF-8 encoded string or any byte sequence the
- * tokenizer accepts) into `out` — an array of ANTS_EMBED_DIM float32
- * values. The mapping is deterministic: the same input bytes on the
- * same canonical model produce identical output to the bit, on any
- * conformant peer.
+ * tokenizer accepts) into `out` — an array of ANTS_EMBED_DIM float32 values.
+ * The input is tokenized, wrapped as <s> ... </s>, run through the BGE-M3
+ * forward, CLS-pooled (the <s> hidden state) and L2-normalised. Determinism is
+ * per-host today; cross-host bit-exactness depends on canonical numerics
+ * (F32 reduction order), the open problem tracked in RFC-0009.
  *
- * Output normalisation: the embedding is L2-normalised to unit length,
- * so cosine similarity reduces to a dot product (which is what
- * cache/semantic's lookup path computes).
+ * Output normalisation: the embedding is L2-normalised to unit length, so
+ * cosine similarity reduces to a dot product (which is what cache/semantic's
+ * lookup path computes).
  *
  * Returns:
  *   ANTS_OK on success;
- *   ANTS_ERROR_INVALID_ARG — NULL pointers or zero-length input;
- *   ANTS_ERROR_NOT_IMPLEMENTED — scaffold phase, no inference yet.
+ *   ANTS_ERROR_INVALID_ARG — NULL pointers, zero-length input, or an
+ *     uninitialised ctx;
+ *   ANTS_ERROR_NON_CANONICAL — the input produced no usable token, or the
+ *     embedding degenerated to a zero vector;
+ *   ANTS_ERROR_MALFORMED — the ggml forward pass failed to run.
  */
 ants_error_t ants_embed(ants_embed_t *ctx,
                         const uint8_t *input_bytes,
