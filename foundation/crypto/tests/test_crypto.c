@@ -785,6 +785,118 @@ static void test_vrf_verify_rejects_tampered(void)
     CHECK(ants_vrf_verify(bad_pk, alpha, alpha_len, pi, beta) != ANTS_OK);
 }
 
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-256 — known-answer + adversarial tests.                          */
+/*                                                                          */
+/* Vectors from Project Wycheproof ecdsa_secp256r1_sha256_p1363 (group 0,   */
+/* testvectors_v1): the IEEE P1363 raw r||s encoding, matching our wrapper's */
+/* 64-byte signature. Wycheproof is an independent, adversarial vector set — */
+/* the cross-check that catches a verifier which is self-consistent but      */
+/* wrong (the ECVRF lesson). Each signature is verified over SHA-256(msg),   */
+/* exercising ants_sha256 in the chain. The 64-byte public key is            */
+/* testGroups[0].publicKey.uncompressed with the leading 0x04 stripped       */
+/* (X || Y). result "valid" -> ANTS_OK; "invalid" -> ANTS_ERROR_MALFORMED.   */
+/* Only 64-byte signatures are taken here — over/under-length P1363/DER      */
+/* encodings are the TEE layer's parsing concern, not this fixed-width       */
+/* primitive's.                                                              */
+/* ------------------------------------------------------------------------ */
+
+static void test_ecdsa_p256_rejects_invalid_args(void)
+{
+    uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZE] = {0};
+    uint8_t sig[ANTS_ECDSA_P256_SIG_SIZE] = {0};
+    uint8_t hash[ANTS_SHA256_HASH_SIZE] = {0};
+    CHECK_EQ(ants_ecdsa_p256_verify(NULL, hash, sizeof hash, sig), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ecdsa_p256_verify(pub, NULL, 1, sig), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ecdsa_p256_verify(pub, hash, sizeof hash, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_ecdsa_p256_wycheproof(void)
+{
+    /* testGroups[0].publicKey.uncompressed, 0x04 prefix stripped (X || Y). */
+    static const char pub_hex[] =
+        "2927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838"
+        "c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e";
+
+    struct kat {
+        int tc_id;
+        const char *msg_hex;
+        const char *sig_hex;
+        ants_error_t expect;
+    };
+    static const struct kat kats[] = {
+        /* valid signatures */
+        {1,
+         "313233343030",
+         "2ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e184"
+         "cd60b855d442f5b3c7b11eb6c4e0ae7525fe710fab9aa7c77a67f79e6fadd76",
+         ANTS_OK},
+        {60,
+         "3639383139",
+         "64a1aab5000d0e804f3e2fc02bdee9be8ff312334e2ba16d11547c97711c898e6"
+         "af015971cc30be6d1a206d4e013e0997772a2f91d73286ffd683b9bb2cf4f1b",
+         ANTS_OK},
+        {61,
+         "343236343739373234",
+         "16aea964a2f6506d6f78c81c91fc7e8bded7d397738448de1e19a0ec580bf2662"
+         "52cd762130c6667cfe8b7bc47d27d78391e8e80c578d1cd38c3ff033be928e9",
+         ANTS_OK},
+        /* invalid signatures — adversarial edge cases */
+        {4,
+         "313233343030", /* r replaced by n - r */
+         "d45c5740946b2a147f59262ee6f5bc90bd01ed280528b62b3aed5fc93f06f739"
+         "b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+         ANTS_ERROR_MALFORMED},
+        {11,
+         "313233343030", /* r = 0, s = 0 */
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "0000000000000000000000000000000000000000000000000000000000000000",
+         ANTS_ERROR_MALFORMED},
+        {12,
+         "313233343030", /* r = 0, s = 1 */
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "0000000000000000000000000000000000000000000000000000000000000001",
+         ANTS_ERROR_MALFORMED},
+        {13,
+         "313233343030", /* r = 0, s = n */
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+         ANTS_ERROR_MALFORMED},
+        {14,
+         "313233343030", /* r = 0, s = n - 1 */
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550",
+         ANTS_ERROR_MALFORMED},
+        {16,
+         "313233343030", /* r = 0, s = p */
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+         ANTS_ERROR_MALFORMED},
+    };
+
+    uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(pub_hex, pub, sizeof pub) == sizeof pub);
+
+    for (size_t i = 0; i < sizeof kats / sizeof kats[0]; i++) {
+        const struct kat *k = &kats[i];
+        uint8_t msg[64];
+        uint8_t sig[ANTS_ECDSA_P256_SIG_SIZE];
+        uint8_t hash[ANTS_SHA256_HASH_SIZE];
+        size_t msg_len = hex_to_bytes(k->msg_hex, msg, sizeof msg);
+        CHECK(hex_to_bytes(k->sig_hex, sig, sizeof sig) == sizeof sig);
+        CHECK_EQ(ants_sha256(msg, msg_len, hash), ANTS_OK);
+        ants_error_t got = ants_ecdsa_p256_verify(pub, hash, sizeof hash, sig);
+        if (got != k->expect) {
+            failures++;
+            fprintf(stderr,
+                    "FAIL ecdsa-p256 wycheproof tcId=%d: expected %s, got %s\n",
+                    k->tc_id,
+                    ants_strerror(k->expect),
+                    ants_strerror(got));
+        }
+    }
+}
+
 int main(void)
 {
     test_blake3_rejects_invalid_args();
@@ -813,6 +925,9 @@ int main(void)
     test_vrf_roundtrip();
     test_vrf_distinct_alpha_distinct_beta();
     test_vrf_verify_rejects_tampered();
+
+    test_ecdsa_p256_rejects_invalid_args();
+    test_ecdsa_p256_wycheproof();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

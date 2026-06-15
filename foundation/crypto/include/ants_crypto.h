@@ -233,6 +233,38 @@ ants_error_t ants_vrf_verify(const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                              const uint8_t proof[ANTS_VRF_PROOF_SIZE],
                              uint8_t out_beta[ANTS_VRF_OUTPUT_SIZE]);
 
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-256 — TEE attestation signature verification (verify-only)       */
+/*                                                                          */
+/* NIST P-256 (secp256r1) ECDSA verification, used to check the vendor      */
+/* signature chains in TEE attestation quotes (RFC-0005). P-256 is Intel    */
+/* TDX's curve; AMD SEV-SNP signs with P-384 (a later sibling primitive).   */
+/*                                                                          */
+/* Verify-only: ANTS never produces P-256 signatures (peer identity is      */
+/* Ed25519). Inputs are the raw fixed-width encodings the verifier holds    */
+/* after stripping container framing — a 64-byte uncompressed public key    */
+/* (X || Y big-endian, no 0x04 prefix) and a 64-byte signature (r || s      */
+/* big-endian). DER/SEC1 unwrapping is the TEE layer's job, not the         */
+/* primitive's.                                                             */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_ECDSA_P256_PUBKEY_SIZE 64
+#define ANTS_ECDSA_P256_SIG_SIZE    64
+
+/*
+ * Verify an ECDSA P-256 signature `sig` over the pre-computed message
+ * digest `hash` (`hash_len` bytes; SHA-256 gives 32) against public key
+ * `pub`. The caller supplies the digest — this function does not hash.
+ *
+ * Returns ANTS_OK on a valid signature, ANTS_ERROR_MALFORMED on an invalid
+ * signature or invalid public key, ANTS_ERROR_INVALID_ARG on a null
+ * pointer. Mirrors the ants_ed25519_verify return convention.
+ */
+ants_error_t ants_ecdsa_p256_verify(const uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZE],
+                                    const uint8_t *hash,
+                                    size_t hash_len,
+                                    const uint8_t sig[ANTS_ECDSA_P256_SIG_SIZE]);
+
 #ifdef __cplusplus
 }
 #endif
