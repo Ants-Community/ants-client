@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -229,6 +230,48 @@ static void test_load_rejects_invalid_escape(void)
     CHECK(blob == NULL);
 }
 
+static void test_load_large_vocab_scale(void)
+{
+    /* Regression guard for the JSMN_PARENT_LINKS fix. Without parent links,
+     * jsmn resolves every closing ']' / '}' by scanning all previously
+     * emitted tokens — O(n) per close, O(n^2) over the file. A real
+     * XLM-R/BGE-M3 tokenizer.json is 250002 vocab entries (~750K tokens),
+     * where that quadratic scan turns a sub-second parse into a multi-minute
+     * hang. This builds a 40000-entry vocab in memory: O(n) parses it in
+     * tens of ms; an O(n^2) regression makes this test hang for tens of
+     * seconds (and trips the CI timeout). */
+    const size_t N = 40000;
+    size_t cap = N * 24u + 64u;
+    char *json = (char *)malloc(cap);
+    CHECK(json != NULL);
+    if (json == NULL) {
+        return;
+    }
+    size_t p = 0;
+    int w = snprintf(json + p, cap - p, "{\"model\":{\"vocab\":[");
+    p += (size_t)w;
+    for (size_t i = 0; i < N; i++) {
+        w = snprintf(json + p, cap - p, "%s[\"t%zu\",-1.0]", i ? "," : "", i);
+        p += (size_t)w;
+    }
+    w = snprintf(json + p, cap - p, "]}}");
+    p += (size_t)w;
+
+    ants_tokenizer_vocab_blob_t *blob = NULL;
+    CHECK_EQ(ants_tokenizer_load_huggingface_json(json, p, &blob), ANTS_OK);
+    CHECK(blob != NULL);
+    if (blob != NULL) {
+        CHECK(ants_tokenizer_vocab_size(blob) == N);
+        const ants_tokenizer_vocab_entry_t *e = ants_tokenizer_vocab_entries(blob);
+        if (e != NULL) {
+            CHECK(e[0].token_id == 0 && e[0].text_len == 2 && memcmp(e[0].text, "t0", 2) == 0);
+            CHECK(e[N - 1].token_id == (uint32_t)(N - 1));
+        }
+        ants_tokenizer_vocab_free(blob);
+    }
+    free(json);
+}
+
 int main(void)
 {
     test_load_rejects_invalid_args();
@@ -239,6 +282,7 @@ int main(void)
     test_load_then_encode_round_trip();
     test_blob_accessors_null_safe();
     test_load_rejects_invalid_escape();
+    test_load_large_vocab_scale();
 
     if (failures > 0) {
         fprintf(stderr, "test_tokenizer_json: %d failure(s)\n", failures);
