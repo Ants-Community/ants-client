@@ -13,6 +13,18 @@ the spec repo's
 
 ## Unreleased
 
+### cache/embedding: embed_vectors --pack emits the test-vector pack · 2026-06-15
+
+`cache/embedding` (PR #156): the `embed_vectors` dev tool gains `--pack`, which
+emits the ants-test-vectors `embedding` pack as JSON — the pinned model hashes +
+metadata and a fixed canonical input set (ASCII / accented-Latin / CJK /
+Cyrillic) with their reference embeddings, all produced by the compiled
+`ants_embed` library after `ants_embed_init` strict-verifies the pinned v1
+hashes. The pack is honest about its nature: the hashes are the bit-exact
+cross-platform pin, while the embedding arrays are reference-with-tolerance
+(cosine ≥ 0.999) pending cross-platform F32 numerics (RFC-0009). Gated behind
+`ANTS_BUILD_EMBED_TOOLS` like the rest of the tool.
+
 ### cache/embedding: pin ants-embed-v1 — Component #11 complete · 2026-06-15
 
 `cache/embedding` (PR #155): the v1 canonical-model hashes are pinned (RFC-0008

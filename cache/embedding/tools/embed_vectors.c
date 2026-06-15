@@ -18,9 +18,13 @@
  *
  * Usage:
  *   embed_vectors <model.gguf> <tokenizer.json> [-p "text"]...
+ *   embed_vectors <model.gguf> <tokenizer.json> --hashes
+ *   embed_vectors <model.gguf> <tokenizer.json> --pack
  *
  * With one or more -p arguments, each is embedded in order. With none,
  * one input per line is read from stdin (trailing newline stripped).
+ * --hashes prints the BLAKE3 of each file and exits. --pack emits the
+ * ants-test-vectors embedding pack (fixed canonical inputs) as JSON.
  *
  * Output: one line per input, ANTS_EMBED_DIM space-separated %.9g floats
  * (9 significant digits round-trips float32 exactly in decimal). A short
@@ -108,6 +112,111 @@ static int embed_and_print(ants_embed_t *ctx, const char *text, size_t text_len)
     return 0;
 }
 
+/* Minimal JSON string emitter: escapes " and \\ and control chars; UTF-8
+ * bytes pass through unchanged (valid in JSON). */
+static void json_puts(const char *s, size_t n)
+{
+    putchar('"');
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            putchar('\\');
+            putchar((char)c);
+        } else if (c < 0x20) {
+            printf("\\u%04x", (unsigned)c);
+        } else {
+            putchar((char)c);
+        }
+    }
+    putchar('"');
+}
+
+/* Canonical, reproducible input set for the --pack test-vector pack. ASCII,
+ * accented-Latin, CJK and Cyrillic, so an independent implementation exercises
+ * the multilingual tokenizer + forward, not just ASCII. */
+static const char *const PACK_INPUTS[] = {
+    "Hello, world!",
+    "The quick brown fox jumps over the lazy dog.",
+    "Ciao mondo",
+    "机器学习",
+    "Привет мир",
+};
+
+/* Emit the ants-test-vectors embedding pack as JSON to stdout. The hashes and
+ * embeddings are produced by the compiled ants_embed library (init has already
+ * strict-verified the buffers against the pinned v1 hashes), so nothing here is
+ * hand-transcribed. */
+static int emit_pack(ants_embed_t *ctx,
+                     const uint8_t *weights,
+                     size_t weights_len,
+                     const uint8_t *tokenizer,
+                     size_t tok_len)
+{
+    uint8_t wh[ANTS_BLAKE3_HASH_SIZE], th[ANTS_BLAKE3_HASH_SIZE];
+    if (ants_blake3_hash(weights, weights_len, wh) != ANTS_OK ||
+        ants_blake3_hash(tokenizer, tok_len, th) != ANTS_OK) {
+        fprintf(stderr, "embed_vectors: blake3 failed\n");
+        return -1;
+    }
+
+    printf("{\n");
+    printf("  \"primitive\": \"canonical embedding model ants-embed-v1: BGE-M3 dense "
+           "embedding (tokenize, wrap <s>..</s>, forward, CLS-pool, L2-normalise)\",\n");
+    printf("  \"spec\": \"RFC-0008 \\u00a75 + \\u00a75.1; RFC-0002 \\u00a7The canonical "
+           "embedding model\",\n");
+    printf("  \"version\": 1,\n");
+    printf("  \"generator\": \"ants-client cache/embedding/tools/embed_vectors.c --pack: "
+           "hashes and embeddings emitted by the compiled ants_embed library; init "
+           "strict-verified weights+tokenizer against the pinned v1 hashes first\",\n");
+    printf("  \"notes\": \"The model hashes are the bit-exact cross-platform pin (a peer "
+           "MUST load files hashing to these). The per-input embedding arrays are "
+           "REFERENCE with tolerance: the F32 forward's reduction order is not yet "
+           "canonical across platforms (open in RFC-0009), so conformant peers agree to "
+           "cosine >= 0.999, not bit-for-bit. Floats are %%.9g decimal (round-trips "
+           "float32). Cross-checked vs llama.cpp llama-embedding at cosine >= 0.999999.\",\n");
+    printf("  \"model\": {\n");
+    printf("    \"model_id\": \"%s\",\n", ANTS_EMBED_MODEL_ID);
+    printf("    \"model_arch\": \"%s\",\n", ANTS_EMBED_MODEL_ARCH);
+    printf("    \"dim\": %d,\n", ANTS_EMBED_DIM);
+    printf("    \"weights_blake3\": \"");
+    for (int k = 0; k < ANTS_BLAKE3_HASH_SIZE; k++) {
+        printf("%02x", wh[k]);
+    }
+    printf("\",\n    \"weights_bytes\": %zu,\n", weights_len);
+    printf("    \"tokenizer_blake3\": \"");
+    for (int k = 0; k < ANTS_BLAKE3_HASH_SIZE; k++) {
+        printf("%02x", th[k]);
+    }
+    printf("\",\n    \"tokenizer_bytes\": %zu\n", tok_len);
+    printf("  },\n");
+    printf("  \"vectors\": [\n");
+
+    const size_t n_inputs = sizeof PACK_INPUTS / sizeof PACK_INPUTS[0];
+    int rc = 0;
+    for (size_t i = 0; i < n_inputs; i++) {
+        const char *text = PACK_INPUTS[i];
+        float vec[ANTS_EMBED_DIM];
+        ants_error_t e = ants_embed(ctx, (const uint8_t *)text, strlen(text), vec);
+        if (e != ANTS_OK) {
+            fprintf(stderr, "embed_vectors: pack embed failed (%d) on input %zu\n", (int)e, i);
+            rc = -1;
+            break;
+        }
+        printf("    {\"text\": ");
+        json_puts(text, strlen(text));
+        printf(", \"embedding\": [");
+        for (int d = 0; d < ANTS_EMBED_DIM; d++) {
+            if (d) {
+                putchar(',');
+            }
+            printf("%.9g", (double)vec[d]);
+        }
+        printf("]}%s\n", (i + 1 < n_inputs) ? "," : "");
+    }
+    printf("  ]\n}\n");
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -180,6 +289,18 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(stderr, "embed_vectors: init OK\n");
+
+    /* --pack: emit the ants-test-vectors embedding pack (fixed canonical
+     * inputs) as JSON to stdout, then exit. */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pack") == 0) {
+            int prc = emit_pack(&ctx, weights, weights_len, tokenizer, tok_len);
+            ants_embed_destroy(&ctx);
+            free(weights);
+            free(tokenizer);
+            return prc == 0 ? 0 : 1;
+        }
+    }
 
     int rc = 0;
     int did_any = 0;
