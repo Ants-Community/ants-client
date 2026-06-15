@@ -59,6 +59,12 @@ static int failures = 0;
 extern ants_error_t
 ants_embed__test_verify(const uint8_t *buf, size_t len, const uint8_t pinned[32]);
 
+/* Brings the model up WITHOUT the pinned-hash gate. The synthetic fixture
+ * below cannot hash to the canonical v1 value, so the behavioural tests use
+ * this hook; the gate itself is covered by test_init_rejects_unpinned_model. */
+extern ants_error_t ants_embed__test_init_unchecked(ants_embed_t *ctx,
+                                                    const ants_embed_config_t *config);
+
 /* ------------------------------------------------------------------------ */
 /* Fixture builder                                                          */
 /*                                                                          */
@@ -285,9 +291,13 @@ static int fixture_init(ants_embed_t *e, uint8_t **out_weights, size_t *out_weig
     cfg.weights_len = *out_weights_len;
     cfg.tokenizer = (const uint8_t *)tokenizer_json;
     cfg.tokenizer_len = sizeof tokenizer_json - 1;
-    ants_error_t err = ants_embed_init(e, &cfg);
+    /* Unchecked: the fixture cannot hash to the pinned v1 value. */
+    ants_error_t err = ants_embed__test_init_unchecked(e, &cfg);
     if (err != ANTS_OK) {
-        fprintf(stderr, "fixture_init: ants_embed_init -> %s (%d)\n", ants_strerror(err), (int)err);
+        fprintf(stderr,
+                "fixture_init: ants_embed__test_init_unchecked -> %s (%d)\n",
+                ants_strerror(err),
+                (int)err);
         free(*out_weights);
         *out_weights = NULL;
         return -1;
@@ -307,9 +317,14 @@ static void test_pinned_constants(void)
     CHECK(ANTS_EMBED_MODEL_ARCH != NULL);
     CHECK(strcmp(ANTS_EMBED_MODEL_ARCH, "bge-m3") == 0);
 
+    /* v1 hashes are pinned (RFC-0008 §5.1): non-zero, no longer placeholders.
+     * Spot-check the leading byte so an accidental edit to the constants trips
+     * here. */
     uint8_t zero[32] = {0};
-    CHECK(memcmp(ANTS_EMBED_WEIGHTS_HASH_PINNED, zero, 32) == 0);
-    CHECK(memcmp(ANTS_EMBED_TOKENIZER_HASH_PINNED, zero, 32) == 0);
+    CHECK(memcmp(ANTS_EMBED_WEIGHTS_HASH_PINNED, zero, 32) != 0);
+    CHECK(memcmp(ANTS_EMBED_TOKENIZER_HASH_PINNED, zero, 32) != 0);
+    CHECK(ANTS_EMBED_WEIGHTS_HASH_PINNED[0] == 0x30);
+    CHECK(ANTS_EMBED_TOKENIZER_HASH_PINNED[0] == 0xa0);
 }
 
 static void test_opaque_ctx_layout(void)
@@ -352,8 +367,9 @@ static void test_init_rejects_invalid_args(void)
 
 static void test_init_rejects_bad_weights(void)
 {
-    /* Random bytes that are not a valid GGUF blob: init should fail
-     * MALFORMED (the wrapper's parse-error path). */
+    /* Random bytes that are not a valid GGUF blob. Via the hash-unchecked path
+     * (checked init would reject on the hash gate first), init should fail
+     * MALFORMED on the GGUF parse error. */
     ants_embed_t e = {{0}};
     uint8_t bogus_weights[64];
     memset(bogus_weights, 0xAB, sizeof bogus_weights);
@@ -363,7 +379,29 @@ static void test_init_rejects_bad_weights(void)
     cfg.weights_len = sizeof bogus_weights;
     cfg.tokenizer = (const uint8_t *)tokenizer_json;
     cfg.tokenizer_len = sizeof tokenizer_json - 1;
-    CHECK_EQ(ants_embed_init(&e, &cfg), ANTS_ERROR_MALFORMED);
+    CHECK_EQ(ants_embed__test_init_unchecked(&e, &cfg), ANTS_ERROR_MALFORMED);
+}
+
+static void test_init_rejects_unpinned_model(void)
+{
+    /* The strict gate: ants_embed_init must reject a model whose weights do not
+     * hash to the pinned v1 value. The synthetic fixture is exactly such a
+     * model, so checked init returns NON_CANONICAL on the weights hash. */
+    ants_embed_t e = {{0}};
+    uint8_t *weights = NULL;
+    size_t weights_len = 0;
+    if (build_gguf(&weights, &weights_len) != 0) {
+        failures++;
+        return;
+    }
+    ants_embed_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.weights = weights;
+    cfg.weights_len = weights_len;
+    cfg.tokenizer = (const uint8_t *)tokenizer_json;
+    cfg.tokenizer_len = sizeof tokenizer_json - 1;
+    CHECK_EQ(ants_embed_init(&e, &cfg), ANTS_ERROR_NON_CANONICAL);
+    free(weights);
 }
 
 static void test_verify_placeholder_skips(void)
@@ -484,6 +522,7 @@ int main(void)
     test_opaque_ctx_layout();
     test_init_rejects_invalid_args();
     test_init_rejects_bad_weights();
+    test_init_rejects_unpinned_model();
     test_verify_placeholder_skips();
     test_verify_matches_real_hash();
     test_destroy_rejects_null();

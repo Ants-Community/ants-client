@@ -13,6 +13,31 @@ the spec repo's
 
 ## Unreleased
 
+### cache/embedding: pin ants-embed-v1 — Component #11 complete · 2026-06-15
+
+`cache/embedding` (PR #155): the v1 canonical-model hashes are pinned (RFC-0008
+§5.1), flipping `ants_embed_init` from placeholder-accept-any to strict
+bit-exact verification.
+
+- `ANTS_EMBED_WEIGHTS_HASH_PINNED` = BLAKE3 of the canonical BGE-M3 **F32 GGUF**
+  (2 273 655 072 B); `ANTS_EMBED_TOKENIZER_HASH_PINNED` = BLAKE3 of the
+  `BAAI/bge-m3` `tokenizer.json` (17 098 108 B). A peer claiming `ants-embed-v1`
+  must now load weights + tokenizer that hash to these, or init returns
+  `NON_CANONICAL`. Provenance and how to obtain the exact files: RFC-0008 §5.
+- Init refactor: the setup path (GGUF load → bind → dim-check → tokenizer) is
+  extracted into a shared helper behind two entry points — `ants_embed_init`
+  (hash-gated) and a new `ants_embed__test_init_unchecked` hook. The
+  synthetic-fixture unit tests cannot hash to the canonical value, so post-pin
+  they bring the model up through the unchecked hook while a new test asserts
+  the gated path rejects them with `NON_CANONICAL`.
+- Header/README doc reconciled: the canonical weights artifact is the **GGUF**
+  the client loads (not safetensors), and the embedding is per-host
+  deterministic with cross-host bit-exactness deferred to RFC-0009.
+
+This is the last piece of Component #11 — the canonical embedding service is
+feature-complete and validated end-to-end against `llama.cpp` (cosine ≥
+0.999999).
+
 ### cache/embedding: wrap inputs as &lt;s&gt; … &lt;/s&gt; for BGE-M3 (correct CLS pooling) · 2026-06-15
 
 `cache/embedding` (PR #154): `ants_embed` fed the Unigram encoder's content
