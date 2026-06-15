@@ -82,16 +82,22 @@ static int embed_and_print(ants_embed_t *ctx, const char *text, size_t text_len)
     float vec[ANTS_EMBED_DIM];
     ants_error_t e = ants_embed(ctx, (const uint8_t *)text, text_len, vec);
     if (e != ANTS_OK) {
-        fprintf(stderr, "embed_vectors: ants_embed failed (%d) on input of %zu bytes\n",
-                (int)e, text_len);
+        fprintf(stderr,
+                "embed_vectors: ants_embed failed (%d) on input of %zu bytes\n",
+                (int)e,
+                text_len);
         return -1;
     }
     double sumsq = 0.0;
     for (int i = 0; i < ANTS_EMBED_DIM; i++) {
         sumsq += (double)vec[i] * (double)vec[i];
     }
-    fprintf(stderr, "  [ok] %zu bytes -> dim=%d L2=%.6f v0=%.6f\n",
-            text_len, ANTS_EMBED_DIM, sumsq, vec[0]);
+    fprintf(stderr,
+            "  [ok] %zu bytes -> dim=%d L2=%.6f v0=%.6f\n",
+            text_len,
+            ANTS_EMBED_DIM,
+            sumsq,
+            vec[0]);
     for (int i = 0; i < ANTS_EMBED_DIM; i++) {
         if (i) {
             putchar(' ');
@@ -121,8 +127,12 @@ int main(int argc, char **argv)
         free(weights);
         return 1;
     }
-    fprintf(stderr, "embed_vectors: weights=%s (%zu B) tokenizer=%s (%zu B)\n",
-            model_path, weights_len, tok_path, tok_len);
+    fprintf(stderr,
+            "embed_vectors: weights=%s (%zu B) tokenizer=%s (%zu B)\n",
+            model_path,
+            weights_len,
+            tok_path,
+            tok_len);
 
     /* --hashes: print the BLAKE3 of each buffer (the exact bytes and the
      * exact hash ants_embed_init checks against the pinned constants) and
