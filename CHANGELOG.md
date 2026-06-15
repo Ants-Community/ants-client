@@ -13,6 +13,27 @@ the spec repo's
 
 ## Unreleased
 
+### cache/embedding: wrap inputs as &lt;s&gt; … &lt;/s&gt; for BGE-M3 (correct CLS pooling) · 2026-06-15
+
+`cache/embedding` (PR #154): `ants_embed` fed the Unigram encoder's content
+tokens straight to the forward pass with no `<s>` / `</s>` wrap. BGE-M3's dense
+embedding is the hidden state of the `<s>` token at position 0 — exactly what
+the forward pass's CLS pooling reads — so without the wrap the pool returned the
+first *content* token's state: a wrong vector. `ants_embed` now wraps content as
+`[<s>=0, …, </s>=2]` (XLM-R special-token ids, fixed by the pinned tokenizer),
+capping content to `n_ctx - 2`.
+
+Validated end-to-end against `llama.cpp`'s `llama-embedding` on the real BGE-M3
+F32 GGUF: cosine ≥ 0.999999 across ASCII, accented, CJK, Cyrillic, numeric and
+whitespace-heavy inputs (residual ~1e-4 is F32 reduction-order noise). The rest
+of the forward graph — positions, token-type, GELU, CLS pooling, L2 — was
+already correct.
+
+- Adds gated dev tooling (`ANTS_BUILD_EMBED_TOOLS`, off by default):
+  `embed_vectors` (loads a real GGUF + tokenizer.json, prints/validates the
+  embedding; the future test-vector emitter) and `tok_timing` (tokenizer
+  bring-up micro-bench).
+
 ### cache/embedding: O(n²) → O(n) tokenizer.json parse (jsmn parent links) · 2026-06-15
 
 `cache/embedding` (PR #153): the HuggingFace `tokenizer.json` loader
