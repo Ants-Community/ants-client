@@ -19,8 +19,10 @@
  *
  * ants_embed runs the BGE-M3 forward via embed_forward:
  *
- *   tokenize input bytes → cap to model->n_ctx → cast uint32 → int32 →
- *   bge_m3_forward → out (already L2-normalised inside forward).
+ *   tokenize input bytes → wrap as <s> ... </s> (content capped to
+ *   model->n_ctx - 2) → cast uint32 → int32 → bge_m3_forward → out
+ *   (already L2-normalised inside forward). The <s>/</s> wrap is required:
+ *   BGE-M3's dense vector is the <s> hidden state that CLS pooling reads.
  *
  * The opaque ctx still holds only the small state struct plus the
  * inline tokenizer; the gguf loader, model, and vocab blob live in
@@ -241,6 +243,16 @@ ants_error_t ants_embed_destroy(ants_embed_t *ctx)
  * case so we don't malloc per call. */
 #define ANTS_EMBED_MAX_TOKENS 8192
 
+/* XLM-RoBERTa / BGE-M3 special-token ids. Fixed by the pinned tokenizer.json
+ * (added_tokens: id 0 = "<s>", id 2 = "</s>"). The Unigram encoder emits
+ * content pieces only (special tokens are the caller's job, per
+ * ants_tokenizer.h); the model expects the input wrapped as <s> ... </s>.
+ * BGE-M3's dense embedding is the hidden state of the <s> token at position 0
+ * — precisely what bge_m3_forward's CLS pooling reads. Omit the wrap and the
+ * pool returns the first *content* token's state, yielding a wrong vector. */
+#define ANTS_EMBED_BOS_ID 0u
+#define ANTS_EMBED_EOS_ID 2u
+
 ants_error_t ants_embed(ants_embed_t *ctx,
                         const uint8_t *input_bytes,
                         size_t input_len,
@@ -257,33 +269,35 @@ ants_error_t ants_embed(ants_embed_t *ctx,
         return ANTS_ERROR_INVALID_ARG;
     }
 
-    /* Tokenize. ants_tokenizer_encode emits uint32_t ids; we cap to
-     * min(model->n_ctx, ANTS_EMBED_MAX_TOKENS) and cast down to int32_t
-     * for the forward pass (vocab << 2^31 so the cast is lossless). */
-    const size_t cap_tokens = (state->model->n_ctx < (uint32_t)ANTS_EMBED_MAX_TOKENS)
-                                  ? state->model->n_ctx
-                                  : (uint32_t)ANTS_EMBED_MAX_TOKENS;
+    /* Tokenize content, then wrap as [<s>, content..., </s>]. Reserve two
+     * slots of the model window for the special tokens; cap content to
+     * min(model->n_ctx, ANTS_EMBED_MAX_TOKENS) - 2. ants_tokenizer_encode
+     * emits uint32_t ids cast down to int32_t (vocab << 2^31, lossless). */
+    const size_t window = (state->model->n_ctx < (uint32_t)ANTS_EMBED_MAX_TOKENS)
+                              ? state->model->n_ctx
+                              : (uint32_t)ANTS_EMBED_MAX_TOKENS;
+    const size_t content_cap = window > 2 ? window - 2 : 0;
     uint32_t ids_u32[ANTS_EMBED_MAX_TOKENS];
-    size_t n_tokens = 0;
+    size_t n_content = 0;
     ants_error_t err = ants_tokenizer_encode(
-        &state->tok, (const char *)input_bytes, input_len, ids_u32, cap_tokens, &n_tokens);
+        &state->tok, (const char *)input_bytes, input_len, ids_u32, content_cap, &n_content);
     /* BUFFER_TOO_SMALL is not a hard failure here: the input was longer
      * than what the model can attend to in one window. ants_tokenizer
      * leaves *out_count at the count it WOULD have written; we truncate
-     * to cap_tokens. */
+     * to content_cap. */
     if (err == ANTS_ERROR_BUFFER_TOO_SMALL) {
-        n_tokens = cap_tokens;
+        n_content = content_cap;
     } else if (err != ANTS_OK) {
         return err;
     }
-    if (n_tokens == 0) {
-        return ANTS_ERROR_NON_CANONICAL;
-    }
 
     int32_t ids_i32[ANTS_EMBED_MAX_TOKENS];
-    for (size_t i = 0; i < n_tokens; i++) {
-        ids_i32[i] = (int32_t)ids_u32[i];
+    size_t n_tokens = 0;
+    ids_i32[n_tokens++] = (int32_t)ANTS_EMBED_BOS_ID;
+    for (size_t i = 0; i < n_content; i++) {
+        ids_i32[n_tokens++] = (int32_t)ids_u32[i];
     }
+    ids_i32[n_tokens++] = (int32_t)ANTS_EMBED_EOS_ID;
 
     return bge_m3_forward(state->model, ids_i32, (uint32_t)n_tokens, NULL, out);
 }

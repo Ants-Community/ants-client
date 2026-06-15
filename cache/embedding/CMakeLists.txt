@@ -86,3 +86,19 @@ if(BUILD_TESTING)
     target_link_libraries(test_embed_forward PRIVATE ants_embed ggml)
     add_test(NAME embed_forward COMMAND test_embed_forward)
 endif()
+
+# ---- Tools (developer/CI convenience, NOT protocol surface) ---------------
+
+# embed_vectors loads a real GGUF + tokenizer.json from disk and prints the
+# embedding for each input. Used to validate the ggml forward graph against
+# an independent reference embedder and to emit the test-vector pack. Gated
+# off by default: it pulls in no new deps but is not something a normal
+# library build needs.
+option(ANTS_BUILD_EMBED_TOOLS "Build cache/embedding developer tools" OFF)
+if(ANTS_BUILD_EMBED_TOOLS)
+    add_executable(embed_vectors tools/embed_vectors.c)
+    target_link_libraries(embed_vectors PRIVATE ants_embed)
+
+    add_executable(tok_timing tools/tok_timing.c)
+    target_link_libraries(tok_timing PRIVATE ants_embed)
+endif()
