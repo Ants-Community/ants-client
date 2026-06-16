@@ -37,6 +37,11 @@ target_link_libraries(ants_crypto PRIVATE blst)
 # p256_generate_random fail-stub since we never sign/keygen with P-256.
 target_link_libraries(ants_crypto PRIVATE p256m)
 
+# Vendored BearSSL EC subset (deps/bearssl, upstream 7bea48e) — ECDSA verify on
+# the NIST prime curves. ANTS uses P-384 (AMD SEV-SNP's attestation curve);
+# p256-m is P-256-only. Verify-only, RNG-free, no local patches.
+target_link_libraries(ants_crypto PRIVATE bearssl_ec)
+
 target_compile_features(ants_crypto PUBLIC c_std_99)
 
 # ECVRF-ELL2 needs direct access to libsodium's ref10 fe/ge/sc
