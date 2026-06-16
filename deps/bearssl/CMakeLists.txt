@@ -1,13 +1,15 @@
-# deps/bearssl — vendored subset of BearSSL (MIT), ECDSA signature
-# verification on the NIST prime curves via the constant-time "i31" backend.
+# deps/bearssl — vendored subset of BearSSL (MIT): ECDSA signature
+# verification on the NIST prime curves (constant-time "i31" backend) plus the
+# SHA-384/512 hash.
 #
 # Upstream: bearssl.org (Thomas Pornin) @ 7bea48e (2026-04-06). BearSSL is a
 # portable, clean-room C90 TLS/crypto library. We vendor ONLY the dependency
-# closure of br_ecdsa_i31_vrfy_raw over br_ec_prime_i31 — the generic-prime
+# closure of (1) br_ecdsa_i31_vrfy_raw over br_ec_prime_i31 — the generic-prime
 # ECDSA *verifier* (P-256 / P-384 / P-521) consuming raw IEEE-P1363 (r||s)
-# signatures. ANTS uses it for ECDSA P-384 attestation-signature verification
-# (RFC-0005; AMD SEV-SNP signs its attestation report with ECDSA P-384). The
-# sources are byte-for-byte upstream — no local patches.
+# signatures — and (2) br_sha384 / br_sha512 (sha2big). ANTS uses both for AMD
+# SEV-SNP attestation: the report is signed ECDSA P-384 over a SHA-384 digest
+# (RFC-0005). Intel TDX is P-256 / SHA-256 (P-256 via deps/p256-m, SHA-256 via
+# blst). The sources are byte-for-byte upstream — no local patches.
 #
 # Closure (empirically reduced: each file was removed until the verifier
 # stopped linking, then restored — see README.md):
@@ -20,10 +22,13 @@
 #                          kept so ec_prime_i31.c stays unmodified upstream.
 #   - ecdsa_i31_vrfy_raw.c + ecdsa_i31_bits.c   the P1363 verifier
 #   - ccopy.c              br_ccopy, constant-time conditional copy
+#   - sha2big.c            br_sha384 + br_sha512 (the SHA-2 512-family)
+#   - dec64be.c, enc64be.c br_range_{dec,enc}64be, sha2big's block codec
 #
-# Verify-only and RNG-free: no sign/keygen path is compiled, and the verify
-# closure pulls in no DRBG (confirmed: no hash/HMAC/RNG symbol is referenced).
-# The wrapper lives in foundation/crypto/src/crypto.c.
+# Verify-only and RNG-free: no sign/keygen path is compiled, and neither the
+# verify nor the hash closure pulls in a DRBG (no RNG symbol is referenced).
+# The wrappers (ants_ecdsa_p384_verify, ants_sha384) live in
+# foundation/crypto/src/crypto.c.
 
 add_library(bearssl_ec STATIC
     src/ccopy.c
@@ -53,6 +58,9 @@ add_library(bearssl_ec STATIC
     src/i31_sub.c
     src/i31_tmont.c
     src/i32_div32.c
+    src/sha2big.c
+    src/dec64be.c
+    src/enc64be.c
 )
 
 # Public: the BearSSL API headers (br_ecdsa_i31_vrfy_raw, br_ec_prime_i31,

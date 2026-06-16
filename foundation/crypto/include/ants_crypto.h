@@ -143,6 +143,26 @@ ants_error_t ants_sha256(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA25
 ants_error_t ants_sha512(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA512_HASH_SIZE]);
 
 /* ------------------------------------------------------------------------ */
+/* SHA-384 — external-interop hashing ONLY                                  */
+/*                                                                          */
+/* The AMD SEV-SNP attestation report is signed with ECDSA P-384 over a      */
+/* SHA-384 digest (RFC-0005); this is that digest. Like SHA-256/512 it is    */
+/* never used for anything ANTS-internal (that is BLAKE3; RFC-0008 §2.1).    */
+/* libsodium exposes SHA-512 but not SHA-384 (a distinct IV + truncation),   */
+/* so this leg is backed by the BearSSL subset already vendored for ECDSA    */
+/* P-384 (deps/bearssl).                                                     */
+/* ------------------------------------------------------------------------ */
+
+/* Output size in bytes. */
+#define ANTS_SHA384_HASH_SIZE 48
+
+/*
+ * One-shot hash: SHA-384(data) -> 48-byte output. `data` may be NULL
+ * only when `len` is 0.
+ */
+ants_error_t ants_sha384(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA384_HASH_SIZE]);
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519 — Peer identity signatures                                       */
 /*                                                                          */
 /* Per RFC-0008 §3.1, all peer-to-peer signatures use Ed25519 (RFC 8032).   */
