@@ -280,6 +280,49 @@ static void test_sha512_known_inputs(void)
                  "8acf5f5a2b21c7f49d2e43721daa61a2b5cee6af6052dfeb766e66ddb0d1719c");
 }
 
+static void test_sha384_rejects_invalid_args(void)
+{
+    uint8_t out[ANTS_SHA384_HASH_SIZE];
+    CHECK_EQ(ants_sha384(NULL, 1, out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_sha384((const uint8_t *)"x", 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_sha384_known_inputs(void)
+{
+    uint8_t out[ANTS_SHA384_HASH_SIZE];
+
+    /* FIPS 180-4 known answers; every value below cross-checked against
+     * two independent implementations (macOS shasum -a 384 and Python
+     * hashlib, 2026-06-16) rather than copied from one source. SHA-384 is
+     * the AMD SEV-SNP attestation-report digest (RFC-0005). */
+    CHECK_EQ(ants_sha384(NULL, 0, out), ANTS_OK);
+    check_hash_n("sha384('')",
+                 out,
+                 ANTS_SHA384_HASH_SIZE,
+                 "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da"
+                 "274edebfe76f65fbd51ad2f14898b95b");
+
+    CHECK_EQ(ants_sha384((const uint8_t *)"abc", 3, out), ANTS_OK);
+    check_hash_n("sha384('abc')",
+                 out,
+                 ANTS_SHA384_HASH_SIZE,
+                 "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+                 "8086072ba1e7cc2358baeca134c825a7");
+
+    /* 200-byte pattern byte[i] = (i*7 + 3) mod 256 — crosses one 128-byte
+     * SHA-384 block boundary (SHA-384 shares SHA-512's 1024-bit block). */
+    uint8_t pattern[200];
+    for (size_t i = 0; i < sizeof pattern; i++) {
+        pattern[i] = (uint8_t)(i * 7 + 3);
+    }
+    CHECK_EQ(ants_sha384(pattern, sizeof pattern, out), ANTS_OK);
+    check_hash_n("sha384(pattern 200B)",
+                 out,
+                 ANTS_SHA384_HASH_SIZE,
+                 "8deb83535fa35d2f493c6c3695b1057b19232d2f531a0d398d2b958413855aa1"
+                 "594b6bcca0ddcbd24a981330a7ff1cc1");
+}
+
 /* drand default chain (scheme pedersen-bls-chained, chain hash
  * 8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce),
  * round 1000, fetched from api.drand.sh on 2026-06-11. */
@@ -1126,6 +1169,9 @@ int main(void)
 
     test_sha512_rejects_invalid_args();
     test_sha512_known_inputs();
+
+    test_sha384_rejects_invalid_args();
+    test_sha384_known_inputs();
 
     test_ed25519_rejects_invalid_args();
     test_ed25519_rfc8032_test1_empty();

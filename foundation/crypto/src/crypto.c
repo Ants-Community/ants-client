@@ -162,6 +162,30 @@ ants_error_t ants_sha512(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA51
 }
 
 /* ------------------------------------------------------------------------ */
+/* SHA-384                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Thin wrapper over BearSSL's SHA-384 (deps/bearssl, br_sha384). libsodium
+ * exposes SHA-512 but not SHA-384 — a distinct IV + truncation, not derivable
+ * from SHA-512 — so this leg comes from the BearSSL subset already vendored
+ * for ECDSA P-384. External-interop-only (see the header): it is the message
+ * digest under AMD SEV-SNP's ECDSA P-384 attestation-report signature
+ * (RFC-0005).
+ */
+ants_error_t ants_sha384(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA384_HASH_SIZE])
+{
+    if ((data == NULL && len > 0) || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    br_sha384_context ctx;
+    br_sha384_init(&ctx);
+    br_sha384_update(&ctx, data, len);
+    br_sha384_out(&ctx, out);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519                                                                  */
 /* ------------------------------------------------------------------------ */
 
