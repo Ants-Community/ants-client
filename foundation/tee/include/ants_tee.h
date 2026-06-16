@@ -3,11 +3,12 @@
  *
  * Spec reference: RFC-0005 (Identity & TEE attestation, all sections).
  *
- * Status: **API surface only — v1.0 ships with every function
- * returning `ANTS_ERROR_NOT_IMPLEMENTED`.** Real implementation is
- * targeted v2.x per RFC-0005's hardware-trust timeline (2030-2032
- * silicon-vulnerability-window closure). See `foundation/tee/README.md`
- * for the scope sketch and the open `[CLAIM]` issue at
+ * Status: **a v1 deliverable, in progress** (un-deferred from v2.x on
+ * 2026-06-15). The functions below still return
+ * `ANTS_ERROR_NOT_IMPLEMENTED` — the per-vendor attestation_verify lands
+ * incrementally (Intel TDX + AMD SEV-SNP first), built on the ECDSA
+ * P-256/P-384 + SHA-256/512 primitives now in foundation/crypto. See
+ * `foundation/tee/README.md` for scope + the open `[CLAIM]` issue at
  * Ants-Community/ants#6.
  *
  * Why the stub exists in v1.0: upstream components (network,
@@ -15,14 +16,15 @@
  * — peer-handshake bindings, trustee key rotation, bond admission, and
  * committee role assumption all carry attestation metadata. Having the
  * API compiled means those components can integrate against it now
- * without having to mock or `#ifdef` a future shape. When the harness
- * lands in v2.x the integration sites need no changes.
+ * without having to mock or `#ifdef` a future shape. When each vendor's
+ * verify lands the integration sites need no changes.
  *
- * v1.0 verifiability without TEE: RFC-0002 lists four legs (re-
- * execution, scheme (C) probabilistic, reputation, TEE attestation).
- * Without leg 4, the protocol still composes the other three. The
- * absence reduces participation-path diversity for low-resource
- * operators — not soundness, safety, or correctness.
+ * The TEE does two jobs. As RFC-0002's fourth verifiability leg (re-
+ * execution, scheme (C) probabilistic, reputation, TEE) it is optional —
+ * the other three legs compose without it. But as the identity root it
+ * is not: RFC-0005 "one attested CPU, one peer identity" and RFC-0004
+ * "one CPU, one voice" both reduce to the attested population, which is
+ * why this is a v1 deliverable, not v2.x.
  */
 
 #ifndef ANTS_TEE_H
