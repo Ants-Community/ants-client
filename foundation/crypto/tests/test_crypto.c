@@ -951,6 +951,167 @@ static void test_ecdsa_p256_wycheproof(void)
     }
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-384 verify — KAT + adversarial vectors from Project Wycheproof.   */
+/*                                                                          */
+/* ecdsa_secp384r1_sha512_p1363_test.json testGroups[0]: AMD SEV-SNP signs  */
+/* its attestation report with ECDSA P-384 (RFC-0005). Wycheproof is an     */
+/* independent, adversarial set — the cross-check that catches a verifier   */
+/* that is self-consistent but wrong (the ECVRF lesson). Each signature is  */
+/* verified over SHA-512(msg), exercising ants_sha512 in the chain. The     */
+/* 96-byte public key is testGroups[0].publicKey.uncompressed with the      */
+/* leading 0x04 stripped (X || Y). result "valid" -> ANTS_OK; "invalid" ->  */
+/* ANTS_ERROR_MALFORMED. Only 96-byte signatures are taken here.            */
+/* ------------------------------------------------------------------------ */
+
+static void test_ecdsa_p384_rejects_invalid_args(void)
+{
+    uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZE] = {0};
+    uint8_t sig[ANTS_ECDSA_P384_SIG_SIZE] = {0};
+    uint8_t hash[ANTS_SHA512_HASH_SIZE] = {0};
+    CHECK_EQ(ants_ecdsa_p384_verify(NULL, hash, sizeof hash, sig), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ecdsa_p384_verify(pub, NULL, 1, sig), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_ecdsa_p384_verify(pub, hash, sizeof hash, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_ecdsa_p384_wycheproof(void)
+{
+    /* testGroups[0].publicKey.uncompressed, 0x04 prefix stripped (X || Y). */
+    static const char pub_hex[] = "2da57dda1089276a543f9ffdac0bff0d976cad71eb7280e7d9bfd9fee4bdb2f2"
+                                  "0f47ff888274389772d98cc5752138aa"
+                                  "4b6d054d69dcf3e25ec49df870715e34883b1836197d76f8ad962e78f6571bbc"
+                                  "7407b0d6091f9e4d88f014274406174f";
+
+    struct kat {
+        int tc_id;
+        const char *msg_hex;
+        const char *sig_hex;
+        ants_error_t expect;
+    };
+    static const struct kat kats[] = {
+        {1,
+         "313233343030", /* signature malleability */
+         "814cc9a70febda342d4ada87fc39426f403d5e89808428460c1eca60c897bfd6728da14673854673d7d297ea9"
+         "44a15e2"
+         "7b0a10ee2dd0dd2fab75095af240d095e446faba7a50a19fbb197e4c4250926e30c5303a2c2d34250f17fcf5a"
+         "b3181a6",
+         ANTS_OK},
+        {60,
+         "3637323636", /* Edge case for Shamir multiplication */
+         "ac042e13ab83394692019170707bc21dd3d7b8d233d11b651757085bdd5767eabbb85322984f14437335de0cd"
+         "f565684"
+         "8f8a277dde5282671af958e3315e795a20e2885157b77663a67a77ef2379020c5d12be6c732fd725402cb9ee8"
+         "c345284",
+         ANTS_OK},
+        {61,
+         "33393439313934313732", /* special case hash */
+         "d51c53fa3e201c440a4e33ea0bbc1d3f3fe18b0cc2a4d6812dd217a9b426e54eb4024113b354441272174549c"
+         "979857c"
+         "0992c5442dc6d5d6095a45720f5c5344acb78bc18817ef32c1334e6eba7726246577d4257942bdefe994c1575"
+         "ed15a6e",
+         ANTS_OK},
+        {62,
+         "35333637363431383737", /* special case hash */
+         "c8d44c8b70abed9e6ae6bbb9f4b72ed6e8b50a52a8e6e1bd3447c0828dad26fc6f395ba09069b307f040d1e86"
+         "a42c022"
+         "01e0af500505bb88b3a2b0f132acb4da64adddc0598318cb7612b5812d29c2d0dde1413d0ce40044b44590e91"
+         "b97bacd",
+         ANTS_OK},
+        {11,
+         "313233343030", /* Signature with special case values r=0 and s=0 */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000",
+         ANTS_ERROR_MALFORMED},
+        {12,
+         "313233343030", /* Signature with special case values r=0 and s=1 */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000001",
+         ANTS_ERROR_MALFORMED},
+        {13,
+         "313233343030", /* Signature with special case values r=0 and s=n */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000"
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52973",
+         ANTS_ERROR_MALFORMED},
+        {14,
+         "313233343030", /* Signature with special case values r=0 and s=n - 1 */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000"
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52972",
+         ANTS_ERROR_MALFORMED},
+        {16,
+         "313233343030", /* Signature with special case values r=0 and s=p */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000"
+         "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000f"
+         "fffffff",
+         ANTS_ERROR_MALFORMED},
+        {18,
+         "313233343030", /* Signature with special case values r=1 and s=0 */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000001"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000",
+         ANTS_ERROR_MALFORMED},
+        {20,
+         "313233343030", /* Signature with special case values r=1 and s=n */
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000001"
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52973",
+         ANTS_ERROR_MALFORMED},
+        {25,
+         "313233343030", /* Signature with special case values r=n and s=0 */
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52973"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000",
+         ANTS_ERROR_MALFORMED},
+        {39,
+         "313233343030", /* Signature with special case values r=n + 1 and s=0 */
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52974"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000000",
+         ANTS_ERROR_MALFORMED},
+        {40,
+         "313233343030", /* Signature with special case values r=n + 1 and s=1 */
+         "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196ac"
+         "cc52974"
+         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+         "0000001",
+         ANTS_ERROR_MALFORMED}};
+
+    uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZE];
+    CHECK(hex_to_bytes(pub_hex, pub, sizeof pub) == sizeof pub);
+
+    for (size_t i = 0; i < sizeof kats / sizeof kats[0]; i++) {
+        const struct kat *k = &kats[i];
+        uint8_t msg[64];
+        uint8_t sig[ANTS_ECDSA_P384_SIG_SIZE];
+        uint8_t hash[ANTS_SHA512_HASH_SIZE];
+        size_t msg_len = hex_to_bytes(k->msg_hex, msg, sizeof msg);
+        CHECK(hex_to_bytes(k->sig_hex, sig, sizeof sig) == sizeof sig);
+        CHECK_EQ(ants_sha512(msg, msg_len, hash), ANTS_OK);
+        ants_error_t got = ants_ecdsa_p384_verify(pub, hash, sizeof hash, sig);
+        if (got != k->expect) {
+            failures++;
+            fprintf(stderr,
+                    "FAIL ecdsa-p384 wycheproof tcId=%d: expected %s, got %s\n",
+                    k->tc_id,
+                    ants_strerror(k->expect),
+                    ants_strerror(got));
+        }
+    }
+}
+
 int main(void)
 {
     test_blake3_rejects_invalid_args();
@@ -985,6 +1146,9 @@ int main(void)
 
     test_ecdsa_p256_rejects_invalid_args();
     test_ecdsa_p256_wycheproof();
+
+    test_ecdsa_p384_rejects_invalid_args();
+    test_ecdsa_p384_wycheproof();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

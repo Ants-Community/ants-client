@@ -287,6 +287,41 @@ ants_error_t ants_ecdsa_p256_verify(const uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZ
                                     size_t hash_len,
                                     const uint8_t sig[ANTS_ECDSA_P256_SIG_SIZE]);
 
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-384 — TEE attestation signature verification (verify-only)       */
+/*                                                                          */
+/* NIST P-384 (secp384r1) ECDSA verification, the sibling of the P-256      */
+/* primitive above: AMD SEV-SNP signs its attestation report with ECDSA     */
+/* P-384 (RFC-0005), where Intel TDX uses P-256. Verify-only — ANTS never   */
+/* produces P-384 signatures (peer identity is Ed25519). Inputs are the raw */
+/* fixed-width encodings the verifier holds after stripping container       */
+/* framing: a 96-byte uncompressed public key (X || Y big-endian, no 0x04   */
+/* prefix) and a 96-byte signature (r || s big-endian). DER/SEC1 unwrapping  */
+/* is the TEE layer's job, not the primitive's.                             */
+/*                                                                          */
+/* AMD SEV-SNP digests the report with SHA-384; this function does not hash */
+/* — the caller supplies the digest (see ants_sha512 for the SHA-2-512      */
+/* family). Backed by the vendored BearSSL EC subset (deps/bearssl).        */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_ECDSA_P384_PUBKEY_SIZE 96
+#define ANTS_ECDSA_P384_SIG_SIZE    96
+
+/*
+ * Verify an ECDSA P-384 signature `sig` over the pre-computed message
+ * digest `hash` (`hash_len` bytes; SHA-384 gives 48, SHA-512 gives 64)
+ * against public key `pub`. The caller supplies the digest — this function
+ * does not hash.
+ *
+ * Returns ANTS_OK on a valid signature, ANTS_ERROR_MALFORMED on an invalid
+ * signature or invalid public key, ANTS_ERROR_INVALID_ARG on a null
+ * pointer. Mirrors the ants_ecdsa_p256_verify return convention.
+ */
+ants_error_t ants_ecdsa_p384_verify(const uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZE],
+                                    const uint8_t *hash,
+                                    size_t hash_len,
+                                    const uint8_t sig[ANTS_ECDSA_P384_SIG_SIZE]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,6 +11,7 @@
 
 #include "ants_crypto.h"
 
+#include "bearssl.h"
 #include "blake3.h"
 #include "blst.h"
 #include "p256-m.h"
@@ -897,6 +898,46 @@ ants_error_t ants_ecdsa_p256_verify(const uint8_t pub[ANTS_ECDSA_P256_PUBKEY_SIZ
      * mean the attestation signature did not verify — map to MALFORMED,
      * matching the ants_ed25519_verify convention. */
     if (p256_ecdsa_verify(sig, pub, hash, hash_len) != P256_SUCCESS) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* ECDSA P-384 — TEE attestation signature verification (verify-only)       */
+/*                                                                          */
+/* Implemented via the vendored BearSSL EC subset (deps/bearssl, MIT): the  */
+/* generic-prime verifier br_ecdsa_i31_vrfy_raw over br_ec_prime_i31, raw   */
+/* IEEE-P1363 (r||s) signatures. AMD SEV-SNP signs its attestation report   */
+/* with ECDSA P-384 (RFC-0005); p256-m is P-256-only. Verify-only, no RNG.  */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_ecdsa_p384_verify(const uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZE],
+                                    const uint8_t *hash,
+                                    size_t hash_len,
+                                    const uint8_t sig[ANTS_ECDSA_P384_SIG_SIZE])
+{
+    if (pub == NULL || (hash == NULL && hash_len > 0) || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* BearSSL wants the public key as the uncompressed SEC1 point
+     * 0x04 || X || Y (97 bytes for P-384). The wrapper takes the 96-byte
+     * X || Y the verifier holds after stripping framing; prepend 0x04. */
+    uint8_t q[1 + ANTS_ECDSA_P384_PUBKEY_SIZE];
+    q[0] = 0x04;
+    memcpy(q + 1, pub, ANTS_ECDSA_P384_PUBKEY_SIZE);
+
+    br_ec_public_key pk;
+    pk.curve = BR_EC_secp384r1;
+    pk.q = q;
+    pk.qlen = sizeof q;
+
+    /* br_ecdsa_i31_vrfy_raw returns 1 on a valid signature, 0 otherwise
+     * (bad signature or bad public key). Map 0 -> MALFORMED, matching the
+     * ants_ecdsa_p256_verify / ants_ed25519_verify convention. */
+    if (br_ecdsa_i31_vrfy_raw(
+            &br_ec_prime_i31, hash, hash_len, &pk, sig, ANTS_ECDSA_P384_SIG_SIZE) != 1) {
         return ANTS_ERROR_MALFORMED;
     }
     return ANTS_OK;
