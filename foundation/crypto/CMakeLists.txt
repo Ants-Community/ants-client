@@ -88,3 +88,11 @@ endif()
 #   ./build/foundation/crypto/ecdsa_p256_vectors > .../vectors/ecdsa-p256/ecdsa-p256.json
 add_executable(ecdsa_p256_vectors tools/ecdsa_p256_vectors.c)
 target_link_libraries(ecdsa_p256_vectors PRIVATE ants_crypto)
+
+# ecdsa_p384_vectors — emits the ecdsa-p384.verify test-vector pack (JSON on
+# stdout, the ants-test-vectors house format). Vectors are sourced from Project
+# Wycheproof (ecdsa_secp384r1_sha512_p1363); every verdict is confirmed against
+# the compiled ants_ecdsa_p384_verify and each digest computed by ants_sha512.
+#   ./build/foundation/crypto/ecdsa_p384_vectors > .../vectors/ecdsa-p384/ecdsa-p384.json
+add_executable(ecdsa_p384_vectors tools/ecdsa_p384_vectors.c)
+target_link_libraries(ecdsa_p384_vectors PRIVATE ants_crypto)
