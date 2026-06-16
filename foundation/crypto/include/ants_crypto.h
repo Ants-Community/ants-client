@@ -121,6 +121,28 @@ ants_error_t ants_blake3_final(ants_blake3_ctx_t *ctx, uint8_t out[ANTS_BLAKE3_H
 ants_error_t ants_sha256(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA256_HASH_SIZE]);
 
 /* ------------------------------------------------------------------------ */
+/* SHA-512 — external-interop hashing ONLY                                  */
+/*                                                                          */
+/* Like SHA-256 (above), SHA-512 exists solely to verify artifacts whose    */
+/* format is fixed by an external protocol — never for anything             */
+/* ANTS-internal (protocol-internal hashing is BLAKE3; RFC-0008 §2.1). It   */
+/* is the message digest under the vendor ECDSA signatures in TEE           */
+/* attestation quotes (RFC-0005): the ECDSA P-384 verify path is keyed by   */
+/* SHA-512/384 digests (AMD SEV-SNP signs P-384, the sibling of Intel TDX's */
+/* P-256/SHA-256). Thin wrapper over the libsodium SHA-512 already linked   */
+/* for ECVRF, so callers never include vendored headers directly.           */
+/* ------------------------------------------------------------------------ */
+
+/* Output size in bytes. */
+#define ANTS_SHA512_HASH_SIZE 64
+
+/*
+ * One-shot hash: SHA-512(data) -> 64-byte output. `data` may be NULL
+ * only when `len` is 0.
+ */
+ants_error_t ants_sha512(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA512_HASH_SIZE]);
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519 — Peer identity signatures                                       */
 /*                                                                          */
 /* Per RFC-0008 §3.1, all peer-to-peer signatures use Ed25519 (RFC 8032).   */

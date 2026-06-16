@@ -66,24 +66,36 @@ static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t out_cap)
     return n / 2;
 }
 
-/* Helper: check that `actual` (32 bytes) matches `expected_hex`. */
-static void check_hash(const char *what, const uint8_t actual[32], const char *expected_hex)
+/* Helper: check that `actual` (`len` bytes, len <= 64) matches `expected_hex`. */
+static void
+check_hash_n(const char *what, const uint8_t *actual, size_t len, const char *expected_hex)
 {
-    uint8_t expected[32];
+    uint8_t expected[64];
+    if (len > sizeof expected) {
+        failures++;
+        fprintf(stderr, "FAIL %s: digest too large\n", what);
+        return;
+    }
     size_t n = hex_to_bytes(expected_hex, expected, sizeof expected);
-    if (n != 32) {
+    if (n != len) {
         failures++;
         fprintf(stderr, "FAIL %s: bad expected hex\n", what);
         return;
     }
-    if (memcmp(actual, expected, 32) != 0) {
+    if (memcmp(actual, expected, len) != 0) {
         failures++;
         fprintf(stderr, "FAIL %s\n  expected: %s\n  got:     ", what, expected_hex);
-        for (size_t i = 0; i < 32; i++) {
+        for (size_t i = 0; i < len; i++) {
             fprintf(stderr, "%02x", actual[i]);
         }
         fprintf(stderr, "\n");
     }
+}
+
+/* Helper: check that `actual` (32 bytes) matches `expected_hex`. */
+static void check_hash(const char *what, const uint8_t actual[32], const char *expected_hex)
+{
+    check_hash_n(what, actual, 32, expected_hex);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -224,6 +236,48 @@ static void test_sha256_known_inputs(void)
     check_hash("sha256(pattern 104B)",
                out,
                "5af877de0ea99d70bd0a547c967dbecd4525d6bba9ab2917d54d6aa742874687");
+}
+
+static void test_sha512_rejects_invalid_args(void)
+{
+    uint8_t out[ANTS_SHA512_HASH_SIZE];
+    CHECK_EQ(ants_sha512(NULL, 1, out), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_sha512((const uint8_t *)"x", 1, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_sha512_known_inputs(void)
+{
+    uint8_t out[ANTS_SHA512_HASH_SIZE];
+
+    /* FIPS 180-4 known answers; every value below cross-checked against
+     * two independent implementations (macOS shasum -a 512 and Python
+     * hashlib, 2026-06-16) rather than copied from one source. */
+    CHECK_EQ(ants_sha512(NULL, 0, out), ANTS_OK);
+    check_hash_n("sha512('')",
+                 out,
+                 ANTS_SHA512_HASH_SIZE,
+                 "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+                 "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e");
+
+    CHECK_EQ(ants_sha512((const uint8_t *)"abc", 3, out), ANTS_OK);
+    check_hash_n("sha512('abc')",
+                 out,
+                 ANTS_SHA512_HASH_SIZE,
+                 "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+                 "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+
+    /* 200-byte pattern byte[i] = (i*7 + 3) mod 256 — crosses one
+     * 128-byte SHA-512 block boundary. Same two references. */
+    uint8_t pattern[200];
+    for (size_t i = 0; i < sizeof pattern; i++) {
+        pattern[i] = (uint8_t)(i * 7 + 3);
+    }
+    CHECK_EQ(ants_sha512(pattern, sizeof pattern, out), ANTS_OK);
+    check_hash_n("sha512(pattern 200B)",
+                 out,
+                 ANTS_SHA512_HASH_SIZE,
+                 "cca3c0276046ef9f2897bdfc3ec330f77f4959914b1462bd581b232ddb3e9aa9"
+                 "8acf5f5a2b21c7f49d2e43721daa61a2b5cee6af6052dfeb766e66ddb0d1719c");
 }
 
 /* drand default chain (scheme pedersen-bls-chained, chain hash
@@ -908,6 +962,9 @@ int main(void)
     test_sha256_rejects_invalid_args();
     test_sha256_known_inputs();
     test_sha256_drand_randomness();
+
+    test_sha512_rejects_invalid_args();
+    test_sha512_known_inputs();
 
     test_ed25519_rejects_invalid_args();
     test_ed25519_rfc8032_test1_empty();

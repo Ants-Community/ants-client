@@ -138,6 +138,29 @@ ants_error_t ants_sha256(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA25
 }
 
 /* ------------------------------------------------------------------------ */
+/* SHA-512                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Thin wrapper over the libsodium SHA-512 (deps/ed25519, already linked and
+ * exercised by ECVRF below). Kept here so callers never include vendored
+ * headers directly; see the header for the external-interop-only usage rule.
+ * Verifies the vendor ECDSA signature chains in TEE attestation quotes
+ * (RFC-0005), whose message digests are SHA-2.
+ */
+ants_error_t ants_sha512(const uint8_t *data, size_t len, uint8_t out[ANTS_SHA512_HASH_SIZE])
+{
+    if ((data == NULL && len > 0) || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    crypto_hash_sha512_state st;
+    crypto_hash_sha512_init(&st);
+    crypto_hash_sha512_update(&st, data, len);
+    crypto_hash_sha512_final(&st, out);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Ed25519                                                                  */
 /* ------------------------------------------------------------------------ */
 
