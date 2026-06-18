@@ -15,6 +15,8 @@
 #include "ants_common.h"
 #include "ants_tee.h"
 
+#include "snp_kat_vectors.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -120,6 +122,109 @@ static void test_is_revoked_returns_false(void)
     CHECK(ants_attestation_is_revoked(NULL) == false);
 }
 
+/* ---- AMD SEV-SNP report parse + signature verify ---------------------- */
+/*                                                                         */
+/* KAT vector: a genuine attestation report from real AMD Milan silicon,   */
+/* its VCEK signature independently confirmed with OpenSSL before pinning  */
+/* (see snp_kat_vectors.h for provenance + the verification transcript).   */
+
+static void test_snp_report_parse_fields(void)
+{
+    ants_snp_report_t r;
+    CHECK_EQ(ants_snp_report_parse(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE, &r), ANTS_OK);
+
+    /* Scalar fields, independently decoded from the report. */
+    CHECK(r.version == 2);
+    CHECK(r.guest_svn == 0);
+    CHECK(r.policy == 0x00000000000b0000ULL);
+    CHECK(r.vmpl == 0);
+    CHECK(r.signature_algo == ANTS_SNP_SIG_ALGO_ECDSA_P384_SHA384);
+    CHECK(r.current_tcb == 0x4405000000000002ULL);
+    CHECK(r.reported_tcb == 0x4405000000000002ULL);
+
+    /* Byte-array fields: anchor both ends so a wrong offset is caught
+     * (REPORT_DATA carries the 01 02 03 04 05 nonce, then zeros). */
+    CHECK(r.report_data[0] == 0x01 && r.report_data[4] == 0x05 && r.report_data[5] == 0x00);
+    CHECK(r.measurement[0] == 0xb0 && r.measurement[ANTS_SNP_MEASUREMENT_SIZE - 1] == 0x01);
+    CHECK(r.chip_id[0] == 0x3a && r.chip_id[ANTS_SNP_CHIP_ID_SIZE - 1] == 0x5d);
+
+    /* Guards. */
+    CHECK_EQ(ants_snp_report_parse(NULL, ANTS_SNP_REPORT_SIZE, &r), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_snp_report_parse(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_snp_report_parse(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE - 1, &r),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_real_report(void)
+{
+    /* Positive KAT: the real Milan VCEK signature must verify. */
+    CHECK_EQ(
+        ants_snp_report_verify_signature(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE, SNP_KAT_VCEK_PUBKEY),
+        ANTS_OK);
+}
+
+static void test_snp_verify_rejects_tampered_body(void)
+{
+    /* Flip a measurement bit (inside the signed [0, 0x2A0) prefix). */
+    uint8_t buf[ANTS_SNP_REPORT_SIZE];
+    memcpy(buf, SNP_KAT_REPORT, sizeof buf);
+    buf[0x90] ^= 0x01;
+    CHECK_EQ(ants_snp_report_verify_signature(buf, sizeof buf, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_rejects_tampered_signature(void)
+{
+    /* Flip a low byte of R. */
+    uint8_t buf[ANTS_SNP_REPORT_SIZE];
+    memcpy(buf, SNP_KAT_REPORT, sizeof buf);
+    buf[0x2A0] ^= 0x01;
+    CHECK_EQ(ants_snp_report_verify_signature(buf, sizeof buf, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_rejects_wrong_key(void)
+{
+    /* Corrupt one byte of the VCEK X coordinate. */
+    uint8_t key[ANTS_SNP_VCEK_PUBKEY_SIZE];
+    memcpy(key, SNP_KAT_VCEK_PUBKEY, sizeof key);
+    key[0] ^= 0x01;
+    CHECK_EQ(ants_snp_report_verify_signature(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE, key),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_rejects_bad_algo(void)
+{
+    /* SIGNATURE_ALGO != ECDSA-P384-SHA384 is rejected before any crypto. */
+    uint8_t buf[ANTS_SNP_REPORT_SIZE];
+    memcpy(buf, SNP_KAT_REPORT, sizeof buf);
+    buf[0x34] = 2;
+    CHECK_EQ(ants_snp_report_verify_signature(buf, sizeof buf, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_rejects_nonzero_rs_padding(void)
+{
+    /* The high 24 bytes of each 72-byte R/S slot must be zero. */
+    uint8_t buf[ANTS_SNP_REPORT_SIZE];
+    memcpy(buf, SNP_KAT_REPORT, sizeof buf);
+    buf[0x2A0 + 48] = 0x01; /* first padding byte of R */
+    CHECK_EQ(ants_snp_report_verify_signature(buf, sizeof buf, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_snp_verify_guards(void)
+{
+    CHECK_EQ(ants_snp_report_verify_signature(NULL, ANTS_SNP_REPORT_SIZE, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_snp_report_verify_signature(SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_snp_report_verify_signature(
+                 SNP_KAT_REPORT, ANTS_SNP_REPORT_SIZE - 1, SNP_KAT_VCEK_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
 int main(void)
 {
     test_vendor_ids_pinned();
@@ -129,6 +234,15 @@ int main(void)
     test_verify_returns_not_implemented();
     test_is_fresh_returns_false();
     test_is_revoked_returns_false();
+
+    test_snp_report_parse_fields();
+    test_snp_verify_real_report();
+    test_snp_verify_rejects_tampered_body();
+    test_snp_verify_rejects_tampered_signature();
+    test_snp_verify_rejects_wrong_key();
+    test_snp_verify_rejects_bad_algo();
+    test_snp_verify_rejects_nonzero_rs_padding();
+    test_snp_verify_guards();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

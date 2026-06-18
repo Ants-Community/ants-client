@@ -179,6 +179,116 @@ bool ants_attestation_is_fresh(const ants_attestation_t *att,
  */
 bool ants_attestation_is_revoked(const ants_attestation_t *att);
 
+/* ------------------------------------------------------------------------ */
+/* AMD SEV-SNP attestation report                                           */
+/*                                                                          */
+/* The first per-vendor structure parser + report-signature verifier. The  */
+/* SNP `vendor_blob` (above) is, at its head, a 0x4A0-byte ATTESTATION_     */
+/* REPORT structure (AMD SEV-SNP ABI spec, "ATTESTATION_REPORT Structure"); */
+/* the trailing bytes carry the VCEK/ASK/ARK certificate table. This        */
+/* section parses the fixed-layout report and verifies its signature        */
+/* against a CALLER-SUPPLIED VCEK public key.                               */
+/*                                                                          */
+/* The VCEK is the leaf of the AMD certificate chain (VCEK -> ASK -> ARK).  */
+/* Extracting the VCEK key from that X.509 chain — and validating the chain */
+/* to the AMD root — is a separate, forthcoming step (it needs ASN.1/X.509  */
+/* + RSA-4096 verification). Until that lands, this verifier takes the      */
+/* leaf key as an input, which is exactly the contract a chain validator    */
+/* will satisfy once it does: parse + chain-validate -> hand us the leaf.   */
+/*                                                                          */
+/* The report is signed with ECDSA P-384 over a SHA-384 digest of its       */
+/* first 0x2A0 bytes (RFC-0005; the only SIGNATURE_ALGO SNP defines). The   */
+/* digest + curve primitives live in foundation/crypto.                     */
+/* ------------------------------------------------------------------------ */
+
+/* Wire size of the fixed ATTESTATION_REPORT structure. */
+#define ANTS_SNP_REPORT_SIZE 0x4A0 /* 1184 bytes */
+
+/* Length of the prefix the signature covers: report bytes [0, 0x2A0). */
+#define ANTS_SNP_SIGNED_PREFIX_LEN 0x2A0 /* 672 bytes */
+
+/* Fixed field sizes (bytes), per the ABI structure. */
+#define ANTS_SNP_FAMILY_ID_SIZE   16
+#define ANTS_SNP_IMAGE_ID_SIZE    16
+#define ANTS_SNP_REPORT_DATA_SIZE 64
+#define ANTS_SNP_MEASUREMENT_SIZE 48
+#define ANTS_SNP_HOST_DATA_SIZE   32
+#define ANTS_SNP_REPORT_ID_SIZE   32
+#define ANTS_SNP_CHIP_ID_SIZE     64
+
+/* The only signature algorithm SNP defines: ECDSA P-384 with SHA-384. */
+#define ANTS_SNP_SIG_ALGO_ECDSA_P384_SHA384 1
+
+/* VCEK public key as the verifier consumes it: the raw 96-byte
+ * uncompressed P-384 point X || Y, big-endian, no 0x04 prefix — exactly
+ * what `ants_ecdsa_p384_verify` expects (== ANTS_ECDSA_P384_PUBKEY_SIZE).
+ * An X.509 SubjectPublicKeyInfo stores X and Y big-endian already, so a
+ * future chain validator can hand these 96 bytes straight through. */
+#define ANTS_SNP_VCEK_PUBKEY_SIZE 96
+
+/*
+ * Decoded view of the stable, version-independent fields of an SNP
+ * attestation report. Only fields whose offsets are identical across
+ * report VERSION 2 and 3 are surfaced; the version-specific reserved
+ * regions are not. Integers are host-order (decoded from the on-wire
+ * little-endian); byte arrays are copied verbatim.
+ */
+typedef struct {
+    uint32_t version;   /* report format version (2 or 3) */
+    uint32_t guest_svn; /* guest security version number */
+    uint64_t policy;    /* guest policy bitfield */
+    uint8_t family_id[ANTS_SNP_FAMILY_ID_SIZE];
+    uint8_t image_id[ANTS_SNP_IMAGE_ID_SIZE];
+    uint32_t vmpl;                                  /* VMPL the report was requested at */
+    uint32_t signature_algo;                        /* SIGNATURE_ALGO (see ANTS_SNP_SIG_ALGO_*) */
+    uint64_t current_tcb;                           /* CurrentTcb */
+    uint64_t platform_info;                         /* PLATFORM_INFO bitfield */
+    uint8_t report_data[ANTS_SNP_REPORT_DATA_SIZE]; /* guest-supplied nonce; binds the peer key */
+    uint8_t measurement[ANTS_SNP_MEASUREMENT_SIZE]; /* launch measurement */
+    uint8_t host_data[ANTS_SNP_HOST_DATA_SIZE];     /* hypervisor-supplied data */
+    uint8_t report_id[ANTS_SNP_REPORT_ID_SIZE];
+    uint64_t reported_tcb;                  /* TCB the VCEK was derived at */
+    uint8_t chip_id[ANTS_SNP_CHIP_ID_SIZE]; /* unique chip identifier */
+} ants_snp_report_t;
+
+/*
+ * Parse the fixed-layout fields of an SNP attestation report.
+ *
+ * `report` must point to at least `report_len` bytes; `report_len` must
+ * equal ANTS_SNP_REPORT_SIZE. On success the decoded fields are written
+ * to `*out`. Parsing does NOT verify the signature (see
+ * ants_snp_report_verify_signature) and does not gate on VERSION — it
+ * only decodes; callers branch on `out->version` / `out->signature_algo`.
+ *
+ * Returns ANTS_OK on success, ANTS_ERROR_INVALID_ARG on a null pointer,
+ * ANTS_ERROR_MALFORMED if `report_len != ANTS_SNP_REPORT_SIZE`.
+ */
+ants_error_t
+ants_snp_report_parse(const uint8_t *report, size_t report_len, ants_snp_report_t *out);
+
+/*
+ * Verify the ECDSA P-384 / SHA-384 signature of an SNP attestation report
+ * against the supplied VCEK public key.
+ *
+ * Recomputes SHA-384 over the signed prefix (report[0, 0x2A0)), converts
+ * the report's little-endian R and S components to the big-endian form the
+ * curve primitive expects, and checks them against `vcek_pubkey`
+ * (ANTS_SNP_VCEK_PUBKEY_SIZE bytes, X || Y big-endian).
+ *
+ * This checks ONLY the report-to-VCEK signature. It does NOT validate the
+ * VCEK certificate chain to the AMD root, nor freshness/revocation — those
+ * are separate, composable checks. A caller that has not yet validated the
+ * chain must not treat a pass here as a full attestation.
+ *
+ * Returns ANTS_OK if the signature is valid; ANTS_ERROR_MALFORMED on a
+ * wrong-size report, an unsupported SIGNATURE_ALGO, non-canonical R/S
+ * padding, or an invalid signature/key; ANTS_ERROR_INVALID_ARG on a null
+ * pointer.
+ */
+ants_error_t ants_snp_report_verify_signature(const uint8_t *report,
+                                              size_t report_len,
+                                              const uint8_t vcek_pubkey[ANTS_SNP_VCEK_PUBKEY_SIZE]);
+
 #ifdef __cplusplus
 }
 #endif

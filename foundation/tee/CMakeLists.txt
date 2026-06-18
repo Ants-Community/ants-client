@@ -1,14 +1,11 @@
 # foundation/tee — TEE attestation harness (Component #3).
 #
-# v1.0: stub only — every function in ants_tee.h returns
-# ANTS_ERROR_NOT_IMPLEMENTED. The API surface is pinned so upstream
-# components (network, reputation, identity) can integrate against it
-# without waiting for the real implementation.
-#
-# Real implementation: targeted v2.x per RFC-0005's hardware-trust
-# timeline (2030-2032 silicon-vulnerability-window closure). See the
-# component README and the open [CLAIM] issue at
-# Ants-Community/ants#6.
+# A v1 deliverable, in progress (un-deferred from v2.x on 2026-06-15).
+# The uniform ants_attestation_* surface is still a stub; the per-vendor
+# structure parsers + report-signature verifiers land incrementally on
+# top of foundation/crypto. AMD SEV-SNP report parse + signature verify
+# is the first (ECDSA P-384 over SHA-384). See the component README and
+# the open [CLAIM] issue at Ants-Community/ants#6.
 
 add_library(ants_tee STATIC
     src/tee.c
@@ -24,6 +21,11 @@ target_include_directories(ants_tee
 # until we extract a shared common.c). Link against it so the tee
 # tests can call ants_strerror without redefining the symbol.
 target_link_libraries(ants_tee PUBLIC ants_cbor)
+
+# SNP report-signature verification uses SHA-384 + ECDSA P-384 from
+# foundation/crypto. Private: crypto is an implementation detail, not
+# part of the ants_tee.h surface.
+target_link_libraries(ants_tee PRIVATE ants_crypto)
 
 target_compile_features(ants_tee PUBLIC c_std_99)
 
