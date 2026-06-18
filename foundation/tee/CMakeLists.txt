@@ -36,3 +36,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_tee PRIVATE ants_tee)
     add_test(NAME tee_basic COMMAND test_tee)
 endif()
+
+# ---- Vector emitter ------------------------------------------------------
+
+# snp_vectors — emits the snp-report.verify test-vector pack (JSON on stdout,
+# the ants-test-vectors house format) from the genuine Milan KAT report. Every
+# verdict is confirmed against the compiled ants_snp_report_verify_signature
+# before emission. Shares the report bytes with the tests via tests/.
+#   ./build/foundation/tee/snp_vectors > .../vectors/snp-report/snp-report.json
+add_executable(snp_vectors tools/snp_vectors.c)
+target_link_libraries(snp_vectors PRIVATE ants_tee)
+target_include_directories(snp_vectors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
