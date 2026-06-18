@@ -13,6 +13,28 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/tee: AMD SEV-SNP attestation report parse + signature verify · 2026-06-18
+
+`foundation/tee` (PR #164): the first per-vendor TEE structure parser +
+report-signature verifier, built on the ECDSA P-384 + SHA-384 primitives in
+`foundation/crypto`. `ants_snp_report_parse` decodes the stable,
+version-independent fields of the `0x4A0`-byte `ATTESTATION_REPORT` structure
+(version, policy, TCB, report_data, measurement, chip_id, …); offsets pinned
+against the AMD SEV-SNP ABI layout. `ants_snp_report_verify_signature`
+recomputes SHA-384 over the signed prefix `report[0, 0x2A0)`, converts the
+report's little-endian R/S to the big-endian `r||s` the curve primitive wants,
+and verifies against a caller-supplied VCEK public key (96-byte `X||Y`). It
+checks **only** the report-to-VCEK signature — VCEK certificate-chain
+validation (ASN.1/X.509 + RSA-4096), freshness, and revocation are separate,
+composable checks; the chain validator lands next and will hand this function
+the leaf key, which is exactly the contract it takes today. The uniform
+`ants_attestation_*` surface stays a stub until those chains exist. KAT: a
+genuine report from real AMD Milan silicon (`go-sev-guest` `verify/testdata`,
+VCEK `CN=SEV-VCEK` / issuer `SEV-Milan`), its signature independently confirmed
+with OpenSSL before pinning — the compiled verifier returns `ANTS_OK` on it and
+`ANTS_ERROR_MALFORMED` on a tampered body, tampered signature, wrong key,
+unsupported `SIGNATURE_ALGO`, or non-canonical R/S padding.
+
 ### cache/embedding: embed_vectors --pack emits the test-vector pack · 2026-06-15
 
 `cache/embedding` (PR #156): the `embed_vectors` dev tool gains `--pack`, which
