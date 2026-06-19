@@ -16,6 +16,7 @@
 #include "ants_tee.h"
 
 #include "snp_kat_vectors.h"
+#include "tdx_kat_vectors.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -225,6 +226,141 @@ static void test_snp_verify_guards(void)
              ANTS_ERROR_MALFORMED);
 }
 
+/* ---- Intel TDX DCAP quote parse + signature verify ------------------- */
+/*                                                                        */
+/* KAT vector: a genuine production Sapphire Rapids TDX quote (v4,         */
+/* ECDSA-P256). Its three signature links (PCK->QE report, QE->att key     */
+/* binding, att key->TD body) were independently confirmed with Python     */
+/* cryptography + OpenSSL before pinning (see tdx_kat_vectors.h).          */
+
+/* Absolute tamper offsets into the structured quote (see tee.c). */
+#define TDX_T_VERSION       0x000
+#define TDX_T_ATT_KEY_TYPE  0x002
+#define TDX_T_TEE_TYPE      0x004
+#define TDX_T_MR_TD         0x0B8 /* inside the att-key-signed [0, 0x278) */
+#define TDX_T_ATT_SIG       0x27C
+#define TDX_T_ATT_KEY       0x2BC
+#define TDX_T_CERT_TYPE     0x2FC
+#define TDX_T_QE_REPORT     0x302
+#define TDX_T_QE_REPORT_SIG 0x482
+#define TDX_T_QE_AUTH       0x4C4
+
+static void test_tdx_quote_parse_fields(void)
+{
+    ants_tdx_quote_t q;
+    CHECK_EQ(ants_tdx_quote_parse(TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, &q), ANTS_OK);
+
+    /* Header. */
+    CHECK(q.version == ANTS_TDX_QUOTE_VERSION);
+    CHECK(q.att_key_type == ANTS_TDX_ATT_KEY_TYPE_ECDSA_P256);
+    CHECK(q.tee_type == ANTS_TDX_TEE_TYPE);
+    CHECK(q.qe_vendor_id[0] == 0x93 && q.qe_vendor_id[ANTS_TDX_QE_VENDOR_ID_SIZE - 1] == 0x07);
+
+    /* Scalar TD-body bitfields, independently decoded from the quote. */
+    CHECK(q.seam_attributes == 0);
+    CHECK(q.td_attributes == 0x0000000040000000ULL);
+    CHECK(q.xfam == 0x0000000000061ae7ULL);
+
+    /* Byte-array fields: anchor both ends so a wrong offset is caught. */
+    CHECK(q.tee_tcb_svn[0] == 0x03);
+    CHECK(q.mr_seam[0] == 0x2f && q.mr_seam[ANTS_TDX_MEASUREMENT_SIZE - 1] == 0x56);
+    CHECK(q.mr_td[0] == 0x63 && q.mr_td[ANTS_TDX_MEASUREMENT_SIZE - 1] == 0xbb);
+    CHECK(q.rtmr[0][0] == 0x29 && q.rtmr[0][ANTS_TDX_MEASUREMENT_SIZE - 1] == 0x2a);
+    CHECK(q.report_data[0] == 0x6c && q.report_data[ANTS_TDX_REPORT_DATA_SIZE - 1] == 0x13);
+
+    /* Guards. */
+    CHECK_EQ(ants_tdx_quote_parse(NULL, sizeof TDX_KAT_QUOTE, &q), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_tdx_quote_parse(TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_tdx_quote_parse(
+                 TDX_KAT_QUOTE, ANTS_TDX_QUOTE_HEADER_SIZE + ANTS_TDX_QUOTE_BODY_SIZE - 1, &q),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_tdx_verify_real_quote(void)
+{
+    /* Positive KAT: the full three-link chain must verify. */
+    CHECK_EQ(ants_tdx_quote_verify_signature(
+                 TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_OK);
+}
+
+/* Helper: copy the KAT, flip one byte, expect MALFORMED. */
+static void tdx_expect_malformed_with_flip(size_t off)
+{
+    uint8_t buf[sizeof TDX_KAT_QUOTE];
+    memcpy(buf, TDX_KAT_QUOTE, sizeof buf);
+    buf[off] ^= 0x01;
+    CHECK_EQ(ants_tdx_quote_verify_signature(buf, sizeof buf, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_tdx_verify_rejects_tampering(void)
+{
+    /* TD body (breaks link 3: att key over header||body). */
+    tdx_expect_malformed_with_flip(TDX_T_MR_TD);
+    /* Attestation signature (link 3). */
+    tdx_expect_malformed_with_flip(TDX_T_ATT_SIG);
+    /* Attestation key (breaks the link-2 binding hash). */
+    tdx_expect_malformed_with_flip(TDX_T_ATT_KEY);
+    /* QE report (breaks link 1: PCK over the QE report). */
+    tdx_expect_malformed_with_flip(TDX_T_QE_REPORT);
+    /* QE report signature (link 1). */
+    tdx_expect_malformed_with_flip(TDX_T_QE_REPORT_SIG);
+    /* QE auth data (breaks link 2 binding in isolation — it is signed by
+     * nothing else, only bound through report_data). */
+    tdx_expect_malformed_with_flip(TDX_T_QE_AUTH);
+}
+
+static void test_tdx_verify_rejects_wrong_pck_key(void)
+{
+    uint8_t key[ANTS_TDX_PCK_PUBKEY_SIZE];
+    memcpy(key, TDX_KAT_PCK_LEAF_PUBKEY, sizeof key);
+    key[0] ^= 0x01;
+    CHECK_EQ(ants_tdx_quote_verify_signature(TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, key),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_tdx_verify_rejects_header_invariants(void)
+{
+    uint8_t buf[sizeof TDX_KAT_QUOTE];
+
+    /* version != 4. */
+    memcpy(buf, TDX_KAT_QUOTE, sizeof buf);
+    buf[TDX_T_VERSION] = 5;
+    CHECK_EQ(ants_tdx_quote_verify_signature(buf, sizeof buf, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+
+    /* att_key_type != 2 (ECDSA-P256). */
+    memcpy(buf, TDX_KAT_QUOTE, sizeof buf);
+    buf[TDX_T_ATT_KEY_TYPE] = 3;
+    CHECK_EQ(ants_tdx_quote_verify_signature(buf, sizeof buf, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+
+    /* tee_type != TDX. */
+    memcpy(buf, TDX_KAT_QUOTE, sizeof buf);
+    buf[TDX_T_TEE_TYPE] = 0x00;
+    CHECK_EQ(ants_tdx_quote_verify_signature(buf, sizeof buf, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+
+    /* certification data type != 6 (QE report). */
+    memcpy(buf, TDX_KAT_QUOTE, sizeof buf);
+    buf[TDX_T_CERT_TYPE] ^= 0x01;
+    CHECK_EQ(ants_tdx_quote_verify_signature(buf, sizeof buf, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
+static void test_tdx_verify_guards(void)
+{
+    CHECK_EQ(ants_tdx_quote_verify_signature(NULL, sizeof TDX_KAT_QUOTE, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_tdx_quote_verify_signature(TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, NULL),
+             ANTS_ERROR_INVALID_ARG);
+    /* Too short to even hold header + body + the sig-data length word. */
+    CHECK_EQ(ants_tdx_quote_verify_signature(TDX_KAT_QUOTE, 0x27B, TDX_KAT_PCK_LEAF_PUBKEY),
+             ANTS_ERROR_MALFORMED);
+}
+
 int main(void)
 {
     test_vendor_ids_pinned();
@@ -243,6 +379,13 @@ int main(void)
     test_snp_verify_rejects_bad_algo();
     test_snp_verify_rejects_nonzero_rs_padding();
     test_snp_verify_guards();
+
+    test_tdx_quote_parse_fields();
+    test_tdx_verify_real_quote();
+    test_tdx_verify_rejects_tampering();
+    test_tdx_verify_rejects_wrong_pck_key();
+    test_tdx_verify_rejects_header_invariants();
+    test_tdx_verify_guards();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

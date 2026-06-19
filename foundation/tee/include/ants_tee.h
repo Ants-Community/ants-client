@@ -289,6 +289,138 @@ ants_error_t ants_snp_report_verify_signature(const uint8_t *report,
                                               size_t report_len,
                                               const uint8_t vcek_pubkey[ANTS_SNP_VCEK_PUBKEY_SIZE]);
 
+/* ------------------------------------------------------------------------ */
+/* Intel TDX DCAP attestation quote (v4, ECDSA-P256)                        */
+/*                                                                          */
+/* The second per-vendor structure parser + signature verifier (after AMD   */
+/* SEV-SNP above). An Intel TDX `vendor_blob` is a DCAP "quote": a 48-byte   */
+/* header, a 584-byte TD report body (the trust domain's measurements),     */
+/* then a variable-length signature section. Where SNP carries a single      */
+/* report-to-VCEK signature, a TDX quote is a three-link chain, and this     */
+/* verifier checks all three against a CALLER-SUPPLIED PCK leaf key:         */
+/*                                                                          */
+/*   1. the platform PCK leaf key signs SHA-256(the QE report);             */
+/*   2. the Quoting Enclave (QE) report's report_data binds the per-quote   */
+/*      attestation key (== SHA-256(att_key || qe_auth_data));              */
+/*   3. that attestation key signs SHA-256(header || TD body).             */
+/*                                                                          */
+/* Together: PCK -> QE -> attestation key -> TD body. The PCK leaf is the    */
+/* leaf of the Intel certificate chain (PCK -> Platform CA -> Root CA),      */
+/* carried as a PEM chain inside the quote. Extracting that leaf from the    */
+/* embedded X.509 chain — and validating the chain to the Intel root — is a  */
+/* separate, forthcoming step (it needs ASN.1/X.509). Until it lands this    */
+/* verifier takes the leaf key as input, exactly the contract that chain     */
+/* validator will satisfy: parse + chain-validate -> hand us the leaf.       */
+/*                                                                          */
+/* All signatures are ECDSA P-256 over SHA-256, with r||s and the public     */
+/* point X||Y stored big-endian — the form ants_ecdsa_p256_verify consumes   */
+/* directly (no byte-order conversion, unlike SNP's little-endian R/S).      */
+/* The curve + digest primitives live in foundation/crypto.                 */
+/* ------------------------------------------------------------------------ */
+
+/* Fixed sizes of the quote's leading, version-determined region. */
+#define ANTS_TDX_QUOTE_HEADER_SIZE 48  /* 0x30 */
+#define ANTS_TDX_QUOTE_BODY_SIZE   584 /* 0x248: the TDX-1.0 TD report body */
+
+/* Header invariants this verifier requires (a v4 ECDSA-P256 TDX quote). */
+#define ANTS_TDX_QUOTE_VERSION           4
+#define ANTS_TDX_TEE_TYPE                0x00000081u /* TDX (SGX is 0x0) */
+#define ANTS_TDX_ATT_KEY_TYPE_ECDSA_P256 2
+
+/* Certification-data types (Intel DCAP). */
+#define ANTS_TDX_CERT_TYPE_QE_REPORT 6 /* QE report + PCK chain */
+#define ANTS_TDX_CERT_TYPE_PCK_CHAIN 5 /* PEM cert chain */
+
+/* The QE report is a 384-byte SGX report body; its trailing 64-byte
+ * report_data field carries the attestation-key binding. */
+#define ANTS_TDX_QE_REPORT_SIZE 384 /* 0x180 */
+
+/* Fixed TD-body field sizes (bytes). */
+#define ANTS_TDX_QE_VENDOR_ID_SIZE 16
+#define ANTS_TDX_TCB_SVN_SIZE      16
+#define ANTS_TDX_MEASUREMENT_SIZE  48 /* mr_seam, mr_td, rtmr*, ... */
+#define ANTS_TDX_REPORT_DATA_SIZE  64
+#define ANTS_TDX_RTMR_COUNT        4
+
+/* PCK leaf public key as the verifier consumes it: the raw 64-byte
+ * uncompressed P-256 point X || Y, big-endian, no 0x04 prefix — exactly
+ * what ants_ecdsa_p256_verify expects (== ANTS_ECDSA_P256_PUBKEY_SIZE). An
+ * X.509 SubjectPublicKeyInfo stores X and Y big-endian already, so a future
+ * chain validator can hand these 64 bytes straight through. */
+#define ANTS_TDX_PCK_PUBKEY_SIZE 64
+
+/* Upper bound on the QE authentication data length the binding hash will
+ * accept. The Intel QE emits 32 bytes; this cap (foundation does no dynamic
+ * allocation) is generous headroom. A larger value is rejected as malformed
+ * rather than truncated. */
+#define ANTS_TDX_QE_AUTH_DATA_MAX 1024
+
+/*
+ * Decoded view of the stable header + TD-body fields of a TDX v4 quote.
+ * Integers are host-order (decoded from on-wire little-endian); byte arrays
+ * are copied verbatim. The variable-length signature section is not
+ * surfaced here (see ants_tdx_quote_verify_signature).
+ */
+typedef struct {
+    uint16_t version;      /* quote format version (== 4) */
+    uint16_t att_key_type; /* attestation key type (== 2, ECDSA P-256) */
+    uint32_t tee_type;     /* == ANTS_TDX_TEE_TYPE */
+    uint8_t qe_vendor_id[ANTS_TDX_QE_VENDOR_ID_SIZE];
+    uint8_t tee_tcb_svn[ANTS_TDX_TCB_SVN_SIZE];
+    uint8_t mr_seam[ANTS_TDX_MEASUREMENT_SIZE];        /* SEAM module measurement */
+    uint8_t mr_signer_seam[ANTS_TDX_MEASUREMENT_SIZE]; /* SEAM signer */
+    uint64_t seam_attributes;
+    uint64_t td_attributes;                   /* TD attributes bitfield */
+    uint64_t xfam;                            /* extended-features-allowed mask */
+    uint8_t mr_td[ANTS_TDX_MEASUREMENT_SIZE]; /* TD measurement (the "what ran") */
+    uint8_t mr_config_id[ANTS_TDX_MEASUREMENT_SIZE];
+    uint8_t mr_owner[ANTS_TDX_MEASUREMENT_SIZE];
+    uint8_t mr_owner_config[ANTS_TDX_MEASUREMENT_SIZE];
+    uint8_t rtmr[ANTS_TDX_RTMR_COUNT][ANTS_TDX_MEASUREMENT_SIZE]; /* runtime-extendable */
+    uint8_t report_data[ANTS_TDX_REPORT_DATA_SIZE]; /* guest-supplied; binds the peer key */
+} ants_tdx_quote_t;
+
+/*
+ * Parse the fixed header + TD-body fields of a TDX v4 quote.
+ *
+ * `quote` must point to at least `quote_len` bytes; `quote_len` must be at
+ * least ANTS_TDX_QUOTE_HEADER_SIZE + ANTS_TDX_QUOTE_BODY_SIZE (the variable
+ * signature section may follow and is ignored here). Decoding the body
+ * presupposes the v4 / TDX-1.0 layout, so unlike the SNP parser this one
+ * gates on version and tee_type. Parsing does NOT verify any signature (see
+ * ants_tdx_quote_verify_signature).
+ *
+ * Returns ANTS_OK on success, ANTS_ERROR_INVALID_ARG on a null pointer,
+ * ANTS_ERROR_MALFORMED if the buffer is too short or version/tee_type are
+ * not those of a v4 TDX quote.
+ */
+ants_error_t ants_tdx_quote_parse(const uint8_t *quote, size_t quote_len, ants_tdx_quote_t *out);
+
+/*
+ * Verify the full internal signature chain of a TDX v4 quote against the
+ * supplied PCK leaf public key:
+ *
+ *   1. PCK leaf signs SHA-256(QE report)          [needs pck_leaf_pubkey]
+ *   2. QE report binds the attestation key
+ *      (qe_report.report_data == SHA-256(att_key || qe_auth_data))
+ *   3. attestation key signs SHA-256(header || TD body)
+ *
+ * All three must hold. The attestation key and QE report are carried in the
+ * quote; only the PCK leaf is external. This does NOT validate the PCK
+ * certificate chain to the Intel root, nor freshness/revocation/TCB — those
+ * are separate, composable checks. A caller that has not yet validated the
+ * chain must not treat a pass here as a full attestation.
+ *
+ * Returns ANTS_OK if all three signatures/bindings hold; ANTS_ERROR_MALFORMED
+ * on a too-short/inconsistent quote, wrong version/key-type/tee-type,
+ * unsupported certification-data type, oversized QE auth data, or any failed
+ * signature/binding; ANTS_ERROR_INVALID_ARG on a null pointer.
+ */
+ants_error_t
+ants_tdx_quote_verify_signature(const uint8_t *quote,
+                                size_t quote_len,
+                                const uint8_t pck_leaf_pubkey[ANTS_TDX_PCK_PUBKEY_SIZE]);
+
 #ifdef __cplusplus
 }
 #endif
