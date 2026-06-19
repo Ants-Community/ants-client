@@ -47,3 +47,13 @@ endif()
 add_executable(snp_vectors tools/snp_vectors.c)
 target_link_libraries(snp_vectors PRIVATE ants_tee)
 target_include_directories(snp_vectors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+# tdx_vectors — emits the tdx-quote.verify test-vector pack (JSON on stdout,
+# the ants-test-vectors house format) from the genuine Sapphire Rapids KAT
+# quote. Every verdict is confirmed against the compiled
+# ants_tdx_quote_verify_signature before emission. Shares the quote bytes with
+# the tests via tests/.
+#   ./build/foundation/tee/tdx_vectors > .../vectors/tdx-quote/tdx-quote.json
+add_executable(tdx_vectors tools/tdx_vectors.c)
+target_link_libraries(tdx_vectors PRIVATE ants_tee)
+target_include_directories(tdx_vectors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
