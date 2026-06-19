@@ -181,3 +181,219 @@ ants_error_t ants_snp_report_verify_signature(const uint8_t *report,
 
     return ants_ecdsa_p384_verify(vcek_pubkey, digest, ANTS_SHA384_HASH_SIZE, sig_be);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Intel TDX DCAP attestation quote (v4, ECDSA-P256)                        */
+/*                                                                          */
+/* Absolute byte offsets into a v4 quote. The header (0x30) and TD report   */
+/* body (0x248) are fixed; the signature section that follows is variable    */
+/* and is walked with bounds checks. Offsets cross-checked against           */
+/* google/go-tdx-guest abi/abi.go and a real Sapphire Rapids quote (see      */
+/* tests/tdx_kat_vectors.h).                                                 */
+/* ------------------------------------------------------------------------ */
+
+/* Header. */
+#define TDX_OFF_VERSION      0x000 /* u16 LE */
+#define TDX_OFF_ATT_KEY_TYPE 0x002 /* u16 LE */
+#define TDX_OFF_TEE_TYPE     0x004 /* u32 LE */
+#define TDX_OFF_QE_VENDOR_ID 0x00C /* 16 */
+
+/* TD report body (starts at 0x30). */
+#define TDX_OFF_TEE_TCB_SVN     0x030 /* 16 */
+#define TDX_OFF_MR_SEAM         0x040 /* 48 */
+#define TDX_OFF_MR_SIGNER_SEAM  0x070 /* 48 */
+#define TDX_OFF_SEAM_ATTRIBUTES 0x0A0 /* u64 LE */
+#define TDX_OFF_TD_ATTRIBUTES   0x0A8 /* u64 LE */
+#define TDX_OFF_XFAM            0x0B0 /* u64 LE */
+#define TDX_OFF_MR_TD           0x0B8 /* 48 */
+#define TDX_OFF_MR_CONFIG_ID    0x0E8 /* 48 */
+#define TDX_OFF_MR_OWNER        0x118 /* 48 */
+#define TDX_OFF_MR_OWNER_CONFIG 0x148 /* 48 */
+#define TDX_OFF_RTMR0           0x178 /* 4 x 48 */
+#define TDX_OFF_REPORT_DATA     0x238 /* 64 */
+
+/* End of header+body == the message the attestation key signs, and the
+ * offset of the u32 LE signature-data length. */
+#define TDX_OFF_SIG_DATA_LEN 0x278 /* == HEADER_SIZE + BODY_SIZE */
+#define TDX_OFF_SIG_DATA     0x27C /* signature data begins here */
+
+/* Signature-data field offsets, relative to TDX_OFF_SIG_DATA. */
+#define TDX_SD_SIGNATURE 0   /* att-key signature, 64 (r||s BE) */
+#define TDX_SD_ATT_KEY   64  /* att public key, 64 (X||Y BE) */
+#define TDX_SD_CERT_TYPE 128 /* u16 LE */
+#define TDX_SD_CERT_SIZE 130 /* u32 LE */
+#define TDX_SD_CERT_BODY 134 /* certification data body */
+
+/* QE-report-certification-data (type 6) offsets, relative to the cert body
+ * (TDX_OFF_SIG_DATA + TDX_SD_CERT_BODY). */
+#define TDX_CD_QE_REPORT     0   /* 384-byte SGX report body */
+#define TDX_CD_QE_REPORT_SIG 384 /* 64 (r||s BE) */
+#define TDX_CD_QE_AUTH_SIZE  448 /* u16 LE */
+#define TDX_CD_QE_AUTH       450 /* qe_auth_data */
+
+/* report_data within the 384-byte QE (SGX) report body. */
+#define TDX_QE_REPORT_DATA_OFF 0x140 /* 320; 64 bytes */
+
+static uint16_t tdx_rd_u16le(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t tdx_rd_u32le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t tdx_rd_u64le(const uint8_t *p)
+{
+    return (uint64_t)tdx_rd_u32le(p) | ((uint64_t)tdx_rd_u32le(p + 4) << 32);
+}
+
+/* OR-accumulate so the result depends on every byte (no early exit). */
+static bool tdx_all_zero(const uint8_t *p, size_t n)
+{
+    uint8_t acc = 0;
+    for (size_t i = 0; i < n; i++) {
+        acc |= p[i];
+    }
+    return acc == 0;
+}
+
+ants_error_t ants_tdx_quote_parse(const uint8_t *quote, size_t quote_len, ants_tdx_quote_t *out)
+{
+    if (quote == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (quote_len < ANTS_TDX_QUOTE_HEADER_SIZE + ANTS_TDX_QUOTE_BODY_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* The body layout is version/tee-type specific; only decode a v4 TDX
+     * quote (the TDX-1.0 584-byte body). */
+    if (tdx_rd_u16le(quote + TDX_OFF_VERSION) != ANTS_TDX_QUOTE_VERSION ||
+        tdx_rd_u32le(quote + TDX_OFF_TEE_TYPE) != ANTS_TDX_TEE_TYPE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->version = tdx_rd_u16le(quote + TDX_OFF_VERSION);
+    out->att_key_type = tdx_rd_u16le(quote + TDX_OFF_ATT_KEY_TYPE);
+    out->tee_type = tdx_rd_u32le(quote + TDX_OFF_TEE_TYPE);
+    memcpy(out->qe_vendor_id, quote + TDX_OFF_QE_VENDOR_ID, ANTS_TDX_QE_VENDOR_ID_SIZE);
+    memcpy(out->tee_tcb_svn, quote + TDX_OFF_TEE_TCB_SVN, ANTS_TDX_TCB_SVN_SIZE);
+    memcpy(out->mr_seam, quote + TDX_OFF_MR_SEAM, ANTS_TDX_MEASUREMENT_SIZE);
+    memcpy(out->mr_signer_seam, quote + TDX_OFF_MR_SIGNER_SEAM, ANTS_TDX_MEASUREMENT_SIZE);
+    out->seam_attributes = tdx_rd_u64le(quote + TDX_OFF_SEAM_ATTRIBUTES);
+    out->td_attributes = tdx_rd_u64le(quote + TDX_OFF_TD_ATTRIBUTES);
+    out->xfam = tdx_rd_u64le(quote + TDX_OFF_XFAM);
+    memcpy(out->mr_td, quote + TDX_OFF_MR_TD, ANTS_TDX_MEASUREMENT_SIZE);
+    memcpy(out->mr_config_id, quote + TDX_OFF_MR_CONFIG_ID, ANTS_TDX_MEASUREMENT_SIZE);
+    memcpy(out->mr_owner, quote + TDX_OFF_MR_OWNER, ANTS_TDX_MEASUREMENT_SIZE);
+    memcpy(out->mr_owner_config, quote + TDX_OFF_MR_OWNER_CONFIG, ANTS_TDX_MEASUREMENT_SIZE);
+    for (size_t i = 0; i < ANTS_TDX_RTMR_COUNT; i++) {
+        memcpy(out->rtmr[i],
+               quote + TDX_OFF_RTMR0 + i * ANTS_TDX_MEASUREMENT_SIZE,
+               ANTS_TDX_MEASUREMENT_SIZE);
+    }
+    memcpy(out->report_data, quote + TDX_OFF_REPORT_DATA, ANTS_TDX_REPORT_DATA_SIZE);
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_tdx_quote_verify_signature(const uint8_t *quote,
+                                size_t quote_len,
+                                const uint8_t pck_leaf_pubkey[ANTS_TDX_PCK_PUBKEY_SIZE])
+{
+    if (quote == NULL || pck_leaf_pubkey == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* Need header + body + the 4-byte signature-data length. */
+    if (quote_len < TDX_OFF_SIG_DATA) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* Header invariants: a v4 ECDSA-P256 TDX quote. */
+    if (tdx_rd_u16le(quote + TDX_OFF_VERSION) != ANTS_TDX_QUOTE_VERSION ||
+        tdx_rd_u16le(quote + TDX_OFF_ATT_KEY_TYPE) != ANTS_TDX_ATT_KEY_TYPE_ECDSA_P256 ||
+        tdx_rd_u32le(quote + TDX_OFF_TEE_TYPE) != ANTS_TDX_TEE_TYPE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* The signature data must fit within the quote (sig_data_len is
+     * authoritative; any trailing bytes are not part of the quote). */
+    uint32_t sig_data_len = tdx_rd_u32le(quote + TDX_OFF_SIG_DATA_LEN);
+    if ((uint64_t)TDX_OFF_SIG_DATA + sig_data_len > quote_len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *sd = quote + TDX_OFF_SIG_DATA;
+
+    /* att signature (64) + att key (64) + 6-byte certification header. */
+    if (sig_data_len < TDX_SD_CERT_BODY) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *att_sig = sd + TDX_SD_SIGNATURE;
+    const uint8_t *att_key = sd + TDX_SD_ATT_KEY;
+    if (tdx_rd_u16le(sd + TDX_SD_CERT_TYPE) != ANTS_TDX_CERT_TYPE_QE_REPORT) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint32_t cert_size = tdx_rd_u32le(sd + TDX_SD_CERT_SIZE);
+    if ((uint64_t)TDX_SD_CERT_BODY + cert_size > sig_data_len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *cd = sd + TDX_SD_CERT_BODY;
+
+    /* QE report (384) + its signature (64) + 2-byte auth length. */
+    if (cert_size < TDX_CD_QE_AUTH) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *qe_report = cd + TDX_CD_QE_REPORT;
+    const uint8_t *qe_report_sig = cd + TDX_CD_QE_REPORT_SIG;
+    uint16_t qe_auth_size = tdx_rd_u16le(cd + TDX_CD_QE_AUTH_SIZE);
+    if ((uint64_t)TDX_CD_QE_AUTH + qe_auth_size > cert_size) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (qe_auth_size > ANTS_TDX_QE_AUTH_DATA_MAX) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *qe_auth = cd + TDX_CD_QE_AUTH;
+
+    ants_error_t err;
+    uint8_t digest[ANTS_SHA256_HASH_SIZE];
+
+    /* Link 1: the platform PCK leaf signs SHA-256(the QE report). */
+    err = ants_sha256(qe_report, ANTS_TDX_QE_REPORT_SIZE, digest);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (ants_ecdsa_p256_verify(pck_leaf_pubkey, digest, ANTS_SHA256_HASH_SIZE, qe_report_sig) !=
+        ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Link 2: the QE report binds the attestation key. The binding is
+     * SHA-256(att_key(64) || qe_auth_data) in the low 32 bytes of the QE
+     * report's report_data; the high 32 bytes are zero. */
+    {
+        uint8_t bind_in[ANTS_ECDSA_P256_PUBKEY_SIZE + ANTS_TDX_QE_AUTH_DATA_MAX];
+        memcpy(bind_in, att_key, ANTS_ECDSA_P256_PUBKEY_SIZE);
+        memcpy(bind_in + ANTS_ECDSA_P256_PUBKEY_SIZE, qe_auth, qe_auth_size);
+        err = ants_sha256(bind_in, (size_t)ANTS_ECDSA_P256_PUBKEY_SIZE + qe_auth_size, digest);
+        if (err != ANTS_OK) {
+            return err;
+        }
+        const uint8_t *rd = qe_report + TDX_QE_REPORT_DATA_OFF;
+        if (memcmp(rd, digest, ANTS_SHA256_HASH_SIZE) != 0 ||
+            !tdx_all_zero(rd + ANTS_SHA256_HASH_SIZE,
+                          ANTS_TDX_REPORT_DATA_SIZE - ANTS_SHA256_HASH_SIZE)) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+
+    /* Link 3: the attestation key signs SHA-256(header || TD body). */
+    err = ants_sha256(quote, TDX_OFF_SIG_DATA_LEN, digest);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (ants_ecdsa_p256_verify(att_key, digest, ANTS_SHA256_HASH_SIZE, att_sig) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
