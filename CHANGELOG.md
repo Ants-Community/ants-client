@@ -13,6 +13,37 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/tee: Intel TDX DCAP quote parse + signature-chain verify · 2026-06-19
+
+`foundation/tee` (PR #167): the second per-vendor TEE structure parser +
+verifier (after AMD SEV-SNP, #164), built on the ECDSA P-256 + SHA-256
+primitives in `foundation/crypto`. `ants_tdx_quote_parse` decodes the fixed
+48-byte header + 584-byte TD report body of a DCAP v4 quote (version,
+attestation-key type, tee type, `qe_vendor_id`, MRSEAM / MRTD / RTMRs, TD
+attributes, XFAM, `report_data`); offsets cross-checked against
+`google/go-tdx-guest` `abi/abi.go` and a real quote. Where SNP carries a
+single report-to-VCEK signature, a TDX quote is a three-link chain, and
+`ants_tdx_quote_verify_signature` checks all three against a caller-supplied
+PCK leaf key: (1) the platform PCK leaf signs `SHA-256(QE report)`; (2) the QE
+report's `report_data` binds the per-quote attestation key
+(`== SHA-256(att_key || qe_auth_data)`); (3) the attestation key signs
+`SHA-256(header || TD body)`. All ECDSA P-256 over SHA-256, with `r||s` and
+`X||Y` big-endian — passed straight to `ants_ecdsa_p256_verify`, no byte-order
+conversion (unlike SNP's little-endian R/S). The variable signature section is
+walked with bounds checks at every step. Like the SNP verifier this checks
+**only** the quote's internal signatures against a provided leaf — PCK
+certificate-chain validation to the Intel root (ASN.1/X.509), freshness, and
+revocation are separate, composable checks; the chain validator lands next and
+will hand this function the leaf key, exactly the contract it takes today. The
+uniform `ants_attestation_*` surface stays a stub until those chains exist.
+KAT: a genuine production Sapphire Rapids TDX quote (`google/go-tdx-guest`
+`testing/testdata/tdx_prod_quote_SPR_E4.dat`, Apache-2.0), all three signature
+links independently confirmed with Python `cryptography` + OpenSSL before
+pinning — the compiled verifier returns `ANTS_OK` on it and
+`ANTS_ERROR_MALFORMED` on a single-byte tamper of any link (TD body, attestation
+signature, attestation key, QE report, QE report signature, QE auth data), a
+wrong PCK key, or a broken header / certification-data invariant.
+
 ### foundation/tee: AMD SEV-SNP attestation report parse + signature verify · 2026-06-18
 
 `foundation/tee` (PR #164): the first per-vendor TEE structure parser +
