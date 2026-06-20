@@ -97,3 +97,14 @@ target_link_libraries(ecdsa_p256_vectors PRIVATE ants_crypto)
 #   ./build/foundation/crypto/ecdsa_p384_vectors > .../vectors/ecdsa-p384/ecdsa-p384.json
 add_executable(ecdsa_p384_vectors tools/ecdsa_p384_vectors.c)
 target_link_libraries(ecdsa_p384_vectors PRIVATE ants_crypto)
+
+# rsa_pss_vectors — emits the rsa-pss.verify test-vector pack (JSON on stdout,
+# the ants-test-vectors house format). The two positive vectors are genuine
+# RSA-4096 RSASSA-PSS signatures from the real AMD SEV-Milan chain; every
+# verdict is confirmed against the compiled ants_rsa_pss_verify and each digest
+# computed by ants_sha384. Shares the pinned key/messages with the tests via
+# tests/ (rsa_kat_vectors.h).
+#   ./build/foundation/crypto/rsa_pss_vectors > .../vectors/rsa-pss/rsa-pss.json
+add_executable(rsa_pss_vectors tools/rsa_pss_vectors.c)
+target_link_libraries(rsa_pss_vectors PRIVATE ants_crypto)
+target_include_directories(rsa_pss_vectors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
