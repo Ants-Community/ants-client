@@ -9,6 +9,7 @@
 
 add_library(ants_tee STATIC
     src/tee.c
+    src/der.c
 )
 
 target_include_directories(ants_tee
@@ -35,6 +36,13 @@ if(BUILD_TESTING)
     add_executable(test_tee tests/test_tee.c)
     target_link_libraries(test_tee PRIVATE ants_tee)
     add_test(NAME tee_basic COMMAND test_tee)
+
+    # The strict DER reader is internal (src/der.h, compiled into ants_tee);
+    # the test includes the header directly and links the library.
+    add_executable(test_der tests/test_der.c)
+    target_link_libraries(test_der PRIVATE ants_tee)
+    target_include_directories(test_der PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME der_basic COMMAND test_der)
 endif()
 
 # ---- Vector emitter ------------------------------------------------------
