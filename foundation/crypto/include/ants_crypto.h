@@ -342,6 +342,55 @@ ants_error_t ants_ecdsa_p384_verify(const uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZ
                                     size_t hash_len,
                                     const uint8_t sig[ANTS_ECDSA_P384_SIG_SIZE]);
 
+/* ------------------------------------------------------------------------ */
+/* RSA RSASSA-PSS — TEE attestation certificate-chain verification          */
+/*                                                                          */
+/* RSASSA-PSS signature verification (verify-only), the third TEE-chain     */
+/* primitive after P-256 and P-384. AMD SEV-SNP's ASK/ARK certificate chain */
+/* is RSA-4096 RSASSA-PSS with SHA-384, MGF1-SHA-384 and a 48-byte salt     */
+/* (RFC-0005); the report itself is ECDSA P-384 (above). This is the only   */
+/* RSA in the protocol — Intel TDX's PKI is all-ECDSA and peer identity is  */
+/* Ed25519. Verify-only: ANTS never produces RSA signatures.                */
+/*                                                                          */
+/* The modulus and exponent are unsigned big-endian (the                    */
+/* SubjectPublicKeyInfo encoding, leading zeros allowed); the signature is  */
+/* the raw big-endian integer, the same byte-length as the modulus (512 for */
+/* RSA-4096). DER/SPKI unwrapping is the TEE layer's job, not the           */
+/* primitive's. As with the ECDSA verifiers the caller supplies the message */
+/* digest — this function does not hash. Backed by the vendored BearSSL     */
+/* RSA-PSS subset (deps/bearssl).                                           */
+/* ------------------------------------------------------------------------ */
+
+/* RSA-4096 — the largest modulus ANTS verifies (AMD ASK/ARK). */
+#define ANTS_RSA_MAX_MODULUS_SIZE 512
+
+/*
+ * Verify a PKCS#1 RSASSA-PSS signature `sig` (`sig_len` bytes) over the
+ * pre-computed message digest `hash` (`hash_len` bytes) against the RSA
+ * public key (`modulus`/`modulus_len`, `exponent`/`exponent_len`, both
+ * unsigned big-endian).
+ *
+ * The PSS parameters are derived from the digest length: hash_len == 48
+ * selects SHA-384 as both the data hash and the MGF1 hash with a 48-byte
+ * salt, matching AMD SEV-SNP's ASK/ARK chain. Other digest lengths are
+ * rejected with ANTS_ERROR_INVALID_ARG (no other RSA-PSS profile is used by
+ * the protocol). `sig_len` must equal the modulus byte-length.
+ *
+ * Returns ANTS_OK on a valid signature, ANTS_ERROR_MALFORMED on an invalid
+ * signature or invalid public key, ANTS_ERROR_INVALID_ARG on a null pointer,
+ * a zero-length input, an oversized modulus (> ANTS_RSA_MAX_MODULUS_SIZE), or
+ * an unsupported digest length. Mirrors the ants_ecdsa_p384_verify return
+ * convention.
+ */
+ants_error_t ants_rsa_pss_verify(const uint8_t *modulus,
+                                 size_t modulus_len,
+                                 const uint8_t *exponent,
+                                 size_t exponent_len,
+                                 const uint8_t *hash,
+                                 size_t hash_len,
+                                 const uint8_t *sig,
+                                 size_t sig_len);
+
 #ifdef __cplusplus
 }
 #endif
