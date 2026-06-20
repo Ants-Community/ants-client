@@ -966,3 +966,71 @@ ants_error_t ants_ecdsa_p384_verify(const uint8_t pub[ANTS_ECDSA_P384_PUBKEY_SIZ
     }
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* RSA RSASSA-PSS — TEE attestation certificate-chain verification          */
+/*                                                                          */
+/* Implemented via the vendored BearSSL RSA-PSS subset (deps/bearssl, MIT): */
+/* br_rsa_i31_pss_vrfy over the i31 public operation (br_rsa_i31_public)     */
+/* plus MGF1 (br_mgf1_xor), with br_sha384_vtable for both the data hash and */
+/* the MGF1. AMD SEV-SNP's ASK/ARK chain is RSA-4096 RSASSA-PSS / SHA-384 /  */
+/* salt 48 (RFC-0005); this is the protocol's only RSA. Verify-only, no RNG. */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_rsa_pss_verify(const uint8_t *modulus,
+                                 size_t modulus_len,
+                                 const uint8_t *exponent,
+                                 size_t exponent_len,
+                                 const uint8_t *hash,
+                                 size_t hash_len,
+                                 const uint8_t *sig,
+                                 size_t sig_len)
+{
+    if (modulus == NULL || exponent == NULL || hash == NULL || sig == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (modulus_len == 0 || exponent_len == 0 || sig_len == 0 ||
+        modulus_len > ANTS_RSA_MAX_MODULUS_SIZE || exponent_len > ANTS_RSA_MAX_MODULUS_SIZE) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* PSS parameters from the digest length. AMD SEV-SNP — the protocol's
+     * only RSA — signs with SHA-384 / MGF1-SHA-384 and a salt equal to the
+     * digest length (48). No other RSA-PSS profile is used, so reject other
+     * digest lengths rather than guess a hash/salt. */
+    const br_hash_class *hf;
+    size_t salt_len;
+    switch (hash_len) {
+    case 48:
+        hf = &br_sha384_vtable;
+        salt_len = 48;
+        break;
+    default:
+        return ANTS_ERROR_INVALID_ARG;
+    }
+
+    /* BearSSL's br_rsa_public_key holds non-const pointers (read-only in the
+     * verify path); copy the caller's modulus/exponent into local buffers to
+     * keep the wrapper free of a const-discarding cast — mirrors the q[] copy
+     * in ants_ecdsa_p384_verify. */
+    uint8_t n_buf[ANTS_RSA_MAX_MODULUS_SIZE];
+    uint8_t e_buf[ANTS_RSA_MAX_MODULUS_SIZE];
+    memcpy(n_buf, modulus, modulus_len);
+    memcpy(e_buf, exponent, exponent_len);
+
+    br_rsa_public_key pk;
+    pk.n = n_buf;
+    pk.nlen = modulus_len;
+    pk.e = e_buf;
+    pk.elen = exponent_len;
+
+    /* br_rsa_i31_pss_vrfy recomputes the PSS encoding from the supplied digest
+     * and compares it internally (no caller-side hash compare needed); it
+     * returns 1 on a valid signature and 0 otherwise (bad signature, bad key,
+     * or sig_len != modulus byte-length). Map 0 -> MALFORMED, matching the
+     * ants_ecdsa_p384_verify / ants_ed25519_verify convention. */
+    if (br_rsa_i31_pss_vrfy(sig, sig_len, hf, hf, hash, salt_len, &pk) != 1) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}

@@ -16,6 +16,8 @@
 #include "ants_common.h"
 #include "ants_crypto.h"
 
+#include "rsa_kat_vectors.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1155,6 +1157,221 @@ static void test_ecdsa_p384_wycheproof(void)
     }
 }
 
+static void test_rsa_pss_rejects_invalid_args(void)
+{
+    uint8_t hash[ANTS_SHA384_HASH_SIZE] = {0};
+
+    /* null pointers */
+    CHECK_EQ(ants_rsa_pss_verify(NULL,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 NULL,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 NULL,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 NULL,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* zero-length modulus / exponent / signature */
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 0,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 0,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 0),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* oversized modulus (> ANTS_RSA_MAX_MODULUS_SIZE): rejected before any
+     * read of the (512-byte) buffer, so passing a larger length is safe. */
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 ANTS_RSA_MAX_MODULUS_SIZE + 1,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 sizeof hash,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* unsupported digest length (SHA-256 = 32; ANTS RSA-PSS is SHA-384 only) */
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 hash,
+                                 32,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG),
+             ANTS_ERROR_INVALID_ARG);
+}
+
+static void test_rsa_pss_amd_milan(void)
+{
+    /* Two real RSA-4096 RSASSA-PSS (SHA-384) signatures from the AMD
+     * SEV-Milan chain, both verified by the ARK public key: ASK signed by
+     * ARK (intermediate-by-root) and ARK self-signed (root). The verifier
+     * input is the SHA-384 digest of the DER TBSCertificate, computed here
+     * with ants_sha384 — so the test exercises the sha384 + RSA-PSS path. */
+    struct rsa_kat {
+        const char *name;
+        const uint8_t *tbs;
+        size_t tbs_len;
+        const uint8_t *sig;
+        size_t sig_len;
+    };
+    static const struct rsa_kat kats[] = {
+        {"ASK-by-ARK",
+         RSA_KAT_ASK_TBS,
+         sizeof RSA_KAT_ASK_TBS,
+         RSA_KAT_ASK_SIG,
+         sizeof RSA_KAT_ASK_SIG},
+        {"ARK-self",
+         RSA_KAT_ARK_TBS,
+         sizeof RSA_KAT_ARK_TBS,
+         RSA_KAT_ARK_SIG,
+         sizeof RSA_KAT_ARK_SIG},
+    };
+
+    for (size_t i = 0; i < sizeof kats / sizeof kats[0]; i++) {
+        const struct rsa_kat *k = &kats[i];
+        uint8_t digest[ANTS_SHA384_HASH_SIZE];
+        CHECK_EQ(ants_sha384(k->tbs, k->tbs_len, digest), ANTS_OK);
+        ants_error_t got = ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                               sizeof RSA_KAT_ARK_N,
+                                               RSA_KAT_ARK_E,
+                                               sizeof RSA_KAT_ARK_E,
+                                               digest,
+                                               sizeof digest,
+                                               k->sig,
+                                               k->sig_len);
+        if (got != ANTS_OK) {
+            failures++;
+            fprintf(stderr,
+                    "FAIL rsa-pss AMD Milan %s: expected ANTS_OK, got %s\n",
+                    k->name,
+                    ants_strerror(got));
+        }
+    }
+
+    /* Tamper cases derived from VECTOR 1 (ASK signed by ARK). Each mutation
+     * must flip the verdict to MALFORMED. */
+    uint8_t digest[ANTS_SHA384_HASH_SIZE];
+    CHECK_EQ(ants_sha384(RSA_KAT_ASK_TBS, sizeof RSA_KAT_ASK_TBS, digest), ANTS_OK);
+
+    /* flipped signature byte */
+    {
+        uint8_t sig[sizeof RSA_KAT_ASK_SIG];
+        memcpy(sig, RSA_KAT_ASK_SIG, sizeof sig);
+        sig[100] ^= 0x01;
+        CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                     sizeof RSA_KAT_ARK_N,
+                                     RSA_KAT_ARK_E,
+                                     sizeof RSA_KAT_ARK_E,
+                                     digest,
+                                     sizeof digest,
+                                     sig,
+                                     sizeof sig),
+                 ANTS_ERROR_MALFORMED);
+    }
+    /* flipped digest byte (wrong message) */
+    {
+        uint8_t bad[ANTS_SHA384_HASH_SIZE];
+        memcpy(bad, digest, sizeof bad);
+        bad[0] ^= 0x01;
+        CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                     sizeof RSA_KAT_ARK_N,
+                                     RSA_KAT_ARK_E,
+                                     sizeof RSA_KAT_ARK_E,
+                                     bad,
+                                     sizeof bad,
+                                     RSA_KAT_ASK_SIG,
+                                     sizeof RSA_KAT_ASK_SIG),
+                 ANTS_ERROR_MALFORMED);
+    }
+    /* flipped modulus byte (wrong key) */
+    {
+        uint8_t n[sizeof RSA_KAT_ARK_N];
+        memcpy(n, RSA_KAT_ARK_N, sizeof n);
+        n[200] ^= 0x01;
+        CHECK_EQ(ants_rsa_pss_verify(n,
+                                     sizeof n,
+                                     RSA_KAT_ARK_E,
+                                     sizeof RSA_KAT_ARK_E,
+                                     digest,
+                                     sizeof digest,
+                                     RSA_KAT_ASK_SIG,
+                                     sizeof RSA_KAT_ASK_SIG),
+                 ANTS_ERROR_MALFORMED);
+    }
+    /* truncated signature (sig_len != modulus byte-length) */
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 digest,
+                                 sizeof digest,
+                                 RSA_KAT_ASK_SIG,
+                                 sizeof RSA_KAT_ASK_SIG - 1),
+             ANTS_ERROR_MALFORMED);
+    /* cross: ARK's self-signature does not verify ASK's digest */
+    CHECK_EQ(ants_rsa_pss_verify(RSA_KAT_ARK_N,
+                                 sizeof RSA_KAT_ARK_N,
+                                 RSA_KAT_ARK_E,
+                                 sizeof RSA_KAT_ARK_E,
+                                 digest,
+                                 sizeof digest,
+                                 RSA_KAT_ARK_SIG,
+                                 sizeof RSA_KAT_ARK_SIG),
+             ANTS_ERROR_MALFORMED);
+}
+
 int main(void)
 {
     test_blake3_rejects_invalid_args();
@@ -1195,6 +1412,9 @@ int main(void)
 
     test_ecdsa_p384_rejects_invalid_args();
     test_ecdsa_p384_wycheproof();
+
+    test_rsa_pss_rejects_invalid_args();
+    test_rsa_pss_amd_milan();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);
