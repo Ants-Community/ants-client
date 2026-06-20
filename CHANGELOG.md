@@ -13,6 +13,33 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/crypto: RSA-4096 RSASSA-PSS signature verification · 2026-06-20
+
+`foundation/crypto` (PR #170): `ants_rsa_pss_verify`, the third TEE-chain
+signature primitive after ECDSA P-256 and P-384 — the RSA the AMD SEV-SNP
+certificate chain needs. AMD signs its ASK/ARK chain with **RSA-4096
+RSASSA-PSS** (SHA-384, MGF1-SHA-384, salt 48), *not* PKCS#1 v1.5 — confirmed
+against the real AMD SEV-Milan chain (`kdsintf.amd.com/vcek/v1/Milan/cert_chain`)
+with OpenSSL. This is the protocol's only RSA: Intel TDX's PKI is all-ECDSA and
+peer identity is Ed25519. Verify-only like the ECDSA primitives — it takes a
+big-endian modulus/exponent, a signature the same byte-length as the modulus,
+and a pre-computed digest (no hashing inside); the digest length selects the PSS
+profile (48 → SHA-384 / salt 48), other lengths rejected with `INVALID_ARG`.
+Backed by a vendored BearSSL RSA-PSS subset (`deps/bearssl`, MIT, upstream
+`7bea48e`, byte-for-byte): `br_rsa_i31_pss_vrfy` + `br_rsa_i31_public` +
+`br_rsa_pss_sig_unpad` + `br_mgf1_xor`, reusing the i31 integer backend and
+`br_sha384_vtable` already vendored for ECDSA — four new files, no new integer
+code. RNG-free: PSS *verification* recovers the salt from the signature, so no
+DRBG is compiled. The `bearssl_ec` CMake target is renamed `bearssl_verify` for
+the broadened scope. KAT: two genuine RSA-4096 PSS signatures from the AMD
+SEV-Milan chain — the ARK self-signed root and the ASK intermediate signed by
+ARK — both verified by the ARK public key and OpenSSL-confirmed before pinning,
+plus single-byte tampers (signature, digest, modulus), a truncated signature, a
+cross-vector mismatch, and the invalid-argument paths. Still verify-only at the
+primitive layer: extracting and chain-validating the ASK/ARK X.509 certs (whose
+RSA-PSS signatures this checks) is the next step, the immediate piece toward
+letting `ants_attestation_*` leave stub.
+
 ### foundation/tee: Intel TDX DCAP quote parse + signature-chain verify · 2026-06-19
 
 `foundation/tee` (PR #167): the second per-vendor TEE structure parser +
