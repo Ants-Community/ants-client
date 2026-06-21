@@ -10,6 +10,7 @@
 add_library(ants_tee STATIC
     src/tee.c
     src/der.c
+    src/x509.c
 )
 
 target_include_directories(ants_tee
@@ -43,6 +44,15 @@ if(BUILD_TESTING)
     target_link_libraries(test_der PRIVATE ants_tee)
     target_include_directories(test_der PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME der_basic COMMAND test_der)
+
+    # The X.509 certificate parser is internal (src/x509.h, compiled into
+    # ants_tee); the test includes the header directly. It also links
+    # ants_crypto so the parsed leaf keys can be driven through the real
+    # SNP/TDX/RSA verifiers end to end (parse -> hand the verifier the leaf).
+    add_executable(test_x509 tests/test_x509.c)
+    target_link_libraries(test_x509 PRIVATE ants_tee ants_crypto)
+    target_include_directories(test_x509 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME x509_basic COMMAND test_x509)
 endif()
 
 # ---- Vector emitter ------------------------------------------------------
