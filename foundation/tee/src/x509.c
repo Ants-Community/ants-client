@@ -259,8 +259,42 @@ static ants_error_t parse_tbs_body(ants_der *tbs, ants_x509_cert *out)
         out->subject_len = (size_t)(cursor(tbs) - start);
     }
 
-    /* subjectPublicKeyInfo. Trailing [1]/[2]/[3] optionals are ignored. */
-    return parse_spki(tbs, out);
+    /* subjectPublicKeyInfo. */
+    e = parse_spki(tbs, out);
+    if (e != ANTS_OK) {
+        return e;
+    }
+
+    /* Optional trailing fields: issuerUniqueID [1], subjectUniqueID [2] and
+     * extensions [3] EXPLICIT. Only the extensions are surfaced (the chain
+     * validator reads BasicConstraints from them); the unique IDs are skipped.
+     * Walk whatever remains so an unexpected element is still rejected. */
+    while (!ants_der_eof(tbs)) {
+        e = ants_der_peek_tag(tbs, &tag);
+        if (e != ANTS_OK) {
+            return e;
+        }
+        if (tag == ANTS_DER_TAG_CONTEXT(3)) {
+            ants_der ext_wrap;
+            e = ants_der_enter(tbs, ANTS_DER_TAG_CONTEXT(3), &ext_wrap);
+            if (e != ANTS_OK) {
+                return e;
+            }
+            ants_der_tlv exts;
+            e = ants_der_read(&ext_wrap, ANTS_DER_TAG_SEQUENCE, &exts);
+            if (e != ANTS_OK) {
+                return e;
+            }
+            out->extensions = exts.val;
+            out->extensions_len = exts.len;
+        } else {
+            e = ants_der_skip(tbs);
+            if (e != ANTS_OK) {
+                return e;
+            }
+        }
+    }
+    return ANTS_OK;
 }
 
 ants_error_t ants_x509_cert_parse(const uint8_t *der, size_t der_len, ants_x509_cert *out)

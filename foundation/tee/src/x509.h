@@ -102,6 +102,13 @@ typedef struct {
     size_t rsa_modulus_len;
     const uint8_t *rsa_exponent;
     size_t rsa_exponent_len;
+
+    /* The DER content of the v3 extensions SEQUENCE — the bytes of the
+     * SEQUENCE OF Extension carried inside the [3] EXPLICIT wrapper — or NULL
+     * if the certificate has no extensions. Not decoded here; the chain
+     * validator iterates it (e.g. for the BasicConstraints CA flag). */
+    const uint8_t *extensions;
+    size_t extensions_len;
 } ants_x509_cert;
 
 /*
