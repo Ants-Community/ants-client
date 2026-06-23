@@ -11,6 +11,7 @@ add_library(ants_tee STATIC
     src/tee.c
     src/der.c
     src/x509.c
+    src/x509_chain.c
 )
 
 target_include_directories(ants_tee
@@ -53,6 +54,15 @@ if(BUILD_TESTING)
     target_link_libraries(test_x509 PRIVATE ants_tee ants_crypto)
     target_include_directories(test_x509 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME x509_basic COMMAND test_x509)
+
+    # The certificate-chain validator is internal (src/x509_chain.h, compiled
+    # into ants_tee); the test includes the header directly. It links
+    # ants_crypto so the full path validation runs against the real RSA-PSS +
+    # ECDSA verifiers over genuine AMD + Intel vendor chains.
+    add_executable(test_x509_chain tests/test_x509_chain.c)
+    target_link_libraries(test_x509_chain PRIVATE ants_tee ants_crypto)
+    target_include_directories(test_x509_chain PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME x509_chain_basic COMMAND test_x509_chain)
 endif()
 
 # ---- Vector emitter ------------------------------------------------------
