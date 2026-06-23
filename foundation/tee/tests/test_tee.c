@@ -1,13 +1,14 @@
 /*
  * test_tee.c — placeholder tests for the TEE attestation harness.
  *
- * v1.0 stub: every function returns NOT_IMPLEMENTED or the documented
- * safe default. These tests pin the contract so a future v2.x
- * implementation can't silently change it without us noticing:
+ * These tests pin the harness contract so it can't silently change:
  *
  *   - public-API symbols link;
- *   - stubs return the documented codes (NOT_IMPLEMENTED for generate
- *     and verify; false for is_fresh and is_revoked);
+ *   - ants_attestation_generate is still a stub (NOT_IMPLEMENTED); verify
+ *     dispatches per vendor (INVALID_ARG on NULL, NOT_IMPLEMENTED for a
+ *     vendor whose wiring is pending; the real Intel TDX verification is
+ *     covered end to end in test_attestation.c); is_fresh / is_revoked
+ *     return their documented false default;
  *   - constant values (vendor IDs, default windows, weight ratios)
  *     match the spec.
  */
@@ -91,15 +92,18 @@ static void test_generate_returns_not_implemented(void)
              ANTS_ERROR_NOT_IMPLEMENTED);
 }
 
-static void test_verify_returns_not_implemented(void)
+static void test_verify_dispatch_contract(void)
 {
+    /* NULL is an argument error. */
+    CHECK_EQ(ants_attestation_verify(NULL), ANTS_ERROR_INVALID_ARG);
+    /* A vendor whose wiring has not landed returns NOT_IMPLEMENTED: a zeroed
+     * att is ANTS_TEE_VENDOR_UNKNOWN, and AMD SEV-SNP is likewise pending. The
+     * real Intel TDX path is covered end to end in test_attestation.c. */
     ants_attestation_t att;
     memset(&att, 0, sizeof att);
     CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_NOT_IMPLEMENTED);
-    /* NULL also returns NOT_IMPLEMENTED (or could return INVALID_ARG;
-     * but in v1.0 we don't expose an error code other than the stub
-     * sentinel — that's the documented behaviour). */
-    CHECK_EQ(ants_attestation_verify(NULL), ANTS_ERROR_NOT_IMPLEMENTED);
+    att.vendor = ANTS_TEE_VENDOR_AMD_SEV_SNP;
+    CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_NOT_IMPLEMENTED);
 }
 
 static void test_is_fresh_returns_false(void)
@@ -367,7 +371,7 @@ int main(void)
     test_default_windows_match_rfc0005();
     test_multivendor_weight_ratios();
     test_generate_returns_not_implemented();
-    test_verify_returns_not_implemented();
+    test_verify_dispatch_contract();
     test_is_fresh_returns_false();
     test_is_revoked_returns_false();
 

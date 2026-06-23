@@ -1,16 +1,22 @@
 /*
  * tee.c — TEE attestation harness.
  *
- * The uniform `ants_attestation_*` surface is still a stub (it needs the
- * vendor certificate chains). The per-vendor structure parsers + report-
- * signature verifiers land incrementally on top of foundation/crypto;
- * AMD SEV-SNP is the first (see the SNP section below). See `ants_tee.h`
- * for the rationale.
+ * ants_attestation_verify is wired for Intel TDX: it composes the quote parser,
+ * the X.509 certificate-chain validator (x509_chain.h) and the pinned Intel SGX
+ * Root CA (tee_roots.h) — see the composition section at the foot of this file.
+ * AMD SEV-SNP verify and ants_attestation_generate are still pending (generate
+ * needs real confidential-compute hardware). The per-vendor structure parsers +
+ * report-signature verifiers (AMD SEV-SNP, then Intel TDX) are below. See
+ * `ants_tee.h` for the rationale.
  */
 
 #include "ants_tee.h"
 
 #include "ants_crypto.h"
+
+#include "tee_roots.h"
+#include "x509.h"
+#include "x509_chain.h"
 
 #include <string.h>
 
@@ -24,10 +30,23 @@ ants_error_t ants_attestation_generate(ants_tee_vendor_t vendor,
     return ANTS_ERROR_NOT_IMPLEMENTED;
 }
 
+/* Per-vendor composition, defined at the foot of this file (it depends on the
+ * TDX layout constants below). */
+static ants_error_t tdx_attestation_verify(const ants_attestation_t *att);
+
 ants_error_t ants_attestation_verify(const ants_attestation_t *att)
 {
-    (void)att;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (att == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    switch (att->vendor) {
+    case ANTS_TEE_VENDOR_INTEL_TDX:
+        return tdx_attestation_verify(att);
+    default:
+        /* AMD SEV-SNP wiring lands next; ARM CCA / Apple SE / Qualcomm are
+         * v1.x. */
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    }
 }
 
 bool ants_attestation_is_fresh(const ants_attestation_t *att,
@@ -393,6 +412,249 @@ ants_tdx_quote_verify_signature(const uint8_t *quote,
         return err;
     }
     if (ants_ecdsa_p256_verify(att_key, digest, ANTS_SHA256_HASH_SIZE, att_sig) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Attestation verification (composition over the per-vendor pieces)        */
+/*                                                                          */
+/* ants_attestation_verify ties the structure parser + the certificate-     */
+/* chain validator (x509_chain.h) together: extract the embedded vendor cert */
+/* chain from the blob, validate it to a PINNED vendor root (tee_roots.h),   */
+/* take the proven leaf key, verify the report/quote signature under it, and */
+/* bind the attestation to the peer's Ed25519 identity key.                  */
+/*                                                                          */
+/* Peer binding (v1): the low 32 bytes of the 64-byte report_data carry the  */
+/* Ed25519 peer public key; the upper 32 bytes are reserved (the generate    */
+/* side zero-fills them; verify does not constrain them in v1). This is the  */
+/* byte-level binding RFC-0005 leaves to the implementation — pin it in the  */
+/* spec when ants_attestation_generate lands.                               */
+/*                                                                          */
+/* No dynamic allocation: embedded certificates decode into fixed stack      */
+/* buffers; an over-large embedded cert is rejected, not truncated.          */
+/* ------------------------------------------------------------------------ */
+
+/* Upper bound on one embedded DER certificate (Intel PCK leaf / Platform CA
+ * are ~0.7-1.1 KB). */
+#define ANTS_TEE_MAX_CERT_DER 2048
+
+/* Ed25519 peer key carried in the low half of the 64-byte report_data. */
+#define ANTS_TEE_PEER_BINDING_LEN 32
+
+static int b64_val(uint8_t c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+') {
+        return 62;
+    }
+    if (c == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+/* Decode base64 [in, in+in_len) into out (cap out_cap), skipping whitespace.
+ * ANTS_ERROR_MALFORMED on overflow or base64 data after '=' padding. */
+static ants_error_t
+b64_decode(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    size_t o = 0;
+    uint32_t acc = 0;
+    int nbits = 0;
+    bool pad = false;
+    for (size_t i = 0; i < in_len; i++) {
+        uint8_t c = in[i];
+        if (c == '=') {
+            pad = true;
+            continue;
+        }
+        int v = b64_val(c);
+        if (v < 0) {
+            continue; /* whitespace / newline */
+        }
+        if (pad) {
+            return ANTS_ERROR_MALFORMED; /* base64 data after padding */
+        }
+        acc = (acc << 6) | (uint32_t)v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (o >= out_cap) {
+                return ANTS_ERROR_MALFORMED;
+            }
+            out[o++] = (uint8_t)((acc >> nbits) & 0xFFu);
+        }
+    }
+    *out_len = o;
+    return ANTS_OK;
+}
+
+/* First occurrence of needle in [hay, hay+hay_len), or NULL. */
+static const uint8_t *
+find_bytes(const uint8_t *hay, size_t hay_len, const char *needle, size_t needle_len)
+{
+    if (needle_len == 0 || hay_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
+/* Decode the next PEM CERTIFICATE block in [*cur, end) to DER, advancing *cur
+ * past its END line. ANTS_ERROR_MALFORMED if none / malformed / oversize. */
+static ants_error_t pem_next_cert(const uint8_t **cur,
+                                  const uint8_t *end,
+                                  uint8_t *out,
+                                  size_t out_cap,
+                                  size_t *out_len)
+{
+    static const char BEGIN[] = "-----BEGIN CERTIFICATE-----";
+    static const char END[] = "-----END CERTIFICATE-----";
+    const uint8_t *b = find_bytes(*cur, (size_t)(end - *cur), BEGIN, sizeof BEGIN - 1);
+    if (b == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *body = b + (sizeof BEGIN - 1);
+    const uint8_t *e = find_bytes(body, (size_t)(end - body), END, sizeof END - 1);
+    if (e == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    ants_error_t err = b64_decode(body, (size_t)(e - body), out, out_cap, out_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    *cur = e + (sizeof END - 1);
+    return ANTS_OK;
+}
+
+/* Locate the PCK certificate PEM chain embedded in a TDX v4 quote: it follows
+ * the QE auth data as a type-5 (PCK_CHAIN) certification-data blob. Mirrors the
+ * bounds checks of ants_tdx_quote_verify_signature up to qe_auth. */
+static ants_error_t
+tdx_locate_pck_pem(const uint8_t *quote, size_t quote_len, const uint8_t **pem, size_t *pem_len)
+{
+    if (quote_len < TDX_OFF_SIG_DATA) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint32_t sig_data_len = tdx_rd_u32le(quote + TDX_OFF_SIG_DATA_LEN);
+    if ((uint64_t)TDX_OFF_SIG_DATA + sig_data_len > quote_len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *sd = quote + TDX_OFF_SIG_DATA;
+    if (sig_data_len < TDX_SD_CERT_BODY) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (tdx_rd_u16le(sd + TDX_SD_CERT_TYPE) != ANTS_TDX_CERT_TYPE_QE_REPORT) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint32_t cert_size = tdx_rd_u32le(sd + TDX_SD_CERT_SIZE);
+    if ((uint64_t)TDX_SD_CERT_BODY + cert_size > sig_data_len) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *cd = sd + TDX_SD_CERT_BODY;
+    if (cert_size < TDX_CD_QE_AUTH) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint16_t qe_auth_size = tdx_rd_u16le(cd + TDX_CD_QE_AUTH_SIZE);
+    if ((uint64_t)TDX_CD_QE_AUTH + qe_auth_size > cert_size) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* The PCK certification data follows qe_auth: type(u16) + size(u32) + body. */
+    uint64_t off = (uint64_t)TDX_CD_QE_AUTH + qe_auth_size;
+    if (off + 6 > cert_size) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *inner = cd + off;
+    if (tdx_rd_u16le(inner) != ANTS_TDX_CERT_TYPE_PCK_CHAIN) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint32_t inner_size = tdx_rd_u32le(inner + 2);
+    if (off + 6 + (uint64_t)inner_size > cert_size) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    *pem = inner + 6;
+    *pem_len = inner_size;
+    return ANTS_OK;
+}
+
+static ants_error_t tdx_attestation_verify(const ants_attestation_t *att)
+{
+    const uint8_t *quote = att->vendor_blob;
+    size_t quote_len = att->vendor_blob_len;
+    if (quote == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Extract the embedded PCK PEM chain (leaf + Platform CA; the root is
+     * pinned, never taken from the quote). */
+    const uint8_t *pem;
+    size_t pem_len;
+    ants_error_t err = tdx_locate_pck_pem(quote, quote_len, &pem, &pem_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    uint8_t pck_der[ANTS_TEE_MAX_CERT_DER];
+    uint8_t plat_der[ANTS_TEE_MAX_CERT_DER];
+    size_t pck_len, plat_len;
+    const uint8_t *cur = pem;
+    const uint8_t *pend = pem + pem_len;
+    err = pem_next_cert(&cur, pend, pck_der, sizeof pck_der, &pck_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = pem_next_cert(&cur, pend, plat_der, sizeof plat_der, &plat_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Validate PCK -> Platform CA -> pinned Intel SGX Root CA, as of the
+     * attestation's issuance time (recency is the separate is_fresh check). */
+    const uint8_t *chain[] = {pck_der, plat_der};
+    size_t lens[] = {pck_len, plat_len};
+    ants_x509_cert leaf;
+    err = ants_x509_chain_verify(chain,
+                                 lens,
+                                 2,
+                                 ANTS_TEE_INTEL_SGX_ROOT_CA_DER,
+                                 ANTS_TEE_INTEL_SGX_ROOT_CA_DER_LEN,
+                                 att->issued_at_unix,
+                                 &leaf);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (leaf.key_kind != ANTS_X509_KEY_EC || leaf.curve != ANTS_X509_CURVE_P256 ||
+        leaf.ec_point_len != ANTS_TDX_PCK_PUBKEY_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Verify the quote's internal 3-link signature chain under the now-trusted
+     * PCK leaf key. */
+    err = ants_tdx_quote_verify_signature(quote, quote_len, leaf.ec_point);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Bind to the peer identity: report_data[0:32] == the peer's Ed25519 key. */
+    ants_tdx_quote_t q;
+    err = ants_tdx_quote_parse(quote, quote_len, &q);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (memcmp(q.report_data, att->peer_pubkey, ANTS_TEE_PEER_BINDING_LEN) != 0) {
         return ANTS_ERROR_MALFORMED;
     }
     return ANTS_OK;
