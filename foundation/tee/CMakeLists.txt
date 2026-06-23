@@ -12,6 +12,7 @@ add_library(ants_tee STATIC
     src/der.c
     src/x509.c
     src/x509_chain.c
+    src/tee_roots.c
 )
 
 target_include_directories(ants_tee
@@ -63,6 +64,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_x509_chain PRIVATE ants_tee ants_crypto)
     target_include_directories(test_x509_chain PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME x509_chain_basic COMMAND test_x509_chain)
+
+    # End-to-end attestation verification: ants_attestation_verify composing the
+    # quote parser + chain validator + pinned root over a real TDX quote (the
+    # public ants_tee.h surface only — no internal headers).
+    add_executable(test_attestation tests/test_attestation.c)
+    target_link_libraries(test_attestation PRIVATE ants_tee)
+    target_include_directories(test_attestation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_test(NAME attestation_basic COMMAND test_attestation)
 endif()
 
 # ---- Vector emitter ------------------------------------------------------
