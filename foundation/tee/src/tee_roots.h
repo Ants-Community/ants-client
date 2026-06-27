@@ -9,7 +9,10 @@
  * v1 pins the production x86-server roots:
  *   - Intel SGX Root CA — anchors every Intel DCAP chain (SGX + TDX): the
  *     PCK -> Platform CA -> Root CA chain embedded in a TDX quote.
- * (AMD's ARK is per-CPU-family; ARK-Milan lands with the SNP wiring.)
+ *   - AMD ARK-Milan — anchors the AMD SEV-SNP chain on Zen3 (Milan): the
+ *     VCEK -> ASK -> ARK chain carried in the report's GHCB cert table. AMD's
+ *     ARK is per-CPU-family, so each family is its own distinct pin (Genoa and
+ *     later add their own ARK as those vendors are brought up).
  *
  * Internal to foundation/tee.
  */
@@ -23,5 +26,9 @@
 /* Intel SGX Root CA, self-signed (CN=Intel SGX Root CA), ECDSA P-256. */
 extern const uint8_t ANTS_TEE_INTEL_SGX_ROOT_CA_DER[];
 extern const size_t ANTS_TEE_INTEL_SGX_ROOT_CA_DER_LEN;
+
+/* AMD ARK-Milan, self-signed (CN=ARK-Milan), RSA-4096 RSASSA-PSS/SHA-384. */
+extern const uint8_t ANTS_TEE_AMD_ARK_MILAN_DER[];
+extern const size_t ANTS_TEE_AMD_ARK_MILAN_DER_LEN;
 
 #endif /* ANTS_TEE_ROOTS_H */

@@ -1,13 +1,13 @@
 /*
  * tee.c — TEE attestation harness.
  *
- * ants_attestation_verify is wired for Intel TDX: it composes the quote parser,
- * the X.509 certificate-chain validator (x509_chain.h) and the pinned Intel SGX
- * Root CA (tee_roots.h) — see the composition section at the foot of this file.
- * AMD SEV-SNP verify and ants_attestation_generate are still pending (generate
- * needs real confidential-compute hardware). The per-vendor structure parsers +
- * report-signature verifiers (AMD SEV-SNP, then Intel TDX) are below. See
- * `ants_tee.h` for the rationale.
+ * ants_attestation_verify is wired for Intel TDX and AMD SEV-SNP: each composes
+ * its structure parser, the X.509 certificate-chain validator (x509_chain.h)
+ * and the pinned vendor root (tee_roots.h: Intel SGX Root CA / AMD ARK-Milan) —
+ * see the composition section at the foot of this file. ants_attestation_generate
+ * is still pending (it needs real confidential-compute hardware). The per-vendor
+ * structure parsers + report-signature verifiers (AMD SEV-SNP, then Intel TDX)
+ * are below. See `ants_tee.h` for the rationale.
  */
 
 #include "ants_tee.h"
@@ -30,9 +30,10 @@ ants_error_t ants_attestation_generate(ants_tee_vendor_t vendor,
     return ANTS_ERROR_NOT_IMPLEMENTED;
 }
 
-/* Per-vendor composition, defined at the foot of this file (it depends on the
- * TDX layout constants below). */
+/* Per-vendor composition, defined at the foot of this file (each depends on the
+ * vendor layout constants + cert-extraction helpers below). */
 static ants_error_t tdx_attestation_verify(const ants_attestation_t *att);
+static ants_error_t snp_attestation_verify(const ants_attestation_t *att);
 
 ants_error_t ants_attestation_verify(const ants_attestation_t *att)
 {
@@ -42,9 +43,10 @@ ants_error_t ants_attestation_verify(const ants_attestation_t *att)
     switch (att->vendor) {
     case ANTS_TEE_VENDOR_INTEL_TDX:
         return tdx_attestation_verify(att);
+    case ANTS_TEE_VENDOR_AMD_SEV_SNP:
+        return snp_attestation_verify(att);
     default:
-        /* AMD SEV-SNP wiring lands next; ARM CCA / Apple SE / Qualcomm are
-         * v1.x. */
+        /* ARM CCA / Apple SE / Qualcomm are v1.x. */
         return ANTS_ERROR_NOT_IMPLEMENTED;
     }
 }
@@ -655,6 +657,162 @@ static ants_error_t tdx_attestation_verify(const ants_attestation_t *att)
         return err;
     }
     if (memcmp(q.report_data, att->peer_pubkey, ANTS_TEE_PEER_BINDING_LEN) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* AMD SEV-SNP attestation (composition over the per-vendor pieces)         */
+/*                                                                          */
+/* The SNP vendor_blob is the 0x4A0-byte ATTESTATION_REPORT followed by an  */
+/* AMD GHCB certificate table carrying the VCEK (leaf) -> ASK -> ARK chain.  */
+/* snp_attestation_verify extracts the VCEK + ASK from that table, validates */
+/* VCEK -> ASK -> the PINNED ARK-Milan root (tee_roots.h; the table's own    */
+/* ARK is ignored — trust is the pin, never the attacker-controlled blob),   */
+/* verifies the report signature under the proven VCEK leaf key, and binds   */
+/* report_data[0:32] to the peer's Ed25519 identity key (the same v1 binding */
+/* as TDX above).                                                           */
+/*                                                                          */
+/* GHCB certificate table (AMD GHCB spec / google/go-sev-guest abi): a       */
+/* sequence of 24-byte entries { GUID[16] || offset:u32 || length:u32 }, the */
+/* offset measured from the table start, terminated by an all-zero entry;    */
+/* the referenced DER certificates follow. offset/length are LITTLE-endian;  */
+/* the GUID is stored in RFC-4122 big-endian order (NOT byte-swapped).       */
+/* ------------------------------------------------------------------------ */
+
+#define SNP_CERT_ENTRY_SIZE 24
+#define SNP_CERT_GUID_SIZE  16
+
+/* AMD certificate GUIDs, on-wire (RFC-4122 big-endian) bytes. Strings per
+ * google/go-sev-guest abi.go: VCEK 63da758d-e664-4564-adc5-f4b93be8accd,
+ * ASK 4ab7b379-bbac-4fe4-a02f-05aef327c782. The ARK GUID is unused — its cert
+ * in the table is ignored in favour of the pinned ARK-Milan root. */
+static const uint8_t SNP_GUID_VCEK[SNP_CERT_GUID_SIZE] = {0x63,
+                                                          0xda,
+                                                          0x75,
+                                                          0x8d,
+                                                          0xe6,
+                                                          0x64,
+                                                          0x45,
+                                                          0x64,
+                                                          0xad,
+                                                          0xc5,
+                                                          0xf4,
+                                                          0xb9,
+                                                          0x3b,
+                                                          0xe8,
+                                                          0xac,
+                                                          0xcd};
+static const uint8_t SNP_GUID_ASK[SNP_CERT_GUID_SIZE] = {0x4a,
+                                                         0xb7,
+                                                         0xb3,
+                                                         0x79,
+                                                         0xbb,
+                                                         0xac,
+                                                         0x4f,
+                                                         0xe4,
+                                                         0xa0,
+                                                         0x2f,
+                                                         0x05,
+                                                         0xae,
+                                                         0xf3,
+                                                         0x27,
+                                                         0xc7,
+                                                         0x82};
+
+/* Locate the DER certificate tagged `guid` in a GHCB cert table [table,
+ * table+table_len). On success returns a slice INTO the table (borrowed, no
+ * copy). ANTS_ERROR_MALFORMED if the GUID is absent, the table is truncated, or
+ * the referenced certificate lies outside the table. */
+static ants_error_t snp_cert_table_find(const uint8_t *table,
+                                        size_t table_len,
+                                        const uint8_t guid[SNP_CERT_GUID_SIZE],
+                                        const uint8_t **cert,
+                                        size_t *cert_len)
+{
+    for (size_t off = 0; off + SNP_CERT_ENTRY_SIZE <= table_len; off += SNP_CERT_ENTRY_SIZE) {
+        const uint8_t *e = table + off;
+        uint32_t c_off = snp_rd_u32le(e + SNP_CERT_GUID_SIZE);
+        uint32_t c_len = snp_rd_u32le(e + SNP_CERT_GUID_SIZE + 4);
+        /* An all-zero entry terminates the table. */
+        if (snp_all_zero(e, SNP_CERT_GUID_SIZE) && c_off == 0 && c_len == 0) {
+            break;
+        }
+        if (memcmp(e, guid, SNP_CERT_GUID_SIZE) == 0) {
+            /* The referenced certificate must lie wholly within the table. */
+            if (c_len == 0 || (uint64_t)c_off + c_len > table_len) {
+                return ANTS_ERROR_MALFORMED;
+            }
+            *cert = table + c_off;
+            *cert_len = c_len;
+            return ANTS_OK;
+        }
+    }
+    return ANTS_ERROR_MALFORMED;
+}
+
+static ants_error_t snp_attestation_verify(const ants_attestation_t *att)
+{
+    const uint8_t *blob = att->vendor_blob;
+    size_t blob_len = att->vendor_blob_len;
+    if (blob == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    /* The blob is the fixed-size report followed by the GHCB cert table. */
+    if (blob_len < ANTS_SNP_REPORT_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    const uint8_t *report = blob;
+    const uint8_t *table = blob + ANTS_SNP_REPORT_SIZE;
+    size_t table_len = blob_len - ANTS_SNP_REPORT_SIZE;
+
+    /* Extract the VCEK leaf + ASK intermediate. The table's ARK is ignored: the
+     * root is the pinned ARK-Milan, never the attacker-controlled blob. */
+    const uint8_t *vcek_der, *ask_der;
+    size_t vcek_len, ask_len;
+    ants_error_t err = snp_cert_table_find(table, table_len, SNP_GUID_VCEK, &vcek_der, &vcek_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    err = snp_cert_table_find(table, table_len, SNP_GUID_ASK, &ask_der, &ask_len);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Validate VCEK -> ASK -> pinned ARK-Milan, as of the issuance time (recency
+     * is the separate is_fresh check). */
+    const uint8_t *chain[] = {vcek_der, ask_der};
+    size_t lens[] = {vcek_len, ask_len};
+    ants_x509_cert leaf;
+    err = ants_x509_chain_verify(chain,
+                                 lens,
+                                 2,
+                                 ANTS_TEE_AMD_ARK_MILAN_DER,
+                                 ANTS_TEE_AMD_ARK_MILAN_DER_LEN,
+                                 att->issued_at_unix,
+                                 &leaf);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (leaf.key_kind != ANTS_X509_KEY_EC || leaf.curve != ANTS_X509_CURVE_P384 ||
+        leaf.ec_point_len != ANTS_SNP_VCEK_PUBKEY_SIZE) {
+        return ANTS_ERROR_MALFORMED;
+    }
+
+    /* Verify the report signature under the now-trusted VCEK leaf key. */
+    err = ants_snp_report_verify_signature(report, ANTS_SNP_REPORT_SIZE, leaf.ec_point);
+    if (err != ANTS_OK) {
+        return err;
+    }
+
+    /* Bind to the peer identity: report_data[0:32] == the peer's Ed25519 key. */
+    ants_snp_report_t r;
+    err = ants_snp_report_parse(report, ANTS_SNP_REPORT_SIZE, &r);
+    if (err != ANTS_OK) {
+        return err;
+    }
+    if (memcmp(r.report_data, att->peer_pubkey, ANTS_TEE_PEER_BINDING_LEN) != 0) {
         return ANTS_ERROR_MALFORMED;
     }
     return ANTS_OK;
