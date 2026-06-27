@@ -97,12 +97,13 @@ static void test_verify_dispatch_contract(void)
     /* NULL is an argument error. */
     CHECK_EQ(ants_attestation_verify(NULL), ANTS_ERROR_INVALID_ARG);
     /* A vendor whose wiring has not landed returns NOT_IMPLEMENTED: a zeroed
-     * att is ANTS_TEE_VENDOR_UNKNOWN, and AMD SEV-SNP is likewise pending. The
-     * real Intel TDX path is covered end to end in test_attestation.c. */
+     * att is ANTS_TEE_VENDOR_UNKNOWN, and ARM CCA is likewise pending (v1.x).
+     * The real Intel TDX + AMD SEV-SNP paths are covered end to end in
+     * test_attestation.c. */
     ants_attestation_t att;
     memset(&att, 0, sizeof att);
     CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_NOT_IMPLEMENTED);
-    att.vendor = ANTS_TEE_VENDOR_AMD_SEV_SNP;
+    att.vendor = ANTS_TEE_VENDOR_ARM_CCA;
     CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_NOT_IMPLEMENTED);
 }
 
