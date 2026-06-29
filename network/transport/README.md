@@ -2,10 +2,13 @@
 
 P2P transport. Network layer.
 
-**Status:** in progress — picoquic vendoring + ANTS-native protocol design.
+**Status:** feature-complete at v0.x (Component #4) — the QUIC transport over
+vendored picoquic, with Ed25519 / RFC-7250 peer identity, multiplexed streams,
+and CBOR framing. A few peer-address / peer-id introspection accessors remain
+stubbed in v1.0 (no durable peer state yet).
 **Effort:** 5 EM total (~3 EM picoquic wrapping + ~2 EM application protocol).
 **Spec:** [RFC-0002 §DHT routing](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-verifiability.md), [RFC-0010 §First peer's flow](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0010-bootstrap.md), [RFC-0005 §Anti-eclipse](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
-**Dependencies:** `foundation/crypto` (Ed25519 peer identity), `foundation/cbor` (frame encoding). External: `deps/picoquic` (to be vendored).
+**Dependencies:** `foundation/crypto` (Ed25519 peer identity), `foundation/cbor` (frame encoding). External: `deps/picoquic` (vendored).
 
 ## Scope
 
@@ -58,17 +61,13 @@ What we write on top:
 The decision is documented in [IMPLEMENTATION.md component #4](https://github.com/Ants-Community/ants/blob/main/IMPLEMENTATION.md)
 and the corresponding [CHANGELOG entry](https://github.com/Ants-Community/ants/blob/main/spec/CHANGELOG.md).
 
-## v1.0 scaffold sequence
+## v1.0 scaffold sequence (completed)
 
-1. **API design** — in progress. The public surface (`ants_transport.h`)
-   needs concrete decisions on sync/async style, opaque ctx sizing,
-   error model, TLS identity binding, stream lifetime.
-2. **Scaffolding PR** — stubs for all transport functions returning
-   `ANTS_ERROR_NOT_IMPLEMENTED`, following the foundation/tee pattern.
-3. **Vendor picoquic** under `deps/picoquic/` with the same snapshot
-   discipline as `deps/{blake3,ed25519,blst}`.
-4. **Wire transport wrapper** against picoquic. Tests + an in-tree
-   loopback round-trip.
+The transport landed in the planned order: API design → scaffolding PR (all
+functions stubbed) → vendor [`picoquic`](https://github.com/private-octopus/picoquic)
+under `deps/picoquic/` (same snapshot discipline as `deps/{blake3,ed25519,blst}`)
+→ wire the transport wrapper against picoquic with tests and an in-tree loopback
+round-trip. Only a few peer-introspection accessors remain stubbed in v1.0.
 
 ## Good-first-contribution flag
 

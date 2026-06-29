@@ -2,7 +2,11 @@
 
 Semantic cache (DHT-routed). Cache layer.
 
-**Status:** scaffold landed (API + stubs); LSH + storage + DHT integration pending.
+**Status:** feature-complete at v0.x (Component #10) — LSH shard-key routing,
+local shard storage + top-K cosine lookup, Hamming-neighbour expansion, the
+client publish/query state machines, Ed25519 producer-signature verification,
+and quality-signal aggregation with decay + challenge invalidation are all
+implemented.
 **Effort:** 5 EM.
 **Spec:** [RFC-0002 v0.4](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-semantic-cache.md).
 **Dependencies:** `network/dht`, `reputation/identity`, `cache/embedding`.

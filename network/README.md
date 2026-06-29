@@ -7,9 +7,9 @@ The peer-to-peer transport, DHT, and gossip overlay. Depends on
 
 | Component | Effort | Spec | Status |
 |---|---|---|---|
-| [`transport/`](./transport) — P2P transport (#4) | 5 EM | RFC-0002 §DHT routing, RFC-0010 §First peer's flow | in progress — pinned to picoquic |
-| [`dht/`](./dht) — Kademlia DHT, shard-key variant (#5) | 3 EM | RFC-0002 §DHT routing | pending claim |
-| [`gossip/`](./gossip) — Gossip overlay for L1 CRDT (#6) | 3 EM | RFC-0004 §Layer 1 + §G-Set pruning | pending claim |
+| [`transport/`](./transport) — P2P transport (#4) | 5 EM | RFC-0002 §DHT routing, RFC-0010 §First peer's flow | feature-complete (picoquic) |
+| [`dht/`](./dht) — Kademlia DHT, shard-key variant (#5) | 3 EM | RFC-0002 §DHT routing | feature-complete |
+| [`gossip/`](./gossip) — Gossip overlay for L1 CRDT (#6) | 3 EM | RFC-0004 §Layer 1 + §G-Set pruning | feature-complete |
 
 ## Transport: picoquic + ANTS-native protocol (decided 2026-05-21)
 
@@ -38,19 +38,9 @@ half-maintained, and the external-daemon-via-IPC approach carries
 the same runtime dependency wrapped in process boundaries. None
 fit the project's day-zero portability target.
 
-## Build status (v1.0 scaffold phase)
+## Build status
 
-This layer is being scaffolded in steps:
-
-1. **API design** for `network/transport/include/ants_transport.h`
-   — in progress, decisions pending on sync/async style, TLS
-   identity binding, stream semantics, error model.
-2. **Scaffolding PR** — stubs for all three components returning
-   `ANTS_ERROR_NOT_IMPLEMENTED`, following the foundation/tee
-   pattern.
-3. **Vendor picoquic** under `deps/picoquic/`.
-4. **Wire transport wrapper** against picoquic.
-5. **DHT + gossip** built on the transport.
-
-Until step 2 lands, `network/CMakeLists.txt` leaves all three
-subdirectories disabled.
+All three components are feature-complete at v0.x and are built + tested in
+`network/CMakeLists.txt`. The original scaffold sequence was: API design →
+scaffolding PR (all stubbed) → vendor picoquic under `deps/picoquic/` → wire the
+transport wrapper → build DHT + gossip on top.

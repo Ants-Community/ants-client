@@ -3,11 +3,12 @@
 L2 PoUH chain. Reputation & identity layer.
 **On the critical path. The single longest implementation deliverable in this layer.**
 
-**Status:** PR1 — scaffold. The full public surface, the protocol structs
-(`EpochSummary`, `PatternFinding`, `Block`) and tunable constants are in;
-every entry point is present and returns `ANTS_ERROR_NOT_IMPLEMENTED` until
-its PR lands (see the PR map in [`ants_chain.h`](include/ants_chain.h)).
-Founder interim primary; CLAIM open.
+**Status:** feature-complete at v0.x. The drand beacon verification + VRF
+seed derivation, block proposal + proposer election, epoch-summary
+generation, equivocation / invalid-transition fault attribution, and the
+saturating Σ T_eff fork choice are all implemented. The remaining runtime
+glue (block production on the wire, L2→L1 prune-cutoff feedback) is
+daemon-blocked. Founder interim primary.
 **Effort:** 6 EM.
 **Spec:** [RFC-0004 v0.6 §Layer 2](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md), §Partition recovery (incl. saturating Σ T_eff fork choice + equivocation slashing + social-Schelling fallback).
 **Dependencies:** `foundation/crypto` (BLS, Ed25519, ECVRF-ELL2), `reputation/crdt`.
