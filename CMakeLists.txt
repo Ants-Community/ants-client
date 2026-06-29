@@ -115,6 +115,10 @@ add_subdirectory(cache)
 add_subdirectory(inference)
 add_subdirectory(economy)
 
+# Runnable executables that compose the component libraries (the node daemon).
+# Added last so every library target it links already exists.
+add_subdirectory(cmd)
+
 # ---- Status banner --------------------------------------------------------
 
 message(STATUS "")
