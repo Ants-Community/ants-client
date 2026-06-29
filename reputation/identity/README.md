@@ -2,7 +2,7 @@
 
 Identity & reputation service. Reputation & identity layer.
 
-**Status:** the (A, T, κ) spine + saturating `T_eff` + the L1 slash gate + the full receipt-bag selective disclosure (Merkle commitment, inclusion proofs, and the `A ≥ b` subset recompute) implemented; compact summaries + bond-admission wiring pending.
+**Status:** the (A, T, κ) spine + saturating `T_eff` + the L1 slash gate + the full receipt-bag selective disclosure (Merkle commitment, inclusion proofs, and the `A ≥ b` subset recompute) + compact summaries are implemented; bond-admission wiring is daemon-blocked.
 **Effort:** 3 EM.
 **Spec:** [RFC-0004 v0.6 §Tenure + §Bond accounting + §Selective disclosure](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md); [RFC-0005 §Multi-vendor reputation weighting](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
 **Dependencies:** `foundation/crypto`, `foundation/cbor` — the library
@@ -100,10 +100,6 @@ Layer 1"):
 
 **Pending (later PRs):**
 
-- **Compact summaries** (RFC-0004 §"Selective disclosure of receipts"):
-  signed `(time_bucket, Σ decayed_value)` hints for large bags, committed
-  via the same Merkle root — an optimization (challengeable into individual
-  receipts), not a security primitive.
 - **Bond-admission wiring** into the real high-stakes-act call sites
   (Tier-3 committee per RFC-0003; L2 committee / fork-recovery vote per
   RFC-0004 §Layer 2) + the `bond_admission` L1 gossip. (Bond accounting
