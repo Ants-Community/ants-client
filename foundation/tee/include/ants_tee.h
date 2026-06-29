@@ -3,21 +3,26 @@
  *
  * Spec reference: RFC-0005 (Identity & TEE attestation, all sections).
  *
- * Status: **a v1 deliverable, in progress** (un-deferred from v2.x on
- * 2026-06-15). The functions below still return
- * `ANTS_ERROR_NOT_IMPLEMENTED` — the per-vendor attestation_verify lands
- * incrementally (Intel TDX + AMD SEV-SNP first), built on the ECDSA
- * P-256/P-384 + SHA-256/512 primitives now in foundation/crypto. See
- * `foundation/tee/README.md` for scope + the open `[CLAIM]` issue at
+ * Status: **a v1 deliverable, largely landed** (un-deferred from v2.x on
+ * 2026-06-15). `ants_attestation_verify` is wired for both mature
+ * x86-server vendors — Intel TDX and AMD SEV-SNP — each composing its
+ * structure parser, the in-tree X.509 certificate-chain validator, and a
+ * pinned vendor root (Intel SGX Root CA / AMD ARK-Milan), built on the
+ * ECDSA P-256/P-384, SHA-256/384/512 and RSA-PSS primitives in
+ * foundation/crypto. `ants_attestation_is_fresh` enforces the recency +
+ * vendor-expiry window. Still pending: `ants_attestation_generate`, which
+ * needs real confidential-compute hardware; the ARM CCA / Apple SE /
+ * Qualcomm vendor paths (v1.x); and `ants_attestation_is_revoked`, a v1
+ * stub until the vendor revocation-list API lands. See
+ * `foundation/tee/README.md` for scope + the `[CLAIM]` issue at
  * Ants-Community/ants#6.
  *
- * Why the stub exists in v1.0: upstream components (network,
- * reputation, identity) reference attestations in their data structures
- * — peer-handshake bindings, trustee key rotation, bond admission, and
- * committee role assumption all carry attestation metadata. Having the
- * API compiled means those components can integrate against it now
- * without having to mock or `#ifdef` a future shape. When each vendor's
- * verify lands the integration sites need no changes.
+ * The surface compiled ahead of the vendors so upstream components
+ * (network, reputation, identity) — whose data structures carry
+ * attestation metadata for peer-handshake bindings, trustee key rotation,
+ * bond admission, and committee role assumption — could integrate against
+ * it before each vendor's verify landed, with no changes needed at the
+ * integration sites once it did.
  *
  * The TEE does two jobs. As RFC-0002's fourth verifiability leg (re-
  * execution, scheme (C) probabilistic, reputation, TEE) it is optional —
@@ -125,9 +130,12 @@ typedef struct {
 /* ------------------------------------------------------------------------ */
 /* API surface                                                              */
 /*                                                                          */
-/* All functions return `ANTS_ERROR_NOT_IMPLEMENTED` in v1.0. The shape is  */
-/* pinned so v1.0 consumers can integrate and v2.x can drop the real       */
-/* implementation in without API churn.                                     */
+/* Most functions are implemented. ants_attestation_verify is wired for     */
+/* Intel TDX + AMD SEV-SNP; ants_attestation_is_fresh enforces recency      */
+/* and the vendor-expiry window. ants_attestation_generate returns          */
+/* ANTS_ERROR_NOT_IMPLEMENTED until confidential-compute hardware is        */
+/* available, as does verify for the ARM CCA / Apple SE / Qualcomm          */
+/* vendors (v1.x). ants_attestation_is_revoked is a v1 stub.                */
 /* ------------------------------------------------------------------------ */
 
 /*

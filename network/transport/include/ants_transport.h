@@ -32,9 +32,10 @@
  * spawns no threads, does no logging, and calls no malloc — all memory
  * is caller-provided per project convention.
  *
- * Status: API surface declared; implementation is stubbed (every
- * function returns ANTS_ERROR_NOT_IMPLEMENTED) and lands in subsequent
- * PRs.
+ * Status: implemented — the QUIC transport (Component #4) is
+ * feature-complete. A few peer-address / peer-id introspection accessors
+ * return ANTS_ERROR_NOT_IMPLEMENTED in v1.0, where the transport carries
+ * no durable peer state yet.
  */
 
 #ifndef ANTS_TRANSPORT_H
