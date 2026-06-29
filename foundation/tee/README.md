@@ -2,23 +2,28 @@
 
 TEE attestation harness. Foundation layer.
 
-**Status:** **a v1 deliverable, in progress** — un-deferred from v2.x on
+**Status:** **a v1 deliverable, largely landed** — un-deferred from v2.x on
 2026-06-15 (see the spec [CHANGELOG](https://github.com/Ants-Community/ants/blob/main/spec/CHANGELOG.md)
 and [IMPLEMENTATION.md](https://github.com/Ants-Community/ants/blob/main/IMPLEMENTATION.md)
-row #3). The crypto-verify primitives the quote/report signature chains need
-have landed in [`foundation/crypto`](../crypto/): ECDSA P-256 (Intel TDX),
-ECDSA P-384 + SHA-512 (AMD SEV-SNP). The per-vendor `ants_attestation_verify`
-is still a `NOT_IMPLEMENTED` stub and lands incrementally, launch vendors
-first. The [CLAIM](https://github.com/Ants-Community/ants/issues/6) remains
-open sine die — no nomination-window deadline; the BDFL is interim primary.
+row #3). `ants_attestation_verify` is wired end to end for both launch vendors,
+**Intel TDX** and **AMD SEV-SNP**: each composes its structure parser, the
+in-tree X.509 certificate-chain validator, and a pinned vendor root (Intel SGX
+Root CA / AMD ARK-Milan), built on the ECDSA P-256/P-384, SHA-256/384/512 and
+RSA-PSS primitives in [`foundation/crypto`](../crypto/).
+`ants_attestation_is_fresh` enforces the recency + vendor-expiry window. What
+remains: `ants_attestation_generate` (gated on real confidential-compute
+hardware), the ARM CCA / Apple SE / Qualcomm vendor paths (v1.x), and
+`ants_attestation_is_revoked` (a v1 stub until the vendor revocation-list API
+lands). The [CLAIM](https://github.com/Ants-Community/ants/issues/6) remains
+open sine die; the BDFL is interim primary.
 
-**Why v1.0 ships the stub:** upstream components (network, reputation,
-identity) reference attestations in their data structures — peer
-handshake bindings, trustee key rotation, bond admission, and committee
-role assumption all carry attestation metadata. Compiling against the
-header now means those components don't need to mock or `#ifdef`
-around a future shape; when the real implementation lands in v2.x,
-integration sites need no changes.
+**Why the surface compiled ahead of the vendors:** upstream components
+(network, reputation, identity) reference attestations in their data
+structures — peer handshake bindings, trustee key rotation, bond admission,
+and committee role assumption all carry attestation metadata. Compiling
+against the header early meant those components never had to mock or `#ifdef`
+around a future shape; when each vendor's verify landed, the integration
+sites needed no changes.
 
 **Why v1, not v2.x — the earlier deferral conflated two jobs.** The TEE does
 two things. As the *fourth verifiability leg* ([RFC-0002](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-verifiability.md)
@@ -26,10 +31,12 @@ two things. As the *fourth verifiability leg* ([RFC-0002](https://github.com/Ant
 genuinely optional: the other three legs suffice for soundness. But as the
 **identity root** it is not. RFC-0005's "one attested CPU, one peer identity"
 Sybil resistance and RFC-0004's "one CPU, one voice" validator pool both
-reduce to *the attested population*. With only the stub, that population is
+reduce to *the attested population*. Until the node daemon wires attestation
+into handshake admission and validator-pool membership, that population is
 every freely-generated Ed25519 keypair — so the L2 committee selection, the
-per-attested-identity rate limits, and the Sybil-cost table are all
-unenforced ("one keypair, one voice"). The 2030-2032 horizon in RFC-0005 is
+per-attested-identity rate limits, and the Sybil-cost table are not yet
+enforced ("one keypair, one voice"); the verification machinery they need now
+exists. The 2030-2032 horizon in RFC-0005 is
 the *open-hardware* migration (Keystone / OpenTitan), **not** a reason to
 defer closed-vendor attestation, which RFC-0005 assumes runs throughout the
 v1 era. The residual closed-silicon trust window is addressed by the security
@@ -38,8 +45,9 @@ audit and the freshness / revocation bounds below — not by waiting.
 **Effort (v1):** 6 EM total — Intel TDX + AMD SEV-SNP launch vendors ~2.4 EM,
 the rest v1.x — plus full security audit.
 **Spec:** [RFC-0005](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md) (all sections).
-**Dependencies:** `crypto/` (BLAKE3, Ed25519, SHA-256/512, ECDSA P-256/P-384;
-ASN.1/X.509 + RSA verify for the vendor cert chains are forthcoming). The
+**Dependencies:** `crypto/` (BLAKE3, Ed25519, SHA-256/384/512, ECDSA
+P-256/P-384, RSA-PSS) plus the in-tree strict DER reader + X.509 certificate
+parser and chain validator (`foundation/tee/src/{der,x509,x509_chain}.c`). The
 quote/report *verification* path is offline- and vector-testable on commodity
 hardware; only quote *generation* and end-to-end need confidential-compute
 hardware (a Confidential VM, or local attestation-capable silicon).
