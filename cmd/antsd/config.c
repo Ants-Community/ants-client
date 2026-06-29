@@ -6,6 +6,9 @@
  *     1: listen_multiaddr (tstr),
  *     2: seeds [ { 0: addr (tstr), 1: peer_id (bstr/32) }, ... ] }
  */
+/* strnlen() is POSIX.1-2008; request it under -std=c99 on glibc. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "config.h"
 
 #include "ants_cbor.h"
