@@ -55,13 +55,12 @@
  * caller-owns-state discipline established by foundation/, network/,
  * cache/, and inference/kernels/.
  *
- * Status: surface 1 (commit-at-send) is implemented — leaf hashing,
- * Merkle root/prove/verify, the canonical CBOR commit codec, and Ed25519
- * sign/verify over that encoding. Surfaces 2–4 (challenge derivation, the
- * betting e-process, the serving runtime) are declared with their full
- * contracts but still return ANTS_ERROR_NOT_IMPLEMENTED until their
- * implementation PRs land. The tests pin both the live behavior and the
- * pending-stub contracts.
+ * Status: implemented — all four surfaces are feature-complete at v0.x
+ * (Component #13): surface 1 commit-at-send (leaf hashing, Merkle
+ * root/prove/verify, the canonical CBOR commit codec, and Ed25519
+ * sign/verify over that encoding), surface 2 challenge derivation,
+ * surface 3 the betting e-process, and surface 4 the serving runtime +
+ * audit. The tests pin the live behavior across all four.
  */
 
 #ifndef ANTS_INFERENCE_H

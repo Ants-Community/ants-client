@@ -25,8 +25,8 @@
  *
  * Spec reference: RFC-0008 §1.1.
  * Component README: ants-client/foundation/cbor/README.md.
- * Status: API surface declared; implementation is stubbed
- *         (returns ANTS_ERROR_NOT_IMPLEMENTED).
+ * Status: implemented — the deterministic encoder and the strict decoder
+ *         are feature-complete (Component #2).
  */
 
 #ifndef ANTS_CBOR_H

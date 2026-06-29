@@ -15,8 +15,8 @@
  *   - ECVRF-ELL2: forked from the RFC 9381 reference C implementation
  *     with the Elligator 2 hash-to-curve port.
  *
- * Status: API surface declared; implementation is stubbed (returns
- * ANTS_ERROR_NOT_IMPLEMENTED) and lands per-primitive in subsequent PRs.
+ * Status: implemented — BLAKE3, SHA-256/384/512, Ed25519, BLS12-381,
+ * ECVRF, ECDSA P-256/P-384 verify, and RSA-PSS verify are all live.
  *
  * All memory is caller-provided. The library never calls malloc.
  */
