@@ -7,8 +7,9 @@
  *   - ants_attestation_generate is still a stub (NOT_IMPLEMENTED); verify
  *     dispatches per vendor (INVALID_ARG on NULL, NOT_IMPLEMENTED for a
  *     vendor whose wiring is pending; the real Intel TDX verification is
- *     covered end to end in test_attestation.c); is_fresh / is_revoked
- *     return their documented false default;
+ *     covered end to end in test_attestation.c); is_fresh enforces the
+ *     recency window + vendor expiry; is_revoked returns its documented
+ *     false default (no revocation list loaded in v1.0);
  *   - constant values (vendor IDs, default windows, weight ratios)
  *     match the spec.
  */
@@ -107,15 +108,64 @@ static void test_verify_dispatch_contract(void)
     CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_NOT_IMPLEMENTED);
 }
 
-static void test_is_fresh_returns_false(void)
+static void test_is_fresh(void)
 {
-    /* Documented contract: false until v2.x ships the real impl. */
+    /* Contract (ants_tee.h): true iff now - issued_at_unix < window AND
+     * (expires_at_unix == 0 || now < expires_at_unix); false on a null
+     * pointer or a non-positive window. */
     ants_attestation_t att;
     memset(&att, 0, sizeof att);
+
+    /* Null attestation → stale (safe default). */
+    CHECK(ants_attestation_is_fresh(NULL, 1000, 100) == false);
+
+    /* A non-positive window admits nothing, regardless of timing. */
+    att.issued_at_unix = 1000;
+    att.expires_at_unix = 0;
+    CHECK(ants_attestation_is_fresh(&att, 1000, 0) == false);
+    CHECK(ants_attestation_is_fresh(&att, 1000, -100) == false);
+
+    /* Recency, no vendor expiry: fresh iff now - issued < window, strict. */
     att.issued_at_unix = 0;
     att.expires_at_unix = 0;
-    CHECK(ants_attestation_is_fresh(&att, 1000, 100) == false);
-    CHECK(ants_attestation_is_fresh(NULL, 1000, 100) == false);
+    CHECK(ants_attestation_is_fresh(&att, 99, 100) == true);    /* age 99  < 100 */
+    CHECK(ants_attestation_is_fresh(&att, 100, 100) == false);  /* age 100 == 100 */
+    CHECK(ants_attestation_is_fresh(&att, 1000, 100) == false); /* age far past window */
+
+    /* A future-dated issuance (now < issued) is within the window per the
+     * documented contract — recency only bounds *staleness*. issued_at_unix
+     * is local metadata, not part of the signed report; the adversarial gate
+     * is ants_attestation_verify + the report_data <-> pubkey binding. */
+    att.issued_at_unix = 2000;
+    att.expires_at_unix = 0;
+    CHECK(ants_attestation_is_fresh(&att, 1500, 1000) == true); /* age -500 < 1000 */
+
+    /* Vendor expiry present: fresh also requires now < expires, strict — even
+     * while still inside the recency window. */
+    att.issued_at_unix = 1000;
+    att.expires_at_unix = 1400;
+    CHECK(ants_attestation_is_fresh(&att, 1399, 1000) == true);  /* in window, pre-expiry */
+    CHECK(ants_attestation_is_fresh(&att, 1400, 1000) == false); /* now == expiry */
+    CHECK(ants_attestation_is_fresh(&att, 1401, 1000) == false); /* past expiry */
+
+    /* Expiry overrides an otherwise-fresh recency check. */
+    att.issued_at_unix = 1000;
+    att.expires_at_unix = 1100;
+    CHECK(ants_attestation_is_fresh(&att, 1200, 1000000) == false); /* deep in window, expired */
+
+    /* Overflow safety: issued_at_unix near INT64_MAX must not wrap the window
+     * addition (UB; the Debug build runs UBSan). Math: age is small, fresh. */
+    att.issued_at_unix = INT64_MAX - 10;
+    att.expires_at_unix = 0;
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX, 1000) == true);       /* age 10 < 1000 */
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX - 100, 1000) == true); /* future, in window */
+
+    /* Overflow safety: issued_at_unix at INT64_MIN is the farthest possible
+     * past — unambiguously stale, evaluated without wrapping the subtraction. */
+    att.issued_at_unix = INT64_MIN;
+    att.expires_at_unix = 0;
+    CHECK(ants_attestation_is_fresh(&att, 0, 1000) == false);
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX, INT64_MAX) == false);
 }
 
 static void test_is_revoked_returns_false(void)
@@ -373,7 +423,7 @@ int main(void)
     test_multivendor_weight_ratios();
     test_generate_returns_not_implemented();
     test_verify_dispatch_contract();
-    test_is_fresh_returns_false();
+    test_is_fresh();
     test_is_revoked_returns_false();
 
     test_snp_report_parse_fields();
