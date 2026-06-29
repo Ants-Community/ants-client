@@ -157,8 +157,8 @@ ants_error_t ants_attestation_verify(const ants_attestation_t *att);
  * `ANTS_TEE_DEFAULT_FRESHNESS_WINDOW_SECONDS` but configurable per
  * RFC-0005 §Attestation freshness window).
  *
- * Returns false on a null pointer (safe default — treat unknown as
- * stale).
+ * Returns false on a null pointer or a non-positive
+ * `freshness_window_seconds` (safe default — treat unknown as stale).
  */
 bool ants_attestation_is_fresh(const ants_attestation_t *att,
                                int64_t now,

@@ -18,6 +18,7 @@
 #include "x509.h"
 #include "x509_chain.h"
 
+#include <stdint.h>
 #include <string.h>
 
 ants_error_t ants_attestation_generate(ants_tee_vendor_t vendor,
@@ -55,15 +56,40 @@ bool ants_attestation_is_fresh(const ants_attestation_t *att,
                                int64_t now,
                                int64_t freshness_window_seconds)
 {
-    /* Documented contract: returns false on a null attestation
-     * pointer (treat unknown as stale). Returning false until the
-     * real implementation lands is the safe default: callers
-     * checking freshness will treat the attestation as expired and
-     * fall back to non-TEE participation paths. */
-    (void)att;
-    (void)now;
-    (void)freshness_window_seconds;
-    return false;
+    /* Null attestation: treat unknown as stale (documented safe default). */
+    if (att == NULL) {
+        return false;
+    }
+    /* A non-positive freshness window can never admit a fresh attestation.
+     * Rejecting it here also guarantees freshness_window_seconds > 0 for the
+     * overflow-guarded arithmetic below. */
+    if (freshness_window_seconds <= 0) {
+        return false;
+    }
+
+    /* Recency: now - issued_at_unix < freshness_window_seconds, rewritten as
+     * now < issued_at_unix + freshness_window_seconds so a hugely negative
+     * issued_at_unix cannot wrap the subtraction. The addition is guarded
+     * against signed overflow (UB — the Debug build runs UBSan): when
+     * issued_at_unix + window would exceed INT64_MAX the bound is beyond any
+     * representable `now`, so the attestation is trivially within the window. */
+    bool within_window;
+    if (att->issued_at_unix >= 0 && att->issued_at_unix > INT64_MAX - freshness_window_seconds) {
+        within_window = true;
+    } else {
+        within_window = now < att->issued_at_unix + freshness_window_seconds;
+    }
+    if (!within_window) {
+        return false;
+    }
+
+    /* Vendor expiry: when present (non-zero), `now` must be strictly before
+     * it. A zero expiry means the vendor carries no hard expiry, and the
+     * freshness window alone bounds staleness. */
+    if (att->expires_at_unix != 0 && now >= att->expires_at_unix) {
+        return false;
+    }
+    return true;
 }
 
 bool ants_attestation_is_revoked(const ants_attestation_t *att)
