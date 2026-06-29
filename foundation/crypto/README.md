@@ -2,15 +2,22 @@
 
 Crypto primitives library. Foundation layer.
 
-**Status:** in progress (BDFL interim primary; claim still open).
-BLAKE3 + Ed25519 implemented. BLS12-381 and ECVRF-ELL2 still stubbed.
+**Status:** implemented — Component #1 is feature-complete. BLAKE3,
+Ed25519, SHA-256/384/512, BLS12-381, ECVRF-ELL2, ECDSA P-256/P-384 verify,
+and RSA-PSS verify are all live and test-vector-checked.
 
 | Primitive | Status | Vendor |
 |---|---|---|
 | BLAKE3 (hash + derive_key + streaming) | ✅ | `deps/blake3/` pinned to BLAKE3 1.8.5 |
 | Ed25519 (sign/verify + pubkey derive) | ✅ | `deps/ed25519/` pinned to libsodium 1.0.22 ref10 subset, RFC 8032 §7.1 vectors verified |
-| BLS12-381 | stub | `supranational/blst` (planned) |
-| ECVRF-EDWARDS25519-SHA512-ELL2 | stub | RFC 9381 reference port (planned) |
+| SHA-256 | ✅ | `deps/blst` portable SHA-256 |
+| SHA-512 | ✅ | `deps/ed25519` (libsodium) |
+| SHA-384 | ✅ | `deps/bearssl` (`br_sha384`) |
+| BLS12-381 (sign/verify + aggregate) | ✅ | `deps/blst` pinned to 0.3.15 |
+| ECVRF-EDWARDS25519-SHA512-ELL2 | ✅ | RFC 9381 reference port + Elligator 2, in-tree |
+| ECDSA P-256 verify | ✅ | `deps/p256-m` (Apache-2.0) |
+| ECDSA P-384 verify | ✅ | `deps/bearssl` EC subset (MIT) |
+| RSA-PSS verify (RSA-4096) | ✅ | `deps/bearssl` RSA-PSS subset (MIT) |
 
 **Effort:** 2 EM (per IMPLEMENTATION.md).
 **Spec:** [RFC-0008 §§ 2–4](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0008-wire-formats.md).
