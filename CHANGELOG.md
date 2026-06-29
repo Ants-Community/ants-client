@@ -13,6 +13,109 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/tee: attestation freshness window check · 2026-06-29
+
+`foundation/tee` (PR #178): `ants_attestation_is_fresh` replaces its v1.0 stub.
+With both per-vendor `ants_attestation_verify` paths now wired (Intel TDX #176,
+AMD SEV-SNP #177), recency is the last pure-software piece of the verify
+surface — the only remaining gap, `ants_attestation_generate`, needs real
+confidential-compute hardware. The check is the documented contract, now
+enforced: fresh iff `now - issued_at_unix < freshness_window_seconds` **and**
+`expires_at_unix == 0 || now < expires_at_unix`, both boundaries strict; false
+on a null attestation or a non-positive window (safe default — treat unknown as
+stale). The recency test is evaluated as `now < issued + window` with the
+addition guarded against signed overflow, so an `issued_at_unix` near the
+`int64` extremes neither wraps the arithmetic (UB — the Debug build runs UBSan)
+nor is mis-judged; the tests exercise `INT64_MAX - 10` and `INT64_MIN` and stay
+clean. `issued_at_unix` is local metadata, not part of the signed report, so a
+future-dated issuance is still within the window by design — `is_fresh` only
+bounds *staleness* (for vendor revocation / TCB propagation, RFC-0005
+§Attestation freshness window); the adversarial gate stays `ants_attestation_verify`
+plus the `report_data <-> pubkey` binding. `ants_attestation_is_revoked` remains
+a v1 stub — no revocation-list management API ships in v1.0.
+
+### foundation/tee: wire ants_attestation_verify for AMD SEV-SNP · 2026-06-27
+
+`foundation/tee` (PR #177): the second composed `ants_attestation_verify` path,
+closing the two mature x86-server vendors. Unlike Intel's DCAP quote, the AMD
+tooling carries no combined attestation blob (`go-sev-guest` ships the 1184-byte
+report and the certificates separately), so the SNP `vendor_blob` is defined
+here as `report || AMD GHCB certificate-table`. The cert-table format is pinned
+from the AMD GHCB layout: 24-byte entries of `GUID[16] || offset:u32 LE ||
+length:u32 LE`, GUIDs encoded RFC-4122 **big-endian** (no Microsoft-style
+mixed-endian swap — VCEK's first byte is `0x63`, not `0x8d`), offsets from the
+blob start, terminated by an all-zero entry. `snp_attestation_verify` parses the
+table, takes VCEK + ASK as no-copy slices (the table's own ARK is ignored —
+trust comes from the pin, not the supplied chain), runs `ants_x509_chain_verify`
+to the **pinned ARK-Milan** root (`tee_roots.c`, RSA-4096 PSS self-signed,
+extracted from the in-repo artifact and re-hashed), checks the EC-P384 leaf, then
+`ants_snp_report_verify_signature`, then the `report_data[0:32] == peer_pubkey`
+binding. `now` for the cert-validity window is the attestation's `issued_at_unix`
+(recency stays the separate `is_fresh` check). No malloc. KAT: a `report ||
+cert-table{VCEK,ASK,ARK}` blob assembled from real pinned pieces with the GUIDs
+encoded independently of the implementation (so a parser bug fails the positive
+case rather than passing it), end-to-end positive plus tamper matrix (wrong peer,
+corrupted body, out-of-window issuance, truncation, corrupted VCEK GUID,
+out-of-bounds cert length); ASan + UBSan clean.
+
+### foundation/tee: wire ants_attestation_verify for Intel TDX · 2026-06-23
+
+`foundation/tee` (PR #176): the first composed `ants_attestation_verify`,
+assembling the structure parser, the X.509 chain validator (#175) and the pinned
+vendor root into one call on a real DCAP v4 quote. It extracts the embedded PCK
+PEM chain (a base64 + PEM decoder navigating the type-5 cert-data section after
+`qe_auth` in `tee.c`), runs `ants_x509_chain_verify` to the **pinned Intel SGX
+Root CA** (new `tee_roots.{c,h}`) with `now = att->issued_at_unix` so the verify
+takes no wall clock (recency is the separate `is_fresh` check), verifies the TDX
+quote signature under the proven PCK leaf, then enforces the
+`report_data[0:32] == peer_pubkey` binding (Ed25519; the high 32 bytes stay
+reserved for the generate-side scheme RFC-0005 will pin). No malloc. KAT
+`test_attestation.c` is end to end: positive, wrong-peer, corrupted body,
+out-of-window issuance, truncated, vendor-pending, NULL — ASan + UBSan clean.
+
+### foundation/tee: X.509 certificate-chain path validation · 2026-06-23
+
+`foundation/tee` (PR #175): `ants_x509_chain_verify` closes the X.509 fork. It
+walks a leaf-first chain to a **pinned** root supplied out of band — trust comes
+from the pin, never from the chain — and for each link checks: name chaining
+(issuer/subject byte-equal), signature dispatch on the algorithm OID
+(RSASSA-PSS/SHA-384 for the AMD ASK/ARK, ecdsa-with-SHA256 for Intel P-256; an
+ECDSA cert signature is the DER `SEQ{r,s}` re-encoded to fixed-width `r||s`; P-384
+is never a cert signer so `ecdsa-with-SHA384` is rejected by design), the
+validity window against a caller-supplied `now` (clock-free; UTCTime /
+GeneralizedTime decoded to epoch), `BasicConstraints cA=TRUE` on every issuer
+(the leaf is exempt), and a self-signed root. `x509.c` now also exposes the raw
+`extensions` slice the field extractor had left as a seam. KAT
+`test_x509_chain.c`: two real vendor chains validated to their pinned roots, an
+end-to-end gate (the *validated* leaf then verifies the real SNP report / TDX
+quote), and a tamper matrix (out-of-window `now`, wrong root, non-self-signed
+root, broken name chain, a corrupted signature at every link, arg guards). The
+two missing Intel certs (PCK Platform CA + SGX Root CA) were sourced from the
+same already-pinned TDX quote, OpenSSL-verified and re-derived from a fresh
+download before pinning.
+
+### foundation/tee: X.509 certificate field extractor · 2026-06-21
+
+`foundation/tee` (PR #174): `ants_x509_cert_parse` walks the DER of #173 and
+extracts the fields chain validation needs — the raw TBSCertificate, issuer and
+subject names, the validity window, the subject public key (EC and RSA), and the
+signature algorithm + value (v3 extensions deferred to the chain walk, where the
+`extensions` slice is consumed). KAT over four real vendor certificates (the AMD
+ARK RSA-4096 root, the ASK RSA-4096 intermediate, an EC-P384 VCEK, and an Intel
+EC-P256 PCK) with an end-to-end gate: the key the parser extracts from each leaf
+verifies the genuine attestation it belongs to (VCEK → SNP report, PCK → TDX
+quote, ARK self-signature, ASK←ARK via RSA-PSS), and every extracted key is
+cross-checked against the in-repo pins.
+
+### foundation/tee: strict DER reader for X.509 certificate parsing · 2026-06-20
+
+`foundation/tee` (PR #173): a strict DER/ASN.1 reader (`der.{c,h}`) — the second
+brick of the X.509 fork after the RSA-PSS primitive. It reads tag/length/value
+triplets with definite-length-only, minimal-length, bounds-checked decoding (no
+indefinite lengths, no trailing slack), the foundation the certificate parser and
+chain walk are built on. No external API change; 251 lines of `test_der.c` cover
+the accept and reject paths.
+
 ### foundation/crypto: RSA-4096 RSASSA-PSS signature verification · 2026-06-20
 
 `foundation/crypto` (PR #170): `ants_rsa_pss_verify`, the third TEE-chain
