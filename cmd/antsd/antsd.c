@@ -10,10 +10,12 @@
  *   antsd show <config>   — decode + print a config (CBOR is not
  *                           hand-editable, so this is how you read it)
  *   antsd run  <config>   — stand up transport + DHT (bootstrapped from
- *                           the config seeds) and drive the tick loop
- *                           until SIGINT/SIGTERM (see run.c)
+ *                           the config seeds) + gossip (view fed from
+ *                           DHT discovery, anti-eclipse epoch refresh)
+ *                           and drive the tick loop until
+ *                           SIGINT/SIGTERM (see run.c)
  *
- * Gossip wiring lands next.
+ * The chain loop lands next.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -33,33 +35,6 @@
 /* Default listen address written by `antsd init`: all interfaces, an
  * OS-assigned UDP port, QUIC v1. */
 #define ANTSD_DEFAULT_LISTEN "/ip4/0.0.0.0/udp/0/quic-v1"
-
-static int read_exact(int fd, uint8_t *buf, size_t n)
-{
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
-        if (r < 0) {
-            return -1;
-        }
-        if (r == 0) {
-            return -1; /* unexpected EOF */
-        }
-        got += (size_t)r;
-    }
-    return 0;
-}
-
-static int read_random(uint8_t *buf, size_t n)
-{
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) {
-        return -1;
-    }
-    int rc = read_exact(fd, buf, n);
-    close(fd);
-    return rc;
-}
 
 static int write_file(const char *path, const uint8_t *buf, size_t len, int mode)
 {
@@ -93,7 +68,7 @@ static int cmd_init(const char *path)
     antsd_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
 
-    if (read_random(cfg.identity_priv, sizeof cfg.identity_priv) != 0) {
+    if (antsd_read_random(cfg.identity_priv, sizeof cfg.identity_priv) != 0) {
         fprintf(stderr, "antsd: could not read /dev/urandom\n");
         return 1;
     }

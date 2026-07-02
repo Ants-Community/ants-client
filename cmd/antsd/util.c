@@ -5,6 +5,33 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+static int read_exact(int fd, uint8_t *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r < 0) {
+            return -1;
+        }
+        if (r == 0) {
+            return -1; /* unexpected EOF */
+        }
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+int antsd_read_random(uint8_t *buf, size_t n)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc = read_exact(fd, buf, n);
+    close(fd);
+    return rc;
+}
+
 int antsd_read_file(const char *path, uint8_t *buf, size_t cap, size_t *out_len)
 {
     int fd = open(path, O_RDONLY);

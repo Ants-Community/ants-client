@@ -14,6 +14,10 @@
  * Returns -1 on open/read error or if the file exceeds `cap`. */
 int antsd_read_file(const char *path, uint8_t *buf, size_t cap, size_t *out_len);
 
+/* Fill `buf` with `n` bytes from /dev/urandom. Returns 0, or -1 on
+ * open/read error. */
+int antsd_read_random(uint8_t *buf, size_t n);
+
 /* Render `n` bytes as lowercase hex into `out` (capacity `cap`). Always
  * NUL-terminates; truncates at whole bytes if cap < 2*n + 1. */
 void antsd_hex_format(const uint8_t *bytes, size_t n, char *out, size_t cap);

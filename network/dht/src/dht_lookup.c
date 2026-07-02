@@ -522,6 +522,28 @@ ants_error_t ants_dht_lookup_do_cancel(ants_dht_lookup_t *lookup_handle)
         lookup->inflight_recs[i].valid = false;
     }
     struct ants_dht_state *state = dht_get_state(lookup->parent);
+    /* Disarm any pending RPC slot still pointing into this handle's
+     * completion records. The caller may legally reuse the handle
+     * after cancel (the header requires validity only "until the
+     * lookup completes ... or is cancelled"), and lookup_start memsets
+     * it — re-validating the SAME record addresses for the next
+     * lookup. Without the disarm, a late terminal event on an old slot
+     * (a straggler response, a reset, a conn close) would fire
+     * on_rpc_complete against the new lookup's record and corrupt it —
+     * e.g. marking a candidate ANSWERED with a stale response, a hole
+     * in the probe's verified-only-fold contract. The slot itself is
+     * still reclaimed by its own stream/conn event; the complete/fail
+     * paths already tolerate a NULL completion. */
+    uintptr_t recs_lo = (uintptr_t)&lookup->inflight_recs[0];
+    uintptr_t recs_hi = (uintptr_t)&lookup->inflight_recs[ANTS_DHT_LOOKUP_INFLIGHT_CAP];
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_RPCS; i++) {
+        struct ants_dht_pending_rpc *slot = &state->pending[i];
+        uintptr_t ctx = (uintptr_t)slot->completion_ctx;
+        if (slot->in_use && ctx >= recs_lo && ctx < recs_hi) {
+            slot->completion = NULL;
+            slot->completion_ctx = NULL;
+        }
+    }
     unregister_lookup(state, lookup_handle);
     return ANTS_OK;
 }
