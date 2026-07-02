@@ -13,6 +13,51 @@ the spec repo's
 
 ## Unreleased
 
+### cmd/antsd: `antsd run` — the node event loop · 2026-07-02
+
+`cmd/antsd` (PR #184): the daemon now runs. `antsd run <config>` loads the
+CBOR config, derives the node identity, stands the QUIC transport up with the
+documented in-memory sign callback (the private seed never enters the
+transport), and drives the single-threaded tick loop until SIGINT/SIGTERM,
+then tears the transport down and exits 0. The transport exposes no socket
+fd in v1.0, so the loop bounds its sleep at 50 ms rather than blocking on
+poll(); a future fd accessor upgrades it to a real poll() wait. The event
+callback is the daemon's central demux — connection lifecycle is logged
+(the libraries never log; stdout is line-buffered so a supervising pipe sees
+the `listening` line as soon as the socket binds), stream events await their
+consumers (DHT, gossip) in the next PRs. When the config says port 0 the
+daemon advertises the actually-bound multiaddr. The integration test spawns
+the real binary, dials it over loopback QUIC with `expected_peer_id` pinned
+to the config-derived pubkey — so a daemon signing with the wrong key fails
+the RFC 7250 pin, not just a log check — verifies the daemon logs the inbound
+peer on connect **and on disconnect**, and requires a clean exit on SIGTERM
+under the ASan/UBSan jobs.
+
+Two `network/transport` fixes ride along, both surfaced by driving the first
+real daemon lifecycle: (1) the picoquic callback bridge now mirrors the peer
+pubkey into `CONN_CLOSED` events the way it always did for `CONN_READY` —
+the header documents `event.peer_id` as mirrored with no per-event caveat,
+but the close arm left it zeroed, so ready/closed pairs could not be
+correlated per peer (adversarial review finding, confirmed 4×); (2) a
+pre-existing use-after-free: when a remote-initiated close freed the
+heap-allocated inbound conn state, the picoquic cnx kept its callback
+pointer to it, and a later `ants_transport_destroy` →
+`picoquic_connection_disconnect` re-fired the callback on the freed state
+(caught by ASan the first time any test exercised remote-close-then-destroy;
+the bridge now unbinds the callback before freeing).
+
+### cmd/antsd: node daemon skeleton — config + init/show · 2026-06-29
+
+`cmd/antsd` (PR #183, recorded late — same backfill discipline as PR #179):
+the first non-test executable in the tree. A CBOR config codec
+(`antsd_config_{encode,decode}`, canonical integer-keyed map holding the
+Ed25519 identity seed, the listen multiaddr, and the bootstrap seed list;
+decode is strict per RFC-0008 §1.1) plus the `antsd` CLI with `init`
+(generate an identity from /dev/urandom, write the config 0600, print the
+derived peer id) and `show` (decode + print — CBOR is not hand-editable by
+design). Deliberately scoped below the transport: no picoquic linkage, so
+the config test stays deterministic.
+
 ### foundation/tee: attestation freshness window check · 2026-06-29
 
 `foundation/tee` (PR #178): `ants_attestation_is_fresh` replaces its v1.0 stub.

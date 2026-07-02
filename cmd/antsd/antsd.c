@@ -2,21 +2,23 @@
  * antsd — the ANTS node daemon.
  *
  * The composing process: it owns all node state (the libraries are
- * caller-owns-memory and never malloc) and will drive a single-threaded
+ * caller-owns-memory and never malloc) and drives a single-threaded
  * event loop over the QUIC transport. This is the first non-test
  * executable in the tree.
  *
- * PR 1 (this file) is the skeleton:
  *   antsd init <config>   — generate an Ed25519 identity + write a config
  *   antsd show <config>   — decode + print a config (CBOR is not
  *                           hand-editable, so this is how you read it)
+ *   antsd run  <config>   — stand up the transport and drive the tick
+ *                           loop until SIGINT/SIGTERM (see run.c)
  *
- * `antsd run <config>` — load the config, stand up the transport, and
- * drive the tick loop — lands next, alongside the DHT wiring.
+ * DHT wiring (bootstrap + event routing) lands next.
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "config.h"
+#include "run.h"
+#include "util.h"
 
 #include "ants_common.h"
 #include "ants_crypto.h"
@@ -76,38 +78,6 @@ static int write_file(const char *path, const uint8_t *buf, size_t len, int mode
     return close(fd) == 0 ? 0 : -1;
 }
 
-/* Read up to `cap` bytes of `path` into `buf`; *out_len gets the count.
- * Returns -1 on open/read error or if the file exceeds `cap`. */
-static int read_file(const char *path, uint8_t *buf, size_t cap, size_t *out_len)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return -1;
-    }
-    size_t got = 0;
-    for (;;) {
-        if (got == cap) {
-            /* One more byte would overflow → file too large. */
-            uint8_t extra;
-            ssize_t r = read(fd, &extra, 1);
-            close(fd);
-            return r == 0 ? (int)(*out_len = got, 0) : -1;
-        }
-        ssize_t r = read(fd, buf + got, cap - got);
-        if (r < 0) {
-            close(fd);
-            return -1;
-        }
-        if (r == 0) {
-            break;
-        }
-        got += (size_t)r;
-    }
-    close(fd);
-    *out_len = got;
-    return 0;
-}
-
 static void print_hex(const char *label, const uint8_t *b, size_t n)
 {
     printf("%s", label);
@@ -159,7 +129,7 @@ static int cmd_show(const char *path)
 {
     uint8_t buf[ANTSD_CONFIG_ENCODED_MAX];
     size_t len;
-    if (read_file(path, buf, sizeof buf, &len) != 0) {
+    if (antsd_read_file(path, buf, sizeof buf, &len) != 0) {
         fprintf(stderr, "antsd: could not read %s (missing or too large)\n", path);
         return 1;
     }
@@ -190,7 +160,8 @@ static int usage(const char *argv0)
     fprintf(stderr,
             "usage: %s <command> <config-path>\n"
             "  init   generate an Ed25519 identity and write a config\n"
-            "  show   decode and print a config\n",
+            "  show   decode and print a config\n"
+            "  run    drive the node event loop until SIGINT/SIGTERM\n",
             argv0);
     return 2;
 }
@@ -205,6 +176,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "show") == 0) {
         return cmd_show(argv[2]);
+    }
+    if (strcmp(argv[1], "run") == 0) {
+        return antsd_cmd_run(argv[2]);
     }
     return usage(argv[0]);
 }
