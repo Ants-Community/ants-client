@@ -536,6 +536,10 @@ static void test_run_bootstraps_to_seed(const char *antsd_path)
     snprintf(needle, sizeof needle, "antsd: dht peer discovered peer=%s", seed_hex);
     CHECK(strstr(cap.data, needle) != NULL);
     CHECK(strstr(cap.data, "antsd: bootstrapping via ") != NULL);
+    /* Discovery also feeds the gossip view: the seed must have been
+     * added as a gossip neighbour. */
+    snprintf(needle, sizeof needle, "antsd: gossip view add peer=%s", seed_hex);
+    CHECK(strstr(cap.data, needle) != NULL);
     /* Mutual handshake: the seed side saw the daemon connect. */
     CHECK(ep.conn_ready >= 1);
 

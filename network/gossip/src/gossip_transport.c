@@ -422,6 +422,12 @@ ants_error_t ants_gossip_transport_handle_event(ants_gossip_transport_t *b,
     /* A peer-initiated stream → bind an accumulation slot. (Our own outbound
      * uni streams never surface STREAM_OPENED to us.) */
     if (event->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
+        /* Gossip push channels are uni-only (see the binding contract
+         * above); a peer-initiated BIDI stream is another subsystem's
+         * (a DHT RPC request). Leave it to that dispatcher. */
+        if (ants_transport_stream_is_bidi(event->stream)) {
+            return ANTS_OK;
+        }
         if (inbound_find_by_stream(s, event->stream) == NULL) {
             (void)inbound_alloc(s, event->conn, event->stream, event->peer_id.bytes);
             /* full → no-op; a sibling dispatcher may still take the stream */

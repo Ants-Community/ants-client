@@ -2,13 +2,15 @@
 #
 # The daemon owns all node state (the libraries are caller-owns-memory
 # and never malloc) and drives a single-threaded event loop over the
-# QUIC transport and the Kademlia DHT:
+# QUIC transport, the Kademlia DHT and the gossip engine:
 #   antsd init <config>  — generate an Ed25519 identity + write a config
 #   antsd show <config>  — decode + print a config
 #   antsd run  <config>  — stand up transport + DHT (bootstrapped from
-#                          the config seeds) and drive the tick loop
-#                          until SIGINT/SIGTERM
-# Gossip wiring lands next.
+#                          the config seeds) + gossip (view fed from DHT
+#                          discovery, refreshed on the anti-eclipse
+#                          epoch cadence) and drive the tick loop until
+#                          SIGINT/SIGTERM
+# The chain loop lands next.
 
 add_library(antsd_config STATIC config.c)
 target_include_directories(antsd_config
@@ -22,7 +24,8 @@ target_link_libraries(antsd_config PUBLIC ants_cbor ants_crypto)
 target_compile_features(antsd_config PUBLIC c_std_99)
 
 add_executable(antsd antsd.c run.c util.c)
-target_link_libraries(antsd PRIVATE antsd_config ants_dht ants_transport ants_crypto)
+target_link_libraries(antsd PRIVATE antsd_config ants_gossip ants_dht ants_crdt ants_transport
+                                    ants_crypto)
 target_compile_features(antsd PRIVATE c_std_99)
 
 if(BUILD_TESTING)

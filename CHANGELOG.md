@@ -13,6 +13,59 @@ the spec repo's
 
 ## Unreleased
 
+### cmd/antsd: wire gossip + the anti-eclipse view into the daemon · 2026-07-02
+
+`cmd/antsd` (PR #187): the node gossips. `antsd run` now stands the full
+dissemination stack up on top of transport + DHT: the L1 G-Set
+(`ants_crdt_init` — the store the epidemic disseminates into), the gossip
+transport binding, and the gossip engine (defaults: fanout 6, 4 KiB frame
+cap), wired in the order ants_gossip.h documents (binding before engine; the
+engine's send_fn is `ants_gossip_transport_send`, its send_ctx the binding).
+The central demux now forwards every transport event to the DHT *and* the
+gossip binding — each consumes its own streams/conns, the daemon logs
+connection lifecycle as before. The gossip peer view is fed two ways: DHT
+discovery mirrors routing-table membership into the view between epochs
+(`gossip view add`/`drop` logged), and every 60 s the daemon runs the
+composed anti-eclipse refresh from ants_dht.h / RFC-0005 — one
+unpredictable random-target probe (S2, key from /dev/urandom, previous probe
+handle cancelled first so at most one is in flight), a rotated
+bucket-diverse redraw of the view (S1+S3, `ants_dht_sample_peers_rotated`
+with a monotonically increasing epoch), and one lazy-pull anti-entropy round
+(`ants_gossip_announce`). This is the first live composition of the #6
+gossip-view recipe that had been waiting on a daemon. Teardown extends the
+documented safe order: transport first (CONN_CLOSED delegation lets the DHT
+and the binding free the connection state they own), then binding, DHT, and
+G-Set. The integration test now also requires the seed to be adopted as a
+gossip neighbour (`gossip view add` with the seed's pubkey) after bootstrap.
+
+Two library fixes ride along, both found by the pre-push adversarial review
+of this composition (the first time the DHT server and gossip coexist on one
+transport): (1) **inbound demux discrimination** — the DHT server bound one
+of its 32 inbound-stream slots to *every* peer-initiated stream, including
+gossip's persistent, never-FIN'd uni channels; with enough gossiping peers
+the registry pinned full and the node silently stopped answering DHT RPCs.
+The transport now exposes `ants_transport_stream_is_bidi` (it already
+tracked the flag), the DHT server skips uni streams (DHT RPCs are bidi-only
+— the server answers on the same stream), and the gossip binding skips bidi
+streams; a regression test pins 32 quiet uni streams and requires a PING to
+still be served. (2) **lookup cancel now disarms pending RPC completions** —
+`ants_dht_lookup_cancel` left in-flight RPC slots holding completion
+pointers into the caller's handle; a caller legally reusing the handle for
+the next lookup (exactly what the daemon's per-epoch probe does) could have
+a straggler event from the cancelled lookup misattributed to the new one —
+up to marking a candidate ANSWERED with a stale response, a hole in the
+probe's verified-only-fold contract (RFC-0005 S2). Cancel now NULLs the
+completion of every pending slot pointing into the handle before release.
+
+Known v1 capacity limits surfaced by the same review, deliberately deferred
+to follow-up PRs: the DHT's 16 pending-dial slots are freed only on
+connection close, so long-lived promoted conns can exhaust them and quietly
+stall probe enrichment (the daemon now logs `epoch N table=… view=…` each
+epoch so a stalled table is at least observable); and `lookup_deadline_ms`
+is stored but not yet enforced (no LOOKUP_TIMEOUT fires), so a lookup
+against a silent-but-connected peer only terminates when its stream or
+connection dies.
+
 ### cmd/antsd: wire the DHT into the daemon · 2026-07-02
 
 `cmd/antsd` (PR #186): the node routes. `antsd run` now stands the Kademlia

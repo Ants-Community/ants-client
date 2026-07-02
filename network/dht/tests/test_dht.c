@@ -1616,6 +1616,119 @@ static void test_server_responds_to_ping(void)
     CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
 }
 
+static void test_server_ignores_uni_streams(void)
+{
+    /* Peer-initiated UNI streams are other protocols' channels (gossip
+     * push channels — persistent, never FIN'd). The server dispatcher
+     * must not bind inbound slots to them: before the is_bidi guard,
+     * 32 quiet uni streams pinned the whole ANTS_DHT_MAX_INBOUND_STREAMS
+     * registry and the node silently stopped answering DHT RPCs. Pin
+     * 32 uni streams, then require a bidi PING to still be served. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x69, sizeof a_priv);
+    memset(b_priv, 0xC3, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_noop_event;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready == 1);
+    CHECK(b_ep.conn_ready == 1);
+
+    /* 32 == ANTS_DHT_MAX_INBOUND_STREAMS (internal): enough quiet uni
+     * streams to have pinned every server slot before the guard. Each
+     * carries a few bytes and never FINs — the persistent-gossip shape. */
+    static ants_transport_stream_t uni[32];
+    const uint8_t blip[] = {0x00, 0x05, 0xAA, 0xBB, 0xCC};
+    for (size_t i = 0; i < 32; i++) {
+        memset(&uni[i], 0, sizeof uni[i]);
+        CHECK_EQ(ants_transport_open_uni_stream(&conn, &uni[i]), ANTS_OK);
+        CHECK_EQ(ants_transport_stream_send(&uni[i], blip, sizeof blip, false), ANTS_OK);
+    }
+    /* Let the bytes land so B's dispatchers see every stream. */
+    for (int i = 0; i < 50; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+    }
+
+    /* The bidi PING must still be served. */
+    test_rpc_completion_t comp;
+    memset(&comp, 0, sizeof comp);
+    CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (comp.fired >= 1) {
+            break;
+        }
+    }
+    CHECK(comp.fired == 1);
+    CHECK_EQ(comp.last_status, ANTS_OK);
+    CHECK(comp.last_resp_type == ANTS_DHT_MSG_PING_RESP);
+
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+}
+
 static void test_server_get_peers_with_announce(void)
 {
     /* B announces shard X locally → its server-side announce set lists
@@ -3515,6 +3628,7 @@ int main(void)
 
     test_announce_unannounce_local();
     test_server_responds_to_ping();
+    test_server_ignores_uni_streams();
     test_server_get_peers_with_announce();
     test_bootstrap_completes();
 

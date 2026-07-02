@@ -428,6 +428,16 @@ uint64_t ants_transport_stream_send_window(const ants_transport_stream_t *stream
 uint64_t ants_transport_stream_bytes_sent(const ants_transport_stream_t *stream);
 uint64_t ants_transport_stream_bytes_received(const ants_transport_stream_t *stream);
 
+/*
+ * Whether `stream` is bidirectional. Uni and bidi streams carry
+ * different protocols in ANTS — DHT RPCs ride bidi streams (the server
+ * answers on the same stream), gossip push channels ride uni streams
+ * (RFC-0004 §Layer 1 propagation is one-way) — so inbound demux layers
+ * use this at STREAM_OPENED to claim only streams that can belong to
+ * them. Returns false on NULL.
+ */
+bool ants_transport_stream_is_bidi(const ants_transport_stream_t *stream);
+
 /* ------------------------------------------------------------------------ */
 /* Connection introspection                                                 */
 /* ------------------------------------------------------------------------ */

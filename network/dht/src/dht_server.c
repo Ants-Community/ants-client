@@ -448,6 +448,14 @@ ants_error_t ants_dht_server_handle_event(ants_dht_t *dht, const ants_transport_
      * the event if this were one of its own; if we got here it's
      * unequivocally an inbound stream.) */
     if (event->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
+        /* DHT requests ride bidi streams exclusively (the server
+         * answers on the same stream). A peer-initiated UNI stream is
+         * another protocol's channel — notably a gossip push channel,
+         * which is persistent and never FIN'd — so binding a slot to
+         * it would pin the registry until the connection dies. */
+        if (!ants_transport_stream_is_bidi(event->stream)) {
+            return ANTS_OK;
+        }
         struct ants_dht_inbound_stream *slot = inbound_find_by_stream(state, event->stream);
         if (slot == NULL) {
             slot = inbound_alloc(state, event->conn, event->stream, &event->peer_id);

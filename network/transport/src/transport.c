@@ -1707,6 +1707,16 @@ uint64_t ants_transport_stream_bytes_received(const ants_transport_stream_t *str
     return 0;
 }
 
+bool ants_transport_stream_is_bidi(const ants_transport_stream_t *stream)
+{
+    if (stream == NULL) {
+        return false;
+    }
+    const struct ants_transport_stream_state *ss =
+        (const struct ants_transport_stream_state *)(const void *)stream->_opaque;
+    return ss->is_bidi != 0;
+}
+
 ants_error_t ants_transport_conn_peer_id(const ants_transport_conn_t *conn,
                                          ants_peer_id_t *out_peer_id)
 {
