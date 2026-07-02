@@ -1,21 +1,20 @@
 /*
  * test_transport.c — Tests for the P2P transport API.
  *
- * v1.0 scaffold: every function returns NOT_IMPLEMENTED or the
- * documented safe default. These tests pin the API contract so a
- * future implementation can't silently change shape:
+ * The transport is implemented (QUIC via vendored picoquic, RFC 7250
+ * raw-pubkey TLS identity binding); these tests exercise it for real
+ * over loopback:
  *
- *   - Public symbols link.
- *   - Stub return values match what ants_transport.h documents
- *     (NOT_IMPLEMENTED for most; UINT32_MAX for tick(); UINT64_MAX
- *     for stream_send_window(); 0 for byte counters; out_count=0 for
- *     peer_list).
- *   - Opaque ctx sizes match the documented constants.
- *   - Event-kind enum values are pinned (they appear in caller code
- *     so changing them is an API break).
- *   - Static asserts: ANTS_PEER_ID_SIZE = 32 (matches Ed25519 pubkey).
- *
- * Same pattern as foundation/tee/tests/test_tee.c.
+ *   - API-contract pins: opaque ctx sizes, event-kind values,
+ *     ANTS_PEER_ID_SIZE == Ed25519 pubkey size, arg-guard returns.
+ *   - Lifecycle: init/destroy round-trips, listener bind with
+ *     kernel-assigned port reported via local_addr, dial validation.
+ *   - Live two-node flows: RFC 7250 handshake with real Ed25519 keys
+ *     (both sides observe CONN_READY under mutual TLS), the
+ *     expected-peer-id anti-MITM rejection, stream open/send/recv/
+ *     close/reset, and a loopback byte exchange.
+ *   - Safe defaults for the v1.0 NOT_IMPLEMENTED introspection
+ *     accessors (conn_peer_id, peer_addr, peer_list).
  */
 
 /* POSIX feature test — required on glibc to expose nanosleep() from
