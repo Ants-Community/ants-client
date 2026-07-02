@@ -21,7 +21,16 @@
  * own multiaddr bound (/ip4|ip6/.../udp/<port>/quic-v1 + /p2p/<base58> has
  * margin under this). */
 #define ANTSD_MULTIADDR_MAX 128
-#define ANTSD_MAX_SEEDS     16
+
+/* The seed list is bounded by the DHT's concurrent-bootstrap capacity
+ * (ANTS_DHT_MAX_BOOTSTRAP_PEERS): `antsd run` issues one
+ * ants_dht_bootstrap per seed at startup, so any seed beyond that
+ * capacity would be silently undialable. Pinning the config bound to
+ * the DHT bound turns an over-long seed list into a hard encode/decode
+ * error instead of a runtime drop. The value is spelled out because
+ * this header deliberately sits below the DHT (the config codec links
+ * only cbor + crypto); run.c compile-time-asserts the two stay equal. */
+#define ANTSD_MAX_SEEDS 8
 
 typedef struct {
     char addr[ANTSD_MULTIADDR_MAX];            /* seed multiaddr (NUL-terminated) */

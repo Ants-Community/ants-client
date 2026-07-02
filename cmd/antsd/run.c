@@ -1,13 +1,15 @@
 /*
  * cmd/antsd/run.c — `antsd run`: the node's event loop.
  *
- * Stands the QUIC transport up from the config and drives the
- * single-threaded tick loop until SIGINT/SIGTERM. The event callback
- * here is the daemon's central demux: subsequent PRs route DHT, gossip
- * and chain traffic out of it to the component handlers; today it logs
- * connection lifecycle and counts events. Logging and signal handling
- * live in the daemon by design — the protocol libraries never log,
- * never install handlers, never malloc.
+ * Stands the QUIC transport and the Kademlia DHT up from the config and
+ * drives the single-threaded tick loop until SIGINT/SIGTERM. The
+ * transport event callback here is the daemon's central demux: every
+ * event is forwarded to the DHT first (it consumes the ones belonging
+ * to its in-flight RPCs, per the delegation contract in ants_dht.h),
+ * then handled locally; gossip and chain handlers plug in the same way
+ * in later PRs. The DHT is seeded from the config's bootstrap list.
+ * Logging and signal handling live in the daemon by design — the
+ * protocol libraries never log, never install handlers, never malloc.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -18,6 +20,7 @@
 
 #include "ants_common.h"
 #include "ants_crypto.h"
+#include "ants_dht.h"
 #include "ants_transport.h"
 
 #include <inttypes.h>
@@ -44,6 +47,18 @@
 #define ANTSD_MAX_CONNECTIONS      64u
 #define ANTSD_MAX_STREAMS_PER_CONN 64u
 
+/* DHT maintenance cadence — the recommended caller-side defaults from
+ * ants_dht.h (bucket refresh, lookup deadline, announce republish). */
+#define ANTSD_DHT_REFRESH_MS            60000u
+#define ANTSD_DHT_LOOKUP_DEADLINE_MS    5000u
+#define ANTSD_DHT_ANNOUNCE_REPUBLISH_MS 1800000u
+
+/* config.h spells the seed-list bound out (it sits below the DHT by
+ * design); every config seed must be bootstrappable, so the two bounds
+ * must not drift apart. Same compile-time-assertion idiom as
+ * foundation/crypto. */
+typedef char antsd_seed_capacity_check[(ANTSD_MAX_SEEDS == ANTS_DHT_MAX_BOOTSTRAP_PEERS) ? 1 : -1];
+
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_stop_signal(int sig)
@@ -52,28 +67,70 @@ static void on_stop_signal(int sig)
     g_stop = 1;
 }
 
+/* The daemon's composed state, threaded through both event callbacks
+ * as their ctx. `dht` stays NULL until ants_dht_init succeeds, so the
+ * transport router is safe during the window between the two inits. */
 typedef struct {
+    ants_dht_t *dht;
     uint64_t conns_ready;
     uint64_t conns_closed;
-} antsd_stats_t;
+    uint64_t dht_peers;
+} antsd_node_t;
 
-/* The daemon's event demux. Connection lifecycle is logged; stream
- * events have no consumer yet — the DHT and gossip handlers plug in
- * here in later PRs. */
+/* The daemon's event demux. Every event is forwarded to the DHT first
+ * (it consumes the ones belonging to its in-flight RPCs and ignores the
+ * rest — cheap no-op, per ants_dht.h's delegation contract); connection
+ * lifecycle is then logged. Remaining stream events have no local
+ * consumer yet — gossip plugs in here next. */
 static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
 {
-    antsd_stats_t *stats = (antsd_stats_t *)ctx;
+    antsd_node_t *node = (antsd_node_t *)ctx;
+    if (node->dht != NULL) {
+        (void)ants_dht_handle_transport_event(node->dht, ev);
+    }
     char hex[ANTS_PEER_ID_SIZE * 2 + 1];
     switch (ev->kind) {
     case ANTS_TRANSPORT_EV_CONN_READY:
-        stats->conns_ready++;
+        node->conns_ready++;
         antsd_hex_format(ev->peer_id.bytes, sizeof ev->peer_id.bytes, hex, sizeof hex);
         printf("antsd: conn ready peer=%s\n", hex);
         break;
     case ANTS_TRANSPORT_EV_CONN_CLOSED:
-        stats->conns_closed++;
+        node->conns_closed++;
         antsd_hex_format(ev->peer_id.bytes, sizeof ev->peer_id.bytes, hex, sizeof hex);
         printf("antsd: conn closed peer=%s\n", hex);
+        break;
+    default:
+        break;
+    }
+    return ANTS_OK;
+}
+
+/* DHT event demux: routing-table membership is logged (it is the
+ * node's emerging view of the network); lookup/announce completions
+ * get consumers when the upper layers arrive. */
+static ants_error_t dht_event_router(const ants_dht_event_t *ev, void *ctx)
+{
+    antsd_node_t *node = (antsd_node_t *)ctx;
+    char hex[ANTS_PEER_ID_SIZE * 2 + 1];
+    switch (ev->kind) {
+    case ANTS_DHT_EV_PEER_DISCOVERED:
+        node->dht_peers++;
+        antsd_hex_format(ev->peer.peer_id.bytes, sizeof ev->peer.peer_id.bytes, hex, sizeof hex);
+        printf("antsd: dht peer discovered peer=%s addr=%s\n", hex, ev->peer.multiaddr);
+        break;
+    case ANTS_DHT_EV_PEER_EVICTED:
+        if (node->dht_peers > 0) {
+            node->dht_peers--;
+        }
+        antsd_hex_format(ev->peer.peer_id.bytes, sizeof ev->peer.peer_id.bytes, hex, sizeof hex);
+        printf("antsd: dht peer evicted peer=%s\n", hex);
+        break;
+    case ANTS_DHT_EV_BOOTSTRAP_COMPLETE:
+        /* The seed answered our self-FIND_NODE — the join round-trip
+         * worked, not just the handshake. */
+        antsd_hex_format(ev->peer.peer_id.bytes, sizeof ev->peer.peer_id.bytes, hex, sizeof hex);
+        printf("antsd: dht bootstrap complete peer=%s\n", hex);
         break;
     default:
         break;
@@ -156,7 +213,8 @@ int antsd_cmd_run(const char *path)
         return 1;
     }
 
-    antsd_stats_t stats = {0, 0};
+    antsd_node_t node;
+    memset(&node, 0, sizeof node);
     ants_transport_config_t tcfg;
     memset(&tcfg, 0, sizeof tcfg);
     memcpy(tcfg.pub, pub, sizeof pub);
@@ -167,7 +225,7 @@ int antsd_cmd_run(const char *path)
     tcfg.max_connections = ANTSD_MAX_CONNECTIONS;
     tcfg.max_streams_per_conn = ANTSD_MAX_STREAMS_PER_CONN;
     tcfg.event_fn = event_router;
-    tcfg.event_ctx = &stats;
+    tcfg.event_ctx = &node;
 
     /* 16 KB of opaque picoquic state — static keeps it off the stack. */
     static ants_transport_t transport;
@@ -193,21 +251,68 @@ int antsd_cmd_run(const char *path)
         printf("antsd: dial-only (no listener)\n");
     }
 
+    /* 32 KB of routing-table + lookup state — static, off the stack. */
+    static ants_dht_t dht;
+    memset(&dht, 0, sizeof dht);
+    ants_dht_config_t dhtcfg;
+    memset(&dhtcfg, 0, sizeof dhtcfg);
+    dhtcfg.transport = &transport;
+    memcpy(dhtcfg.local_peer_id.bytes, pub, sizeof pub);
+    dhtcfg.event_fn = dht_event_router;
+    dhtcfg.event_ctx = &node;
+    dhtcfg.refresh_interval_ms = ANTSD_DHT_REFRESH_MS;
+    dhtcfg.lookup_deadline_ms = ANTSD_DHT_LOOKUP_DEADLINE_MS;
+    dhtcfg.announce_republish_ms = ANTSD_DHT_ANNOUNCE_REPUBLISH_MS;
+    rc = ants_dht_init(&dht, &dhtcfg);
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: dht init failed: %s\n", ants_strerror(rc));
+        ants_transport_destroy(&transport, 0);
+        return 1;
+    }
+    node.dht = &dht;
+
+    /* Seed the routing table. A failed seed is logged and skipped —
+     * the node can still be ignited by the remaining seeds or by
+     * inbound connections. */
+    for (size_t i = 0; i < cfg.seed_count; i++) {
+        ants_peer_id_t seed_id;
+        memcpy(seed_id.bytes, cfg.seeds[i].peer_id, sizeof seed_id.bytes);
+        rc = ants_dht_bootstrap(&dht, cfg.seeds[i].addr, &seed_id);
+        if (rc != ANTS_OK) {
+            fprintf(stderr,
+                    "antsd: bootstrap via %s failed: %s\n",
+                    cfg.seeds[i].addr,
+                    ants_strerror(rc));
+        } else {
+            printf("antsd: bootstrapping via %s\n", cfg.seeds[i].addr);
+        }
+    }
+
     while (!g_stop) {
-        uint32_t wait_ms = ants_transport_tick(&transport);
+        uint32_t t_wait = ants_transport_tick(&transport);
+        uint32_t d_wait = ants_dht_tick(&dht);
         if (g_stop) {
             break;
         }
+        uint32_t wait_ms = t_wait < d_wait ? t_wait : d_wait;
         uint32_t nap = wait_ms < ANTSD_TICK_SLEEP_CAP_MS ? wait_ms : ANTSD_TICK_SLEEP_CAP_MS;
         if (nap > 0) {
             sleep_ms(nap);
         }
     }
 
-    printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ")\n",
-           stats.conns_ready,
-           stats.conns_closed);
+    printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ", dht peers %" PRIu64
+           ")\n",
+           node.conns_ready,
+           node.conns_closed,
+           node.dht_peers);
+    /* Teardown order matters: the transport goes first, so its
+     * CONN_CLOSED callbacks still reach the DHT (via the router above)
+     * and let it release any bootstrap-owned connection state; only
+     * then is the DHT itself destroyed. See the teardown note in
+     * network/dht/tests/test_dht.c. */
     ants_transport_destroy(&transport, 0);
+    ants_dht_destroy(&dht);
     memset(cfg.identity_priv, 0, sizeof cfg.identity_priv);
     return 0;
 }

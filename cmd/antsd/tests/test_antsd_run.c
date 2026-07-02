@@ -19,6 +19,15 @@
  *     ASan/UBSan CI jobs that also proves the shutdown path tears the
  *     transport down without leaking.
  *
+ * A second spawn exercises the DHT wiring end-to-end: the test runs an
+ * in-process seed node (transport + DHT, the same composition the
+ * daemon uses), puts it in the config's bootstrap list, and requires
+ * the daemon to dial it (pinned to the seed's peer id), complete the
+ * bootstrap self-FIND_NODE against the seed's server dispatcher —
+ * asserted via the daemon's "dht bootstrap complete" line, which fires
+ * only when the seed's response arrives — and log the seed's discovery
+ * into its routing table.
+ *
  * Plus the cheap failure path: `antsd run <missing-file>` exits 1.
  *
  * Every wait is bounded by a wall-clock deadline and every child is
@@ -37,6 +46,7 @@
 
 #include "ants_common.h"
 #include "ants_crypto.h"
+#include "ants_dht.h"
 #include "ants_transport.h"
 
 #include <poll.h>
@@ -179,10 +189,15 @@ static int capture_pump(int fd, capture_t *c, int wait_ms)
 }
 
 /* Wait until the captured output contains `needle`, EOF, or the
- * absolute deadline. While waiting, optionally tick a transport so the
- * QUIC handshake can progress while we watch the daemon's log. */
-static const char *
-wait_for_output(int fd, capture_t *c, const char *needle, uint64_t deadline, ants_transport_t *tick)
+ * absolute deadline. While waiting, optionally tick a transport (and a
+ * DHT riding on it) so our side of the QUIC/RPC exchange can progress
+ * while we watch the daemon's log. */
+static const char *wait_for_output(int fd,
+                                   capture_t *c,
+                                   const char *needle,
+                                   uint64_t deadline,
+                                   ants_transport_t *tick,
+                                   ants_dht_t *dht_tick)
 {
     for (;;) {
         const char *hit = strstr(c->data, needle);
@@ -194,6 +209,9 @@ wait_for_output(int fd, capture_t *c, const char *needle, uint64_t deadline, ant
         }
         if (tick != NULL) {
             ants_transport_tick(tick);
+        }
+        if (dht_tick != NULL) {
+            ants_dht_tick(dht_tick);
         }
         if (capture_pump(fd, c, tick != NULL ? 1 : 50) < 0) {
             return strstr(c->data, needle); /* EOF: last look */
@@ -367,14 +385,14 @@ static void test_run_serves_and_shuts_down(const char *antsd_path)
     char needle[sizeof dialer_hex + 32];
     snprintf(needle, sizeof needle, "antsd: conn ready peer=%s", dialer_hex);
     const char *hit =
-        wait_for_output(out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &dialer);
+        wait_for_output(out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &dialer, NULL);
     CHECK(hit != NULL);
 
     /* 4. Disconnect: the daemon must log the close with the SAME peer
      * id, not a zeroed one — ready/closed pairs stay correlatable. */
     CHECK(ants_transport_peer_disconnect(&conn, 0) == ANTS_OK);
     snprintf(needle, sizeof needle, "antsd: conn closed peer=%s", dialer_hex);
-    hit = wait_for_output(out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &dialer);
+    hit = wait_for_output(out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &dialer, NULL);
     CHECK(hit != NULL);
 
     /* 5. SIGTERM → clean exit 0 with the shutdown line. */
@@ -395,6 +413,152 @@ static void test_run_serves_and_shuts_down(const char *antsd_path)
     unlink(cfg_path);
 }
 
+/* Transport event forwarder for the in-process seed node: every event
+ * goes to the seed's DHT first (its server dispatcher answers the
+ * daemon's bootstrap FIND_NODE), CONN_READY is counted. Mirrors the
+ * endpoint idiom in network/dht/tests/test_dht.c — and the daemon's own
+ * router in run.c. */
+typedef struct {
+    ants_dht_t *dht;
+    int conn_ready;
+} seed_endpoint_t;
+
+static ants_error_t seed_endpoint_event(const ants_transport_event_t *ev, void *ctx)
+{
+    seed_endpoint_t *e = (seed_endpoint_t *)ctx;
+    if (e->dht != NULL) {
+        (void)ants_dht_handle_transport_event(e->dht, ev);
+    }
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        e->conn_ready++;
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t noop_dht_event(const ants_dht_event_t *ev, void *ctx)
+{
+    (void)ev;
+    (void)ctx;
+    return ANTS_OK;
+}
+
+static void test_run_bootstraps_to_seed(const char *antsd_path)
+{
+    /* In-process seed node: listening transport + DHT — the same
+     * composition the daemon runs, driven from this process. */
+    uint8_t seed_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t seed_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(seed_priv, 0x55, sizeof seed_priv);
+    CHECK(ants_ed25519_pubkey_from_priv(seed_priv, seed_pub) == ANTS_OK);
+
+    seed_endpoint_t ep;
+    memset(&ep, 0, sizeof ep);
+    static ants_transport_t seed_transport; /* 16 KB — off the stack */
+    memset(&seed_transport, 0, sizeof seed_transport);
+    ants_transport_config_t scfg;
+    memset(&scfg, 0, sizeof scfg);
+    memcpy(scfg.pub, seed_pub, sizeof seed_pub);
+    scfg.sign_fn = real_sign;
+    scfg.sign_ctx = seed_priv;
+    scfg.event_fn = seed_endpoint_event;
+    scfg.event_ctx = &ep;
+    scfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK(ants_transport_init(&seed_transport, &scfg) == ANTS_OK);
+    char seed_addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK(ants_transport_local_addr(&seed_transport, seed_addr, sizeof seed_addr) == ANTS_OK);
+
+    static ants_dht_t seed_dht; /* 32 KB — off the stack */
+    memset(&seed_dht, 0, sizeof seed_dht);
+    ants_dht_config_t sdcfg;
+    memset(&sdcfg, 0, sizeof sdcfg);
+    sdcfg.transport = &seed_transport;
+    memcpy(sdcfg.local_peer_id.bytes, seed_pub, sizeof seed_pub);
+    sdcfg.event_fn = noop_dht_event;
+    sdcfg.event_ctx = &ep;
+    /* Timers 0: no automatic refresh — the test drives everything. */
+    CHECK(ants_dht_init(&seed_dht, &sdcfg) == ANTS_OK);
+    ep.dht = &seed_dht;
+
+    /* Daemon config: fixed identity, a listener, and the seed in the
+     * bootstrap list. */
+    antsd_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    memset(cfg.identity_priv, 0x33, sizeof cfg.identity_priv);
+    static const char listen[] = "/ip4/127.0.0.1/udp/0/quic-v1";
+    memcpy(cfg.listen_multiaddr, listen, sizeof listen);
+    CHECK(strlen(seed_addr) < sizeof cfg.seeds[0].addr);
+    memcpy(cfg.seeds[0].addr, seed_addr, strlen(seed_addr));
+    memcpy(cfg.seeds[0].peer_id, seed_pub, sizeof cfg.seeds[0].peer_id);
+    cfg.seed_count = 1;
+
+    uint8_t enc[ANTSD_CONFIG_ENCODED_MAX];
+    size_t enc_len = 0;
+    CHECK(antsd_config_encode(&cfg, enc, sizeof enc, &enc_len) == ANTS_OK);
+
+    char cfg_path[512];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(cfg_path, sizeof cfg_path, "%s/antsd_seed_XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    int cfd = mkstemp(cfg_path);
+    CHECK(cfd >= 0);
+    if (cfd < 0) {
+        return;
+    }
+    CHECK(write(cfd, enc, enc_len) == (ssize_t)enc_len);
+    CHECK(close(cfd) == 0);
+
+    pid_t pid = -1;
+    int out_fd = spawn_run(antsd_path, cfg_path, &pid);
+    CHECK(out_fd >= 0);
+    if (out_fd < 0) {
+        unlink(cfg_path);
+        return;
+    }
+
+    static capture_t cap;
+    memset(&cap, 0, sizeof cap);
+
+    /* The daemon must dial the seed (pinned to its peer id), run the
+     * bootstrap self-FIND_NODE against the seed's server dispatcher,
+     * and log the completed join round-trip. Waiting on the
+     * BOOTSTRAP_COMPLETE line (not the earlier promotion-time
+     * "discovered" line) is what forces the full RPC exchange: it only
+     * fires after the seed's dispatcher answered our FIND_NODE. We tick
+     * the seed's transport + DHT the whole time — it is the other half
+     * of the exchange. */
+    char seed_hex[ANTS_ED25519_PUBKEY_SIZE * 2 + 1];
+    hex_format(seed_pub, sizeof seed_pub, seed_hex);
+    char needle[sizeof seed_hex + 48];
+    snprintf(needle, sizeof needle, "antsd: dht bootstrap complete peer=%s", seed_hex);
+    const char *hit = wait_for_output(
+        out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &seed_transport, &seed_dht);
+    CHECK(hit != NULL);
+    /* The promotion-time discovery line must have preceded it. */
+    snprintf(needle, sizeof needle, "antsd: dht peer discovered peer=%s", seed_hex);
+    CHECK(strstr(cap.data, needle) != NULL);
+    CHECK(strstr(cap.data, "antsd: bootstrapping via ") != NULL);
+    /* Mutual handshake: the seed side saw the daemon connect. */
+    CHECK(ep.conn_ready >= 1);
+
+    /* SIGTERM → clean exit 0 (the daemon tears down transport before
+     * DHT; ASan in the child verifies the bootstrap conn is freed). */
+    CHECK(kill(pid, SIGTERM) == 0);
+    int status = reap_with_deadline(pid, EXIT_DEADLINE_MS);
+    CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    while (capture_pump(out_fd, &cap, 100) > 0) {
+    }
+    CHECK(strstr(cap.data, "antsd: shutting down") != NULL);
+
+    if (failures > 0) {
+        fprintf(stderr, "daemon output: <<<%s>>>\n", cap.data);
+    }
+
+    CHECK(ants_transport_destroy(&seed_transport, 0) == ANTS_OK);
+    CHECK(ants_dht_destroy(&seed_dht) == ANTS_OK);
+    close(out_fd);
+    unlink(cfg_path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -403,6 +567,7 @@ int main(int argc, char **argv)
     }
     test_run_missing_config(argv[1]);
     test_run_serves_and_shuts_down(argv[1]);
+    test_run_bootstraps_to_seed(argv[1]);
 
     if (failures == 0) {
         printf("all checks passed\n");

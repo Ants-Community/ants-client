@@ -13,6 +13,51 @@ the spec repo's
 
 ## Unreleased
 
+### cmd/antsd: wire the DHT into the daemon · 2026-07-02
+
+`cmd/antsd` (PR #186): the node routes. `antsd run` now stands the Kademlia
+DHT up on top of the transport (`ants_dht_init` with the header-recommended
+maintenance cadence), seeds it from the config's bootstrap list
+(`ants_dht_bootstrap`, dial pinned to each seed's peer id — a failed seed is
+logged and skipped, the node can still be ignited by the others or by inbound
+connections), and drives `ants_dht_tick` alongside the transport tick with
+the loop sleeping on the smaller of the two wake requests. The transport
+event router now forwards every event to `ants_dht_handle_transport_event`
+first — the delegation contract from ants_dht.h; the DHT consumes the events
+belonging to its in-flight RPCs, the daemon logs connection lifecycle as
+before, and gossip plugs into the same demux next. Routing-table membership
+is logged (`dht peer discovered`/`evicted`, `dht bootstrap complete`);
+teardown destroys the transport before the DHT so CONN_CLOSED delegation lets
+the DHT release bootstrap-owned connection state (the documented safe order
+from the DHT test suite). The integration test grows an end-to-end bootstrap
+case: an in-process seed node (transport + DHT, the daemon's own composition)
+goes into the config's seed list, and the spawned daemon must dial it pinned
+to the seed identity, run the bootstrap self-FIND_NODE against the seed's
+server dispatcher, log the seed's discovery into its routing table, and still
+exit clean on SIGTERM — under the Debug jobs, with ASan checking the
+bootstrap conn teardown in the daemon process.
+
+Three `network/dht` changes ride along, all surfaced by the pre-push
+adversarial review of this wiring: (1) **capacity alignment** — the config
+allowed 16 seeds but the DHT has 8 concurrent-bootstrap slots, so seeds 9-16
+of a full config would have been silently undialable for the daemon's
+lifetime (`ants_dht_bootstrap` returns BUFFER_TOO_SMALL with no retry path);
+`ANTS_DHT_MAX_BOOTSTRAP_PEERS` moves into the public header as part of the
+bootstrap contract, and `ANTSD_MAX_SEEDS` is pinned to it, turning an
+over-long seed list into a hard config encode/decode error. (2) **a new
+`ANTS_DHT_EV_BOOTSTRAP_COMPLETE` event** (kind 7, additive): the self-
+FIND_NODE completion was a silent no-op, so nothing observable distinguished
+"handshake done" from "the seed actually answered a DHT RPC" — the review
+showed the integration test was green even if the whole RPC/server-dispatch
+path was broken. The event fires from the completion on success, carrying the
+seed's pinned identity; the daemon logs it, both the unit test
+(`test_bootstrap_completes`) and the integration test now assert the full
+round-trip. (3) **the delegation-contract comment in ants_dht.h told a
+false story** — it promised `ants_dht_handle_transport_event` never calls
+back into the transport and never fires the DHT event_fn, while the
+promotion paths do both (nested, and safely, per the transport's reentrancy
+model); the comment now documents the real contract.
+
 ### cmd/antsd: `antsd run` — the node event loop · 2026-07-02
 
 `cmd/antsd` (PR #184): the daemon now runs. `antsd run <config>` loads the
