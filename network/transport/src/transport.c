@@ -1261,6 +1261,13 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     case picoquic_callback_application_close:
     case picoquic_callback_stateless_reset:
         ev.kind = ANTS_TRANSPORT_EV_CONN_CLOSED;
+        /* Mirror the peer id exactly as the READY case does, so the
+         * caller can correlate ready/closed pairs per peer. A close
+         * before the handshake bound a pubkey (e.g. stateless reset)
+         * legitimately leaves it all-zero. */
+        if (cs->peer_pubkey_set) {
+            memcpy(ev.peer_id.bytes, cs->peer_pubkey, ANTS_PEER_ID_SIZE);
+        }
         (void)event_fn(&ev, event_ctx);
         /* After the callback returns picoquic deletes the cnx; clear
          * our pointer so subsequent stream ops fail closed rather than
@@ -1290,6 +1297,11 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
             if (*link == cs) {
                 *link = cs->next_inbound;
             }
+            /* The picoquic cnx outlives this cs (picoquic deletes it
+             * after the callback, or at picoquic_free time). Unbind the
+             * callback so a later delete-time disconnect event can't
+             * dereference the freed cs. */
+            picoquic_set_callback(cnx, NULL, NULL);
             free(cs);
         }
         break;
