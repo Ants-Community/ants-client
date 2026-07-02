@@ -338,10 +338,18 @@ struct ants_dht_announce {
 /* and to free the heap-allocated conn buffer on CONN_CLOSED / destroy.   */
 /* ------------------------------------------------------------------------ */
 
-#define ANTS_DHT_MAX_BOOTSTRAP_PEERS 8
+/* Capacity lives in ants_dht.h (ANTS_DHT_MAX_BOOTSTRAP_PEERS) — it is
+ * part of the public bootstrap contract so callers can size seed lists
+ * against it. */
+
+struct ants_dht_state;
 
 struct ants_dht_bootstrap_entry {
     bool in_use;
+    /* Back-pointer to the owning dht state, so the self-FIND_NODE
+     * completion (which receives this entry as its ctx) can fire
+     * BOOTSTRAP_COMPLETE through the state's event_fn. */
+    struct ants_dht_state *owner;
     /* Heap-allocated by ants_dht_bootstrap so it outlives the call stack.
      * Freed on CONN_CLOSED (transport guarantees no further callbacks
      * once it fires) or on dht_destroy if still open. */

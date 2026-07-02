@@ -99,6 +99,11 @@ static void test_pinned_constants(void)
     CHECK(ANTS_DHT_EV_LOOKUP_TIMEOUT == 4);
     CHECK(ANTS_DHT_EV_ANNOUNCE_CONFIRMED == 5);
     CHECK(ANTS_DHT_EV_TABLE_REFRESHED == 6);
+    CHECK(ANTS_DHT_EV_BOOTSTRAP_COMPLETE == 7);
+
+    /* Bootstrap capacity is part of the public contract (callers size
+     * seed lists against it — cmd/antsd pins its config bound to it). */
+    CHECK(ANTS_DHT_MAX_BOOTSTRAP_PEERS == 8);
 }
 
 static void test_opaque_ctx_layout(void)
@@ -1476,7 +1481,9 @@ typedef struct {
     int peer_evicted;
     int table_refreshed;
     int announce_confirmed;
+    int bootstrap_complete;
     ants_dht_peer_t last_evicted;
+    ants_dht_peer_t last_bootstrap;
     ants_dht_shard_key_t last_confirmed_key;
 } test_dht_event_recorder_t;
 
@@ -1491,6 +1498,9 @@ static ants_error_t test_dht_event_recorder(const ants_dht_event_t *ev, void *ct
     } else if (ev->kind == ANTS_DHT_EV_ANNOUNCE_CONFIRMED) {
         r->announce_confirmed++;
         r->last_confirmed_key = ev->shard_key;
+    } else if (ev->kind == ANTS_DHT_EV_BOOTSTRAP_COMPLETE) {
+        r->bootstrap_complete++;
+        r->last_bootstrap = ev->peer;
     }
     return ANTS_OK;
 }
@@ -1747,15 +1757,22 @@ static void test_bootstrap_completes(void)
 
     ants_dht_t da = {{0}};
     ants_dht_t db = {{0}};
+    test_dht_event_recorder_t a_rec;
+    memset(&a_rec, 0, sizeof a_rec);
     ants_dht_config_t dcfg;
     memset(&dcfg, 0, sizeof dcfg);
-    dcfg.event_fn = test_noop_event;
 
+    /* A gets the recorder: bootstrap must surface BOOTSTRAP_COMPLETE
+     * when the self-FIND_NODE round-trip finishes. */
+    dcfg.event_fn = test_dht_event_recorder;
+    dcfg.event_ctx = &a_rec;
     dcfg.transport = &ta;
     memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
     CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
     a_ep.dht = &da;
 
+    dcfg.event_fn = test_noop_event;
+    dcfg.event_ctx = NULL;
     dcfg.transport = &tb;
     memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
     CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
@@ -1781,12 +1798,19 @@ static void test_bootstrap_completes(void)
     CHECK(a_ep.conn_ready == 1);
     CHECK(b_ep.conn_ready == 1);
 
-    /* Drive a few more ticks for the self-FIND_NODE round-trip. */
-    for (int i = 0; i < 50; i++) {
+    /* Drive the self-FIND_NODE round-trip: B's server dispatcher must
+     * answer, and A's completion fires BOOTSTRAP_COMPLETE carrying the
+     * seed's pinned identity. */
+    for (int i = 0; i < 500; i++) {
         tick_pace();
         ants_transport_tick(&ta);
         ants_transport_tick(&tb);
+        if (a_rec.bootstrap_complete >= 1) {
+            break;
+        }
     }
+    CHECK(a_rec.bootstrap_complete == 1);
+    CHECK(memcmp(a_rec.last_bootstrap.peer_id.bytes, b_pub, ANTS_PEER_ID_SIZE) == 0);
 
     /* A's routing table should now contain B. */
     CHECK(ants_dht_routing_table_size(&da) == 1);

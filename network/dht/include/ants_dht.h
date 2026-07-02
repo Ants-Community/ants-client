@@ -94,6 +94,13 @@ extern "C" {
  * resets to zero. Three strikes is the BitTorrent mainline convention. */
 #define ANTS_DHT_DEAD_STRIKE_THRESHOLD 3
 
+/* Concurrently-pending bootstrap capacity: at most this many
+ * ants_dht_bootstrap dials can be outstanding at once (a slot frees when
+ * its connection closes). Callers sizing a seed list against this bound
+ * — e.g. a node config — should validate against it rather than discover
+ * ANTS_ERROR_BUFFER_TOO_SMALL at runtime. */
+#define ANTS_DHT_MAX_BOOTSTRAP_PEERS 8
+
 /* ------------------------------------------------------------------------ */
 /* Shard-key type                                                           */
 /*                                                                          */
@@ -199,6 +206,14 @@ typedef int32_t ants_dht_event_kind_t;
  * heartbeat" cadence. */
 #define ANTS_DHT_EV_TABLE_REFRESHED ((ants_dht_event_kind_t)6)
 
+/* A bootstrap seed completed: the pinned dial was promoted into the
+ * routing table AND the self-FIND_NODE issued through it received the
+ * seed's response — the full join round-trip, not just the handshake.
+ * ev.peer carries the seed (peer_id = the pinned identity, multiaddr =
+ * the dialed address). Fires at most once per ants_dht_bootstrap call;
+ * a seed whose connection drops before responding never fires it. */
+#define ANTS_DHT_EV_BOOTSTRAP_COMPLETE ((ants_dht_event_kind_t)7)
+
 typedef struct {
     ants_dht_event_kind_t kind;
 
@@ -243,7 +258,8 @@ typedef struct {
      * (and so we never insert ourselves into our own routing table). */
     ants_peer_id_t local_peer_id;
 
-    /* Event callback + opaque cookie. Both required (cannot be NULL). */
+    /* Event callback (required, cannot be NULL) + opaque cookie (may be
+     * NULL if event_fn doesn't need it). */
     ants_dht_event_fn event_fn;
     void *event_ctx;
 
@@ -328,16 +344,20 @@ uint32_t ants_dht_tick(ants_dht_t *dht);
  *   3. Issue a FIND_NODE on our own local_peer_id to populate nearby
  *      buckets via the peer's view of the network.
  *
- * Multiple bootstrap calls can be issued. They're processed in
+ * Multiple bootstrap calls can be issued — up to
+ * ANTS_DHT_MAX_BOOTSTRAP_PEERS pending at once. They're processed in
  * parallel; the routing table will eventually contain the union of
  * what each seed peer surfaced.
  *
  * Returns ANTS_OK once the bootstrap request is queued, NOT once the
- * handshake completes (that surfaces via PEER_DISCOVERED).
+ * handshake completes (that surfaces via PEER_DISCOVERED; the full
+ * join round-trip via BOOTSTRAP_COMPLETE).
  *
  * Errors:
  *   ANTS_ERROR_INVALID_ARG — NULL dht/multiaddr/expected_peer_id;
- *   ANTS_ERROR_PEER_UNREACHABLE — transport refused the dial.
+ *   ANTS_ERROR_PEER_UNREACHABLE — transport refused the dial;
+ *   ANTS_ERROR_BUFFER_TOO_SMALL — all bootstrap slots are pending
+ *     (slots free when their connections close).
  */
 ants_error_t
 ants_dht_bootstrap(ants_dht_t *dht, const char *multiaddr, const ants_peer_id_t *expected_peer_id);
@@ -463,15 +483,23 @@ ants_dht_probe(ants_dht_t *dht, ants_dht_shard_key_t random_key, ants_dht_lookup
 /* ------------------------------------------------------------------------ */
 
 /*
- * Hand a transport event to the DHT for in-flight-RPC dispatch. Returns
- * ANTS_OK on success, including the case where the event did not belong
- * to any DHT-owned stream. Returns ANTS_ERROR_INVALID_ARG on NULL args.
+ * Hand a transport event to the DHT for dispatch. Returns ANTS_OK on
+ * success, including the case where the event did not belong to any
+ * DHT-owned stream or connection. Returns ANTS_ERROR_INVALID_ARG on
+ * NULL args.
  *
- * Safe to call from inside the caller's own transport event_fn. Does NOT
- * call back into the transport (no nested dial/send) and does NOT call
- * the DHT's event_fn — RPC completions are surfaced through the per-RPC
- * completion handler registered at send time, not through the DHT's
- * general event callback.
+ * Designed to be called from inside the caller's own transport
+ * event_fn. Note the reentrancy this implies — all of it permitted by
+ * the transport's event model (callbacks may call ants_transport_* on
+ * the conn/stream that triggered them):
+ *   - promotion paths (bootstrap CONN_READY, lazy dial-promotion) call
+ *     back into the transport (stream open/send for the self-FIND_NODE)
+ *     and fire the DHT's own event_fn synchronously (PEER_DISCOVERED,
+ *     BOOTSTRAP_COMPLETE) — nested inside the transport callback;
+ *   - RPC responses complete through the per-RPC completion handler
+ *     registered at send time.
+ * The hard rule stands: never call ants_dht_destroy or
+ * ants_transport_destroy from inside the nested callbacks.
  */
 ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transport_event_t *event);
 

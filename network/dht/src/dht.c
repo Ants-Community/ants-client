@@ -923,6 +923,7 @@ ants_dht_bootstrap(ants_dht_t *dht, const char *multiaddr, const ants_peer_id_t 
     }
 
     be->in_use = true;
+    be->owner = state;
     be->conn = conn;
     be->expected_peer_id = *expected_peer_id;
     be->promoted = false;
@@ -1145,13 +1146,31 @@ size_t ants_dht_sample_peers_rotated(const ants_dht_t *dht,
 static void bootstrap_find_node_completion(ants_error_t status, const void *resp, void *ctx)
 {
     (void)resp;
-    (void)ctx;
     /* The lookup machinery is the proper path for fold-peers-into-
      * routing-table; this RPC is just for seeding via the FIND_NODE_RESP
      * from the bootstrap peer's perspective. Phase 6 keeps it simple:
      * the response is observed but its peers aren't folded back. Phase 7
-     * end-to-end test uses ants_dht_lookup for real discovery. */
-    (void)status;
+     * end-to-end test uses ants_dht_lookup for real discovery.
+     *
+     * A successful round-trip IS the join signal, though: the seed
+     * answered a DHT RPC over the pinned connection. Surface it as
+     * BOOTSTRAP_COMPLETE so the node can observe "joined via seed X"
+     * rather than inferring it from the handshake alone. On failure
+     * (conn dropped, RPC timeout) no event fires — the slot recycles
+     * via CONN_CLOSED and the caller may bootstrap again. */
+    struct ants_dht_bootstrap_entry *be = (struct ants_dht_bootstrap_entry *)ctx;
+    if (status != ANTS_OK || be == NULL || be->owner == NULL) {
+        return;
+    }
+    struct ants_dht_state *state = be->owner;
+    if (state->event_fn != NULL) {
+        ants_dht_event_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.kind = ANTS_DHT_EV_BOOTSTRAP_COMPLETE;
+        ev.peer.peer_id = be->expected_peer_id;
+        memcpy(ev.peer.multiaddr, be->multiaddr, sizeof ev.peer.multiaddr);
+        (void)state->event_fn(&ev, state->event_ctx);
+    }
 }
 
 static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_event_t *event)
@@ -1172,9 +1191,13 @@ static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_ev
         (void)dht_routing_upsert(dht, &peer, be->conn, dht_now_us());
         be->promoted = true;
 
-        /* Seed nearby buckets by issuing FIND_NODE on our own peer_id. */
+        /* Seed nearby buckets by issuing FIND_NODE on our own peer_id.
+         * The entry rides along as completion ctx so the response can
+         * fire BOOTSTRAP_COMPLETE; the entry outlives the RPC (it stays
+         * in_use until CONN_CLOSED, and a closed conn fails the RPC
+         * before the slot recycles). */
         (void)ants_dht_rpc_send_find_node(
-            dht, be->conn, &state->local_peer_id, bootstrap_find_node_completion, NULL);
+            dht, be->conn, &state->local_peer_id, bootstrap_find_node_completion, be);
         break;
     }
 }

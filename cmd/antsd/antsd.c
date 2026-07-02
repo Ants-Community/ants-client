@@ -9,10 +9,11 @@
  *   antsd init <config>   — generate an Ed25519 identity + write a config
  *   antsd show <config>   — decode + print a config (CBOR is not
  *                           hand-editable, so this is how you read it)
- *   antsd run  <config>   — stand up the transport and drive the tick
- *                           loop until SIGINT/SIGTERM (see run.c)
+ *   antsd run  <config>   — stand up transport + DHT (bootstrapped from
+ *                           the config seeds) and drive the tick loop
+ *                           until SIGINT/SIGTERM (see run.c)
  *
- * DHT wiring (bootstrap + event routing) lands next.
+ * Gossip wiring lands next.
  */
 #define _POSIX_C_SOURCE 200809L
 
