@@ -1454,8 +1454,12 @@ static void test_announce_unannounce_local(void)
 typedef struct {
     ants_dht_t *dht;
     int conn_ready;
+    int conn_closed;
     int stream_opened;
     ants_peer_id_t peer_id;
+    /* The conn of the most recent CONN_READY — lets a test close a
+     * peer-initiated conn from this side (ants_transport_peer_disconnect). */
+    ants_transport_conn_t *last_conn;
 } test_dht_endpoint_t;
 
 static ants_error_t test_dht_endpoint_event(const ants_transport_event_t *ev, void *ctx)
@@ -1467,6 +1471,9 @@ static ants_error_t test_dht_endpoint_event(const ants_transport_event_t *ev, vo
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         e->conn_ready++;
         e->peer_id = ev->peer_id;
+        e->last_conn = ev->conn;
+    } else if (ev->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
+        e->conn_closed++;
     } else if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
         e->stream_opened++;
     }
@@ -1941,11 +1948,124 @@ static void test_bootstrap_completes(void)
     /* Teardown order matters here: when the DHT holds a bootstrap-
      * allocated heap conn, the transport must be destroyed FIRST so
      * its CONN_CLOSED callback delegates to dht_handle_transport_event,
-     * which then frees the heap conn via handle_bootstrap_conn_closed.
+     * which transfers the heap conn into the owned-conn registry
+     * (freed by ants_dht_destroy, or by the next tick's reap).
      * Destroying the DHT first would free the conn before picoquic
      * finishes using it (heap-use-after-free during transport_destroy).
      * For tests that don't use bootstrap (or have already-closed
      * conns), either order works. */
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_dht_destroy(&db), ANTS_OK);
+}
+
+static void test_bootstrap_slot_recycles_and_reaps(void)
+{
+    /* A bootstrap conn that closes must release its slot AND its heap
+     * buffer: the entry transfers the conn to the owned-conn registry
+     * at CONN_CLOSED, the next tick's reap frees it (ASan proves the
+     * deferred-free timing is right; LSan on the Linux Debug jobs
+     * proves reuse no longer orphans the old buffer), and the slot is
+     * reusable — all ANTS_DHT_MAX_BOOTSTRAP_PEERS slots must be
+     * claimable again afterwards, and the one-past-capacity call must
+     * reject. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x8A, sizeof a_priv);
+    memset(b_priv, 0x4B, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_dht_endpoint_t a_ep;
+    memset(&a_ep, 0, sizeof a_ep);
+    test_dht_endpoint_t b_ep;
+    memset(&b_ep, 0, sizeof b_ep);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_dht_endpoint_event;
+    bcfg.event_ctx = &b_ep;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_dht_endpoint_event;
+    acfg.event_ctx = &a_ep;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_t db = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.event_fn = test_noop_event;
+
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    a_ep.dht = &da;
+
+    dcfg.transport = &tb;
+    memcpy(dcfg.local_peer_id.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_init(&db, &dcfg), ANTS_OK);
+    b_ep.dht = &db;
+
+    ants_peer_id_t b_pid;
+    memcpy(b_pid.bytes, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_ready >= 1 && b_ep.conn_ready >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_ready == 1);
+
+    /* The seed hangs up: B disconnects the inbound conn (and stays
+     * alive to flush the CONNECTION_CLOSE — a destroyed transport
+     * never sends it). A's CONN_CLOSED delegation then transfers the
+     * bootstrap conn to the owned-conn registry. */
+    CHECK(b_ep.last_conn != NULL);
+    CHECK_EQ(ants_transport_peer_disconnect(b_ep.last_conn, 0), ANTS_OK);
+    for (int i = 0; i < 500; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        if (a_ep.conn_closed >= 1) {
+            break;
+        }
+    }
+    CHECK(a_ep.conn_closed >= 1);
+
+    /* Reap: the next tick frees the adopted conn. Under ASan this also
+     * proves the free happens strictly after the transport's close arm
+     * finished with the buffer. */
+    (void)ants_dht_tick(&da);
+
+    /* Every bootstrap slot must be claimable again... */
+    for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
+        CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_OK);
+    }
+    /* ...and the one-past-capacity call must reject. */
+    CHECK_EQ(ants_dht_bootstrap(&da, baddr, &b_pid), ANTS_ERROR_BUFFER_TOO_SMALL);
+
+    /* Teardown: transports first (CONN_CLOSED delegation transfers the
+     * pending bootstrap conns), then the DHTs free whatever they own. */
     CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
     CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
     CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
@@ -3631,6 +3751,7 @@ int main(void)
     test_server_ignores_uni_streams();
     test_server_get_peers_with_announce();
     test_bootstrap_completes();
+    test_bootstrap_slot_recycles_and_reaps();
 
     test_refresh_pings_stale_peer();
     test_refresh_evicts_after_threshold();

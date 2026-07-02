@@ -76,6 +76,12 @@ uint64_t dht_now_us(void)
 typedef char ants_dht_state_size_check
     [(sizeof(struct ants_dht_state) <= sizeof(((ants_dht_t *)0)->_opaque)) ? 1 : -1];
 
+/* Owned-conn registry helpers — defined with the event hooks below. */
+static bool
+owned_conn_adopt(struct ants_dht_state *state, ants_transport_conn_t *conn, bool closed);
+static void owned_conn_mark_closed(struct ants_dht_state *state, const ants_transport_conn_t *conn);
+static void owned_conn_reap(struct ants_dht_state *state);
+
 /* ------------------------------------------------------------------------ */
 /* XOR distance + bucket index                                              */
 /* ------------------------------------------------------------------------ */
@@ -837,6 +843,13 @@ ants_error_t ants_dht_destroy(ants_dht_t *dht)
             state->pending_dials[i].promoted = false;
         }
     }
+    /* And for adopted conns (promoted or closed-awaiting-reap alike). */
+    for (size_t i = 0; i < ANTS_DHT_MAX_OWNED_CONNS; i++) {
+        if (state->owned_conns[i].in_use) {
+            free(state->owned_conns[i].conn);
+            memset(&state->owned_conns[i], 0, sizeof state->owned_conns[i]);
+        }
+    }
     /* Drop any heap-allocated bucket entries before zeroing the buffer.
      * Idempotent on a never-init'd (zeroed) dht: all bucket heads are
      * NULL, the loop is a no-op. */
@@ -851,6 +864,9 @@ uint32_t ants_dht_tick(ants_dht_t *dht)
         return UINT32_MAX;
     }
     struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
+    /* Free adopted conns whose CONN_CLOSED arrived since the last tick
+     * — safe here, outside any transport callback. */
+    owned_conn_reap(state);
     /* Advance every active iterative lookup: issue more RPCs if alpha
      * isn't saturated, check for convergence, fire LOOKUP_COMPLETE on
      * any lookup that just converged. */
@@ -1134,6 +1150,51 @@ size_t ants_dht_sample_peers_rotated(const ants_dht_t *dht,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Owned-conn registry (see dht_internal.h)                                 */
+/* ------------------------------------------------------------------------ */
+
+/* Adopt a heap conn whose originating slot is being released. Returns
+ * false when the registry is full — the caller keeps the old
+ * keep-in-slot behavior. */
+static bool owned_conn_adopt(struct ants_dht_state *state, ants_transport_conn_t *conn, bool closed)
+{
+    for (size_t i = 0; i < ANTS_DHT_MAX_OWNED_CONNS; i++) {
+        if (!state->owned_conns[i].in_use) {
+            state->owned_conns[i].in_use = true;
+            state->owned_conns[i].closed = closed;
+            state->owned_conns[i].conn = conn;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Mark an adopted conn closed (CONN_CLOSED observed); freed at the next
+ * tick / destroy. */
+static void owned_conn_mark_closed(struct ants_dht_state *state, const ants_transport_conn_t *conn)
+{
+    for (size_t i = 0; i < ANTS_DHT_MAX_OWNED_CONNS; i++) {
+        if (state->owned_conns[i].in_use && state->owned_conns[i].conn == conn) {
+            state->owned_conns[i].closed = true;
+            return;
+        }
+    }
+}
+
+/* Free every closed adopted conn. Runs at tick time — never from inside
+ * a transport callback (the close arm still touches the conn state
+ * after the callback returns). */
+static void owned_conn_reap(struct ants_dht_state *state)
+{
+    for (size_t i = 0; i < ANTS_DHT_MAX_OWNED_CONNS; i++) {
+        if (state->owned_conns[i].in_use && state->owned_conns[i].closed) {
+            free(state->owned_conns[i].conn);
+            memset(&state->owned_conns[i], 0, sizeof state->owned_conns[i]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Bootstrap event hooks                                                    */
 /*                                                                          */
 /* Promotion path: a bootstrap dial returns immediately, but the conn       */
@@ -1205,17 +1266,27 @@ static void handle_bootstrap_conn_ready(ants_dht_t *dht, const ants_transport_ev
 static void handle_bootstrap_conn_closed(ants_dht_t *dht, const ants_transport_event_t *event)
 {
     struct ants_dht_state *state = (struct ants_dht_state *)(void *)dht->_opaque;
-    /* Mark the entry dead but DO NOT free(be->conn) yet — picoquic's
+    /* Release the entry, transferring the heap conn to the owned-conn
+     * registry as closed (freed on the next tick — picoquic's
      * disconnect path keeps using the conn state for a few lines after
-     * firing CONN_CLOSED (it nulls cs->cnx, etc.). We free the heap
-     * buffer in ants_dht_destroy, after the transport has been fully
-     * torn down. The leak window is exactly one destroy call. */
+     * firing CONN_CLOSED, so freeing here would be premature). The
+     * transfer also makes slot reuse safe: previously the pointer was
+     * parked "for destroy" and silently overwritten when the slot was
+     * reclaimed by a new bootstrap. Registry full → old model (parked
+     * pointer, freed at destroy). */
     for (size_t i = 0; i < ANTS_DHT_MAX_BOOTSTRAP_PEERS; i++) {
         struct ants_dht_bootstrap_entry *be = &state->bootstrap_entries[i];
         if (be->in_use && be->conn == event->conn) {
-            be->in_use = false;
-            be->promoted = false;
-            /* be->conn stays non-NULL — destroy will free it. */
+            if (owned_conn_adopt(state, be->conn, true /* closed */)) {
+                memset(be, 0, sizeof *be);
+            } else {
+                be->in_use = false;
+                be->promoted = false;
+                /* be->conn stays parked: freed at destroy unless the
+                 * slot is reused first (reuse orphans it — the bounded
+                 * pre-registry behavior, acceptable in the unlikely
+                 * registry-full case). */
+            }
         }
     }
     /* Also clear any routing-table entry whose conn matches the closed
@@ -1268,9 +1339,17 @@ static void handle_pending_dial_conn_ready(ants_dht_t *dht, const ants_transport
         memcpy(peer.multiaddr, pd->multiaddr, sizeof peer.multiaddr);
         (void)dht_routing_upsert(dht, &peer, pd->conn, dht_now_us());
         ants_dht_lookup_promote_dialed_peer(dht, &pd->expected_peer_id, pd->conn);
-        pd->promoted = true;
-        /* Slot stays in_use until destroy frees pd->conn — same lazy
-         * lifetime model as bootstrap_entries[]. */
+        /* Transfer the conn to the owned-conn registry and free the
+         * slot for new dial-promotes. Slots pinned by long-lived
+         * promoted conns were exhausting the 16-slot registry, after
+         * which probe enrichment (anti-eclipse S2) silently stalled —
+         * every new candidate failed at try_dial_promote. Registry
+         * full → old model: the slot stays pinned until CONN_CLOSED. */
+        if (owned_conn_adopt(state, pd->conn, false /* live */)) {
+            memset(pd, 0, sizeof *pd);
+        } else {
+            pd->promoted = true;
+        }
         break;
     }
 }
@@ -1288,10 +1367,19 @@ static void handle_pending_dial_conn_closed(ants_dht_t *dht, const ants_transpor
              * FAILED to every awaiting lookup. */
             ants_dht_lookup_fail_dialing_candidates(dht, &pd->expected_peer_id);
         }
-        pd->in_use = false;
-        pd->promoted = false;
-        /* pd->conn stays non-NULL — destroy will free it. Same
-         * picoquic-lifetime concern as bootstrap_entries[]. */
+        /* Same transfer-on-close as bootstrap entries: adopt as closed
+         * (freed next tick), so slot reuse never orphans the buffer.
+         * Registry full → parked pointer, freed at destroy. */
+        if (owned_conn_adopt(state, pd->conn, true /* closed */)) {
+            memset(pd, 0, sizeof *pd);
+        } else {
+            pd->in_use = false;
+            pd->promoted = false;
+            /* pd->conn stays parked: freed at destroy unless the slot
+             * is reused first (reuse orphans it — the bounded
+             * pre-registry behavior, acceptable in the unlikely
+             * registry-full case). */
+        }
     }
 }
 
@@ -1315,6 +1403,14 @@ ants_error_t ants_dht_handle_transport_event(ants_dht_t *dht, const ants_transpo
     } else if (event->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
         handle_bootstrap_conn_closed(dht, event);
         handle_pending_dial_conn_closed(dht, event);
+        /* Drop every borrowed copy of this conn held by active-lookup
+         * candidates — the reap frees the buffer on the next tick, and
+         * a surviving borrower would dereference freed memory (or fold
+         * a dangling pointer into the routing table). */
+        ants_dht_lookup_invalidate_conn(dht, event->conn);
+        /* A conn adopted at promotion closes later: mark it for the
+         * next tick's reap. */
+        owned_conn_mark_closed((struct ants_dht_state *)(void *)dht->_opaque, event->conn);
     }
     /* Outbound RPC dispatch (responses for ants_dht_rpc_send_*). */
     (void)ants_dht_rpc_handle_event(dht, event);
