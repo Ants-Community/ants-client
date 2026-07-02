@@ -619,3 +619,31 @@ void ants_dht_lookup_fail_dialing_candidates(ants_dht_t *dht, const ants_peer_id
         }
     }
 }
+
+void ants_dht_lookup_invalidate_conn(ants_dht_t *dht, const ants_transport_conn_t *conn)
+{
+    if (dht == NULL || conn == NULL) {
+        return;
+    }
+    struct ants_dht_state *state = dht_get_state(dht);
+    for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+        ants_dht_lookup_t *h = state->active_lookups[i];
+        if (h == NULL) {
+            continue;
+        }
+        struct ants_dht_lookup_state *lookup = lookup_get_state(h);
+        if (lookup->completed) {
+            continue;
+        }
+        for (size_t j = 0; j < lookup->candidate_count; j++) {
+            struct ants_dht_lookup_candidate *c = &lookup->candidates[j];
+            if (c->conn == conn) {
+                /* The candidate itself stays queryable: with conn NULL
+                 * the advance loop falls back to try_dial_promote (or
+                 * FAILs it), and the probe's ANSWERED fold upserts a
+                 * known-only entry instead of a dangling pointer. */
+                c->conn = NULL;
+            }
+        }
+    }
+}

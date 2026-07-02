@@ -373,6 +373,35 @@ struct ants_dht_bootstrap_entry {
 #define ANTS_DHT_MAX_LOCAL_ANNOUNCES 16
 
 /* ------------------------------------------------------------------------ */
+/* Owned conns                                                              */
+/*                                                                          */
+/* Heap conn buffers the DHT allocated whose originating slot (bootstrap    */
+/* entry / pending dial) has been released: a pending dial transfers here   */
+/* at promotion — freeing its slot for new dial-promotes, so probe          */
+/* enrichment (anti-eclipse S2) doesn't stall once a handful of promoted    */
+/* conns live long — and both slot kinds transfer here at CONN_CLOSED, so   */
+/* recycling a slot never orphans its old buffer (previously the pointer    */
+/* was parked "for destroy" and silently overwritten on reuse).             */
+/*                                                                          */
+/* A closed entry is freed on the NEXT ants_dht_tick: by then the           */
+/* transport's close arm has fully finished with the buffer and has         */
+/* unbound the picoquic callback (transport.c), so no reference survives.   */
+/* Freeing inside the CONN_CLOSED callback would be premature — the close   */
+/* arm still writes to the conn state after the callback returns.           */
+/* ants_dht_destroy frees whatever is left. A full registry falls back to   */
+/* the old keep-in-slot model (capacity-limited but correct).               */
+/* ------------------------------------------------------------------------ */
+
+#define ANTS_DHT_MAX_OWNED_CONNS 64
+
+struct ants_dht_owned_conn {
+    bool in_use;
+    /* CONN_CLOSED observed; free deferred to the next tick / destroy. */
+    bool closed;
+    ants_transport_conn_t *conn;
+};
+
+/* ------------------------------------------------------------------------ */
 /* Pending dials (phase 6.1.c dial-promote)                                 */
 /*                                                                          */
 /* When a lookup encounters a closer-than-current candidate that has a      */
@@ -460,6 +489,9 @@ struct ants_dht_state {
     /* Lookup-initiated dials in progress / promoted. Same heap-conn
      * lifetime as bootstrap_entries[]: freed in destroy. */
     struct ants_dht_pending_dial pending_dials[ANTS_DHT_MAX_PENDING_DIALS];
+    /* Heap conns whose originating slot has been released — see the
+     * registry comment above ANTS_DHT_MAX_OWNED_CONNS. */
+    struct ants_dht_owned_conn owned_conns[ANTS_DHT_MAX_OWNED_CONNS];
     /* Local-host announce set (shards we've announced via ants_dht_announce). */
     struct ants_dht_local_announce local_announces[ANTS_DHT_MAX_LOCAL_ANNOUNCES];
     /* Server secret for GET_PEERS_RESP token derivation. Initialised by

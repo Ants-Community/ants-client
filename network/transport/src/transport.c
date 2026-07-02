@@ -1285,6 +1285,14 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
             }
             cs->inbound_streams_head = NULL;
         }
+        /* The picoquic cnx can outlive this cs (picoquic deletes it
+         * after the callback, or at picoquic_free time). Unbind the
+         * callback for EVERY closed conn — heap or caller-owned — so
+         * nothing can call back into a cs its owner frees or reuses
+         * after this event. (Callers like the DHT's owned-conn
+         * registry free their heap conn buffers on their next tick,
+         * once this close arm has fully finished with the state.) */
+        picoquic_set_callback(cnx, NULL, NULL);
         /* Heap-allocated cs (inbound bootstrap) needs to be unlinked from
          * the transport's inbound list and freed. Outbound cs lives in
          * the caller's _opaque buffer — never free()d by us. */
@@ -1297,11 +1305,6 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
             if (*link == cs) {
                 *link = cs->next_inbound;
             }
-            /* The picoquic cnx outlives this cs (picoquic deletes it
-             * after the callback, or at picoquic_free time). Unbind the
-             * callback so a later delete-time disconnect event can't
-             * dereference the freed cs. */
-            picoquic_set_callback(cnx, NULL, NULL);
             free(cs);
         }
         break;

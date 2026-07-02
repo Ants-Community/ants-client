@@ -13,6 +13,40 @@ the spec repo's
 
 ## Unreleased
 
+### network/dht: owned-conn registry — dial slots recycle, probe enrichment stays alive · 2026-07-02
+
+`network/dht` (PR #188): closes the deferred capacity findings from PR #187's
+review. The DHT's dial-promotion slots (16) stayed `in_use` for as long as
+their promoted connections lived, so on a network with enough stable peers
+the slots filled within the first epochs and every subsequent probe
+candidate failed at `try_dial_promote` — anti-eclipse S2 enrichment silently
+became a no-op exactly when the network was healthy. And both slot kinds
+(bootstrap entries, pending dials) parked their heap conn pointer "for
+destroy" when the connection closed, then silently overwrote it when the
+slot was reused — an unbounded slow leak in a long-running daemon. Both are
+fixed by a new owned-conn registry: a pending dial transfers its conn there
+at promotion (freeing the slot immediately), and both slot kinds transfer
+at CONN_CLOSED (so recycling never orphans a buffer). A closed adopted conn
+is freed on the next `ants_dht_tick` — by then the transport's close arm
+has finished with the buffer and, with this PR, has unbound the picoquic
+callback for **every** closed connection (generalising the #184 fix beyond
+inbound heap conns), so no reference survives. `ants_dht_destroy` frees
+whatever is left; a full registry falls back to the old keep-in-slot model.
+The pre-push lifetime audit caught the one borrower the shorter buffer
+lifetime would have broken: active-lookup candidates hold borrowed copies of
+these conn pointers (seeded from routing entries or set at dial-promotion)
+and were never invalidated at CONN_CLOSED — safe before only because the
+buffer was parked until destroy. A new `ants_dht_lookup_invalidate_conn`
+sweep in the CONN_CLOSED delegation drops every borrowed copy (mirroring the
+existing bucket/replacements sweeps), so neither the advance loop nor the
+probe's ANSWERED fold can touch a reaped buffer.
+The regression test drives a real bootstrap conn through remote hang-up →
+transfer → next-tick reap (ASan proves the deferred-free timing; LSan on
+the Linux Debug jobs proves reuse no longer leaks) and then requires all
+bootstrap slots to be claimable again, with the one-past-capacity call
+rejecting. Still deferred: `lookup_deadline_ms` enforcement (stored, never
+fires LOOKUP_TIMEOUT).
+
 ### cmd/antsd: wire gossip + the anti-eclipse view into the daemon · 2026-07-02
 
 `cmd/antsd` (PR #187): the node gossips. `antsd run` now stands the full

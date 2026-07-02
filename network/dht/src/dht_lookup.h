@@ -84,6 +84,16 @@ void ants_dht_lookup_promote_dialed_peer(ants_dht_t *dht,
                                          ants_transport_conn_t *conn);
 void ants_dht_lookup_fail_dialing_candidates(ants_dht_t *dht, const ants_peer_id_t *peer_id);
 
+/* CONN_CLOSED sweep over every active lookup's candidates: any candidate
+ * borrowing `conn` drops the pointer (NULL). Candidates hold borrowed
+ * copies of DHT-heap conns (seeded from routing entries, or set by
+ * promote_dialed_peer); the owned-conn registry frees a closed conn on
+ * the next tick, so a borrower that survived the close would otherwise
+ * dereference freed memory (issue_rpc_for_candidate) or fold a dangling
+ * pointer back into the routing table (the probe's ANSWERED fold).
+ * Mirrors the bucket/replacements sweeps in handle_bootstrap_conn_closed. */
+void ants_dht_lookup_invalidate_conn(ants_dht_t *dht, const ants_transport_conn_t *conn);
+
 #ifdef __cplusplus
 }
 #endif
