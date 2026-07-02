@@ -1,10 +1,10 @@
 # network/transport — P2P transport (Component #4).
 #
-# v1.0 scaffold: stub returning NOT_IMPLEMENTED. The real
-# implementation against vendored picoquic + picotls lands in
-# subsequent PRs. The API surface is pinned in ants_transport.h so
-# upstream components (network/dht, network/gossip, reputation) can
-# integrate now against the agreed shape.
+# Implemented: encrypted, authenticated, multiplexed QUIC streams over
+# vendored picoquic + picotls, with RFC 7250 raw-pubkey TLS identity
+# binding (the Ed25519 peer pubkey IS the TLS auth key). A few
+# peer-introspection accessors remain NOT_IMPLEMENTED in v1.0 — see the
+# status note in ants_transport.h.
 #
 # See:
 #   - network/transport/README.md for the picoquic decision rationale
