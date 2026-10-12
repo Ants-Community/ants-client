@@ -13,6 +13,35 @@ the spec repo's
 
 ## Unreleased
 
+### network/attest + cmd/antsd: the v1 attestation gate — RFC-0008 §11.12 on the wire, verify-and-tag in the daemon · 2026-10-12
+
+New `network/attest` (PR5 of the node-daemon sequence): the attestation exchange and the per-connection verdict of RFC-0005's v1 handshake gate.
+
+**Exchange.** ATTEST_REQ / ATTEST_RESP (bidi-RPC envelope types 9/10) run with a strict canonical codec:
+- the empty body omits key 2;
+- the decoder rejects vendor 0, empty or oversized blobs (`ATTESTATION_MAX_BLOB_BYTES` 16384), responses over 20480 bytes, txids above 2³²−1, key-order violations and trailing bytes.
+
+The engine is a sibling dispatcher of the DHT server. Both see every inbound bidi stream, each claims only its own envelope types, and both release foreign streams silently. Nothing changed in the DHT: its server already released non-DHT envelopes for exactly this purpose.
+
+**Verdicts.** On CONN_READY the engine requests; on the answer it decides:
+- `ATTESTED`: `ants_attestation_verify` passes, including the §11.12 binding against the connection's **authenticated** peer-id, and `is_fresh` passes;
+- `UNATTESTED`: empty answer, a vendor not wired yet (fail closed), or genuine but stale evidence;
+- `REJECTED`: evidence fails verification, or the answer is malformed or carries the wrong txid.
+
+**Daemon.** The daemon runs the RFC-0005 v0.3 posture: it logs every verdict, admits unattested peers and disconnects rejected ones (`ANTSD_CLOSE_ATTEST_REJECTED`). It presents nothing itself, because `generate` is hardware-gated.
+
+**Capacity.** The pre-push adversarial review found two availability issues, both fixed here:
+- **Outbound tables.** A peer that never answers held a global slot until it disconnected, so 32 silent connections switched the gate off. The outbound and verdict tables are now sized at `ANTS_ATTEST_MAX_CONNS` (64), which must be ≥ the transport's `max_connections`. The daemon compile-asserts this, so starving the gate first requires exhausting the transport's connection cap.
+- **Inbound table.** One connection is now limited to 2 unfinished inbound streams in the table (`test_engine_inbound_cap_per_conn`, falsified at a cap of 32). A local allocation failure no longer frees the stream handle mid-stream.
+
+**Transport.** `ants_transport_conn_peer_id` is now implemented; it was a `NOT_IMPLEMENTED` stub. The gate needs it, because stream events do not mirror the peer-id. It returns the key only after CONN_READY. The Certificate's key is captured before its CertificateVerify signature is checked, so exposing it earlier would hand out an unauthenticated identity.
+
+**Tests.**
+- `test_attest` covers the codec, with hand-written bytes, plus five engine scenarios over real loopback QUIC.
+- The central scenario is a **genuine** Intel TDX quote (real chain, real signatures) presented by a peer it is not bound to. The verdict is `REJECTED`: this is the relay attack the binding exists to stop.
+- `test_antsd_run` runs the gate in the spawned daemon, next to DHT bootstrap on the same connection. Both sides admit each other unattested. A seed presenting that foreign quote gets `verdict=rejected` and is disconnected; the test was falsified by removing the disconnect, which makes it fail on the seed's close assertion.
+- `ATTESTED` end to end needs `generate` on a real CVM.
+
 ### foundation/tee: RFC-0008 §11.12 report_data binding — issued_at becomes signed · 2026-10-12
 
 `foundation/tee`: implements the binding pinned by RFC-0008 v0.9 §11.12. `ants_attestation_verify` used to check only `report_data[0:32] == peer_pubkey` and left the upper 32 bytes unconstrained, so `issued_at_unix` was unsigned presenter metadata. Anyone replaying a stale attestation could re-date it, and the 30-day freshness window bounded nothing. The comment in `is_fresh` said so openly: future-dating was allowed "on purpose".

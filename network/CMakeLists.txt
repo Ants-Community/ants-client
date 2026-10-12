@@ -28,3 +28,8 @@ add_subdirectory(dht)
 # send callback. Wiring to real ants_transport streams + the inbound demux,
 # lazy-pull anti-entropy, and anti-eclipse DHT peer sampling land later.
 add_subdirectory(gossip)
+
+# Attestation presentation + the v1 handshake gate (RFC-0008 §11.12,
+# RFC-0005 verify-and-tag): a sibling of the DHT server on the bidi-RPC
+# envelope, verifying through foundation/tee.
+add_subdirectory(attest)

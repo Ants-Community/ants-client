@@ -403,6 +403,12 @@ struct ants_transport_conn_state {
     uint8_t peer_pubkey[ANTS_ED25519_PUBKEY_SIZE];
     int peer_pubkey_set;
 
+    /* Set when picoquic reports the handshake complete (CONN_READY).
+     * peer_pubkey is captured from the Certificate message BEFORE the
+     * CertificateVerify signature is checked, so it only counts as the
+     * authenticated identity from here on (ants_transport_conn_peer_id). */
+    int ready;
+
     /* Inbound-cnx bookkeeping. is_heap == 1 means this struct was
      * malloc'd by the verify_certificate bootstrap (for an inbound
      * cnx the caller never dialed) and needs free() on CONN_CLOSED or
@@ -1247,6 +1253,7 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     switch (fin_or_event) {
     case picoquic_callback_ready:
         ev.kind = ANTS_TRANSPORT_EV_CONN_READY;
+        cs->ready = 1;
         /* RFC 7250 binding: the verify_certificate callback populated
          * cs->peer_pubkey during the handshake. Mirror it into the
          * event's peer_id so the caller doesn't need to round-trip
@@ -1723,9 +1730,19 @@ bool ants_transport_stream_is_bidi(const ants_transport_stream_t *stream)
 ants_error_t ants_transport_conn_peer_id(const ants_transport_conn_t *conn,
                                          ants_peer_id_t *out_peer_id)
 {
-    (void)conn;
-    (void)out_peer_id;
-    return ANTS_ERROR_NOT_IMPLEMENTED;
+    if (conn == NULL || out_peer_id == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    const struct ants_transport_conn_state *cs =
+        (const struct ants_transport_conn_state *)(const void *)conn->_opaque;
+    /* Only a completed handshake has AUTHENTICATED the key: before
+     * CONN_READY the Certificate may have arrived without its signature
+     * having been verified. */
+    if (!cs->ready || !cs->peer_pubkey_set) {
+        return ANTS_ERROR_PEER_UNREACHABLE;
+    }
+    memcpy(out_peer_id->bytes, cs->peer_pubkey, ANTS_PEER_ID_SIZE);
+    return ANTS_OK;
 }
 
 ants_error_t

@@ -44,10 +44,14 @@
 
 #include "config.h"
 
+#include "ants_attest.h"
 #include "ants_common.h"
 #include "ants_crypto.h"
 #include "ants_dht.h"
+#include "ants_tee.h"
 #include "ants_transport.h"
+
+#include "tdx_kat_vectors.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -420,7 +424,11 @@ static void test_run_serves_and_shuts_down(const char *antsd_path)
  * router in run.c. */
 typedef struct {
     ants_dht_t *dht;
+    ants_attest_t *attest;
     int conn_ready;
+    int conn_closed;
+    int verdicts;
+    ants_attest_result_t last_verdict;
 } seed_endpoint_t;
 
 static ants_error_t seed_endpoint_event(const ants_transport_event_t *ev, void *ctx)
@@ -429,10 +437,22 @@ static ants_error_t seed_endpoint_event(const ants_transport_event_t *ev, void *
     if (e->dht != NULL) {
         (void)ants_dht_handle_transport_event(e->dht, ev);
     }
+    if (e->attest != NULL) {
+        ants_attest_handle_transport_event(e->attest, ev, (int64_t)time(NULL));
+    }
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         e->conn_ready++;
+    } else if (ev->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
+        e->conn_closed++;
     }
     return ANTS_OK;
+}
+
+static void seed_verdict(const ants_attest_result_t *r, void *ctx)
+{
+    seed_endpoint_t *e = (seed_endpoint_t *)ctx;
+    e->verdicts++;
+    e->last_verdict = *r;
 }
 
 static ants_error_t noop_dht_event(const ants_dht_event_t *ev, void *ctx)
@@ -442,7 +462,12 @@ static ants_error_t noop_dht_event(const ants_dht_event_t *ev, void *ctx)
     return ANTS_OK;
 }
 
-static void test_run_bootstraps_to_seed(const char *antsd_path)
+/* `seed_local` NULL: the honest v1 run — bootstrap, gossip view, and the
+ * attestation gate admitting each side UNATTESTED. Non-NULL: the seed
+ * presents that evidence; the daemon must judge it REJECTED and drop the
+ * connection (RFC-0005 verify-and-tag: false evidence → disconnect). */
+static void test_run_bootstraps_to_seed(const char *antsd_path,
+                                        const ants_attest_presentation_t *seed_local)
 {
     /* In-process seed node: listening transport + DHT — the same
      * composition the daemon runs, driven from this process. */
@@ -478,6 +503,20 @@ static void test_run_bootstraps_to_seed(const char *antsd_path)
     /* Timers 0: no automatic refresh — the test drives everything. */
     CHECK(ants_dht_init(&seed_dht, &sdcfg) == ANTS_OK);
     ep.dht = &seed_dht;
+
+    /* The seed also runs the attestation gate, sharing the connection
+     * (and its bidi streams) with the DHT — both directions of the
+     * §11.12 exchange then ride alongside the bootstrap RPCs. */
+    static ants_attest_t seed_attest; /* 32 KB — off the stack */
+    ants_attest_config_t sacfg;
+    memset(&sacfg, 0, sizeof sacfg);
+    sacfg.local = seed_local;
+    sacfg.freshness_window_seconds = ANTS_TEE_DEFAULT_FRESHNESS_WINDOW_SECONDS;
+    sacfg.request_on_ready = true;
+    sacfg.verdict_fn = seed_verdict;
+    sacfg.verdict_ctx = &ep;
+    CHECK(ants_attest_init(&seed_attest, &sacfg) == ANTS_OK);
+    ep.attest = &seed_attest;
 
     /* Daemon config: fixed identity, a listener, and the seed in the
      * bootstrap list. */
@@ -528,20 +567,54 @@ static void test_run_bootstraps_to_seed(const char *antsd_path)
     char seed_hex[ANTS_ED25519_PUBKEY_SIZE * 2 + 1];
     hex_format(seed_pub, sizeof seed_pub, seed_hex);
     char needle[sizeof seed_hex + 48];
-    snprintf(needle, sizeof needle, "antsd: dht bootstrap complete peer=%s", seed_hex);
-    const char *hit = wait_for_output(
-        out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &seed_transport, &seed_dht);
-    CHECK(hit != NULL);
-    /* The promotion-time discovery line must have preceded it. */
-    snprintf(needle, sizeof needle, "antsd: dht peer discovered peer=%s", seed_hex);
-    CHECK(strstr(cap.data, needle) != NULL);
-    CHECK(strstr(cap.data, "antsd: bootstrapping via ") != NULL);
-    /* Discovery also feeds the gossip view: the seed must have been
-     * added as a gossip neighbour. */
-    snprintf(needle, sizeof needle, "antsd: gossip view add peer=%s", seed_hex);
-    CHECK(strstr(cap.data, needle) != NULL);
-    /* Mutual handshake: the seed side saw the daemon connect. */
-    CHECK(ep.conn_ready >= 1);
+    const char *hit = NULL;
+    if (seed_local != NULL) {
+        /* The daemon verifies the seed's presentation against the seed's
+         * AUTHENTICATED peer-id: the genuine quote is not bound to it, so
+         * the verdict is REJECTED and the daemon disconnects. The seed
+         * observes the close. */
+        snprintf(needle, sizeof needle, "antsd: attest peer=%s verdict=rejected", seed_hex);
+        hit = wait_for_output(
+            out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &seed_transport, &seed_dht);
+        CHECK(hit != NULL);
+        for (int i = 0; i < 3000 && ep.conn_closed == 0; i++) {
+            tick_pace();
+            ants_transport_tick(&seed_transport);
+        }
+        CHECK(ep.conn_closed >= 1);
+    } else {
+        snprintf(needle, sizeof needle, "antsd: dht bootstrap complete peer=%s", seed_hex);
+        hit = wait_for_output(
+            out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &seed_transport, &seed_dht);
+        CHECK(hit != NULL);
+        /* The promotion-time discovery line must have preceded it. */
+        snprintf(needle, sizeof needle, "antsd: dht peer discovered peer=%s", seed_hex);
+        CHECK(strstr(cap.data, needle) != NULL);
+        CHECK(strstr(cap.data, "antsd: bootstrapping via ") != NULL);
+        /* Discovery also feeds the gossip view: the seed must have been
+         * added as a gossip neighbour. */
+        snprintf(needle, sizeof needle, "antsd: gossip view add peer=%s", seed_hex);
+        CHECK(strstr(cap.data, needle) != NULL);
+        /* Mutual handshake: the seed side saw the daemon connect. */
+        CHECK(ep.conn_ready >= 1);
+
+        /* Attestation gate, both directions, on the same connection as the
+         * DHT exchange: neither node can present evidence in v1, so each
+         * admits the other UNATTESTED (RFC-0005 verify-and-tag). */
+        snprintf(needle, sizeof needle, "antsd: attest peer=%s verdict=unattested", seed_hex);
+        hit = wait_for_output(
+            out_fd, &cap, needle, now_ms() + HANDSHAKE_DEADLINE_MS, &seed_transport, &seed_dht);
+        CHECK(hit != NULL);
+        for (int i = 0; i < 2000 && ep.verdicts == 0; i++) {
+            tick_pace();
+            ants_transport_tick(&seed_transport);
+        }
+        CHECK(ep.verdicts == 1);
+        CHECK(ep.last_verdict.verdict == ANTS_ATTEST_VERDICT_UNATTESTED);
+        uint8_t daemon_pub[ANTS_ED25519_PUBKEY_SIZE];
+        CHECK(ants_ed25519_pubkey_from_priv(cfg.identity_priv, daemon_pub) == ANTS_OK);
+        CHECK(memcmp(ep.last_verdict.peer_id.bytes, daemon_pub, sizeof daemon_pub) == 0);
+    }
 
     /* SIGTERM → clean exit 0 (the daemon tears down transport before
      * DHT; ASan in the child verifies the bootstrap conn is freed). */
@@ -558,6 +631,7 @@ static void test_run_bootstraps_to_seed(const char *antsd_path)
     }
 
     CHECK(ants_transport_destroy(&seed_transport, 0) == ANTS_OK);
+    ants_attest_destroy(&seed_attest);
     CHECK(ants_dht_destroy(&seed_dht) == ANTS_OK);
     close(out_fd);
     unlink(cfg_path);
@@ -571,7 +645,18 @@ int main(int argc, char **argv)
     }
     test_run_missing_config(argv[1]);
     test_run_serves_and_shuts_down(argv[1]);
-    test_run_bootstraps_to_seed(argv[1]);
+    test_run_bootstraps_to_seed(argv[1], NULL);
+
+    /* A GENUINE Intel TDX quote (real chain, real signatures) presented by
+     * a peer it was never bound to — a relayed attestation. */
+    ants_attest_presentation_t foreign;
+    memset(&foreign, 0, sizeof foreign);
+    foreign.present = true;
+    foreign.vendor = ANTS_TEE_VENDOR_INTEL_TDX;
+    foreign.issued_at_unix = (int64_t)1735689600; /* inside the chain's validity */
+    foreign.blob = TDX_KAT_QUOTE;
+    foreign.blob_len = sizeof TDX_KAT_QUOTE;
+    test_run_bootstraps_to_seed(argv[1], &foreign);
 
     if (failures == 0) {
         printf("all checks passed\n");

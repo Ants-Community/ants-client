@@ -10,6 +10,7 @@ The peer-to-peer transport, DHT, and gossip overlay. Depends on
 | [`transport/`](./transport) — P2P transport (#4) | 5 EM | RFC-0002 §DHT routing, RFC-0010 §First peer's flow | feature-complete (picoquic) |
 | [`dht/`](./dht) — Kademlia DHT, shard-key variant (#5) | 3 EM | RFC-0002 §DHT routing | feature-complete |
 | [`gossip/`](./gossip) — Gossip overlay for L1 CRDT (#6) | 3 EM | RFC-0004 §Layer 1 + §G-Set pruning | feature-complete |
+| [`attest/`](./attest) — attestation presentation + v1 handshake gate (#3 × #4) | — | RFC-0008 §11.12, RFC-0005 §v1 admission posture | verify-and-tag (generate is hardware-gated) |
 
 ## Transport: picoquic + ANTS-native protocol (decided 2026-05-21)
 
@@ -40,7 +41,8 @@ fit the project's day-zero portability target.
 
 ## Build status
 
-All three components are feature-complete at v0.x and are built + tested in
+The three components are feature-complete at v0.x (`attest/` is the glue that
+puts foundation/tee's verifier on the wire) and are built + tested in
 `network/CMakeLists.txt`. The original scaffold sequence was: API design →
 scaffolding PR (all stubbed) → vendor picoquic under `deps/picoquic/` → wire the
 transport wrapper → build DHT + gossip on top.

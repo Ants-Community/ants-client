@@ -13,8 +13,10 @@
  *     (both sides observe CONN_READY under mutual TLS), the
  *     expected-peer-id anti-MITM rejection, stream open/send/recv/
  *     close/reset, and a loopback byte exchange.
+ *   - conn_peer_id: the authenticated key after CONN_READY, an error
+ *     before it.
  *   - Safe defaults for the v1.0 NOT_IMPLEMENTED introspection
- *     accessors (conn_peer_id, peer_addr, peer_list).
+ *     accessors (peer_addr, peer_list).
  */
 
 /* POSIX feature test — required on glibc to expose nanosleep() from
@@ -603,6 +605,9 @@ static void test_handshake_completes_with_real_keys(void)
     /* Capture the conn handle for later peer_id inspection. */
     ants_transport_conn_t conn = {{0}};
     CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+    /* No identity before the handshake completes. */
+    ants_peer_id_t pid;
+    CHECK_EQ(ants_transport_conn_peer_id(&conn, &pid), ANTS_ERROR_PEER_UNREACHABLE);
 
     /* Drive the handshake. The TLS exchange on localhost typically
      * needs only a handful of ticks; bound generously at 200 to absorb
@@ -620,11 +625,10 @@ static void test_handshake_completes_with_real_keys(void)
     CHECK(dialer_rec.conn_ready == 1);
     CHECK(dialer_rec.conn_closed == 0);
 
-    /* The CONN_READY event carried the listener's pubkey as peer_id. We
-     * inspect via ants_transport_conn_peer_id... which isn't wired yet,
-     * so instead verify via a fresh dial-with-expected-peer-id check
-     * after this PR. For now, recording the event_fn invocation is
-     * sufficient — the bridge unit-tests the mirror. */
+    /* After CONN_READY the conn reports the listener's authenticated
+     * key — the same identity the event mirrored. */
+    CHECK_EQ(ants_transport_conn_peer_id(&conn, &pid), ANTS_OK);
+    CHECK(memcmp(pid.bytes, listener_pub, ANTS_ED25519_PUBKEY_SIZE) == 0);
 
     CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
     CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
@@ -890,13 +894,15 @@ static void test_introspection_safe_defaults(void)
 
 static void test_conn_introspection_stubs(void)
 {
-    /* conn_peer_id and conn_peer_addr still require TLS handshake to
-     * have bound a peer identity — phase 3b. peer_disconnect IS wired
+    /* conn_peer_id on a never-handshaken conn has no identity to report;
+     * conn_peer_addr is still a stub. peer_disconnect IS wired
      * (phase 3c) and is idempotent on a zero-init conn. */
     ants_transport_conn_t c = {{0}};
     ants_peer_id_t pid;
     char addr[ANTS_MULTIADDR_MAX_LEN];
-    CHECK_EQ(ants_transport_conn_peer_id(&c, &pid), ANTS_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(ants_transport_conn_peer_id(&c, &pid), ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK_EQ(ants_transport_conn_peer_id(NULL, &pid), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_transport_conn_peer_id(&c, NULL), ANTS_ERROR_INVALID_ARG);
     CHECK_EQ(ants_transport_conn_peer_addr(&c, addr, sizeof addr), ANTS_ERROR_NOT_IMPLEMENTED);
     /* peer_disconnect on a never-dialed conn is a no-op success. */
     CHECK_EQ(ants_transport_peer_disconnect(&c, 0), ANTS_OK);
