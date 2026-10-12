@@ -173,6 +173,67 @@ static void test_invalid_args(void)
     CHECK(antsd_config_decode(buf, sizeof buf, NULL) == ANTS_ERROR_INVALID_ARG);
 }
 
+static void test_genesis_roundtrip_and_rejects(void)
+{
+    /* A config carrying the v1 genesis (key 3) round-trips byte-exactly,
+     * including at the trustee ceiling; trustees out of order, duplicated
+     * or absent are refused on encode, and a hand-corrupted order on
+     * decode. A config without genesis still decodes with present = false. */
+    antsd_config_t in;
+    memset(&in, 0, sizeof in);
+    in.identity_priv[0] = 1;
+    in.genesis.present = true;
+    in.genesis.time = 1735689600;
+    memset(in.genesis.hash, 0x47, sizeof in.genesis.hash);
+    in.genesis.trustee_count = ANTSD_MAX_TRUSTEES;
+    for (size_t i = 0; i < ANTSD_MAX_TRUSTEES; i++) {
+        memset(in.genesis.trustees[i], 0, sizeof in.genesis.trustees[i]);
+        in.genesis.trustees[i][0] = (uint8_t)(i + 1); /* ascending */
+    }
+    static uint8_t buf[ANTSD_CONFIG_ENCODED_MAX];
+    size_t len;
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_OK);
+    antsd_config_t out;
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_OK);
+    CHECK(out.genesis.present && out.genesis.time == in.genesis.time);
+    CHECK(memcmp(out.genesis.hash, in.genesis.hash, 32) == 0);
+    CHECK(out.genesis.trustee_count == ANTSD_MAX_TRUSTEES);
+    CHECK(memcmp(out.genesis.trustees, in.genesis.trustees, sizeof in.genesis.trustees) == 0);
+
+    /* Decode-side: swap two trustees' leading bytes in the encoded form. */
+    uint8_t first = in.genesis.trustees[0][0], second = in.genesis.trustees[1][0];
+    size_t at0 = len, at1 = len;
+    for (size_t i = 0; i + 34 < len; i++) {
+        if (buf[i] == 0x58 && buf[i + 1] == 0x20 && buf[i + 2] == first && at0 == len) {
+            at0 = i + 2;
+        } else if (buf[i] == 0x58 && buf[i + 1] == 0x20 && buf[i + 2] == second && at0 != len) {
+            at1 = i + 2;
+            break;
+        }
+    }
+    CHECK(at0 < len && at1 < len);
+    buf[at0] = second;
+    buf[at1] = first;
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_ERROR_MALFORMED);
+
+    /* Encode-side refusals. */
+    in.genesis.trustees[1][0] = in.genesis.trustees[0][0]; /* duplicate */
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_ERROR_INVALID_ARG);
+    in.genesis.trustees[1][0] = 2;
+    in.genesis.trustee_count = 0;
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_ERROR_INVALID_ARG);
+
+    /* No genesis: present stays false. */
+    in.genesis.present = false;
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_OK);
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_OK);
+    CHECK(!out.genesis.present);
+
+    /* Trailing bytes after the map are rejected (strict decode). */
+    buf[len] = 0x00;
+    CHECK(antsd_config_decode(buf, len + 1, &out) != ANTS_OK);
+}
+
 int main(void)
 {
     test_roundtrip_full();
@@ -183,6 +244,7 @@ int main(void)
     test_decode_rejects_garbage();
     test_decode_rejects_truncated();
     test_invalid_args();
+    test_genesis_roundtrip_and_rejects();
 
     if (failures == 0) {
         printf("all checks passed\n");

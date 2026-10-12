@@ -22,4 +22,8 @@ int antsd_read_random(uint8_t *buf, size_t n);
  * NUL-terminates; truncates at whole bytes if cap < 2*n + 1. */
 void antsd_hex_format(const uint8_t *bytes, size_t n, char *out, size_t cap);
 
+/* Parse exactly 2*n hex digits (either case) from the NUL-terminated `hex`
+ * into `out`. Returns 0, or -1 on a bad digit or the wrong length. */
+int antsd_hex_parse(const char *hex, uint8_t *out, size_t n);
+
 #endif /* ANTSD_UTIL_H */

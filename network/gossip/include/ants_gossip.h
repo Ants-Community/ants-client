@@ -135,9 +135,24 @@ extern "C" {
  *   IWANT — lazy-pull request: "send me these content-ids".
  * Decoding an unknown type fails closed with ANTS_ERROR_UNSUPPORTED_TYPE.
  */
-#define ANTS_GOSSIP_MSG_PUSH  0u
-#define ANTS_GOSSIP_MSG_IHAVE 1u
-#define ANTS_GOSSIP_MSG_IWANT 2u
+#define ANTS_GOSSIP_MSG_PUSH   0u
+#define ANTS_GOSSIP_MSG_IHAVE  1u
+#define ANTS_GOSSIP_MSG_IWANT  2u
+#define ANTS_GOSSIP_MSG_BLOCK  3u /* L2 proposal (RFC-0008 §11.13)          */
+#define ANTS_GOSSIP_MSG_ATTEST 4u /* L2 committee attestation (§11.13)      */
+
+/* RFC-0008 §7 CHAIN_MAX_BLOCK_FRAME_BYTES (pinned): the cap on a BLOCK frame
+ * — it covers a block at the MAX_PATTERN_FINDINGS ceiling. The other frame
+ * types keep max_frame_bytes. */
+#define ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME 32768u
+
+/* RFC-0008 §7 CHAIN_GOSSIP_DEDUP_S: how long a chain frame counts as already
+ * seen. Holders re-broadcast an open attempt's frames at this interval, and
+ * the window lets those repeats re-flood to nodes that joined meanwhile. */
+#define ANTS_GOSSIP_CHAIN_DEDUP_S 10u
+
+/* Chain frames remembered for deduplication at once. */
+#define ANTS_GOSSIP_CHAIN_DEDUP_SLOTS 128u
 
 /* Maximum content-ids carried in one IHAVE/IWANT frame. 64 ids × 32 bytes +
  * envelope sits well under the default 4 KiB frame cap; anti-entropy here is
@@ -193,7 +208,7 @@ typedef struct {
 /* the send callback — no allocation, the view is a fixed array.            */
 /* ------------------------------------------------------------------------ */
 
-#define ANTS_GOSSIP_CTX_SIZE 8192
+#define ANTS_GOSSIP_CTX_SIZE 16384
 
 typedef union {
     uint8_t _opaque[ANTS_GOSSIP_CTX_SIZE];
@@ -398,6 +413,73 @@ typedef struct {
     uint64_t last_seen_us;   /* monotonic stamp of the most recent new proof  */
 } ants_gossip_stats_t;
 
+/* ------------------------------------------------------------------------ */
+/* Chain frames — L2 proposals and attestations (RFC-0008 §11.13)           */
+/*                                                                          */
+/*   BLOCK  = { 0: 3, 1: block (bytes) }                                     */
+/*   ATTEST = { 0: 4, 1: height, 2: block_hash (32), 3: signer (32),         */
+/*              4: sig (64) }                                                */
+/*                                                                          */
+/* The engine floods them like PUSH (validate → new → forward to the fanout */
+/* excluding the sender) but does not interpret them: semantic validation   */
+/* (does the block decode, is the signer in the population, does the        */
+/* signature verify) and consumption belong to the chain handler the caller */
+/* registers. Deduplication is by BLAKE3(frame) for ANTS_GOSSIP_CHAIN_DEDUP_S. */
+/* Without a handler, chain frames are UNSUPPORTED_TYPE, as before.         */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t height;
+    uint8_t block_hash[32];
+    uint8_t signer[ANTS_GOSSIP_PEER_ID_SIZE];
+    uint8_t sig[64];
+} ants_gossip_attest_t;
+
+/* Encode / decode a BLOCK frame. decode points *out_block into `frame`. */
+ants_error_t ants_gossip_block_encode(const uint8_t *block,
+                                      size_t block_len,
+                                      uint8_t *out,
+                                      size_t cap,
+                                      size_t *out_len);
+ants_error_t ants_gossip_block_decode(const uint8_t *frame,
+                                      size_t len,
+                                      const uint8_t **out_block,
+                                      size_t *out_block_len);
+
+/* Encode / decode an ATTEST frame. */
+ants_error_t
+ants_gossip_attest_encode(const ants_gossip_attest_t *a, uint8_t *out, size_t cap, size_t *out_len);
+ants_error_t ants_gossip_attest_decode(const uint8_t *frame, size_t len, ants_gossip_attest_t *out);
+
+/*
+ * The chain handler: validate and consume one chain frame (`type` is
+ * ANTS_GOSSIP_MSG_BLOCK or _ATTEST; the frame already decoded structurally).
+ * `from_peer` is the neighbour it arrived on, or NULL for a frame this node
+ * originated (never handed back). Return:
+ *   ANTS_OK                     valid — the engine forwards it;
+ *   ANTS_ERROR_UNSUPPORTED_TYPE well-formed but not for this node (e.g. a
+ *                               non-degraded block in v1): dropped, NOT
+ *                               counted against the sender, not forwarded;
+ *   anything else               invalid: dropped and counted against the
+ *                               sender (the reject hook fires).
+ */
+typedef ants_error_t (*ants_gossip_chain_fn)(const uint8_t *from_peer,
+                                             uint64_t type,
+                                             const uint8_t *frame,
+                                             size_t len,
+                                             void *ctx);
+
+ants_error_t ants_gossip_set_chain_handler(ants_gossip_t *g, ants_gossip_chain_fn fn, void *ctx);
+
+/*
+ * Originate a chain frame: mark it seen (so its echo is not re-handled) and
+ * send it to the fanout. The caller encoded it with the codecs above.
+ * @return ANTS_OK; INVALID_ARG on NULL / len 0 / a frame over its type's cap
+ *         or not a BLOCK/ATTEST frame.
+ */
+ants_error_t
+ants_gossip_broadcast_chain(ants_gossip_t *g, const uint8_t *frame, size_t len, size_t *out_sent);
+
 /*
  * Copy the engine's current counters into *out.
  * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL g / out.
@@ -578,11 +660,12 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
 #define ANTS_GOSSIP_TRANSPORT_MAX_INBOUND_STREAMS 32u
 
 /* Per-inbound-stream accumulation cap (bytes): one length-prefixed frame —
- * the engine's default max frame plus the 2-byte length prefix. The deframer
+ * the largest frame any type may carry (a BLOCK, RFC-0008 §11.13) plus the
+ * 2-byte length prefix; the engine applies the per-type cap. The deframer
  * drains complete frames as they arrive, so the buffer never holds more than
- * one in-progress prefixed frame; a declared length over the engine cap, or a
+ * one in-progress prefixed frame; a declared length over this cap, or a
  * frame that otherwise cannot be deframed, releases the stream. */
-#define ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP (ANTS_GOSSIP_DEFAULT_MAX_FRAME + 2u)
+#define ANTS_GOSSIP_TRANSPORT_INBOUND_RECV_CAP (ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME + 2u)
 
 /* Maximum persistent outbound channels — one unidirectional stream per live
  * connection (see the lifetime note above). Bounded by the connection count,

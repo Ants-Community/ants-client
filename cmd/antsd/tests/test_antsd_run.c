@@ -45,9 +45,12 @@
 #include "config.h"
 
 #include "ants_attest.h"
+#include "ants_chain_runtime.h"
 #include "ants_common.h"
+#include "ants_crdt.h"
 #include "ants_crypto.h"
 #include "ants_dht.h"
+#include "ants_gossip.h"
 #include "ants_tee.h"
 #include "ants_transport.h"
 
@@ -196,6 +199,10 @@ static int capture_pump(int fd, capture_t *c, int wait_ms)
  * absolute deadline. While waiting, optionally tick a transport (and a
  * DHT riding on it) so our side of the QUIC/RPC exchange can progress
  * while we watch the daemon's log. */
+/* Extra work to run on every iteration of wait_for_output (the in-process
+ * seed's chain runtime, which needs its clock driven); NULL when unused. */
+static void (*g_extra_tick)(void) = NULL;
+
 static const char *wait_for_output(int fd,
                                    capture_t *c,
                                    const char *needle,
@@ -216,6 +223,9 @@ static const char *wait_for_output(int fd,
         }
         if (dht_tick != NULL) {
             ants_dht_tick(dht_tick);
+        }
+        if (g_extra_tick != NULL) {
+            g_extra_tick();
         }
         if (capture_pump(fd, c, tick != NULL ? 1 : 50) < 0) {
             return strstr(c->data, needle); /* EOF: last look */
@@ -637,6 +647,303 @@ static void test_run_bootstraps_to_seed(const char *antsd_path,
     unlink(cfg_path);
 }
 
+/* ------------------------------------------------------------------------ */
+/* L2 chain: two trustees, one of them the spawned daemon                    */
+/* ------------------------------------------------------------------------ */
+
+/* The in-process seed for the chain scenario: transport + DHT (so the
+ * daemon's bootstrap and gossip-view discovery work as in production) +
+ * gossip (binding + engine over its own G-Set) + a trustee chain runtime. */
+typedef struct {
+    ants_dht_t *dht;
+    ants_gossip_transport_t *binding;
+    ants_gossip_t *gossip;
+    ants_chain_rt_t *rt;     /* NULL until the genesis time arrives */
+    ants_chain_rt_t *rt_mem; /* storage, initialised lazily by cs_tick */
+    ants_chain_rt_config_t rcfg;
+    uint64_t genesis_time;
+    uint8_t priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t trustees[2][32];
+    int finals;
+    ants_chain_head_t head;
+} chain_seed_t;
+
+static chain_seed_t g_cs;
+
+static ants_error_t cs_event(const ants_transport_event_t *ev, void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    (void)ants_dht_handle_transport_event(c->dht, ev);
+    (void)ants_gossip_transport_handle_event(c->binding, ev);
+    if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
+        (void)ants_gossip_add_peer(c->gossip, ev->peer_id.bytes);
+    }
+    return ANTS_OK;
+}
+
+static ants_error_t cs_sign(const uint8_t hash[32], uint8_t sig[64], void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    return ants_ed25519_sign(c->priv, hash, 32, sig);
+}
+
+/* The seed's Layer-1 view: its G-Set is empty, like the daemon's. */
+static ants_error_t cs_view(uint64_t cutoff,
+                            const uint8_t (**ids)[32],
+                            size_t *n_ids,
+                            const ants_chain_event_t **events,
+                            size_t *n_events,
+                            void *ctx)
+{
+    (void)cutoff;
+    (void)ctx;
+    *ids = NULL;
+    *n_ids = 0;
+    *events = NULL;
+    *n_events = 0;
+    return ANTS_OK;
+}
+
+static void cs_out_proposal(const uint8_t *block, size_t len, void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    static uint8_t frame[ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME];
+    size_t flen = 0;
+    if (ants_gossip_block_encode(block, len, frame, sizeof frame, &flen) == ANTS_OK) {
+        (void)ants_gossip_broadcast_chain(c->gossip, frame, flen, NULL);
+    }
+}
+
+static void cs_out_attestation(const ants_chain_attestation_t *att, void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    ants_gossip_attest_t a;
+    a.height = att->height;
+    memcpy(a.block_hash, att->block_hash, 32);
+    memcpy(a.signer, att->signer, 32);
+    memcpy(a.sig, att->sig, 64);
+    uint8_t frame[256];
+    size_t flen = 0;
+    if (ants_gossip_attest_encode(&a, frame, sizeof frame, &flen) == ANTS_OK) {
+        (void)ants_gossip_broadcast_chain(c->gossip, frame, flen, NULL);
+    }
+}
+
+static void cs_final(const ants_chain_head_t *head, void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    c->finals++;
+    c->head = *head;
+}
+
+static ants_error_t
+cs_on_chain(const uint8_t *from, uint64_t type, const uint8_t *frame, size_t len, void *ctx)
+{
+    chain_seed_t *c = (chain_seed_t *)ctx;
+    (void)from;
+    uint64_t now = (uint64_t)time(NULL);
+    if (c->rt == NULL) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE; /* before genesis */
+    }
+    if (type == ANTS_GOSSIP_MSG_BLOCK) {
+        const uint8_t *b;
+        size_t bl;
+        ants_error_t rc = ants_gossip_block_decode(frame, len, &b, &bl);
+        return rc != ANTS_OK ? rc : ants_chain_rt_on_proposal(c->rt, b, bl, now);
+    }
+    ants_gossip_attest_t a;
+    if (ants_gossip_attest_decode(frame, len, &a) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    ants_chain_attestation_t att;
+    att.height = a.height;
+    memcpy(att.block_hash, a.block_hash, 32);
+    memcpy(att.signer, a.signer, 32);
+    memcpy(att.sig, a.sig, 64);
+    return ants_chain_rt_on_attestation(c->rt, &att, now);
+}
+
+static void cs_send(const uint8_t peer[32], const uint8_t *frame, size_t len, void *ctx)
+{
+    ants_gossip_transport_send(peer, frame, len, ctx);
+}
+
+static void cs_tick(void)
+{
+    uint64_t now = (uint64_t)time(NULL);
+    if (g_cs.rt == NULL && now >= g_cs.genesis_time) {
+        CHECK(ants_chain_rt_init(g_cs.rt_mem, &g_cs.rcfg, now) == ANTS_OK);
+        g_cs.rt = g_cs.rt_mem;
+    }
+    if (g_cs.rt != NULL) {
+        ants_chain_rt_tick(g_cs.rt, now);
+    }
+}
+
+static void test_run_chain_two_trustees(const char *antsd_path)
+{
+    /* The daemon and an in-process seed are the two genesis trustees.
+     * With k = 2, finality needs BOTH signatures, so a final block can only
+     * come out of a real exchange over the wire: the proposer's BLOCK frame
+     * reaching the other node, which recomputes it from its own view and
+     * gossips its ATTEST back. Both must then report the same head. */
+    memset(&g_cs, 0, sizeof g_cs);
+    memset(g_cs.priv, 0x56, sizeof g_cs.priv);
+    uint8_t seed_pub[32];
+    CHECK(ants_ed25519_pubkey_from_priv(g_cs.priv, seed_pub) == ANTS_OK);
+
+    antsd_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    memset(cfg.identity_priv, 0x34, sizeof cfg.identity_priv);
+    uint8_t daemon_pub[32];
+    CHECK(ants_ed25519_pubkey_from_priv(cfg.identity_priv, daemon_pub) == ANTS_OK);
+    bool seed_first = memcmp(seed_pub, daemon_pub, 32) < 0;
+    memcpy(g_cs.trustees[0], seed_first ? seed_pub : daemon_pub, 32);
+    memcpy(g_cs.trustees[1], seed_first ? daemon_pub : seed_pub, 32);
+    /* Genesis 2 s ahead: both nodes start before it — the daemon must wait
+     * for it (pending) rather than run with the chain off. */
+    uint64_t genesis_time = (uint64_t)time(NULL) + 2;
+    g_cs.genesis_time = genesis_time;
+
+    static ants_transport_t st;
+    memset(&st, 0, sizeof st);
+    ants_transport_config_t tcfg;
+    memset(&tcfg, 0, sizeof tcfg);
+    memcpy(tcfg.pub, seed_pub, 32);
+    tcfg.sign_fn = real_sign;
+    tcfg.sign_ctx = g_cs.priv;
+    tcfg.event_fn = cs_event;
+    tcfg.event_ctx = &g_cs;
+    tcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK(ants_transport_init(&st, &tcfg) == ANTS_OK);
+    char seed_addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK(ants_transport_local_addr(&st, seed_addr, sizeof seed_addr) == ANTS_OK);
+
+    static ants_dht_t sd;
+    memset(&sd, 0, sizeof sd);
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &st;
+    memcpy(dcfg.local_peer_id.bytes, seed_pub, 32);
+    dcfg.event_fn = noop_dht_event;
+    CHECK(ants_dht_init(&sd, &dcfg) == ANTS_OK);
+    g_cs.dht = &sd;
+
+    ants_crdt_t *gset = NULL;
+    CHECK(ants_crdt_init(&gset) == ANTS_OK);
+    static ants_gossip_t sg;
+    static ants_gossip_transport_t sb;
+    memset(&sg, 0, sizeof sg);
+    memset(&sb, 0, sizeof sb);
+    CHECK(ants_gossip_transport_init(&sb, &sg, &st) == ANTS_OK);
+    CHECK(ants_gossip_init(&sg, gset, seed_pub, NULL, cs_send, &sb) == ANTS_OK);
+    CHECK(ants_gossip_set_chain_handler(&sg, cs_on_chain, &g_cs) == ANTS_OK);
+    g_cs.gossip = &sg;
+    g_cs.binding = &sb;
+
+    static ants_chain_rt_t srt;
+    ants_chain_rt_config_t rcfg;
+    memset(&rcfg, 0, sizeof rcfg);
+    g_cs.rt_mem = &srt;
+    rcfg.trustees = (const uint8_t(*)[32])g_cs.trustees;
+    rcfg.n_trustees = 2;
+    rcfg.genesis_time = genesis_time;
+    memset(rcfg.genesis_hash, 0x47, 32);
+    rcfg.k_phase = ANTS_CHAIN_RT_PHASE1_K;
+    memcpy(rcfg.self, seed_pub, 32);
+    rcfg.sign_fn = cs_sign;
+    rcfg.sign_ctx = &g_cs;
+    rcfg.view_fn = cs_view;
+    rcfg.proposal_fn = cs_out_proposal;
+    rcfg.attestation_fn = cs_out_attestation;
+    rcfg.final_fn = cs_final;
+    rcfg.out_ctx = &g_cs;
+    g_cs.rcfg = rcfg; /* initialised by cs_tick at the genesis time */
+
+    /* Daemon config: listener, the seed to bootstrap from, the genesis. */
+    static const char listen[] = "/ip4/127.0.0.1/udp/0/quic-v1";
+    memcpy(cfg.listen_multiaddr, listen, sizeof listen);
+    memcpy(cfg.seeds[0].addr, seed_addr, strlen(seed_addr));
+    memcpy(cfg.seeds[0].peer_id, seed_pub, 32);
+    cfg.seed_count = 1;
+    cfg.genesis.present = true;
+    cfg.genesis.time = genesis_time;
+    memset(cfg.genesis.hash, 0x47, 32);
+    memcpy(cfg.genesis.trustees, g_cs.trustees, sizeof g_cs.trustees);
+    cfg.genesis.trustee_count = 2;
+    static uint8_t enc[ANTSD_CONFIG_ENCODED_MAX];
+    size_t enc_len = 0;
+    CHECK(antsd_config_encode(&cfg, enc, sizeof enc, &enc_len) == ANTS_OK);
+    char cfg_path[512];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(cfg_path, sizeof cfg_path, "%s/antsd_chain_XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    int cfd = mkstemp(cfg_path);
+    CHECK(cfd >= 0);
+    if (cfd < 0) {
+        return;
+    }
+    CHECK(write(cfd, enc, enc_len) == (ssize_t)enc_len);
+    CHECK(close(cfd) == 0);
+
+    pid_t pid = -1;
+    int out_fd = spawn_run(antsd_path, cfg_path, &pid);
+    CHECK(out_fd >= 0);
+    if (out_fd < 0) {
+        unlink(cfg_path);
+        return;
+    }
+    static capture_t cap;
+    memset(&cap, 0, sizeof cap);
+
+    /* First final block: the drand floor (30 s) dominates. */
+    g_extra_tick = cs_tick;
+    const char *hit = wait_for_output(out_fd,
+                                      &cap,
+                                      "antsd: chain final height=",
+                                      now_ms() + 30000 + ANTS_CHAIN_RT_DRAND_FLOOR_S * 1000,
+                                      &st,
+                                      &sd);
+    CHECK(hit != NULL);
+    CHECK(strstr(cap.data, "antsd: chain waiting for genesis time") != NULL);
+    CHECK(strstr(cap.data, "antsd: chain on (trustee, 2 trustees) at genesis time") != NULL);
+    unsigned long long d_height = 0;
+    char d_hash[65] = {0};
+    if (hit != NULL) {
+        CHECK(sscanf(hit, "antsd: chain final height=%llu hash=%64s", &d_height, d_hash) == 2);
+    }
+    /* The seed reaches the same head (it may finalise a beat later). */
+    uint64_t until = now_ms() + 10000;
+    while (now_ms() < until && (g_cs.rt == NULL || g_cs.head.height < d_height)) {
+        tick_pace();
+        ants_transport_tick(&st);
+        ants_dht_tick(&sd);
+        cs_tick();
+    }
+    g_extra_tick = NULL;
+    CHECK(d_height >= 1);
+    CHECK(g_cs.head.height == d_height);
+    char s_hash[65];
+    hex_format(g_cs.head.hash, 32, s_hash);
+    s_hash[64] = '\0';
+    CHECK(strcmp(s_hash, d_hash) == 0);
+    CHECK(g_cs.head.degraded_seed);
+
+    CHECK(kill(pid, SIGTERM) == 0);
+    int status = reap_with_deadline(pid, EXIT_DEADLINE_MS);
+    CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    while (capture_pump(out_fd, &cap, 100) > 0) {
+    }
+    if (failures > 0) {
+        fprintf(stderr, "daemon output: <<<%s>>>\n", cap.data);
+    }
+    CHECK(ants_transport_destroy(&st, 0) == ANTS_OK);
+    ants_gossip_transport_destroy(&sb);
+    CHECK(ants_dht_destroy(&sd) == ANTS_OK);
+    ants_crdt_destroy(gset);
+    close(out_fd);
+    unlink(cfg_path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -657,6 +964,7 @@ int main(int argc, char **argv)
     foreign.blob = TDX_KAT_QUOTE;
     foreign.blob_len = sizeof TDX_KAT_QUOTE;
     test_run_bootstraps_to_seed(argv[1], &foreign);
+    test_run_chain_two_trustees(argv[1]);
 
     if (failures == 0) {
         printf("all checks passed\n");

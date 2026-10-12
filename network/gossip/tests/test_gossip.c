@@ -988,6 +988,204 @@ static void test_reject_table_overflow(void)
  * fire. A 1 ms sleep per iteration lets real time advance (the same macOS-CI
  * flake mitigation as test_dht.c); the loop still breaks as soon as its
  * predicate holds, so green runs stay fast. */
+/* ---- chain frames (RFC-0008 §11.13) ------------------------------------ */
+
+static void test_chain_codec(void)
+{
+    /* BLOCK {0: 3, 1: h'616263'} — bytes written out by hand. */
+    static const uint8_t blk[] = {'a', 'b', 'c'};
+    static const uint8_t want_block[] = {0xa2, 0x00, 0x03, 0x01, 0x43, 0x61, 0x62, 0x63};
+    uint8_t buf[256];
+    size_t len = 0;
+    CHECK_EQ(ants_gossip_block_encode(blk, sizeof blk, buf, sizeof buf, &len), ANTS_OK);
+    CHECK(len == sizeof want_block && memcmp(buf, want_block, len) == 0);
+    const uint8_t *got = NULL;
+    size_t got_len = 0;
+    CHECK_EQ(ants_gossip_block_decode(want_block, sizeof want_block, &got, &got_len), ANTS_OK);
+    CHECK(got_len == 3 && got == want_block + 5);
+
+    /* ATTEST {0: 4, 1: 7, 2: h'11'*32, 3: h'22'*32, 4: h'33'*64}. */
+    ants_gossip_attest_t a;
+    a.height = 7;
+    memset(a.block_hash, 0x11, 32);
+    memset(a.signer, 0x22, 32);
+    memset(a.sig, 0x33, 64);
+    uint8_t want_att[5 + 3 + 32 + 3 + 32 + 3 + 64];
+    size_t w = 0;
+    want_att[w++] = 0xa5;
+    want_att[w++] = 0x00;
+    want_att[w++] = 0x04;
+    want_att[w++] = 0x01;
+    want_att[w++] = 0x07;
+    want_att[w++] = 0x02;
+    want_att[w++] = 0x58;
+    want_att[w++] = 0x20;
+    memset(want_att + w, 0x11, 32);
+    w += 32;
+    want_att[w++] = 0x03;
+    want_att[w++] = 0x58;
+    want_att[w++] = 0x20;
+    memset(want_att + w, 0x22, 32);
+    w += 32;
+    want_att[w++] = 0x04;
+    want_att[w++] = 0x58;
+    want_att[w++] = 0x40;
+    memset(want_att + w, 0x33, 64);
+    w += 64;
+    CHECK(w == sizeof want_att);
+    CHECK_EQ(ants_gossip_attest_encode(&a, buf, sizeof buf, &len), ANTS_OK);
+    CHECK(len == sizeof want_att && memcmp(buf, want_att, len) == 0);
+    ants_gossip_attest_t d;
+    CHECK_EQ(ants_gossip_attest_decode(want_att, sizeof want_att, &d), ANTS_OK);
+    CHECK(d.height == 7 && memcmp(&d, &a, sizeof d) == 0);
+
+    /* Rejections. */
+    uint8_t m[sizeof want_att];
+    memcpy(m, want_att, sizeof m);
+    m[7] = 0x1f; /* block_hash declared 31 bytes */
+    CHECK(ants_gossip_attest_decode(m, sizeof m, &d) != ANTS_OK);
+    static const uint8_t empty_block[] = {0xa2, 0x00, 0x03, 0x01, 0x40};
+    CHECK(ants_gossip_block_decode(empty_block, sizeof empty_block, &got, &got_len) != ANTS_OK);
+    /* A BLOCK decoder handed an ATTEST frame, and vice versa. */
+    CHECK(ants_gossip_block_decode(want_att, sizeof want_att, &got, &got_len) != ANTS_OK);
+    CHECK(ants_gossip_attest_decode(want_block, sizeof want_block, &d) != ANTS_OK);
+}
+
+/* Chain handler capture: how often it ran, and what it answers. */
+struct chain_capture {
+    int calls;
+    ants_error_t answer;
+    uint64_t last_type;
+};
+
+static ants_error_t
+chain_fn(const uint8_t *from_peer, uint64_t type, const uint8_t *frame, size_t len, void *ctx)
+{
+    struct chain_capture *c = (struct chain_capture *)ctx;
+    (void)from_peer;
+    (void)frame;
+    (void)len;
+    c->calls++;
+    c->last_type = type;
+    return c->answer;
+}
+
+static void test_chain_flood_and_dedup(void)
+{
+    /* A -> B -> C. A originates a BLOCK: B and C each hand it to their chain
+     * handler once and B forwards it. A second broadcast of the SAME frame
+     * inside the dedup window reaches B again but is not re-handled. */
+    static struct harness h;
+    harness_init(&h, 3, 0x60);
+    node_t *a = &h.nodes[0], *b = &h.nodes[1], *c = &h.nodes[2];
+    link_dir(a, b);
+    link_dir(b, c);
+    struct chain_capture cb = {0, ANTS_OK, 0}, cc = {0, ANTS_OK, 0};
+    CHECK_EQ(ants_gossip_set_chain_handler(&b->g, chain_fn, &cb), ANTS_OK);
+    CHECK_EQ(ants_gossip_set_chain_handler(&c->g, chain_fn, &cc), ANTS_OK);
+
+    static const uint8_t blk[] = {0x01, 0x02, 0x03, 0x04};
+    uint8_t frame[64];
+    size_t len = 0;
+    CHECK_EQ(ants_gossip_block_encode(blk, sizeof blk, frame, sizeof frame, &len), ANTS_OK);
+    size_t sent = 0;
+    CHECK_EQ(ants_gossip_broadcast_chain(&a->g, frame, len, &sent), ANTS_OK);
+    CHECK(sent == 1);
+    harness_pump(&h);
+    CHECK(cb.calls == 1 && cb.last_type == ANTS_GOSSIP_MSG_BLOCK);
+    CHECK(cc.calls == 1);
+    CHECK(h.total_new == 2);
+
+    CHECK_EQ(ants_gossip_broadcast_chain(&a->g, frame, len, &sent), ANTS_OK);
+    harness_pump(&h);
+    CHECK(cb.calls == 1); /* duplicate inside the window */
+    CHECK(cc.calls == 1);
+    harness_destroy(&h);
+}
+
+static void test_chain_unsupported_and_invalid(void)
+{
+    /* B answers UNSUPPORTED_TYPE: the frame is neither forwarded to C nor
+     * counted against A. Then B answers MALFORMED: still not forwarded,
+     * and now counted (stats.rejected, out_rejected). */
+    static struct harness h;
+    harness_init(&h, 3, 0x70);
+    node_t *a = &h.nodes[0], *b = &h.nodes[1], *c = &h.nodes[2];
+    link_dir(a, b);
+    link_dir(b, c);
+    struct chain_capture cb = {0, ANTS_ERROR_UNSUPPORTED_TYPE, 0}, cc = {0, ANTS_OK, 0};
+    CHECK_EQ(ants_gossip_set_chain_handler(&b->g, chain_fn, &cb), ANTS_OK);
+    CHECK_EQ(ants_gossip_set_chain_handler(&c->g, chain_fn, &cc), ANTS_OK);
+
+    ants_gossip_attest_t at;
+    memset(&at, 0x44, sizeof at);
+    at.height = 9;
+    uint8_t frame[256];
+    size_t len = 0;
+    CHECK_EQ(ants_gossip_attest_encode(&at, frame, sizeof frame, &len), ANTS_OK);
+    CHECK_EQ(ants_gossip_broadcast_chain(&a->g, frame, len, NULL), ANTS_OK);
+    harness_pump(&h);
+    CHECK(cb.calls == 1 && cc.calls == 0);
+    ants_gossip_stats_t st;
+    CHECK_EQ(ants_gossip_get_stats(&b->g, &st), ANTS_OK);
+    CHECK(st.rejected == 0);
+
+    cb.answer = ANTS_ERROR_MALFORMED;
+    at.height = 10; /* a different frame: not deduplicated */
+    CHECK_EQ(ants_gossip_attest_encode(&at, frame, sizeof frame, &len), ANTS_OK);
+    size_t nw = 9, rj = 9;
+    CHECK_EQ(ants_gossip_on_message(&b->g, a->id, frame, len, &nw, &rj), ANTS_OK);
+    CHECK(nw == 0 && rj == 1);
+    CHECK_EQ(ants_gossip_get_stats(&b->g, &st), ANTS_OK);
+    CHECK(st.rejected == 1);
+    harness_pump(&h);
+    CHECK(cc.calls == 0);
+
+    /* A node with no chain handler keeps the old contract. */
+    CHECK_EQ(ants_gossip_on_message(&a->g, b->id, frame, len, NULL, NULL),
+             ANTS_ERROR_UNSUPPORTED_TYPE);
+    harness_destroy(&h);
+}
+
+static void test_chain_frame_caps(void)
+{
+    /* A BLOCK may exceed max_frame_bytes (up to the 32 KiB cap); no other
+     * type may. Driven straight into on_message (the harness queue holds
+     * only default-size frames); B has an empty view, so nothing is sent. */
+    static struct harness h;
+    harness_init(&h, 2, 0x80);
+    node_t *a = &h.nodes[0], *b = &h.nodes[1];
+    struct chain_capture cb = {0, ANTS_OK, 0};
+    CHECK_EQ(ants_gossip_set_chain_handler(&b->g, chain_fn, &cb), ANTS_OK);
+
+    static uint8_t blk[ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME];
+    static uint8_t frame[ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME + 16];
+    memset(blk, 0x5A, sizeof blk);
+    size_t len = 0;
+    CHECK_EQ(ants_gossip_block_encode(blk, 10000, frame, sizeof frame, &len), ANTS_OK);
+    CHECK(len > ANTS_GOSSIP_DEFAULT_MAX_FRAME);
+    CHECK_EQ(ants_gossip_on_message(&b->g, a->id, frame, len, NULL, NULL), ANTS_OK);
+    CHECK(cb.calls == 1);
+
+    /* Over the BLOCK cap: refused by the encoder, rejected by the engine. */
+    CHECK_EQ(ants_gossip_block_encode(blk, sizeof blk, frame, sizeof frame, &len),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_gossip_on_message(
+                 &b->g, a->id, frame, ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME + 1, NULL, NULL),
+             ANTS_ERROR_MALFORMED);
+
+    /* A PUSH above max_frame_bytes is still MALFORMED (per-type cap). */
+    CHECK_EQ(ants_gossip_push_encode(blk, 5000, frame, sizeof frame, &len), ANTS_OK);
+    CHECK_EQ(ants_gossip_on_message(&b->g, a->id, frame, len, NULL, NULL), ANTS_ERROR_MALFORMED);
+
+    /* broadcast_chain refuses anything that is not a BLOCK/ATTEST frame. */
+    CHECK_EQ(ants_gossip_push_encode(blk, 100, frame, sizeof frame, &len), ANTS_OK);
+    CHECK_EQ(ants_gossip_broadcast_chain(&a->g, frame, len, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_gossip_broadcast_chain(NULL, frame, len, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK(cb.calls == 1);
+    harness_destroy(&h);
+}
+
 static void tick_pace(void)
 {
     struct timespec ts = {0, 1000000L}; /* 1 ms */
@@ -1158,6 +1356,10 @@ static void test_two_node_over_quic(void)
 
 int main(void)
 {
+    test_chain_codec();
+    test_chain_flood_and_dedup();
+    test_chain_unsupported_and_invalid();
+    test_chain_frame_caps();
     test_push_codec_roundtrip();
     test_push_codec_errors();
     test_view_management();

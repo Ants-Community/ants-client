@@ -213,7 +213,7 @@ static bool inbound_drain(struct gossip_transport_state *s, struct gt_inbound *s
 {
     while (slot->recv_len >= GT_LEN_PREFIX) {
         size_t flen = ((size_t)slot->recv_buf[0] << 8) | (size_t)slot->recv_buf[1];
-        if (flen == 0 || flen > ANTS_GOSSIP_DEFAULT_MAX_FRAME) {
+        if (flen == 0 || flen > ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME) {
             inbound_release(slot);
             return false;
         }
@@ -346,6 +346,9 @@ void ants_gossip_transport_send(const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE],
     }
     struct gossip_transport_state *s = state_of((ants_gossip_transport_t *)ctx);
 
+    if (len > ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME) {
+        return; /* no frame type is this large */
+    }
     ants_transport_conn_t *conn = conn_find_by_peer(s, peer_id);
     if (conn == NULL) {
         return; /* no live connection to this peer — best-effort drop */
@@ -380,11 +383,23 @@ void ants_gossip_transport_send(const uint8_t peer_id[ANTS_GOSSIP_PEER_ID_SIZE],
      * send queue (all-or-nothing), so no partial frame can corrupt the
      * receiver's deframing; a rare queue-full drops this whole frame. */
     {
-        uint8_t out[GT_LEN_PREFIX + ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+        /* Small frames (proofs, digests, attestations) frame on the stack;
+         * a BLOCK can reach 32 KiB and is framed on the heap. */
+        uint8_t small[GT_LEN_PREFIX + ANTS_GOSSIP_DEFAULT_MAX_FRAME];
+        uint8_t *out = small;
+        if (len > ANTS_GOSSIP_DEFAULT_MAX_FRAME) {
+            out = (uint8_t *)malloc(GT_LEN_PREFIX + len);
+            if (out == NULL) {
+                return;
+            }
+        }
         out[0] = (uint8_t)((len >> 8) & 0xFFu);
         out[1] = (uint8_t)(len & 0xFFu);
         memcpy(out + GT_LEN_PREFIX, frame, len);
         (void)ants_transport_stream_send(slot->stream, out, GT_LEN_PREFIX + len, false);
+        if (out != small) {
+            free(out);
+        }
     }
 }
 

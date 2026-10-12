@@ -74,3 +74,33 @@ void antsd_hex_format(const uint8_t *bytes, size_t n, char *out, size_t cap)
         out[o] = '\0';
     }
 }
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+int antsd_hex_parse(const char *hex, uint8_t *out, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (hex[2 * i] == '\0' || hex[2 * i + 1] == '\0') {
+            return -1;
+        }
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return hex[2 * n] == '\0' ? 0 : -1;
+}

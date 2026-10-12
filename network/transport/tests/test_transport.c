@@ -886,6 +886,78 @@ static void test_loopback_byte_exchange(void)
     CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
 }
 
+/* One quiet connection with a 2-s idle timeout on both ends: does it
+ * survive `quiet_ms` of silence? Returns the dialer's CONN_CLOSED count. */
+static int run_quiet_connection(bool keep_alive, int quiet_ms)
+{
+    uint8_t dp[ANTS_ED25519_PRIVKEY_SIZE], dpub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t lp[ANTS_ED25519_PRIVKEY_SIZE], lpub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(dp, 0x13, sizeof dp);
+    memset(lp, 0x24, sizeof lp);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(dp, dpub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(lp, lpub), ANTS_OK);
+    test_event_recorder_t drec, lrec;
+    memset(&drec, 0, sizeof drec);
+    memset(&lrec, 0, sizeof lrec);
+
+    static ants_transport_t listener, dialer;
+    memset(&listener, 0, sizeof listener);
+    memset(&dialer, 0, sizeof dialer);
+    ants_transport_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    memcpy(cfg.pub, lpub, sizeof lpub);
+    cfg.sign_fn = test_real_sign;
+    cfg.sign_ctx = lp;
+    cfg.event_fn = test_recording_event;
+    cfg.event_ctx = &lrec;
+    cfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    cfg.idle_timeout_ms = 2000;
+    CHECK_EQ(ants_transport_init(&listener, &cfg), ANTS_OK);
+    char laddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&listener, laddr, sizeof laddr), ANTS_OK);
+
+    memset(&cfg, 0, sizeof cfg);
+    memcpy(cfg.pub, dpub, sizeof dpub);
+    cfg.sign_fn = test_real_sign;
+    cfg.sign_ctx = dp;
+    cfg.event_fn = test_recording_event;
+    cfg.event_ctx = &drec;
+    cfg.idle_timeout_ms = 2000;
+    cfg.keep_alive = keep_alive;
+    CHECK_EQ(ants_transport_init(&dialer, &cfg), ANTS_OK);
+
+    static ants_transport_conn_t conn;
+    memset(&conn, 0, sizeof conn);
+    CHECK_EQ(ants_transport_dial(&dialer, laddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500 && drec.conn_ready == 0; i++) {
+        tick_pace();
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+    CHECK(drec.conn_ready == 1);
+    /* Silence: no application traffic at all, just ticking. */
+    for (int i = 0; i < quiet_ms; i++) {
+        tick_pace();
+        ants_transport_tick(&dialer);
+        ants_transport_tick(&listener);
+    }
+    int closed = drec.conn_closed;
+    CHECK_EQ(ants_transport_destroy(&dialer, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&listener, 0), ANTS_OK);
+    return closed;
+}
+
+static void test_idle_timeout_and_keep_alive(void)
+{
+    /* idle_timeout_ms is honoured (it used to be ignored: every connection
+     * ran on picoquic's 30-s default), and keep_alive keeps a quiet but
+     * live connection up past it. The tick loop runs ~1 ms per iteration
+     * plus tick cost, so 5000 iterations is at least 5 s of silence —
+     * well past the 2-s timeout. */
+    CHECK(run_quiet_connection(false, 5000) == 1);
+    CHECK(run_quiet_connection(true, 5000) == 0);
+}
+
 static void test_introspection_safe_defaults(void)
 {
     /* The four introspection helpers return safe defaults rather than
@@ -942,6 +1014,7 @@ int main(void)
     test_loopback_byte_exchange();
     test_introspection_safe_defaults();
     test_conn_introspection_stubs();
+    test_idle_timeout_and_keep_alive();
 
     if (failures > 0) {
         fprintf(stderr, "%d test check(s) failed\n", failures);

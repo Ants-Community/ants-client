@@ -256,11 +256,21 @@ typedef struct {
      * Format: same multiaddr textual form as dial_addr accepts. */
     const char *listen_multiaddr;
 
-    /* Idle timeout in milliseconds. Connections with no application
-     * traffic for this long are torn down. Recommended caller-side
-     * default: 30000 ms. 0 means "no timeout" and is permitted but not
-     * recommended for production. */
+    /* Idle timeout in milliseconds: a connection on which nothing at all
+     * arrives from the peer for this long is torn down (QUIC max_idle_
+     * timeout; the effective value is the smaller of the two peers').
+     * Recommended caller-side default: 30000 ms. 0 means "no timeout" and
+     * is permitted but not recommended for production. */
     uint32_t idle_timeout_ms;
+
+    /* Send QUIC keep-alives (PING) every idle_timeout_ms / 2 on every
+     * connection once it is ready, so a live but quiet peer is never torn
+     * down — the idle timeout then only detects peers that stopped
+     * answering. A node whose protocols have long silent stretches (the
+     * L2 chain waits out a 30-s drand floor at every attempt) needs this,
+     * or its connections drop between messages. Ignored when
+     * idle_timeout_ms is 0. */
+    bool keep_alive;
 
     /* Maximum number of concurrent connections. Bounds memory: each
      * inbound CONN_READY is rejected at the handshake if accepting

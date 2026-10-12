@@ -4,7 +4,9 @@ P2P transport. Network layer.
 
 **Status:** feature-complete at v0.x (Component #4) — the QUIC transport over
 vendored picoquic, with Ed25519 / RFC-7250 peer identity, multiplexed streams,
-and CBOR framing. `ants_transport_conn_peer_id` reports a connection's
+and CBOR framing. The configured idle timeout applies to every connection,
+and the optional QUIC keep-alive keeps quiet but live peers connected.
+`ants_transport_conn_peer_id` reports a connection's
 authenticated peer key; the peer-address / peer-list introspection accessors
 remain stubbed in v1.0 (no durable peer state yet).
 **Effort:** 5 EM total (~3 EM picoquic wrapping + ~2 EM application protocol).
