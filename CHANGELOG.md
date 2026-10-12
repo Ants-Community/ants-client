@@ -13,6 +13,26 @@ the spec repo's
 
 ## Unreleased
 
+### foundation/tee: RFC-0008 §11.12 report_data binding — issued_at becomes signed · 2026-10-12
+
+`foundation/tee`: implements the binding pinned by RFC-0008 v0.9 §11.12. `ants_attestation_verify` used to check only `report_data[0:32] == peer_pubkey` and left the upper 32 bytes unconstrained, so `issued_at_unix` was unsigned presenter metadata. Anyone replaying a stale attestation could re-date it, and the 30-day freshness window bounded nothing. The comment in `is_fresh` said so openly: future-dating was allowed "on purpose".
+
+Verify now requires the full 64 bytes to equal `peer_pubkey ‖ LE64(issued_at) ‖ 0×24`, built by the new public `ants_attestation_report_data`. The generate side will use the same builder. A negative `issued_at` is rejected as MALFORMED, because the wire field is unsigned. Since `issued_at` is now signed, `ants_attestation_is_fresh` rejects an issuance more than `ANTS_TEE_CLOCK_SKEW_SECONDS` (300 s, RFC-0005's ±5 min) in the verifier's future. The skew arithmetic is wrap-free at the INT64 extremes and UBSan-clean.
+
+Verify is restructured into two halves:
+- **Evidence:** the chain to the pinned root plus the report/quote signature, now `tdx_verify_evidence` / `snp_verify_evidence`. It returns the signed `report_data`.
+- **Binding:** compares that `report_data` against the builder's output.
+
+Genuine vendor KATs carry third-party `report_data`, so none of them can satisfy the full binding. That positive test needs `generate` on a real CVM. `test_attestation` therefore exercises the evidence half over the real TDX/SNP attestations through an internal hook, `ants_attestation__test_verify_evidence`. Every tamper case now goes through the hook, so each failure comes from the tamper itself and not from the binding.
+
+The binding half is covered by:
+- a hand-written known answer;
+- the SNP KAT's own `report_data`, reproduced exactly by `report_data(peer, 0)`;
+- verify rejecting genuine-but-unbound evidence;
+- the SNP case where claiming `issued_at = 0` satisfies the binding but then fails chain validity, so rewriting `issued_at` cannot get past both checks.
+
+Falsified on both checks: truncating the comparison to 32 bytes fails 2 checks, and disabling the skew rule fails 4.
+
 ### network/dht: enforce lookup_deadline_ms — LOOKUP_TIMEOUT fires · 2026-10-12
 
 `network/dht`: `ants_dht_config_t.lookup_deadline_ms` was stored at init and

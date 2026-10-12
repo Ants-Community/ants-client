@@ -111,6 +111,7 @@ static void test_verify_dispatch_contract(void)
 static void test_is_fresh(void)
 {
     /* Contract (ants_tee.h): true iff now - issued_at_unix < window AND
+     * issued_at_unix <= now + ANTS_TEE_CLOCK_SKEW_SECONDS AND
      * (expires_at_unix == 0 || now < expires_at_unix); false on a null
      * pointer or a non-positive window. */
     ants_attestation_t att;
@@ -132,13 +133,14 @@ static void test_is_fresh(void)
     CHECK(ants_attestation_is_fresh(&att, 100, 100) == false);  /* age 100 == 100 */
     CHECK(ants_attestation_is_fresh(&att, 1000, 100) == false); /* age far past window */
 
-    /* A future-dated issuance (now < issued) is within the window per the
-     * documented contract — recency only bounds *staleness*. issued_at_unix
-     * is local metadata, not part of the signed report; the adversarial gate
-     * is ants_attestation_verify + the report_data <-> pubkey binding. */
+    /* Future-dated issuance: issued_at is signed (committed in report_data,
+     * RFC-0008 §11.12), so only clock skew is tolerated — up to
+     * ANTS_TEE_CLOCK_SKEW_SECONDS ahead of `now`, inclusive. */
     att.issued_at_unix = 2000;
     att.expires_at_unix = 0;
-    CHECK(ants_attestation_is_fresh(&att, 1500, 1000) == true); /* age -500 < 1000 */
+    CHECK(ants_attestation_is_fresh(&att, 2000 - ANTS_TEE_CLOCK_SKEW_SECONDS, 1000) == true);
+    CHECK(ants_attestation_is_fresh(&att, 2000 - ANTS_TEE_CLOCK_SKEW_SECONDS - 1, 1000) == false);
+    CHECK(ants_attestation_is_fresh(&att, 1500, 1000) == false); /* 500 s ahead */
 
     /* Vendor expiry present: fresh also requires now < expires, strict — even
      * while still inside the recency window. */
@@ -157,8 +159,14 @@ static void test_is_fresh(void)
      * addition (UB; the Debug build runs UBSan). Math: age is small, fresh. */
     att.issued_at_unix = INT64_MAX - 10;
     att.expires_at_unix = 0;
-    CHECK(ants_attestation_is_fresh(&att, INT64_MAX, 1000) == true);       /* age 10 < 1000 */
-    CHECK(ants_attestation_is_fresh(&att, INT64_MAX - 100, 1000) == true); /* future, in window */
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX, 1000) == true);         /* age 10 < 1000 */
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX - 100, 1000) == true);   /* 90 s ahead: skew */
+    CHECK(ants_attestation_is_fresh(&att, INT64_MAX - 1000, 1000) == false); /* 990 s ahead */
+
+    /* Skew arithmetic at the other extreme: issued far ahead of a hugely
+     * negative now must not wrap (the difference exceeds INT64_MAX). */
+    att.issued_at_unix = INT64_MAX;
+    CHECK(ants_attestation_is_fresh(&att, INT64_MIN, INT64_MAX) == false);
 
     /* Overflow safety: issued_at_unix at INT64_MIN is the farthest possible
      * past — unambiguously stale, evaluated without wrapping the subtraction. */

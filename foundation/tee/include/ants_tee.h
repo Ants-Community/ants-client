@@ -74,6 +74,15 @@ typedef int32_t ants_tee_vendor_t;
  * value, not a baked-in literal. */
 #define ANTS_TEE_DEFAULT_FRESHNESS_WINDOW_SECONDS ((int64_t)(30 * 24 * 3600))
 
+/* Clock skew tolerated on the signed issued_at (RFC-0005 §Attestation
+ * freshness window: ±5 minutes; RFC-0008 §7 ATTESTATION_CLOCK_SKEW). An
+ * issuance further than this in the verifier's future is not fresh. */
+#define ANTS_TEE_CLOCK_SKEW_SECONDS ((int64_t)300)
+
+/* The 64 guest-chosen report_data bytes both SNP and TDX sign. RFC-0008
+ * §11.12 pins their layout — see ants_attestation_report_data. */
+#define ANTS_TEE_REPORT_DATA_SIZE 64
+
 /* Default vendor revocation propagation bound: 72 hours. After this
  * window, revoked attestations are network-wide rejected. */
 #define ANTS_TEE_DEFAULT_REVOCATION_BOUND_SECONDS ((int64_t)(72 * 3600))
@@ -113,9 +122,11 @@ typedef struct {
      * fingerprint). Format is vendor-defined; opaque to consumers
      * except for equality comparison against vendor revocation lists. */
     uint8_t tcb_identifier[ANTS_TEE_TCB_IDENTIFIER_SIZE];
-    /* Issuance time (seconds since Unix epoch). Used by the freshness
-     * window check; the harness does NOT consult a system clock —
-     * callers supply the reference `now`. */
+    /* Issuance time (seconds since Unix epoch). Signed: committed in the
+     * evidence's report_data (RFC-0008 §11.12), so ants_attestation_verify
+     * rejects a presentation whose issued_at was rewritten. Used by the
+     * freshness window check; the harness does NOT consult a system
+     * clock — callers supply the reference `now`. */
     int64_t issued_at_unix;
     /* Vendor-supplied expiry (seconds since Unix epoch). May be 0 if
      * the vendor doesn't carry a hard expiry; in that case the freshness
@@ -150,16 +161,37 @@ ants_error_t ants_attestation_generate(ants_tee_vendor_t vendor,
                                        ants_attestation_t *out);
 
 /*
- * Verify the attestation's vendor signature chain. Does NOT consult the
- * freshness window or revocation state — those are separate, composable
- * checks. Returns ANTS_OK on a valid signature chain;
- * ANTS_ERROR_MALFORMED on invalid blob, wrong vendor root, or bound
- * pubkey mismatch.
+ * Build the 64-byte report_data an attestation binding `peer_pubkey` at
+ * `issued_at_unix` must carry (RFC-0008 §11.12):
+ *
+ *     peer_pubkey[32] ‖ LE64(issued_at_unix) ‖ 0x00 × 24
+ *
+ * The generate side writes it into the TEE report; verify compares it.
+ * Returns ANTS_ERROR_INVALID_ARG on NULL args or a negative
+ * issued_at_unix (the wire field is unsigned).
+ */
+ants_error_t ants_attestation_report_data(const uint8_t peer_pubkey[32],
+                                          int64_t issued_at_unix,
+                                          uint8_t out[ANTS_TEE_REPORT_DATA_SIZE]);
+
+/*
+ * Verify the attestation (RFC-0008 §11.12 steps 1-4): the vendor
+ * certificate chain to the pinned root, valid at issued_at_unix; the
+ * report/quote signature under the chain's leaf; and the signed
+ * report_data equal to ants_attestation_report_data(peer_pubkey,
+ * issued_at_unix). `peer_pubkey` MUST be the identity the caller
+ * authenticated (the connection's TLS peer-id), never a claimed key.
+ * Does NOT consult the freshness window or revocation state — those are
+ * separate, composable checks (step 5 is ants_attestation_is_fresh).
+ * Returns ANTS_OK on success; ANTS_ERROR_MALFORMED on an invalid blob,
+ * wrong vendor root, binding mismatch, or negative issued_at_unix;
+ * ANTS_ERROR_NOT_IMPLEMENTED for vendors not wired yet (v1.x).
  */
 ants_error_t ants_attestation_verify(const ants_attestation_t *att);
 
 /*
  * Returns true iff `now - issued_at_unix < freshness_window_seconds`
+ * AND `issued_at_unix <= now + ANTS_TEE_CLOCK_SKEW_SECONDS`
  * AND `now < expires_at_unix` (when expires_at_unix != 0). Caller
  * supplies both `now` (UTC seconds) and the freshness window (typically
  * `ANTS_TEE_DEFAULT_FRESHNESS_WINDOW_SECONDS` but configurable per
