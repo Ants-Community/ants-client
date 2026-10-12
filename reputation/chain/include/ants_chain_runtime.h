@@ -38,6 +38,13 @@
  *     block per height, ever (signing two is attributable equivocation,
  *     RFC-0004 §Equivocation slashing). Members whose view lags abstain.
  *   Finality at ceil(2k/3) valid attestations (ants_chain_finality_verify).
+ *     An attestation is identified by (block_hash, signer) — the signature
+ *     covers only the hash, which commits the height — so copies of one
+ *     attestation re-labelled with other heights collapse into one entry.
+ *   Filing.  A block is filed (and signed or adopted) only once a
+ *     population attestation for its hash is on file — blocks carry no
+ *     proposer signature — so every node emits its attestation BEFORE the
+ *     block it attests.
  *   Skip.  An attempt not final ANTS_CHAIN_FINALITY_TIMEOUT_S after it
  *     started is skipped: the node moves to h+1 on the SAME prev — a new
  *     committee and proposer, and no member ever needs to sign a second
@@ -195,19 +202,34 @@ ants_chain_rt_init(ants_chain_rt_t *rt, const ants_chain_rt_config_t *cfg, uint6
 void ants_chain_rt_tick(ants_chain_rt_t *rt, uint64_t now);
 
 /* A proposal arrived (canonical block bytes). Malformed or irrelevant
- * input is ignored — the returned code only reports why, for logging:
- * ANTS_OK when filed (and signed, if this node is an eligible member whose
- * recomputation matched); MALFORMED / NON_CANONICAL on undecodable bytes;
- * UNSUPPORTED_TYPE for a non-degraded block (v1 holds no beacon to
- * recompute its committee). */
+ * input is ignored — the returned code reports why, and is the gossip
+ * layer's forward decision:
+ *   ANTS_OK              filed (and signed, if this node is an eligible
+ *                        member whose recomputation matched), or at/below
+ *                        the head — forward;
+ *   UNSUPPORTED_TYPE     no population attestation for the block's hash is
+ *                        on file yet (a block carries no proposer
+ *                        signature: an unattested one could be anyone's;
+ *                        proposers send their attestation first), or a
+ *                        non-degraded block (v1 holds no beacon) — drop
+ *                        quietly, do not forward;
+ *   MALFORMED / NON_CANONICAL  undecodable bytes. */
 ants_error_t
 ants_chain_rt_on_proposal(ants_chain_rt_t *rt, const uint8_t *block, size_t len, uint64_t now);
 
-/* An attestation arrived. Filed if its signer is a trustee and its height
- * is above the head; signatures are checked when finality is evaluated. */
-void ants_chain_rt_on_attestation(ants_chain_rt_t *rt,
-                                  const ants_chain_attestation_t *att,
-                                  uint64_t now);
+/* An attestation arrived. Its identity is (block_hash, signer): the
+ * signature covers only the hash, which commits the height, so `height` is
+ * an unsigned hint and a copy re-labelled with another height is the same
+ * attestation. Returns, for the gossip layer's forward decision:
+ *   ANTS_OK                     newly filed, or an exact repeat — forward;
+ *   ANTS_ERROR_UNSUPPORTED_TYPE a re-labelled copy, or at/below the head —
+ *                               drop quietly, do not forward;
+ *   ANTS_ERROR_MALFORMED        signer not in the population, or a bad
+ *                               signature — the sender relayed garbage;
+ *   ANTS_ERROR_INVALID_ARG      NULL args. */
+ants_error_t ants_chain_rt_on_attestation(ants_chain_rt_t *rt,
+                                          const ants_chain_attestation_t *att,
+                                          uint64_t now);
 
 /* The current final head. */
 void ants_chain_rt_head(const ants_chain_rt_t *rt, ants_chain_head_t *out);

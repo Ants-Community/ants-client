@@ -14,6 +14,7 @@
 #include "ants_common.h"
 #include "ants_crypto.h" /* ANTS_ED25519_{PRIVKEY,PUBKEY}_SIZE */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -37,6 +38,22 @@ typedef struct {
     uint8_t peer_id[ANTS_ED25519_PUBKEY_SIZE]; /* expected Ed25519 peer id */
 } antsd_seed_t;
 
+/* Genesis trustees the config can carry: the chain's committee ceiling
+ * (ANTS_CHAIN_COMMITTEE_K_MAX; run.c compile-time-asserts they match). */
+#define ANTSD_MAX_TRUSTEES 64
+
+/* The v1 genesis: the subset of RFC-0010's GenesisState the L2 chain needs
+ * (RFC-0004 §"Block production runtime (v1)"). Absent → the chain loop is
+ * off. Pinning the full GenesisState bytes (hash, trustee signature) is a
+ * separate RFC amendment; until then the operators agree on these values. */
+typedef struct {
+    bool present;
+    uint64_t time;                                                  /* unix seconds */
+    uint8_t hash[32];                                               /* block 0 hash */
+    uint8_t trustees[ANTSD_MAX_TRUSTEES][ANTS_ED25519_PUBKEY_SIZE]; /* ascending */
+    size_t trustee_count;
+} antsd_genesis_t;
+
 typedef struct {
     /* Ed25519 private seed — the node's identity. Held only by the daemon
      * and exposed to the transport solely through a sign callback. */
@@ -44,6 +61,7 @@ typedef struct {
     char listen_multiaddr[ANTSD_MULTIADDR_MAX]; /* "" => dial-only */
     antsd_seed_t seeds[ANTSD_MAX_SEEDS];
     size_t seed_count;
+    antsd_genesis_t genesis;
 } antsd_config_t;
 
 /*
@@ -63,9 +81,13 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
  */
 ants_error_t antsd_config_decode(const uint8_t *buf, size_t len, antsd_config_t *out);
 
+/* True iff `g` carries 1..ANTSD_MAX_TRUSTEES strictly ascending trustees. */
+bool antsd_genesis_trustees_valid(const antsd_genesis_t *g);
+
 /* Upper bound on the encoded size of any valid antsd_config_t. */
 #define ANTSD_CONFIG_ENCODED_MAX                                                                   \
     (16 + ANTS_ED25519_PRIVKEY_SIZE + ANTSD_MULTIADDR_MAX +                                        \
-     ANTSD_MAX_SEEDS * (8 + ANTSD_MULTIADDR_MAX + ANTS_ED25519_PUBKEY_SIZE))
+     ANTSD_MAX_SEEDS * (8 + ANTSD_MULTIADDR_MAX + ANTS_ED25519_PUBKEY_SIZE) + 64 +                 \
+     ANTSD_MAX_TRUSTEES * (2 + ANTS_ED25519_PUBKEY_SIZE))
 
 #endif /* ANTSD_CONFIG_H */

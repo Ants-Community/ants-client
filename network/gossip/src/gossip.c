@@ -27,6 +27,7 @@
 #include "ants_gossip.h"
 
 #include "ants_cbor.h"
+#include "ants_crypto.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -81,6 +82,13 @@ struct gossip_reject_entry {
     uint64_t count;
 };
 
+/* One remembered chain frame: BLAKE3(frame) and when it stops counting as
+ * seen (monotonic µs). */
+struct gossip_chain_seen {
+    uint8_t hash[32];
+    uint64_t until_us;
+};
+
 struct gossip_state {
     ants_crdt_t *gset; /* borrowed L1 G-Set; the dedup oracle      */
     ants_gossip_send_fn send_fn;
@@ -99,6 +107,9 @@ struct gossip_state {
     ants_gossip_stats_t stats; /* propagation instrumentation (T_prop budget)      */
     struct gossip_reject_entry reject_tab[ANTS_GOSSIP_REJECT_TABLE_SIZE];
     uint8_t view[ANTS_GOSSIP_MAX_VIEW][ANTS_GOSSIP_PEER_ID_SIZE];
+    ants_gossip_chain_fn chain_fn; /* NULL: chain frames are UNSUPPORTED_TYPE */
+    void *chain_ctx;
+    struct gossip_chain_seen chain_seen[ANTS_GOSSIP_CHAIN_DEDUP_SLOTS];
 };
 
 /* The opaque ctx must be large enough to hold the real state. */
@@ -293,7 +304,9 @@ static ants_error_t peek_frame_type(const uint8_t *buf, size_t len, uint64_t *ou
     if (ants_cbor_dec_init(&dec, buf, len) != ANTS_OK) {
         return ANTS_ERROR_MALFORMED;
     }
-    if (ants_cbor_dec_map(&dec, &n) != ANTS_OK || n != GOSSIP_PUSH_PAIRS) {
+    /* map(2) for every type but ATTEST's map(5); each type's own decoder
+     * re-checks its exact shape. */
+    if (ants_cbor_dec_map(&dec, &n) != ANTS_OK || (n != GOSSIP_PUSH_PAIRS && n != 5)) {
         return ANTS_ERROR_MALFORMED;
     }
     if (ants_cbor_dec_peek_type(&dec, &ty) != ANTS_OK || ty != ANTS_CBOR_TYPE_UINT) {
@@ -306,6 +319,131 @@ static ants_error_t peek_frame_type(const uint8_t *buf, size_t len, uint64_t *ou
         return ANTS_ERROR_MALFORMED;
     }
     if (ants_cbor_dec_uint(&dec, out_type) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Chain-frame wire codec (RFC-0008 §11.13)                                  */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_gossip_block_encode(const uint8_t *block,
+                                      size_t block_len,
+                                      uint8_t *out,
+                                      size_t cap,
+                                      size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+    if (block == NULL || block_len == 0 || out == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((rc = ants_cbor_enc_init(&enc, out, cap)) != ANTS_OK ||
+        (rc = ants_cbor_enc_map(&enc, 2)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, GOSSIP_KEY_TYPE)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, ANTS_GOSSIP_MSG_BLOCK)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, 1)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, block, block_len)) != ANTS_OK ||
+        (rc = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return rc;
+    }
+    if (enc.pos > ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_len = enc.pos;
+    return ANTS_OK;
+}
+
+ants_error_t ants_gossip_block_decode(const uint8_t *frame,
+                                      size_t len,
+                                      const uint8_t **out_block,
+                                      size_t *out_block_len)
+{
+    ants_cbor_dec_t dec;
+    size_t n;
+    uint64_t k, type;
+    if (frame == NULL || out_block == NULL || out_block_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (len > ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (ants_cbor_is_canonical(frame, len) != ANTS_OK) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if (ants_cbor_dec_init(&dec, frame, len) != ANTS_OK || ants_cbor_dec_map(&dec, &n) != ANTS_OK ||
+        n != 2 || ants_cbor_dec_uint(&dec, &k) != ANTS_OK || k != GOSSIP_KEY_TYPE ||
+        ants_cbor_dec_uint(&dec, &type) != ANTS_OK || type != ANTS_GOSSIP_MSG_BLOCK ||
+        ants_cbor_dec_uint(&dec, &k) != ANTS_OK || k != 1 ||
+        ants_cbor_dec_bytes(&dec, out_block, out_block_len) != ANTS_OK ||
+        ants_cbor_dec_finalise(&dec) != ANTS_OK || *out_block_len == 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_gossip_attest_encode(const ants_gossip_attest_t *a, uint8_t *out, size_t cap, size_t *out_len)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t rc;
+    if (a == NULL || out == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((rc = ants_cbor_enc_init(&enc, out, cap)) != ANTS_OK ||
+        (rc = ants_cbor_enc_map(&enc, 5)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, GOSSIP_KEY_TYPE)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, ANTS_GOSSIP_MSG_ATTEST)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, 1)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, a->height)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, 2)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, a->block_hash, sizeof a->block_hash)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, 3)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, a->signer, sizeof a->signer)) != ANTS_OK ||
+        (rc = ants_cbor_enc_uint(&enc, 4)) != ANTS_OK ||
+        (rc = ants_cbor_enc_bytes(&enc, a->sig, sizeof a->sig)) != ANTS_OK ||
+        (rc = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return rc;
+    }
+    *out_len = enc.pos;
+    return ANTS_OK;
+}
+
+/* Decode `key: bstr` of exactly `want` bytes into `out`. */
+static bool dec_fixed_bytes(ants_cbor_dec_t *dec, uint64_t want_key, uint8_t *out, size_t want)
+{
+    uint64_t k;
+    const uint8_t *b;
+    size_t blen;
+    if (ants_cbor_dec_uint(dec, &k) != ANTS_OK || k != want_key ||
+        ants_cbor_dec_bytes(dec, &b, &blen) != ANTS_OK || blen != want) {
+        return false;
+    }
+    memcpy(out, b, want);
+    return true;
+}
+
+ants_error_t ants_gossip_attest_decode(const uint8_t *frame, size_t len, ants_gossip_attest_t *out)
+{
+    ants_cbor_dec_t dec;
+    size_t n;
+    uint64_t k, type;
+    if (frame == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (ants_cbor_is_canonical(frame, len) != ANTS_OK) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if (ants_cbor_dec_init(&dec, frame, len) != ANTS_OK || ants_cbor_dec_map(&dec, &n) != ANTS_OK ||
+        n != 5 || ants_cbor_dec_uint(&dec, &k) != ANTS_OK || k != GOSSIP_KEY_TYPE ||
+        ants_cbor_dec_uint(&dec, &type) != ANTS_OK || type != ANTS_GOSSIP_MSG_ATTEST ||
+        ants_cbor_dec_uint(&dec, &k) != ANTS_OK || k != 1 ||
+        ants_cbor_dec_uint(&dec, &out->height) != ANTS_OK ||
+        !dec_fixed_bytes(&dec, 2, out->block_hash, sizeof out->block_hash) ||
+        !dec_fixed_bytes(&dec, 3, out->signer, sizeof out->signer) ||
+        !dec_fixed_bytes(&dec, 4, out->sig, sizeof out->sig) ||
+        ants_cbor_dec_finalise(&dec) != ANTS_OK) {
         return ANTS_ERROR_MALFORMED;
     }
     return ANTS_OK;
@@ -912,6 +1050,132 @@ handle_iwant(struct gossip_state *s, const uint8_t *from_peer, const uint8_t *fr
     return ANTS_OK;
 }
 
+ants_error_t ants_gossip_set_chain_handler(ants_gossip_t *g, ants_gossip_chain_fn fn, void *ctx)
+{
+    if (g == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct gossip_state *s = state_of(g);
+    s->chain_fn = fn;
+    s->chain_ctx = ctx;
+    return ANTS_OK;
+}
+
+/* Has this chain frame been seen within the dedup window? */
+static bool chain_seen(struct gossip_state *s, const uint8_t hash[32], uint64_t now_us)
+{
+    for (size_t i = 0; i < ANTS_GOSSIP_CHAIN_DEDUP_SLOTS; i++) {
+        if (s->chain_seen[i].until_us > now_us && memcmp(s->chain_seen[i].hash, hash, 32) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Remember a chain frame for the dedup window, reusing an expired slot or,
+ * when none is, the one closest to expiry. */
+static void chain_mark(struct gossip_state *s, const uint8_t hash[32], uint64_t now_us)
+{
+    size_t at = 0;
+    for (size_t i = 0; i < ANTS_GOSSIP_CHAIN_DEDUP_SLOTS; i++) {
+        if (s->chain_seen[i].until_us <= now_us) {
+            at = i;
+            break;
+        }
+        if (s->chain_seen[i].until_us < s->chain_seen[at].until_us) {
+            at = i;
+        }
+    }
+    memcpy(s->chain_seen[at].hash, hash, 32);
+    s->chain_seen[at].until_us = now_us + (uint64_t)ANTS_GOSSIP_CHAIN_DEDUP_S * 1000000u;
+}
+
+/* The structural check for a chain frame of `type` (its own decoder). */
+static ants_error_t chain_frame_check(uint64_t type, const uint8_t *frame, size_t len)
+{
+    if (type == ANTS_GOSSIP_MSG_BLOCK) {
+        const uint8_t *b;
+        size_t blen;
+        return ants_gossip_block_decode(frame, len, &b, &blen);
+    }
+    ants_gossip_attest_t a;
+    return ants_gossip_attest_decode(frame, len, &a);
+}
+
+static ants_error_t handle_chain(struct gossip_state *s,
+                                 const uint8_t *from_peer,
+                                 uint64_t type,
+                                 const uint8_t *frame,
+                                 size_t len,
+                                 size_t *out_new,
+                                 size_t *out_rejected)
+{
+    if (s->chain_fn == NULL) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    ants_error_t rc = chain_frame_check(type, frame, len);
+    if (rc != ANTS_OK) {
+        s->stats.rejected++;
+        record_reject(s, from_peer);
+        return rc;
+    }
+    uint8_t hash[32];
+    if (ants_blake3_hash(frame, len, hash) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    uint64_t now_us = gossip_now_us();
+    if (chain_seen(s, hash, now_us)) {
+        return ANTS_OK; /* duplicate within the window: the flood terminates */
+    }
+    rc = s->chain_fn(from_peer, type, frame, len, s->chain_ctx);
+    if (rc == ANTS_ERROR_UNSUPPORTED_TYPE) {
+        return ANTS_OK; /* not for this node: neither counted nor forwarded */
+    }
+    if (rc != ANTS_OK) {
+        s->stats.rejected++;
+        record_reject(s, from_peer);
+        if (out_rejected != NULL) {
+            *out_rejected = 1;
+        }
+        return ANTS_OK;
+    }
+    chain_mark(s, hash, now_us);
+    if (out_new != NULL) {
+        *out_new = 1;
+    }
+    (void)fanout_send(s, frame, len, from_peer);
+    return ANTS_OK;
+}
+
+ants_error_t
+ants_gossip_broadcast_chain(ants_gossip_t *g, const uint8_t *frame, size_t len, size_t *out_sent)
+{
+    uint64_t type = 0;
+    if (out_sent != NULL) {
+        *out_sent = 0;
+    }
+    if (g == NULL || frame == NULL || len == 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct gossip_state *s = state_of(g);
+    if (peek_frame_type(frame, len, &type) != ANTS_OK ||
+        (type != ANTS_GOSSIP_MSG_BLOCK && type != ANTS_GOSSIP_MSG_ATTEST) ||
+        (type == ANTS_GOSSIP_MSG_ATTEST && len > s->max_frame_bytes) ||
+        chain_frame_check(type, frame, len) != ANTS_OK) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    uint8_t hash[32];
+    if (ants_blake3_hash(frame, len, hash) != ANTS_OK) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    chain_mark(s, hash, gossip_now_us());
+    size_t sent = fanout_send(s, frame, len, NULL);
+    if (out_sent != NULL) {
+        *out_sent = sent;
+    }
+    return ANTS_OK;
+}
+
 ants_error_t ants_gossip_on_message(ants_gossip_t *g,
                                     const uint8_t from_peer[ANTS_GOSSIP_PEER_ID_SIZE],
                                     const uint8_t *frame,
@@ -934,8 +1198,10 @@ ants_error_t ants_gossip_on_message(ants_gossip_t *g,
     }
     s = state_of(g);
 
-    /* Oversized frames are rejected without decoding (RFC-0004 §DoS). */
-    if (len > s->max_frame_bytes) {
+    /* Oversized frames are rejected without decoding (RFC-0004 §DoS): no
+     * type may exceed the BLOCK cap; every type but BLOCK keeps
+     * max_frame_bytes (checked once the type is known). */
+    if (len > ANTS_GOSSIP_CHAIN_MAX_BLOCK_FRAME) {
         return ANTS_ERROR_MALFORMED;
     }
     /* Canonical gate + read the message type, then dispatch. A malformed or
@@ -944,7 +1210,13 @@ ants_error_t ants_gossip_on_message(ants_gossip_t *g,
     if (rc != ANTS_OK) {
         return rc; /* MALFORMED / NON_CANONICAL */
     }
+    if (type != ANTS_GOSSIP_MSG_BLOCK && len > s->max_frame_bytes) {
+        return ANTS_ERROR_MALFORMED;
+    }
     switch (type) {
+    case ANTS_GOSSIP_MSG_BLOCK:
+    case ANTS_GOSSIP_MSG_ATTEST:
+        return handle_chain(s, from_peer, type, frame, len, out_new, out_rejected);
     case ANTS_GOSSIP_MSG_PUSH:
         return handle_push(s, from_peer, frame, len, out_new, out_rejected);
     case ANTS_GOSSIP_MSG_IHAVE:

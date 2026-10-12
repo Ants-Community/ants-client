@@ -35,6 +35,7 @@ target_link_libraries(ants_gossip
         ants_transport
     PRIVATE
         ants_cbor
+        ants_crypto
 )
 
 target_compile_features(ants_gossip PUBLIC c_std_99)

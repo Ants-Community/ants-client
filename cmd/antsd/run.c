@@ -9,7 +9,10 @@
  * (each consumes the ones belonging to its own streams/conns, per the
  * delegation contracts in ants_dht.h / ants_gossip.h / ants_attest.h),
  * then handled locally; the chain loop plugs in the same way in a later
- * PR. The attestation gate runs RFC-0005's v1 verify-and-tag posture:
+ * PR. When the config carries a genesis, the L2 chain loop runs on top
+ * (chain.c): the RFC-0004 v1 block-production runtime, its proposals and
+ * attestations flooded as gossip BLOCK / ATTEST frames (RFC-0008
+ * §11.13). The attestation gate runs RFC-0005's v1 verify-and-tag posture:
  * every connection is asked for its attestation, unattested peers are
  * admitted, attested ones tagged, and peers presenting evidence that
  * fails verification are disconnected. The DHT is seeded from the config's
@@ -24,6 +27,7 @@
 
 #include "run.h"
 
+#include "chain.h"
 #include "config.h"
 #include "util.h"
 
@@ -438,6 +442,10 @@ int antsd_cmd_run(const char *path)
     tcfg.sign_ctx = cfg.identity_priv;
     tcfg.listen_multiaddr = cfg.listen_multiaddr[0] != '\0' ? cfg.listen_multiaddr : NULL;
     tcfg.idle_timeout_ms = ANTSD_IDLE_TIMEOUT_MS;
+    /* Keep quiet-but-live peers connected: the chain loop is silent for
+     * the 30-s drand floor at every attempt, as long as the idle timeout,
+     * so without keep-alives its connections drop between messages. */
+    tcfg.keep_alive = true;
     tcfg.max_connections = ANTSD_MAX_CONNECTIONS;
     tcfg.max_streams_per_conn = ANTSD_MAX_STREAMS_PER_CONN;
     tcfg.event_fn = event_router;
@@ -544,6 +552,30 @@ int antsd_cmd_run(const char *path)
     }
     node.attest = &attest;
 
+    /* The L2 chain loop — only with a genesis in the config. A trustee
+     * proposes and signs; any other node follows as an observer. A
+     * genesis time still ahead leaves the loop pending until it arrives;
+     * a genesis the runtime rejects leaves the rest of the node running
+     * with the chain off. */
+    static antsd_chain_t chain; /* ~200 KB of runtime state — static */
+    memset(&chain, 0, sizeof chain);
+    if (cfg.genesis.present) {
+        rc = antsd_chain_start(
+            &chain, &cfg.genesis, cfg.identity_priv, pub, &gossip, gset, (uint64_t)time(NULL));
+        if (rc == ANTS_OK && chain.pending) {
+            printf("antsd: chain waiting for genesis time %llu\n",
+                   (unsigned long long)cfg.genesis.time);
+        } else if (rc == ANTS_OK) {
+            printf("antsd: chain on (%s, %zu trustees)\n",
+                   chain.trustee ? "trustee" : "observer",
+                   cfg.genesis.trustee_count);
+        } else {
+            fprintf(stderr, "antsd: chain off: genesis rejected: %s\n", ants_strerror(rc));
+        }
+    } else {
+        printf("antsd: chain off (no genesis in config)\n");
+    }
+
     /* Seed the routing table. A failed seed is logged and skipped —
      * the node can still be ignited by the remaining seeds or by
      * inbound connections. */
@@ -576,6 +608,7 @@ int antsd_cmd_run(const char *path)
         if (g_stop) {
             break;
         }
+        antsd_chain_tick(&chain, (uint64_t)time(NULL));
         if (monotonic_ms() - last_refresh_ms >= ANTSD_VIEW_REFRESH_MS) {
             last_refresh_ms = monotonic_ms();
             gossip_view_refresh(&node, &dht, &probe, &probe_active, &epoch);
@@ -588,14 +621,16 @@ int antsd_cmd_run(const char *path)
     }
 
     printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ", dht peers %" PRIu64
-           ", view %zu, attest %" PRIu64 "/%" PRIu64 "/%" PRIu64 " attested/unattested/rejected)\n",
+           ", view %zu, attest %" PRIu64 "/%" PRIu64 "/%" PRIu64
+           " attested/unattested/rejected, chain finals %" PRIu64 ")\n",
            node.conns_ready,
            node.conns_closed,
            node.dht_peers,
            node.view_count,
            node.attested,
            node.unattested,
-           node.rejected);
+           node.rejected,
+           chain.finals);
     /* Teardown order matters: the transport goes first, so its
      * CONN_CLOSED callbacks still reach the DHT and the gossip binding
      * (via the router above) and let them release the connection state

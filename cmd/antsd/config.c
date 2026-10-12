@@ -4,7 +4,12 @@
  * Schema (integer keys, ascending = canonical order):
  *   { 0: identity_priv (bstr/32),
  *     1: listen_multiaddr (tstr),
- *     2: seeds [ { 0: addr (tstr), 1: peer_id (bstr/32) }, ... ] }
+ *     2: seeds [ { 0: addr (tstr), 1: peer_id (bstr/32) }, ... ],
+ *     3: genesis { 0: time (uint), 1: hash (bstr/32),
+ *                  2: trustees [ bstr/32, ... ] }      ; optional }
+ *
+ * Trustees are 1..ANTSD_MAX_TRUSTEES strictly ascending peer-ids (the
+ * chain's canonical population order).
  */
 /* strnlen() is POSIX.1-2008; request it under -std=c99 on glibc. */
 #define _POSIX_C_SOURCE 200809L
@@ -14,6 +19,19 @@
 #include "ants_cbor.h"
 
 #include <string.h>
+
+bool antsd_genesis_trustees_valid(const antsd_genesis_t *g)
+{
+    if (g == NULL || g->trustee_count == 0 || g->trustee_count > ANTSD_MAX_TRUSTEES) {
+        return false;
+    }
+    for (size_t i = 1; i < g->trustee_count; i++) {
+        if (memcmp(g->trustees[i - 1], g->trustees[i], sizeof g->trustees[i]) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /* Copy a decoded text slice into a fixed NUL-terminated field. The slice
  * must leave room for the terminator. */
@@ -38,6 +56,10 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
         return ANTS_ERROR_INVALID_ARG; /* unterminated */
     }
 
+    const antsd_genesis_t *g = &cfg->genesis;
+    if (g->present && !antsd_genesis_trustees_valid(g)) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
     ants_cbor_enc_t enc;
     ants_error_t rc = ants_cbor_enc_init(&enc, buf, cap);
     if (rc != ANTS_OK) {
@@ -52,7 +74,7 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
         }                                                                                          \
     } while (0)
 
-    ENC(ants_cbor_enc_map(&enc, 3));
+    ENC(ants_cbor_enc_map(&enc, g->present ? 4 : 3));
     ENC(ants_cbor_enc_uint(&enc, 0));
     ENC(ants_cbor_enc_bytes(&enc, cfg->identity_priv, sizeof cfg->identity_priv));
     ENC(ants_cbor_enc_uint(&enc, 1));
@@ -69,6 +91,19 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
         ENC(ants_cbor_enc_text(&enc, cfg->seeds[i].addr, alen));
         ENC(ants_cbor_enc_uint(&enc, 1));
         ENC(ants_cbor_enc_bytes(&enc, cfg->seeds[i].peer_id, sizeof cfg->seeds[i].peer_id));
+    }
+    if (g->present) {
+        ENC(ants_cbor_enc_uint(&enc, 3));
+        ENC(ants_cbor_enc_map(&enc, 3));
+        ENC(ants_cbor_enc_uint(&enc, 0));
+        ENC(ants_cbor_enc_uint(&enc, g->time));
+        ENC(ants_cbor_enc_uint(&enc, 1));
+        ENC(ants_cbor_enc_bytes(&enc, g->hash, sizeof g->hash));
+        ENC(ants_cbor_enc_uint(&enc, 2));
+        ENC(ants_cbor_enc_array(&enc, g->trustee_count));
+        for (size_t i = 0; i < g->trustee_count; i++) {
+            ENC(ants_cbor_enc_bytes(&enc, g->trustees[i], sizeof g->trustees[i]));
+        }
     }
     ENC(ants_cbor_enc_finalise(&enc));
 #undef ENC
@@ -127,7 +162,7 @@ ants_error_t antsd_config_decode(const uint8_t *buf, size_t len, antsd_config_t 
 
     size_t n;
     DEC(ants_cbor_dec_map(&dec, &n));
-    if (n != 3) {
+    if (n != 3 && n != 4) {
         return ANTS_ERROR_MALFORMED;
     }
 
@@ -161,6 +196,33 @@ ants_error_t antsd_config_decode(const uint8_t *buf, size_t len, antsd_config_t 
         DEC(decode_fixed_bytes(&dec, out->seeds[i].peer_id, sizeof out->seeds[i].peer_id));
     }
     out->seed_count = seed_n;
+    if (n == 4) {
+        antsd_genesis_t *g = &out->genesis;
+        size_t gn, tn;
+        DEC(expect_key(&dec, 3));
+        DEC(ants_cbor_dec_map(&dec, &gn));
+        if (gn != 3) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        DEC(expect_key(&dec, 0));
+        DEC(ants_cbor_dec_uint(&dec, &g->time));
+        DEC(expect_key(&dec, 1));
+        DEC(decode_fixed_bytes(&dec, g->hash, sizeof g->hash));
+        DEC(expect_key(&dec, 2));
+        DEC(ants_cbor_dec_array(&dec, &tn));
+        if (tn == 0 || tn > ANTSD_MAX_TRUSTEES) {
+            return ANTS_ERROR_MALFORMED;
+        }
+        for (size_t i = 0; i < tn; i++) {
+            DEC(decode_fixed_bytes(&dec, g->trustees[i], sizeof g->trustees[i]));
+        }
+        g->trustee_count = tn;
+        g->present = true;
+        if (!antsd_genesis_trustees_valid(g)) {
+            return ANTS_ERROR_MALFORMED;
+        }
+    }
+    DEC(ants_cbor_dec_finalise(&dec));
 #undef DEC
 
     return ANTS_OK;

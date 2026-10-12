@@ -327,6 +327,7 @@ struct ants_transport_state {
     uint32_t max_connections;
     uint32_t max_streams_per_conn;
     uint32_t idle_timeout_ms;
+    bool keep_alive;
 
     /* Listening UDP socket. ANTS_INVALID_SOCKET when listen_multiaddr
      * was NULL (dial-only client). */
@@ -694,6 +695,7 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
     state->max_connections = config->max_connections;
     state->max_streams_per_conn = config->max_streams_per_conn;
     state->idle_timeout_ms = config->idle_timeout_ms;
+    state->keep_alive = config->keep_alive;
 
     /* Create the picoquic context.
      *
@@ -818,8 +820,11 @@ ants_error_t ants_transport_init(ants_transport_t *t, const ants_transport_confi
         }
     }
 
-    /* Idle timeout: picoquic exposes per-connection idle timeouts.
-     * Phase 2 will plumb config->idle_timeout_ms through. */
+    /* Idle timeout: set on the context before any connection exists, so
+     * every connection (dialed or accepted) proposes it. 0 = infinity,
+     * matching the config's "no timeout". Until this was plumbed, every
+     * connection ran on picoquic's 30-s default regardless of config. */
+    picoquic_set_default_idle_timeout(state->quic, (uint64_t)config->idle_timeout_ms);
 
     return ANTS_OK;
 }
@@ -1278,6 +1283,10 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     case picoquic_callback_ready:
         ev.kind = ANTS_TRANSPORT_EV_CONN_READY;
         cs->ready = 1;
+        if (cs->parent->keep_alive && cs->parent->idle_timeout_ms != 0) {
+            /* interval 0 = idle_timeout / 2 (picoquic) */
+            picoquic_enable_keep_alive(cnx, 0);
+        }
         /* RFC 7250 binding: the verify_certificate callback populated
          * cs->peer_pubkey during the handshake. Mirror it into the
          * event's peer_id so the caller doesn't need to round-trip

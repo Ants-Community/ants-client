@@ -491,6 +491,16 @@ static void test_equivocation_guard(void)
     size_t len = 0;
     CHECK(ants_chain_block_encode(&b, bytes, sizeof bytes, &len) == ANTS_OK);
     g_now++;
+    /* Unattested, the second block is not even filed... */
+    CHECK(ants_chain_rt_on_proposal(&o->rt, bytes, len, g_now) == ANTS_ERROR_UNSUPPORTED_TYPE);
+    /* ...so the (byzantine) proposer attests it first, as proposers do. */
+    ants_chain_attestation_t pa;
+    memset(&pa, 0, sizeof pa);
+    pa.height = 1;
+    CHECK(ants_chain_block_hash(&b, pa.block_hash) == ANTS_OK);
+    memcpy(pa.signer, g_nodes[prop].pub, 32);
+    CHECK(ants_ed25519_sign(g_nodes[prop].priv, pa.block_hash, 32, pa.sig) == ANTS_OK);
+    CHECK(ants_chain_rt_on_attestation(&o->rt, &pa, g_now) == ANTS_OK);
     CHECK(ants_chain_rt_on_proposal(&o->rt, bytes, len, g_now) == ANTS_OK);
     CHECK(o->attestations_emitted == signed_before);
 }
@@ -544,6 +554,92 @@ static void test_forged_attestation_ignored(void)
     CHECK(h.height == 1);
 }
 
+static void test_relabelled_attestations_do_not_stall(void)
+{
+    /* Regression (pre-push review F1): an attestation's height is not
+     * signed. Flooding every node with copies of a genuine attestation
+     * re-labelled with 200 other heights must neither fill the table nor
+     * keep the chain from finalising — the copies collapse onto the one
+     * (hash, signer) entry and are refused for forwarding. */
+    net_setup(3, 3, 0xA1);
+    step(ANTS_CHAIN_RT_DRAND_FLOOR_S);
+    heads_agree(3, 1);
+    /* Capture a genuine attestation: the proposer re-broadcasts its own. */
+    g_bus_n = 0;
+    ants_chain_attestation_t genuine;
+    memset(&genuine, 0, sizeof genuine);
+    bool got = false;
+    for (int s = 0; s < (int)ANTS_CHAIN_RT_DRAND_FLOOR_S + 10 && !got; s++) {
+        g_now++;
+        for (int j = 0; j < g_n_nodes; j++) {
+            ants_chain_rt_tick(&g_nodes[j].rt, g_now);
+        }
+        for (int i = 0; i < g_bus_n && !got; i++) {
+            if (!g_bus[i].is_proposal) {
+                genuine = g_bus[i].att;
+                got = true;
+            }
+        }
+        bus_drain();
+    }
+    CHECK(got);
+    for (int j = 0; j < 3; j++) {
+        for (uint64_t k = 0; k < 200; k++) {
+            ants_chain_attestation_t fake = genuine;
+            fake.height = 1000 + k;
+            ants_error_t rc = ants_chain_rt_on_attestation(&g_nodes[j].rt, &fake, g_now);
+            CHECK(rc == ANTS_ERROR_UNSUPPORTED_TYPE || rc == ANTS_OK);
+            if (k > 0) {
+                CHECK(rc == ANTS_ERROR_UNSUPPORTED_TYPE); /* never forwarded twice */
+            }
+        }
+    }
+    ants_chain_head_t before;
+    ants_chain_rt_head(&g_nodes[0].rt, &before);
+    step(3 * ANTS_CHAIN_BLOCK_TIME_S);
+    ants_chain_head_t after;
+    ants_chain_rt_head(&g_nodes[0].rt, &after);
+    CHECK(after.height >= before.height + 2);
+    heads_agree(3, after.height);
+}
+
+static void test_unattested_block_not_filed(void)
+{
+    /* Regression (pre-push review F2): blocks carry no proposer signature.
+     * A flood of decodable blocks nobody attested must not be filed (so it
+     * cannot evict the real proposal) nor forwarded. */
+    net_setup(3, 4, 0xB1); /* node 3: an observer */
+    static ants_chain_pattern_finding_t f[ANTS_CHAIN_MAX_PATTERN_FINDINGS];
+    uint8_t prev[32];
+    memset(prev, 0x47, sizeof prev);
+    for (uint64_t h = 1; h <= 8; h++) {
+        ants_chain_block_t b;
+        size_t nf = 0;
+        CHECK(ants_chain_block_propose(h,
+                                       prev,
+                                       0,
+                                       GENESIS_TIME + 30 + h,
+                                       true,
+                                       NULL,
+                                       0,
+                                       NULL,
+                                       0,
+                                       f,
+                                       ANTS_CHAIN_MAX_PATTERN_FINDINGS,
+                                       &nf,
+                                       &b) == ANTS_OK);
+        uint8_t bytes[MSG_MAX];
+        size_t len = 0;
+        CHECK(ants_chain_block_encode(&b, bytes, sizeof bytes, &len) == ANTS_OK);
+        for (int j = 0; j < 4; j++) {
+            CHECK(ants_chain_rt_on_proposal(&g_nodes[j].rt, bytes, len, g_now) ==
+                  ANTS_ERROR_UNSUPPORTED_TYPE);
+        }
+    }
+    step(ANTS_CHAIN_RT_DRAND_FLOOR_S + ANTS_CHAIN_RT_REBROADCAST_S);
+    heads_agree(4, 1); /* the observer adopts the real block too */
+}
+
 static void test_single_trustee(void)
 {
     /* k = 1: the lone trustee's own signature is 2/3 of one. */
@@ -593,6 +689,8 @@ int main(void)
     test_late_observer_adopts();
     test_equivocation_guard();
     test_forged_attestation_ignored();
+    test_relabelled_attestations_do_not_stall();
+    test_unattested_block_not_filed();
     test_single_trustee();
     if (failures == 0) {
         printf("test_chain_runtime: all checks passed\n");

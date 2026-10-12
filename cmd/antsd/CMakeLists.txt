@@ -9,9 +9,10 @@
 #                          the config seeds) + gossip (view fed from DHT
 #                          discovery, refreshed on the anti-eclipse
 #                          epoch cadence) + the attestation gate
-#                          (RFC-0005 v1 verify-and-tag) and drive the
-#                          tick loop until SIGINT/SIGTERM
-# The chain loop lands next.
+#                          (RFC-0005 v1 verify-and-tag) + the L2 chain
+#                          loop when the config carries a genesis, and
+#                          drive the tick loop until SIGINT/SIGTERM
+#   antsd genesis <config> <time> <hash> <trustee>... — write the v1 genesis
 
 add_library(antsd_config STATIC config.c)
 target_include_directories(antsd_config
@@ -24,12 +25,12 @@ target_include_directories(antsd_config
 target_link_libraries(antsd_config PUBLIC ants_cbor ants_crypto)
 target_compile_features(antsd_config PUBLIC c_std_99)
 
-add_executable(antsd antsd.c run.c util.c)
+add_executable(antsd antsd.c run.c chain.c util.c)
 # ants_crypto (Ed25519) arrives through antsd_config (PUBLIC) — listing it
 # again next to ants_attest's transitive copy trips macOS 'ld: ignoring
 # duplicate libraries'.
-target_link_libraries(antsd PRIVATE antsd_config ants_attest ants_gossip ants_dht ants_crdt
-                                    ants_transport)
+target_link_libraries(antsd PRIVATE antsd_config ants_attest ants_chain ants_gossip ants_dht
+                                    ants_crdt ants_transport)
 target_compile_features(antsd PRIVATE c_std_99)
 
 if(BUILD_TESTING)
@@ -42,7 +43,8 @@ if(BUILD_TESTING)
     # node the daemon bootstraps its DHT against, then SIGTERMs it and
     # requires a clean exit.
     add_executable(test_antsd_run tests/test_antsd_run.c)
-    target_link_libraries(test_antsd_run PRIVATE antsd_config ants_attest ants_dht ants_transport)
+    target_link_libraries(test_antsd_run PRIVATE antsd_config ants_attest ants_chain ants_gossip ants_dht
+                                         ants_transport)
     # The genuine Intel TDX quote, presented by the seed as foreign evidence.
     target_include_directories(test_antsd_run PRIVATE ${CMAKE_SOURCE_DIR}/foundation/tee/tests)
     add_test(NAME antsd_run_basic COMMAND test_antsd_run $<TARGET_FILE:antsd>)

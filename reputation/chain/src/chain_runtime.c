@@ -69,6 +69,8 @@ struct rt_state {
 
     struct rt_proposal props[RT_MAX_PROPOSALS];
     bool att_used[RT_MAX_ATTESTATIONS];
+    uint64_t att_seq[RT_MAX_ATTESTATIONS]; /* filing order, for FIFO eviction */
+    uint64_t next_att_seq;
     ants_chain_attestation_t atts[RT_MAX_ATTESTATIONS];
 
     /* Decode / compose scratch. */
@@ -211,37 +213,56 @@ static struct rt_proposal *prop_alloc(struct rt_state *s)
     return victim;
 }
 
-/* File an attestation already known to carry a valid signature. */
-static void att_file(struct rt_state *s, const ants_chain_attestation_t *a)
+/* The attestation on file for (block_hash, signer), or NULL. That pair is
+ * an attestation's identity: the signature covers only the hash, and the
+ * hash commits the height, so the frame's `height` is an unsigned hint — a
+ * copy with a different height is the same attestation, not a new one. */
+static ants_chain_attestation_t *att_find(struct rt_state *s,
+                                          const uint8_t hash[ANTS_CHAIN_HASH_SIZE],
+                                          const uint8_t signer[ANTS_CHAIN_PEER_ID_SIZE])
 {
-    size_t free_i = RT_MAX_ATTESTATIONS;
-    size_t low_i = RT_MAX_ATTESTATIONS;
     for (size_t i = 0; i < RT_MAX_ATTESTATIONS; i++) {
-        if (!s->att_used[i]) {
-            if (free_i == RT_MAX_ATTESTATIONS) {
-                free_i = i;
-            }
-            continue;
-        }
-        const ants_chain_attestation_t *e = &s->atts[i];
-        if (e->height == a->height &&
-            memcmp(e->block_hash, a->block_hash, ANTS_CHAIN_HASH_SIZE) == 0 &&
-            memcmp(e->signer, a->signer, ANTS_CHAIN_PEER_ID_SIZE) == 0) {
-            return; /* duplicate */
-        }
-        if (low_i == RT_MAX_ATTESTATIONS || e->height < s->atts[low_i].height) {
-            low_i = i;
+        if (s->att_used[i] && memcmp(s->atts[i].block_hash, hash, ANTS_CHAIN_HASH_SIZE) == 0 &&
+            memcmp(s->atts[i].signer, signer, ANTS_CHAIN_PEER_ID_SIZE) == 0) {
+            return &s->atts[i];
         }
     }
-    size_t at = free_i;
-    if (at == RT_MAX_ATTESTATIONS) {
-        if (low_i == RT_MAX_ATTESTATIONS || s->atts[low_i].height >= a->height) {
-            return; /* full of at-least-as-relevant entries */
+    return NULL;
+}
+
+/* File an attestation already known to carry a valid signature, evicting
+ * the oldest entry when full. Returns false if (hash, signer) is already
+ * on file. */
+static bool att_file(struct rt_state *s, const ants_chain_attestation_t *a)
+{
+    if (att_find(s, a->block_hash, a->signer) != NULL) {
+        return false;
+    }
+    size_t at = RT_MAX_ATTESTATIONS;
+    for (size_t i = 0; i < RT_MAX_ATTESTATIONS; i++) {
+        if (!s->att_used[i]) {
+            at = i;
+            break;
         }
-        at = low_i;
+        if (at == RT_MAX_ATTESTATIONS || s->att_seq[i] < s->att_seq[at]) {
+            at = i;
+        }
     }
     s->att_used[at] = true;
     s->atts[at] = *a;
+    s->att_seq[at] = ++s->next_att_seq;
+    return true;
+}
+
+/* Is there at least one population attestation on file for `hash`? */
+static bool att_any_for(const struct rt_state *s, const uint8_t hash[ANTS_CHAIN_HASH_SIZE])
+{
+    for (size_t i = 0; i < RT_MAX_ATTESTATIONS; i++) {
+        if (s->att_used[i] && memcmp(s->atts[i].block_hash, hash, ANTS_CHAIN_HASH_SIZE) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Drop everything at or below the head. */
@@ -297,12 +318,14 @@ sign_and_emit(struct rt_state *s, struct rt_proposal *p, bool emit_proposal, uin
     }
     s->last_signed_height = p->height; /* never sign this height again */
     s->cur = (int)(p - s->props);
-    att_file(s, &a);
-    if (emit_proposal && s->proposal_fn != NULL) {
-        s->proposal_fn(p->bytes, p->len, s->out_ctx);
-    }
+    (void)att_file(s, &a);
+    /* Attestation BEFORE the block: receivers file (and forward) a block
+     * only once a population attestation for its hash is on file. */
     if (s->attestation_fn != NULL) {
         s->attestation_fn(&a, s->out_ctx);
+    }
+    if (emit_proposal && s->proposal_fn != NULL) {
+        s->proposal_fn(p->bytes, p->len, s->out_ctx);
     }
     s->last_emit = now;
 }
@@ -324,8 +347,8 @@ static bool is_final(const struct rt_state *s, const struct rt_proposal *p)
         mask[pos] = false;
         for (size_t i = 0; i < RT_MAX_ATTESTATIONS; i++) {
             const ants_chain_attestation_t *a = &s->atts[i];
-            if (s->att_used[i] && a->height == p->height &&
-                memcmp(a->block_hash, p->hash, ANTS_CHAIN_HASH_SIZE) == 0 &&
+            /* Matched by (hash, signer) only: the hash commits the height. */
+            if (s->att_used[i] && memcmp(a->block_hash, p->hash, ANTS_CHAIN_HASH_SIZE) == 0 &&
                 memcmp(a->signer, pubkeys[pos], ANTS_CHAIN_PEER_ID_SIZE) == 0) {
                 mask[pos] = true;
                 memcpy(sigs + n_sigs * ANTS_CHAIN_SIG_SIZE, a->sig, ANTS_CHAIN_SIG_SIZE);
@@ -444,16 +467,12 @@ void ants_chain_rt_tick(ants_chain_rt_t *rt, uint64_t now)
         /* Re-broadcast the proposal we hold for this attempt and our
          * attestation on it, for members that missed them. */
         struct rt_proposal *p = &s->props[s->cur];
+        const ants_chain_attestation_t *mine = att_find(s, p->hash, s->self);
+        if (mine != NULL && s->attestation_fn != NULL) {
+            s->attestation_fn(mine, s->out_ctx); /* attestation first, as above */
+        }
         if (s->proposal_fn != NULL) {
             s->proposal_fn(p->bytes, p->len, s->out_ctx);
-        }
-        for (size_t i = 0; i < RT_MAX_ATTESTATIONS && s->attestation_fn != NULL; i++) {
-            const ants_chain_attestation_t *a = &s->atts[i];
-            if (s->att_used[i] && a->height == p->height &&
-                memcmp(a->block_hash, p->hash, ANTS_CHAIN_HASH_SIZE) == 0 &&
-                memcmp(a->signer, s->self, ANTS_CHAIN_PEER_ID_SIZE) == 0) {
-                s->attestation_fn(a, s->out_ctx);
-            }
         }
         s->last_emit = now;
     }
@@ -484,6 +503,13 @@ ants_chain_rt_on_proposal(ants_chain_rt_t *rt, const uint8_t *block, size_t len,
         return err;
     }
     struct rt_proposal *p = prop_find(s, hash);
+    if (p == NULL && !att_any_for(s, hash)) {
+        /* No population attestation for this block yet: a block carries no
+         * proposer signature, so an unattested one could be anyone's. Not
+         * filed, not forwarded — the proposer's attestation travels ahead
+         * of its block, and re-broadcasts bring the block again. */
+        return ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
     if (p == NULL) {
         p = prop_alloc(s);
         if (p == NULL) {
@@ -516,25 +542,33 @@ ants_chain_rt_on_proposal(ants_chain_rt_t *rt, const uint8_t *block, size_t len,
     return ANTS_OK;
 }
 
-void ants_chain_rt_on_attestation(ants_chain_rt_t *rt,
-                                  const ants_chain_attestation_t *att,
-                                  uint64_t now)
+ants_error_t
+ants_chain_rt_on_attestation(ants_chain_rt_t *rt, const ants_chain_attestation_t *att, uint64_t now)
 {
     if (rt == NULL || att == NULL) {
-        return;
+        return ANTS_ERROR_INVALID_ARG;
     }
     struct rt_state *s = st(rt);
-    if (att->height <= s->head.height || !trustee_index(s, att->signer, NULL)) {
-        return;
-    }
     /* Verify before filing: an attestation with a bad signature would
      * otherwise turn the whole finality verdict false for its block. */
-    if (ants_ed25519_verify(att->signer, att->block_hash, ANTS_CHAIN_HASH_SIZE, att->sig) !=
-        ANTS_OK) {
-        return;
+    if (!trustee_index(s, att->signer, NULL) ||
+        ants_ed25519_verify(att->signer, att->block_hash, ANTS_CHAIN_HASH_SIZE, att->sig) !=
+            ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
     }
-    att_file(s, att);
+    const ants_chain_attestation_t *known = att_find(s, att->block_hash, att->signer);
+    if (known != NULL) {
+        /* The same attestation again. An exact repeat (a holder's periodic
+         * re-broadcast) may travel on; a copy with a different, unsigned
+         * height is a re-labelled duplicate and stops here. */
+        return known->height == att->height ? ANTS_OK : ANTS_ERROR_UNSUPPORTED_TYPE;
+    }
+    if (att->height <= s->head.height) {
+        return ANTS_ERROR_UNSUPPORTED_TYPE; /* at or below the head */
+    }
+    (void)att_file(s, att);
     try_finalize(s, now);
+    return ANTS_OK;
 }
 
 void ants_chain_rt_head(const ants_chain_rt_t *rt, ants_chain_head_t *out)

@@ -10,6 +10,12 @@ the inbound deframer, lazy-pull anti-entropy (IHAVE/IWANT digest + pull),
 `T_prop` propagation instrumentation (per-node stats + a per-new-proof
 observation hook), and **local reject accountability** (per-peer reject
 tallies + a hook to rate-limit the sender, RFC-0004 §DoS) are implemented.
+The overlay also carries the **L2 chain's BLOCK / ATTEST frames**
+(RFC-0008 §11.13). It floods them like proofs, but deduplicates by
+`BLAKE3(frame)` for 10 s so that periodic re-broadcasts reach late joiners.
+BLOCK frames have their own 32 KiB cap. Semantic validation is delegated to
+a caller-registered chain handler (the daemon's, which knows the trustee
+population).
 Remaining: anti-eclipse peer sampling from the DHT, and a globally-attributable
 *emitted* fault proof against a garbage relayer (needs signed forwards — a wire
 change — plus a fault class).

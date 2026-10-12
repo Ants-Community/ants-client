@@ -13,6 +13,48 @@ the spec repo's
 
 ## Unreleased
 
+### network/gossip + cmd/antsd: the L2 chain on the wire (PR6b of the node daemon) · 2026-10-12
+
+The block-production runtime from #193 now runs inside the daemon, and its proposals and attestations travel the network. This implements RFC-0008 v0.10 §11.13 and RFC-0004 v0.8 §"Block production runtime (v1)" (spec: Ants-Community/ants#10).
+
+**`network/gossip`.**
+- **Frame types and codecs.** New types 3 BLOCK `{0:3, 1:block}` and 4 ATTEST `{0:4, 1:height, 2:hash, 3:signer, 4:sig}`, with codecs.
+- **Chain handler.** Callers register a chain handler. A frame it accepts is forwarded to the fanout, excluding the sender. `UNSUPPORTED_TYPE` drops the frame quietly, without counting it against the sender (e.g. a non-degraded block in v1). Any other answer is a reject counted against the sender.
+- **Deduplication** is by `BLAKE3(frame)` for `CHAIN_GOSSIP_DEDUP_S` (10 s), so holders' periodic re-broadcasts re-flood to nodes that joined meanwhile.
+- **Origination.** `ants_gossip_broadcast_chain` sends a locally produced frame.
+- **Size caps.** Caps are now per type: a BLOCK may reach 32 KiB, every other type keeps `max_frame_bytes`. The binding's inbound buffer and outbound framing were enlarged to match, with frames above 4 KiB framed on the heap.
+- **Context size.** The engine context grew from 8 to 16 KiB.
+
+**`cmd/antsd`.**
+- **Genesis config.** The config gains an optional genesis (key 3): time, hash, and trustees in strictly ascending order. It is a v1 subset of RFC-0010's GenesisState. The decoder now also rejects trailing bytes. The new `antsd genesis <config> <time> <hash> <trustee>...` writes it, sorting the trustees and refusing duplicates, and `antsd show` prints it.
+- **Chain loop.** `chain.c` drives the runtime when a genesis is present: a trustee proposes and signs, any other node follows as an observer.
+  - **Layer-1 view.** The view is the G-Set's proofs, with content-ids ascending. Proofs carry an `epoch`, not a signing time, so a proof is visible at a cutoff iff its epoch has begun (`genesis + epoch·EPOCH_DURATION ≤ cutoff`), and its event time is that epoch's start. This rule is deterministic but **not yet in the spec**: RFC-0004's sketch speaks of a `signed_at` the envelope does not carry.
+  - **Wire.** Proposals and attestations go out as gossip frames. Inbound ATTEST frames are checked for a trustee signer and a valid Ed25519 signature before they reach the runtime.
+  - **Logging.** Final heads are logged as `antsd: chain final height=… hash=…`.
+
+**Pre-push adversarial review.** One critical issue and three medium ones were found; all are fixed here, and the spec was hardened to match (RFC-0008 v0.11 / RFC-0004 v0.9, Ants-Community/ants#11).
+- **F1, critical.** An ATTEST's `height` is not signed. One genuine attestation re-labelled with fresh heights produced unlimited valid, distinct frames that filled every node's attestation store and **halted finality network-wide**. The reviewer's reproducer showed a forged head of 0 against a control of 13.
+  - **Fix:** the runtime now identifies an attestation by `(block_hash, signer)`. Finality matches on that pair, and a re-labelled copy returns `UNSUPPORTED` (dropped, not forwarded). `ants_chain_rt_on_attestation` now returns the forward verdict, and eviction is FIFO.
+  - **Result:** the reproducer now gives a forged head of 13, equal to the control.
+- **F2, medium.** Unsigned bogus blocks were relayed and could push the real proposal out.
+  - **Fix:** a block is filed and forwarded only once a population attestation for its hash is on file, and every node now emits its ATTEST before the BLOCK.
+- **F4, medium.** A genesis time still in the future left the chain off for the life of the process.
+  - **Fix:** the daemon now waits (`chain waiting for genesis time`) and turns the chain on at the genesis time.
+- **F3, medium.** The Layer-1 view rule.
+  - **Fix:** the rule is now pinned in RFC-0004 item 9 with its limits, and the view bound was raised to 65536 proofs until pruning lands.
+- **Low.** The binding now checks the frame length before opening a stream.
+
+**Transport — a liveness bug the new e2e exposed.** `idle_timeout_ms` was never passed to picoquic, so every connection ran on picoquic's 30-s default. Nothing kept a quiet connection alive either. The chain is silent for the 30-s drand floor at every attempt, so the daemon's connections dropped between blocks. The first two-trustee e2e passed only because its proposal landed at 29.x s.
+- The timeout is now plumbed through.
+- A new `keep_alive` config option (QUIC PING every timeout/2) keeps quiet but live peers up. The daemon enables it.
+- `test_idle_timeout_and_keep_alive` was falsified both ways: with the timeout unplumbed the quiet connection is not closed; with keep-alive off it is.
+
+**Tests.**
+- `test_chain_runtime` adds two regressions. Re-labelled attestations do not stall the chain (falsified: with height in the identity, the copies are forwarded). Unattested blocks are not filed (falsified).
+- `test_gossip`: hand-written frame bytes and codec rejections; flooding with deduplication along a line A→B→C (falsified: with dedup removed the frames are re-handled); UNSUPPORTED neither counted nor forwarded (falsified); invalid frames counted; per-type caps (a 10 KB BLOCK passes, a 5 KB PUSH does not).
+- `test_antsd_config`: genesis round-trip at the 64-trustee ceiling; order and duplicates refused on encode; a swapped order rejected on decode; trailing bytes rejected.
+- `test_antsd_run`: **the spawned daemon and an in-process seed are the two genesis trustees**, with the genesis 2 s in the future so both start pending. With k = 2, finality needs both signatures, so it can only come from a real exchange over QUIC gossip. The test requires both nodes to report the same final height and hash. Falsified: with the seed's view diverging, no block finalises.
+
 ### reputation/chain: the block-production runtime (PR6a of the node daemon) · 2026-10-12
 
 `reputation/chain`: new `ants_chain_runtime.h` / `chain_runtime.c`, the state machine that turns the chain's pure functions into a running chain. Those functions are VRF committee selection, proposer election, `block_propose`, finality verification and the degraded seed. Until now RFC-0004 §"Consensus mechanism" had them, but nothing composed them: which height to attempt, when to propose, whether to sign, when a block is final, what happens on timeout.
