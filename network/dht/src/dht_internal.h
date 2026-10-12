@@ -266,6 +266,9 @@ struct ants_dht_lookup_state {
     uint8_t _pad[5];
     ants_dht_t *parent;
     ants_dht_shard_key_t target_key;
+    /* dht_now_us() at ants_dht_lookup_start — the origin the parent's
+     * lookup_deadline_ms is measured from. */
+    uint64_t started_at_us;
     /* BLAKE3(target_key_le_bytes) — the target in peer-id space. The DHT
      * routes by full 256-bit XOR; the shard-key projection lives here. */
     uint8_t target_peer_id[ANTS_PEER_ID_SIZE];

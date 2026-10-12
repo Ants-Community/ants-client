@@ -875,8 +875,9 @@ uint32_t ants_dht_tick(ants_dht_t *dht)
     uint64_t now_us = dht_now_us();
     (void)refresh_tick(dht, now_us);
     republish_tick(dht, now_us);
-    /* Wake-delay hint = the smaller of refresh_interval_ms/4 and
-     * announce_republish_ms/4 (or UINT32_MAX when both timers are off).
+    /* Wake-delay hint = the smallest of refresh_interval_ms/4,
+     * announce_republish_ms/4 and (while a lookup is active)
+     * lookup_deadline_ms/4 — or UINT32_MAX when every timer is off.
      * The caller may tick sooner when transport I/O arrives. */
     uint32_t wake = UINT32_MAX;
     if (state->refresh_interval_ms != 0) {
@@ -886,6 +887,22 @@ uint32_t ants_dht_tick(ants_dht_t *dht)
         uint32_t rwake = state->announce_republish_ms / 4u;
         if (rwake < wake) {
             wake = rwake;
+        }
+    }
+    /* An active lookup's deadline only fires from a tick, so while any
+     * is live, ask to be woken often enough to honour it. */
+    if (state->lookup_deadline_ms != 0) {
+        for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
+            if (state->active_lookups[i] != NULL) {
+                uint32_t lwake = state->lookup_deadline_ms / 4u;
+                if (lwake == 0) {
+                    lwake = 1;
+                }
+                if (lwake < wake) {
+                    wake = lwake;
+                }
+                break;
+            }
         }
     }
     return wake;
