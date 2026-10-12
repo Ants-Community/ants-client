@@ -13,6 +13,33 @@ the spec repo's
 
 ## Unreleased
 
+### reputation/chain: the block-production runtime (PR6a of the node daemon) · 2026-10-12
+
+`reputation/chain`: new `ants_chain_runtime.h` / `chain_runtime.c`, the state machine that turns the chain's pure functions into a running chain. Those functions are VRF committee selection, proposer election, `block_propose`, finality verification and the degraded seed. Until now RFC-0004 §"Consensus mechanism" had them, but nothing composed them: which height to attempt, when to propose, whether to sign, when a block is final, what happens on timeout.
+
+The runtime owns no I/O, no clock and no memory. The caller supplies `now`, the proposals and attestations that arrived, and a Layer-1 view callback. The runtime hands back, through callbacks, the proposals and attestations to broadcast and every new final head.
+
+**v1 rules** (RFC-0010 Phase 1 "trustee-signed"; DRAFT pending the RFC amendment that also pins the wire):
+- **Population and committee.** The population is the genesis trustees, strictly ascending. Heights are sequential on prev = head. The committee is `committee_select` over the trustees with k = min(N, 5), seeded by `vrf_seed_degraded(prev, h)`. v1 has no drand fetcher, so every block is a degraded-seed block. The proposer is position h mod k.
+- **Proposal.** The proposer waits out the 30-s drand hard floor and one block time past the head's cutoff, then proposes with cutoff = now.
+- **Signing.** A member signs only if the cutoff is in [head cutoff + 30 s, now + 10 s] and its *own* view recomposes the byte-identical block (recompute-and-compare). It signs at most one block per height, ever (the equivocation guard).
+- **Attestations.** Each one is signature-checked on arrival: one bad signature would otherwise make the whole finality verdict false.
+- **Finality and skip.** A block is final at ⌈2k/3⌉. A height not final within 120 s is skipped: h+1 on the same prev gets a new committee and proposer, and no member ever needs to sign twice.
+- **Adoption.** Any block provably final above the head is adopted, even across a gap: a late node catches up on finality, not on history. Full chain sync is later work.
+
+`test_chain_runtime` drives an in-process network (real Ed25519 keys, a fake 1-s clock, a message bus) through nine scenarios:
+- **healthy:** heights 1, 2, 3 finalise in order;
+- **offline proposer:** height 1 is skipped at 120 s and height 2 finalises on genesis;
+- **divergent view:** the member abstains, 2/3 still finalise, and it adopts the result;
+- **no quorum:** the head stays at genesis and attempts advance one per timeout;
+- **late observer:** it adopts the head;
+- **equivocation guard;**
+- **forged attestation;**
+- **single trustee;**
+- **init arguments.**
+
+Each of the four rules was falsified by removing it — skip, the equivocation guard, the signature check on arrival, the recompute — and each removal fails its scenario. The first equivocation test turned out not to exercise the guard (with 3 trustees the block was already final), so it was rebuilt with 4 before the guard could be shown to matter.
+
 ### network/transport + network/dht: unbind caller-owned streams — closes a remote use-after-free · 2026-10-12
 
 `network/transport`: callers allocate the handle for every stream they open (`ants_transport_stream_t`), and the transport registers it with picoquic as the stream's app context. Nothing ever unregistered it, so any callback that arrived after the caller freed the handle wrote into freed memory. The bridge also treated a ctx-less callback as a brand-new peer-opened stream, even for stream ids we had opened ourselves.
