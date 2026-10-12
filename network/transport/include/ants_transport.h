@@ -33,9 +33,9 @@
  * is caller-provided per project convention.
  *
  * Status: implemented — the QUIC transport (Component #4) is
- * feature-complete. A few peer-address / peer-id introspection accessors
+ * feature-complete. The peer-address / peer-list introspection accessors
  * return ANTS_ERROR_NOT_IMPLEMENTED in v1.0, where the transport carries
- * no durable peer state yet.
+ * no durable peer state yet; conn_peer_id is implemented.
  */
 
 #ifndef ANTS_TRANSPORT_H
@@ -442,6 +442,14 @@ bool ants_transport_stream_is_bidi(const ants_transport_stream_t *stream);
 /* Connection introspection                                                 */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * The peer's Ed25519 public key as AUTHENTICATED by the RFC 7250
+ * handshake on this connection — the identity to bind anything
+ * peer-scoped to (e.g. an attestation's report_data, RFC-0008 §11.12).
+ * Valid from CONN_READY on, including inside stream events (whose
+ * ev.peer_id is not populated). Returns ANTS_ERROR_PEER_UNREACHABLE
+ * before the handshake has completed, ANTS_ERROR_INVALID_ARG on NULL.
+ */
 ants_error_t ants_transport_conn_peer_id(const ants_transport_conn_t *conn,
                                          ants_peer_id_t *out_peer_id);
 

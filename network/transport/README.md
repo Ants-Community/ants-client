@@ -4,8 +4,9 @@ P2P transport. Network layer.
 
 **Status:** feature-complete at v0.x (Component #4) — the QUIC transport over
 vendored picoquic, with Ed25519 / RFC-7250 peer identity, multiplexed streams,
-and CBOR framing. A few peer-address / peer-id introspection accessors remain
-stubbed in v1.0 (no durable peer state yet).
+and CBOR framing. `ants_transport_conn_peer_id` reports a connection's
+authenticated peer key; the peer-address / peer-list introspection accessors
+remain stubbed in v1.0 (no durable peer state yet).
 **Effort:** 5 EM total (~3 EM picoquic wrapping + ~2 EM application protocol).
 **Spec:** [RFC-0002 §DHT routing](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0002-verifiability.md), [RFC-0010 §First peer's flow](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0010-bootstrap.md), [RFC-0005 §Anti-eclipse](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0005-identity.md).
 **Dependencies:** `foundation/crypto` (Ed25519 peer identity), `foundation/cbor` (frame encoding). External: `deps/picoquic` (vendored).

@@ -1,14 +1,18 @@
 /*
  * cmd/antsd/run.c — `antsd run`: the node's event loop.
  *
- * Stands the QUIC transport, the Kademlia DHT and the gossip engine up
- * from the config and drives the single-threaded tick loop until
- * SIGINT/SIGTERM. The transport event callback here is the daemon's
- * central demux: every event is forwarded to the DHT and to the gossip
- * transport binding (each consumes the ones belonging to its own
- * streams/conns, per the delegation contracts in ants_dht.h /
- * ants_gossip.h), then handled locally; the chain loop plugs in the
- * same way in a later PR. The DHT is seeded from the config's
+ * Stands the QUIC transport, the Kademlia DHT, the gossip engine and
+ * the attestation gate up from the config and drives the
+ * single-threaded tick loop until SIGINT/SIGTERM. The transport event
+ * callback here is the daemon's central demux: every event is forwarded
+ * to the DHT, the gossip transport binding and the attestation engine
+ * (each consumes the ones belonging to its own streams/conns, per the
+ * delegation contracts in ants_dht.h / ants_gossip.h / ants_attest.h),
+ * then handled locally; the chain loop plugs in the same way in a later
+ * PR. The attestation gate runs RFC-0005's v1 verify-and-tag posture:
+ * every connection is asked for its attestation, unattested peers are
+ * admitted, attested ones tagged, and peers presenting evidence that
+ * fails verification are disconnected. The DHT is seeded from the config's
  * bootstrap list; the gossip view is fed from DHT discovery and
  * refreshed on the anti-eclipse epoch cadence (probe + rotated
  * bucket-diverse sample, the composed recipe from ants_dht.h /
@@ -23,11 +27,13 @@
 #include "config.h"
 #include "util.h"
 
+#include "ants_attest.h"
 #include "ants_common.h"
 #include "ants_crdt.h"
 #include "ants_crypto.h"
 #include "ants_dht.h"
 #include "ants_gossip.h"
+#include "ants_tee.h"
 #include "ants_transport.h"
 
 #include <inttypes.h>
@@ -82,6 +88,16 @@ typedef char antsd_seed_capacity_check[(ANTSD_MAX_SEEDS == ANTS_DHT_MAX_BOOTSTRA
  * cadence. */
 #define ANTSD_VIEW_REFRESH_MS 60000u
 
+/* Every connection the transport admits must fit the attestation
+ * engine's per-connection tables, or a few silent peers could starve the
+ * gate (see ANTS_ATTEST_MAX_CONNS). */
+typedef char antsd_attest_capacity_check[(ANTSD_MAX_CONNECTIONS <= ANTS_ATTEST_MAX_CONNS) ? 1 : -1];
+
+/* QUIC application close code for a peer whose attestation failed
+ * verification (RFC-0005 verify-and-tag: false evidence → disconnect).
+ * Local to the daemon; the protocol does not register close codes. */
+#define ANTSD_CLOSE_ATTEST_REJECTED 0xA7u
+
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_stop_signal(int sig)
@@ -100,9 +116,13 @@ typedef struct {
     ants_dht_t *dht;
     ants_gossip_t *gossip;
     ants_gossip_transport_t *gossip_binding;
+    ants_attest_t *attest;
     uint64_t conns_ready;
     uint64_t conns_closed;
     uint64_t dht_peers;
+    uint64_t attested;
+    uint64_t unattested;
+    uint64_t rejected;
     ants_peer_id_t view[ANTSD_GOSSIP_VIEW_SIZE];
     size_t view_count;
 } antsd_node_t;
@@ -157,10 +177,13 @@ static void gossip_view_drop(antsd_node_t *node, const uint8_t *peer_id)
     }
 }
 
-/* The daemon's event demux. Every event is forwarded to the DHT and to
- * the gossip transport binding first (each consumes the ones belonging
- * to its own streams/conns and ignores the rest — cheap no-ops, per
- * the delegation contracts); connection lifecycle is then logged. */
+/* The daemon's event demux. Every event is forwarded to the DHT, the
+ * gossip transport binding and the attestation engine first (each
+ * consumes the ones belonging to its own streams/conns and ignores the
+ * rest — cheap no-ops, per the delegation contracts; the DHT server and
+ * the attestation engine both see every inbound bidi stream and split
+ * them by envelope type, RFC-0008 §11.11); connection lifecycle is then
+ * logged. */
 static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
 {
     antsd_node_t *node = (antsd_node_t *)ctx;
@@ -169,6 +192,9 @@ static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
     }
     if (node->gossip_binding != NULL) {
         (void)ants_gossip_transport_handle_event(node->gossip_binding, ev);
+    }
+    if (node->attest != NULL) {
+        ants_attest_handle_transport_event(node->attest, ev, (int64_t)time(NULL));
     }
     char hex[ANTS_PEER_ID_SIZE * 2 + 1];
     switch (ev->kind) {
@@ -186,6 +212,36 @@ static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
         break;
     }
     return ANTS_OK;
+}
+
+/* Attestation verdicts (one per connection). v1 policy, RFC-0005
+ * verify-and-tag: log every verdict; disconnect a peer whose evidence
+ * failed verification. Nothing here relaxes an attestation-requiring
+ * context — those consult the tag when they land. */
+static void attest_verdict(const ants_attest_result_t *r, void *ctx)
+{
+    antsd_node_t *node = (antsd_node_t *)ctx;
+    char hex[ANTS_PEER_ID_SIZE * 2 + 1];
+    antsd_hex_format(r->peer_id.bytes, sizeof r->peer_id.bytes, hex, sizeof hex);
+    switch (r->verdict) {
+    case ANTS_ATTEST_VERDICT_ATTESTED:
+        node->attested++;
+        printf("antsd: attest peer=%s verdict=attested vendor=%d\n", hex, (int)r->vendor);
+        break;
+    case ANTS_ATTEST_VERDICT_UNATTESTED:
+        node->unattested++;
+        printf("antsd: attest peer=%s verdict=unattested\n", hex);
+        break;
+    case ANTS_ATTEST_VERDICT_REJECTED:
+        node->rejected++;
+        printf("antsd: attest peer=%s verdict=rejected vendor=%d, disconnecting\n",
+               hex,
+               (int)r->vendor);
+        (void)ants_transport_peer_disconnect(r->conn, ANTSD_CLOSE_ATTEST_REJECTED);
+        break;
+    default:
+        break;
+    }
 }
 
 /* DHT event demux: routing-table membership is logged (it is the
@@ -465,6 +521,29 @@ int antsd_cmd_run(const char *path)
     node.gossip = &gossip;
     node.gossip_binding = &gossip_binding;
 
+    /* The attestation gate. No local presentation: generating one needs
+     * real confidential-compute hardware (ants_attestation_generate), so
+     * every v1 node answers with the empty body and is admitted
+     * unattested by its peers. */
+    static ants_attest_t attest; /* 32 KB — static, off the stack */
+    ants_attest_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    acfg.local = NULL;
+    acfg.freshness_window_seconds = ANTS_TEE_DEFAULT_FRESHNESS_WINDOW_SECONDS;
+    acfg.request_on_ready = true;
+    acfg.verdict_fn = attest_verdict;
+    acfg.verdict_ctx = &node;
+    rc = ants_attest_init(&attest, &acfg);
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: attest init failed: %s\n", ants_strerror(rc));
+        ants_transport_destroy(&transport, 0);
+        ants_gossip_transport_destroy(&gossip_binding);
+        ants_dht_destroy(&dht);
+        ants_crdt_destroy(gset);
+        return 1;
+    }
+    node.attest = &attest;
+
     /* Seed the routing table. A failed seed is logged and skipped —
      * the node can still be ignited by the remaining seeds or by
      * inbound connections. */
@@ -509,11 +588,14 @@ int antsd_cmd_run(const char *path)
     }
 
     printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ", dht peers %" PRIu64
-           ", view %zu)\n",
+           ", view %zu, attest %" PRIu64 "/%" PRIu64 "/%" PRIu64 " attested/unattested/rejected)\n",
            node.conns_ready,
            node.conns_closed,
            node.dht_peers,
-           node.view_count);
+           node.view_count,
+           node.attested,
+           node.unattested,
+           node.rejected);
     /* Teardown order matters: the transport goes first, so its
      * CONN_CLOSED callbacks still reach the DHT and the gossip binding
      * (via the router above) and let them release the connection state
@@ -522,6 +604,7 @@ int antsd_cmd_run(const char *path)
      * teardown notes in network/dht/tests/test_dht.c and
      * ants_gossip.h. */
     ants_transport_destroy(&transport, 0);
+    ants_attest_destroy(&attest);
     ants_gossip_transport_destroy(&gossip_binding);
     ants_dht_destroy(&dht);
     ants_crdt_destroy(gset);
