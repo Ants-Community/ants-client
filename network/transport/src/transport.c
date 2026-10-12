@@ -409,6 +409,14 @@ struct ants_transport_conn_state {
      * authenticated identity from here on (ants_transport_conn_peer_id). */
     int ready;
 
+    /* Set by ants_transport_stream_unbind when a caller unbinds (and so
+     * may free) a stream from inside one of that stream's own events.
+     * The callback bridge clears it before delivering each stream event
+     * and checks it afterwards: once set, the ss the bridge holds may be
+     * freed memory and is not touched again. */
+    int unbound_in_cb;
+    uint64_t unbound_stream_id;
+
     /* Inbound-cnx bookkeeping. is_heap == 1 means this struct was
      * malloc'd by the verify_certificate bootstrap (for an inbound
      * cnx the caller never dialed) and needs free() on CONN_CLOSED or
@@ -1214,6 +1222,22 @@ bootstrap_inbound_stream(picoquic_cnx_t *cnx,
 /* event_fn. Runs synchronously from inside tick() — no threading.          */
 /* ------------------------------------------------------------------------ */
 
+/* True when `stream_id` was opened by this endpoint (QUIC: the low bit is
+ * the initiator — 0 client, 1 server). A callback for one of OUR streams
+ * that arrives with no app context means the caller unbound it (it is
+ * done with the stream, possibly freed it): drop the event rather than
+ * mistake the stream for a new peer-opened one. */
+static int stream_is_local(picoquic_cnx_t *cnx, uint64_t stream_id)
+{
+    return PICOQUIC_IS_CLIENT_STREAM_ID(stream_id) == (picoquic_is_client(cnx) ? 1u : 0u);
+}
+
+/* Did the event just delivered unbind this stream (see unbound_in_cb)? */
+static int stream_unbound_by_caller(const struct ants_transport_conn_state *cs, uint64_t stream_id)
+{
+    return cs->unbound_in_cb && cs->unbound_stream_id == stream_id;
+}
+
 static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
                                     uint64_t stream_id,
                                     uint8_t *bytes,
@@ -1319,8 +1343,12 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
     case picoquic_callback_stream_data:
         /* Peer-opened streams arrive with stream_ctx == NULL the first
          * time. Bootstrap a heap ss and fire STREAM_OPENED, then deliver
-         * the data through the normal STREAM_READABLE path. */
+         * the data through the normal STREAM_READABLE path. A NULL ctx
+         * on one of OUR streams means the caller unbound it: drop. */
         if (ss == NULL) {
+            if (stream_is_local(cnx, stream_id)) {
+                return 0;
+            }
             ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
             if (ss == NULL) {
                 return 0; /* allocation failed; drop silently */
@@ -1338,12 +1366,15 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
         }
         break;
 
-    case picoquic_callback_stream_fin:
+    case picoquic_callback_stream_fin: {
         /* Deliver the trailing bytes (if any) as STREAM_READABLE first,
          * then fire STREAM_FIN. Two events keeps the contract simple:
          * payload-bearing events ALWAYS use STREAM_READABLE; FIN is a
          * pure signal. */
         if (ss == NULL) {
+            if (stream_is_local(cnx, stream_id)) {
+                return 0; /* unbound by the caller: drop */
+            }
             ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
             if (ss == NULL) {
                 return 0;
@@ -1357,15 +1388,31 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
             ev.stream = (ants_transport_stream_t *)(void *)ss;
             ev.payload = bytes;
             ev.payload_len = length;
+            cs->unbound_in_cb = 0;
             (void)event_fn(&ev, event_ctx);
+            if (stream_unbound_by_caller(cs, stream_id)) {
+                return 0; /* the caller let go of ss (it may be freed) */
+            }
         }
         ss->remote_fin_seen = 1;
+        /* Both directions of a stream WE opened are finished once the
+         * peer FINs after our own FIN: the caller is entitled to free
+         * its handle inside the event below, so unbind afterwards —
+         * using only (cnx, stream_id), never ss. A late frame for the
+         * stream (e.g. a RESET_STREAM racing our unacked FIN) then
+         * arrives ctx-less and is dropped instead of writing into
+         * freed memory. */
+        int unbind_after = !ss->is_heap && ss->local_fin_sent;
         memset(&ev, 0, sizeof ev);
         ev.conn = (ants_transport_conn_t *)(void *)cs;
         ev.kind = ANTS_TRANSPORT_EV_STREAM_FIN;
         ev.stream = (ants_transport_stream_t *)(void *)ss;
         (void)event_fn(&ev, event_ctx);
+        if (unbind_after) {
+            picoquic_unlink_app_stream_ctx(cnx, stream_id);
+        }
         break;
+    }
 
     case picoquic_callback_stream_reset:
     case picoquic_callback_stop_sending:
@@ -1375,15 +1422,27 @@ static int ants_transport_stream_cb(picoquic_cnx_t *cnx,
          * stream we haven't seen any data on yet — bootstrap in that
          * case so the caller learns about the (now-dead) stream. */
         if (ss == NULL) {
+            if (stream_is_local(cnx, stream_id)) {
+                return 0; /* unbound by the caller: drop */
+            }
             ss = bootstrap_inbound_stream(cnx, cs, stream_id, event_fn, event_ctx);
             if (ss == NULL) {
                 return 0;
             }
         }
         ss->reset_seen = 1;
-        ev.kind = ANTS_TRANSPORT_EV_STREAM_RESET;
-        ev.stream = (ants_transport_stream_t *)(void *)ss;
-        (void)event_fn(&ev, event_ctx);
+        {
+            /* A reset ends a stream we opened: the caller may free its
+             * handle in the event, so unbind afterwards (see the FIN
+             * arm). Peer-opened streams stay bound — they are ours. */
+            int unbind_after = !ss->is_heap;
+            ev.kind = ANTS_TRANSPORT_EV_STREAM_RESET;
+            ev.stream = (ants_transport_stream_t *)(void *)ss;
+            (void)event_fn(&ev, event_ctx);
+            if (unbind_after) {
+                picoquic_unlink_app_stream_ctx(cnx, stream_id);
+            }
+        }
         break;
 
     default:
@@ -1715,6 +1774,33 @@ uint64_t ants_transport_stream_bytes_received(const ants_transport_stream_t *str
 {
     (void)stream;
     return 0;
+}
+
+ants_error_t ants_transport_stream_unbind(ants_transport_stream_t *stream)
+{
+    if (stream == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_transport_stream_state *ss =
+        (struct ants_transport_stream_state *)(void *)stream->_opaque;
+    if (ss->is_heap) {
+        /* Peer-opened streams belong to the transport (freed at the
+         * conn's close); unbinding one would only orphan it. */
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    struct ants_transport_conn_state *cs = ss->parent_conn;
+    if (cs == NULL) {
+        return ANTS_OK; /* never opened, or already unbound */
+    }
+    if (cs->cnx != NULL) {
+        picoquic_unlink_app_stream_ctx(cs->cnx, ss->stream_id);
+    }
+    /* Tell the bridge, if this runs inside one of the stream's own
+     * events, that the ss it holds is no longer the caller's to keep. */
+    cs->unbound_in_cb = 1;
+    cs->unbound_stream_id = ss->stream_id;
+    ss->parent_conn = NULL;
+    return ANTS_OK;
 }
 
 bool ants_transport_stream_is_bidi(const ants_transport_stream_t *stream)

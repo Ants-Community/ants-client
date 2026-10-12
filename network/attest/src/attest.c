@@ -254,6 +254,9 @@ ants_error_t ants_attest_request(ants_attest_t *a, ants_transport_conn_t *conn)
     o->stream = stream;
     if ((err = ants_transport_open_bidi_stream(conn, stream)) != ANTS_OK ||
         (err = ants_transport_stream_send(stream, req, req_len, true)) != ANTS_OK) {
+        /* If the open succeeded the stream is bound: detach it before the
+         * handle is freed (a no-op when the open itself failed). */
+        (void)ants_transport_stream_unbind(stream);
         outbound_release(o);
         return err;
     }

@@ -429,6 +429,27 @@ uint64_t ants_transport_stream_bytes_sent(const ants_transport_stream_t *stream)
 uint64_t ants_transport_stream_bytes_received(const ants_transport_stream_t *stream);
 
 /*
+ * Detach a stream WE opened from the transport, so its handle may be freed
+ * or reused before the stream has ended — e.g. an RPC abandoning a reply
+ * that overflowed its buffer. After this call no event will ever carry
+ * the handle again (late frames for the stream are dropped) and stream
+ * operations on it fail. Call it while the stream's connection is still
+ * open — typically from inside one of the stream's own events, which is
+ * safe: the transport stops using the handle once the event returns.
+ *
+ * Not needed after a terminal event: once a stream we opened has seen
+ * STREAM_RESET, or STREAM_FIN after our own FIN, the transport unbinds
+ * it itself as that event returns, so the handle may be freed inside the
+ * event. Nor after CONN_CLOSED or ants_transport_destroy, which deliver
+ * nothing further for the connection's streams.
+ *
+ * Returns ANTS_OK (also for a never-opened or already-unbound handle);
+ * ANTS_ERROR_INVALID_ARG on NULL or on a peer-opened stream (the
+ * transport owns those).
+ */
+ants_error_t ants_transport_stream_unbind(ants_transport_stream_t *stream);
+
+/*
  * Whether `stream` is bidirectional. Uni and bidi streams carry
  * different protocols in ANTS — DHT RPCs ride bidi streams (the server
  * answers on the same stream), gossip push channels ride uni streams

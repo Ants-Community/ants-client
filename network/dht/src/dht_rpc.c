@@ -162,6 +162,9 @@ static ants_error_t arm_and_send(struct ants_dht_state *state,
     }
     err = ants_transport_stream_send(stream, encoded, encoded_len, true /* fin */);
     if (err != ANTS_OK) {
+        /* The stream is open (bound) but will never be used: unbind
+         * before release_slot frees the handle. */
+        (void)ants_transport_stream_unbind(stream);
         slot->completion = NULL;
         release_slot(slot);
         return err;
@@ -381,10 +384,15 @@ static ants_error_t handle_readable(struct ants_dht_pending_rpc *slot,
     if (event->payload == NULL || event->payload_len == 0) {
         return ANTS_OK;
     }
+    /* Abandoning the RPC here is MID-stream: the peer may still send
+     * (and FIN). Unbind the stream before fail_slot frees its handle, so
+     * the transport drops those late deliveries instead of writing into
+     * freed memory (a peer controls when this path runs). */
     /* Lazy-alloc recv_buf on first fragment. */
     if (slot->recv_buf == NULL) {
         slot->recv_buf = (uint8_t *)malloc(ANTS_DHT_RPC_RECV_CAP);
         if (slot->recv_buf == NULL) {
+            (void)ants_transport_stream_unbind(slot->stream);
             fail_slot(slot, ANTS_ERROR_MALFORMED);
             return ANTS_OK;
         }
@@ -393,6 +401,7 @@ static ants_error_t handle_readable(struct ants_dht_pending_rpc *slot,
     }
     /* Check for overflow before memcpy. */
     if (event->payload_len > slot->recv_cap - slot->recv_len) {
+        (void)ants_transport_stream_unbind(slot->stream);
         fail_slot(slot, ANTS_ERROR_BUFFER_TOO_SMALL);
         return ANTS_OK;
     }
