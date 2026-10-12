@@ -25,11 +25,21 @@
  *   NO_ANSWER — the stream was reset, the connection closed, or the
  *               request timed out (ants_infer_tick) first.
  *
+ * After an ANSWERED exchange the requester may pay for it with a receipt
+ * (§11.15): RECEIPT_OFFER (13) carries the §11.9 body, nonce =
+ * BLAKE3(commit)[0:16], and the requester's signature; the producer
+ * countersigns in RECEIPT_ACK (14) — at most once per nonce, only for an
+ * answer it served to this requester within RECEIPT_WINDOW, at no less
+ * than the reference rate, with the timestamp within RECEIPT_CLOCK_SKEW —
+ * or refuses with the empty body. The producer remembers what it served
+ * (ANTS_INFER_MAX_SERVED answers); filing the receipt is the caller's
+ * (receipt_fn).
+ *
  * Integration — forward every transport event, like the DHT and attest:
  *
  *     ants_dht_handle_transport_event(&app->dht, ev);
  *     ants_attest_handle_transport_event(&app->attest, ev, now);
- *     ants_infer_handle_transport_event(&app->infer, ev);
+ *     ants_infer_handle_transport_event(&app->infer, ev, now);
  *
  * Single-threaded, driven from inside the transport's event callback; the
  * producer callback runs synchronously there. Heap: stream handles and
@@ -41,6 +51,7 @@
 
 #include "ants_common.h"
 #include "ants_inference.h"
+#include "ants_reputation.h"
 #include "ants_transport.h"
 
 #include <stdbool.h>
@@ -70,6 +81,23 @@ extern "C" {
  * receiver bound derived from the input cap. */
 #define ANTS_INFER_MAX_REQ_BYTES (ANTS_INFER_MAX_INPUT_BYTES + 128u)
 
+/* The receipt exchange (§11.15): types 13/14 on the same envelope. */
+#define ANTS_INFER_MSG_RECEIPT_OFFER 13u
+#define ANTS_INFER_MSG_RECEIPT_ACK   14u
+/* RECEIPT_MAX_OFFER_BYTES (pinned): a larger RECEIPT_OFFER is malformed. */
+#define ANTS_INFER_RECEIPT_MAX_OFFER_BYTES 512u
+/* RECEIPT_MAX_ACK_BYTES (pinned): a larger RECEIPT_ACK is malformed. */
+#define ANTS_INFER_RECEIPT_MAX_ACK_BYTES 128u
+/* INFER_REF_UNCS_PER_POSITION (calibratable): the v1 reference rate, the
+ * least a producer countersigns per committed position. */
+#define ANTS_INFER_REF_UNCS_PER_POSITION 1000u
+/* RECEIPT_WINDOW (calibratable): how long a served answer stays
+ * receiptable, seconds. */
+#define ANTS_INFER_RECEIPT_WINDOW_S 600u
+/* RECEIPT_CLOCK_SKEW (calibratable): how far a receipt's timestamp may be
+ * from the producer's clock, seconds. */
+#define ANTS_INFER_RECEIPT_CLOCK_SKEW_S 300u
+
 typedef char ants_infer_positions_match_model
     [(ANTS_INFER_MAX_POSITIONS == ANTS_INFERENCE_REF_SEQLEN_MAX) ? 1 : -1];
 
@@ -97,6 +125,20 @@ typedef struct {
     const uint8_t *envelope; /* the §11.8 answer envelope */
     size_t envelope_len;     /* >= 1 */
 } ants_infer_answer_t;
+
+/* A RECEIPT_OFFER body: the §11.9 receipt-body encoding and the client's
+ * signature over it. `body` is borrowed. */
+typedef struct {
+    const uint8_t *body;
+    size_t body_len; /* 1 .. ANTS_REP_RECEIPT_BODY_ENCODED_MAX */
+    uint8_t client_sig[ANTS_REP_SIG_SIZE];
+} ants_infer_offer_t;
+
+/* A RECEIPT_ACK body. `present == false` is the empty body (refused). */
+typedef struct {
+    bool present;
+    uint8_t server_sig[ANTS_REP_SIG_SIZE];
+} ants_infer_ack_t;
 
 /* ------------------------------------------------------------------------ */
 /* Codec — canonical CBOR per RFC-0008 §1.1, strict decoders                */
@@ -126,6 +168,46 @@ ants_error_t ants_infer_wire_decode_resp(const uint8_t *buf,
                                          size_t len,
                                          uint32_t *out_txid,
                                          ants_infer_answer_t *out);
+
+ants_error_t ants_infer_wire_encode_offer(uint8_t *buf,
+                                          size_t cap,
+                                          size_t *out_len,
+                                          uint32_t txid,
+                                          const ants_infer_offer_t *o);
+/* ANTS_ERROR_BUFFER_TOO_SMALL when len > ANTS_INFER_RECEIPT_MAX_OFFER_BYTES. */
+ants_error_t ants_infer_wire_decode_offer(const uint8_t *buf,
+                                          size_t len,
+                                          uint32_t *out_txid,
+                                          ants_infer_offer_t *out);
+
+ants_error_t ants_infer_wire_encode_ack(uint8_t *buf,
+                                        size_t cap,
+                                        size_t *out_len,
+                                        uint32_t txid,
+                                        const ants_infer_ack_t *a);
+ants_error_t ants_infer_wire_decode_ack(const uint8_t *buf,
+                                        size_t len,
+                                        uint32_t *out_txid,
+                                        ants_infer_ack_t *out);
+
+/* ------------------------------------------------------------------------ */
+/* Receipts (§11.15)                                                        */
+/* ------------------------------------------------------------------------ */
+
+/* The receipt nonce of an answer: BLAKE3(commit encoding)[0:16]. */
+ants_error_t ants_infer_receipt_nonce(const ants_inference_commit_t *commit,
+                                      uint8_t out[ANTS_REP_NONCE_SIZE]);
+
+/* A requester's receipt for an answered `commit`: server = the producer's
+ * peer-id (the one the connection authenticated), client = the public key
+ * of `client_priv`, ncs_value = ANTS_INFER_REF_UNCS_PER_POSITION ×
+ * commit.length, timestamp = `now_unix`, nonce from the commit — and the
+ * client signature over the body. `out->server_sig` is zeroed. */
+ants_error_t ants_infer_receipt_prepare(const ants_inference_commit_t *commit,
+                                        const ants_peer_id_t *server,
+                                        const uint8_t client_priv[ANTS_INFERENCE_PRIVKEY_SIZE],
+                                        uint64_t now_unix,
+                                        ants_reputation_receipt_t *out);
 
 /* ------------------------------------------------------------------------ */
 /* Engine                                                                   */
@@ -189,6 +271,50 @@ ants_error_t ants_infer_serve_reference(ants_inference_t *ctx,
                                         const ants_infer_request_t *req,
                                         ants_infer_served_t *out);
 
+typedef int32_t ants_infer_receipt_verdict_t;
+
+#define ANTS_INFER_RECEIPT_NO_ANSWER ((ants_infer_receipt_verdict_t)0)
+#define ANTS_INFER_RECEIPT_ACKED     ((ants_infer_receipt_verdict_t)1)
+#define ANTS_INFER_RECEIPT_REFUSED   ((ants_infer_receipt_verdict_t)2)
+#define ANTS_INFER_RECEIPT_REJECTED  ((ants_infer_receipt_verdict_t)3)
+
+typedef struct {
+    ants_transport_conn_t *conn;
+    ants_peer_id_t peer_id; /* the producer, as the transport authenticated it */
+    ants_infer_receipt_verdict_t verdict;
+    void *cookie; /* the caller's, from ants_infer_offer_receipt */
+    /* ACKED: the complete receipt, both signatures verified. Otherwise the
+     * receipt as offered (no server signature). */
+    ants_reputation_receipt_t receipt;
+} ants_infer_receipt_result_t;
+
+/* Requester callback, once per ants_infer_offer_receipt that returned
+ * ANTS_OK. Same restrictions as ants_infer_result_fn. */
+typedef void (*ants_infer_receipt_result_fn)(const ants_infer_receipt_result_t *result, void *ctx);
+
+/* Producer: sign `msg` with the node identity (the key whose public half is
+ * config.local_id). */
+typedef ants_error_t (*ants_infer_sign_fn)(void *ctx,
+                                           const uint8_t *msg,
+                                           size_t msg_len,
+                                           uint8_t out_sig[ANTS_REP_SIG_SIZE]);
+
+/* Producer: a receipt was countersigned and must be filed in the node's
+ * receipt bag. Called before the ACK is sent. */
+typedef void (*ants_infer_receipt_fn)(void *ctx, const ants_reputation_receipt_t *receipt);
+
+/* Producer: has the node ever filed a receipt with this nonce? The served
+ * table forgets answers after RECEIPT_WINDOW, but the commit of an answer is
+ * deterministic (a replayed INFER_REQ is answered with the same commit), so
+ * "at most one receipt per nonce" needs the node's whole history: the bag. */
+typedef bool (*ants_infer_receipt_paid_fn)(void *ctx, const uint8_t nonce[ANTS_REP_NONCE_SIZE]);
+
+/* Answers the producer remembers as receiptable (RECEIPT_WINDOW). A nonce
+ * is recorded once, for the first requester it was served to. When the
+ * table is full, answers already paid are forgotten first, then the oldest
+ * — whose receipt can then no longer be countersigned. */
+#define ANTS_INFER_MAX_SERVED 256
+
 /* Outbound exchanges in flight at once. */
 #define ANTS_INFER_MAX_OUTBOUND 16
 
@@ -201,7 +327,7 @@ ants_error_t ants_infer_serve_reference(ants_inference_t *ctx,
  * network/attest sizing rule). */
 #define ANTS_INFER_MAX_CONNS 64
 
-#define ANTS_INFER_CTX_SIZE  16384
+#define ANTS_INFER_CTX_SIZE  65536
 
 typedef union {
     uint8_t _opaque[ANTS_INFER_CTX_SIZE];
@@ -218,6 +344,22 @@ typedef struct {
     /* How long an outbound request may wait for its INFER_RESP before
      * ants_infer_tick gives up on it (NO_ANSWER). 0 → no timeout. */
     uint64_t timeout_ms;
+
+    /* Receipts, producer side (§11.15). `receipt_sign_fn` NULL → every
+     * RECEIPT_OFFER is refused. `local_id` is the node's peer-id: the
+     * `server` an offer must name. */
+    ants_peer_id_t local_id;
+    ants_infer_sign_fn receipt_sign_fn;
+    void *receipt_sign_ctx;
+    ants_infer_receipt_fn receipt_fn;
+    void *receipt_ctx;
+    /* NULL → only the served table is consulted (a nonce can then be paid
+     * again once its entry is gone). */
+    ants_infer_receipt_paid_fn receipt_paid_fn;
+    void *receipt_paid_ctx;
+    /* Receipts, requester side (may be NULL). */
+    ants_infer_receipt_result_fn receipt_result_fn;
+    void *receipt_result_ctx;
 } ants_infer_config_t;
 
 ants_error_t ants_infer_init(ants_infer_t *e, const ants_infer_config_t *config);
@@ -238,13 +380,25 @@ ants_error_t ants_infer_request(ants_infer_t *e,
                                 uint64_t now_ms,
                                 void *cookie);
 
+/* Offer `receipt` (body + client_sig, as ants_infer_receipt_prepare makes
+ * it) to the producer on `conn`. Same errors and timeout as
+ * ants_infer_request; the verdict arrives through receipt_result_fn. */
+ants_error_t ants_infer_offer_receipt(ants_infer_t *e,
+                                      ants_transport_conn_t *conn,
+                                      const ants_reputation_receipt_t *receipt,
+                                      uint64_t now_ms,
+                                      void *cookie);
+
 /* Expire outbound requests older than config.timeout_ms: each is reset,
  * released, and reported NO_ANSWER. Call from the event loop's tick. */
 void ants_infer_tick(ants_infer_t *e, uint64_t now_ms);
 
 /* Forward EVERY transport event; events that are not the module's are
- * cheap no-ops. */
-void ants_infer_handle_transport_event(ants_infer_t *e, const ants_transport_event_t *ev);
+ * cheap no-ops. `now_unix` is the node's wall clock in seconds: it stamps
+ * served answers and checks a receipt's window and timestamp. */
+void ants_infer_handle_transport_event(ants_infer_t *e,
+                                       const ants_transport_event_t *ev,
+                                       uint64_t now_unix);
 
 #ifdef __cplusplus
 }

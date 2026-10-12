@@ -1,10 +1,14 @@
 /*
- * infer.c — the inference exchange engine (RFC-0008 §11.14).
+ * infer.c — the inference exchange engine (RFC-0008 §11.14) and the
+ * receipt exchange that pays for an answer (§11.15).
  *
- * Two fixed tables live in the caller's opaque buffer:
- *   - outbound exchanges: our INFER_REQ in flight on a stream we opened
- *     (heap stream handle, a copy of the request for the answer check, a
- *     response buffer allocated on first byte — the DHT RPC lifetime);
+ * Three fixed tables live in the caller's opaque buffer:
+ *   - outbound exchanges: our INFER_REQ or RECEIPT_OFFER in flight on a
+ *     stream we opened (heap stream handle, a copy of what we asked for the
+ *     check, a response buffer allocated on first byte — the DHT RPC
+ *     lifetime);
+ *   - served answers: what this node answered, to whom, and when — the
+ *     only answers it will countersign a receipt for, once each;
  *   - inbound streams: peer-initiated bidi streams. Every such stream is
  *     also seen by the DHT server and network/attest, so a stream is first
  *     CLASSIFIED from its envelope head (a few bytes) and released at once
@@ -15,7 +19,9 @@
 
 #include "ants_infer.h"
 
+#include "ants_crypto.h"
 #include "ants_inference.h"
+#include "ants_reputation.h"
 #include "ants_transport.h"
 
 #include <stdbool.h>
@@ -37,14 +43,18 @@
  * and the signature (≈ 290 bytes at most). */
 #define INFER_RESP_OVERHEAD 512
 
+enum { OUT_INFER = 0, OUT_RECEIPT = 1 };
+
+typedef char infer_nonce_size_check[(ANTS_REP_NONCE_SIZE <= ANTS_INFERENCE_HASH_SIZE) ? 1 : -1];
+
 struct infer_outbound {
     bool in_use;
+    uint8_t kind; /* OUT_INFER | OUT_RECEIPT */
     /* Local allocation failure: no verdict (it says nothing about the
      * peer). The slot stays until the stream ends — freeing the stream
      * handle mid-stream would leave the transport writing into it. */
     bool local_oom;
     bool oversized;
-    uint8_t _pad;
     uint32_t txid;
     ants_transport_conn_t *conn;
     ants_transport_stream_t *stream; /* heap, ours */
@@ -54,17 +64,30 @@ struct infer_outbound {
     size_t input_len;
     uint32_t tier;
     uint8_t req_nonce[ANTS_INFERENCE_HASH_SIZE];
-    uint8_t *buf; /* heap, lazily: ANTS_INFER_MAX_RESP_BYTES */
+    ants_reputation_receipt_t receipt; /* OUT_RECEIPT: what we offered */
+    uint8_t *buf;                      /* heap, lazily: ANTS_INFER_MAX_RESP_BYTES */
     size_t len;
+};
+
+/* An answer this node served: receiptable once, by its requester, within
+ * RECEIPT_WINDOW. */
+struct infer_served {
+    bool in_use;
+    bool receipted;
+    uint8_t nonce[ANTS_REP_NONCE_SIZE];
+    uint8_t client[ANTS_REP_PEER_ID_SIZE];
+    uint32_t length;
+    uint64_t served_at;
 };
 
 struct infer_inbound {
     bool in_use;
-    bool claimed; /* the head said INFER_REQ: `buf` holds the message */
-    uint8_t _pad[6];
+    bool claimed; /* the head said INFER_REQ or RECEIPT_OFFER */
+    uint8_t _pad[2];
+    uint32_t type; /* once claimed */
     ants_transport_conn_t *conn;
     ants_transport_stream_t *stream; /* the transport's */
-    uint8_t *buf;                    /* heap once claimed: ANTS_INFER_MAX_REQ_BYTES */
+    uint8_t *buf;                    /* heap once claimed: inbound_cap(type) */
     size_t len;
     uint8_t head[INFER_HEAD_PREFIX]; /* before the claim */
 };
@@ -75,10 +98,12 @@ struct infer_state {
      * from inside a NO_ANSWER callback is refused (it would bind a stream
      * to a connection about to be freed). */
     const ants_transport_conn_t *closing;
+    uint64_t now_unix; /* the clock of the event being handled */
     uint32_t next_txid;
     uint8_t _pad[4];
     struct infer_outbound out[ANTS_INFER_MAX_OUTBOUND];
     struct infer_inbound in[INFER_MAX_INBOUND];
+    struct infer_served served[ANTS_INFER_MAX_SERVED];
 };
 
 typedef char infer_state_fits_opaque
@@ -151,10 +176,28 @@ static void emit(struct infer_state *s, const ants_infer_result_t *r)
     }
 }
 
+static void emit_receipt(struct infer_state *s, const ants_infer_receipt_result_t *r)
+{
+    if (s->cfg.receipt_result_fn != NULL) {
+        s->cfg.receipt_result_fn(r, s->cfg.receipt_result_ctx);
+    }
+}
+
 /* Report NO_ANSWER for `o` (the peer-id may be unknown by now). */
 static void emit_no_answer(struct infer_state *s, const struct infer_outbound *o)
 {
     ants_infer_result_t r;
+    if (o->kind == OUT_RECEIPT) {
+        ants_infer_receipt_result_t rr;
+        memset(&rr, 0, sizeof rr);
+        rr.conn = o->conn;
+        (void)ants_transport_conn_peer_id(o->conn, &rr.peer_id);
+        rr.verdict = ANTS_INFER_RECEIPT_NO_ANSWER;
+        rr.cookie = o->cookie;
+        rr.receipt = o->receipt;
+        emit_receipt(s, &rr);
+        return;
+    }
     memset(&r, 0, sizeof r);
     r.conn = o->conn;
     (void)ants_transport_conn_peer_id(o->conn, &r.peer_id);
@@ -163,66 +206,52 @@ static void emit_no_answer(struct infer_state *s, const struct infer_outbound *o
     emit(s, &r);
 }
 
-ants_error_t ants_infer_request(ants_infer_t *e,
-                                ants_transport_conn_t *conn,
-                                const ants_infer_request_t *req,
-                                uint64_t now_ms,
-                                void *cookie)
+/* A free outbound slot for `conn`, or NULL (with *err set). */
+static struct infer_outbound *
+outbound_alloc(struct infer_state *s, const ants_transport_conn_t *conn, ants_error_t *err)
 {
-    struct infer_state *s;
-    struct infer_outbound *o = NULL;
-    uint8_t *msg;
-    size_t msg_len;
-    uint32_t txid;
-    ants_transport_stream_t *stream;
-    ants_error_t err;
     size_t i;
-
-    if (e == NULL || conn == NULL || req == NULL) {
-        return ANTS_ERROR_INVALID_ARG;
-    }
-    s = get_state(e);
     if (conn == s->closing) {
-        return ANTS_ERROR_PEER_UNREACHABLE;
+        *err = ANTS_ERROR_PEER_UNREACHABLE;
+        return NULL;
     }
     for (i = 0; i < ANTS_INFER_MAX_OUTBOUND; i++) {
         if (!s->out[i].in_use) {
-            o = &s->out[i];
-            break;
+            return &s->out[i];
         }
     }
-    if (o == NULL) {
-        return ANTS_ERROR_BUFFER_TOO_SMALL;
-    }
+    *err = ANTS_ERROR_BUFFER_TOO_SMALL;
+    return NULL;
+}
 
-    txid = s->next_txid++;
+static uint32_t next_txid(struct infer_state *s)
+{
+    uint32_t txid = s->next_txid++;
     if (s->next_txid == 0) {
         s->next_txid = 1;
     }
-    msg = (uint8_t *)malloc(ANTS_INFER_MAX_REQ_BYTES);
-    if (msg == NULL) {
-        return ANTS_ERROR_BUFFER_TOO_SMALL;
-    }
-    err = ants_infer_wire_encode_req(msg, ANTS_INFER_MAX_REQ_BYTES, &msg_len, txid, req);
-    if (err != ANTS_OK) {
-        free(msg);
-        return err;
-    }
-    stream = (ants_transport_stream_t *)malloc(sizeof(ants_transport_stream_t));
-    o->input = (uint8_t *)malloc(req->input_len);
-    if (stream == NULL || o->input == NULL) {
-        free(stream);
-        free(o->input);
-        o->input = NULL;
-        free(msg);
+    return txid;
+}
+
+/* Open a stream for the prepared slot `o` and send `msg` with FIN. The slot
+ * is claimed before the open, so a nested event finds it; on failure it is
+ * released. */
+static ants_error_t outbound_launch(struct infer_outbound *o,
+                                    ants_transport_conn_t *conn,
+                                    uint32_t txid,
+                                    const uint8_t *msg,
+                                    size_t msg_len,
+                                    uint64_t now_ms,
+                                    void *cookie)
+{
+    ants_error_t err;
+    ants_transport_stream_t *stream =
+        (ants_transport_stream_t *)malloc(sizeof(ants_transport_stream_t));
+    if (stream == NULL) {
+        outbound_release(o);
         return ANTS_ERROR_BUFFER_TOO_SMALL;
     }
     memset(stream, 0, sizeof *stream);
-    memcpy(o->input, req->input, req->input_len);
-    o->input_len = req->input_len;
-    o->tier = req->tier;
-    memcpy(o->req_nonce, req->req_nonce, sizeof o->req_nonce);
-    /* Claim the slot before opening, so a nested event finds it. */
     o->in_use = true;
     o->txid = txid;
     o->conn = conn;
@@ -234,11 +263,95 @@ ants_error_t ants_infer_request(ants_infer_t *e,
         /* A no-op when the open itself failed. */
         (void)ants_transport_stream_unbind(stream);
         outbound_release(o);
+        return err;
+    }
+    return ANTS_OK;
+}
+
+ants_error_t ants_infer_request(ants_infer_t *e,
+                                ants_transport_conn_t *conn,
+                                const ants_infer_request_t *req,
+                                uint64_t now_ms,
+                                void *cookie)
+{
+    struct infer_state *s;
+    struct infer_outbound *o;
+    uint8_t *msg;
+    size_t msg_len;
+    uint32_t txid;
+    ants_error_t err = ANTS_OK;
+
+    if (e == NULL || conn == NULL || req == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    s = get_state(e);
+    if ((o = outbound_alloc(s, conn, &err)) == NULL) {
+        return err;
+    }
+    txid = next_txid(s);
+    msg = (uint8_t *)malloc(ANTS_INFER_MAX_REQ_BYTES);
+    if (msg == NULL) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    err = ants_infer_wire_encode_req(msg, ANTS_INFER_MAX_REQ_BYTES, &msg_len, txid, req);
+    if (err != ANTS_OK) {
         free(msg);
         return err;
     }
+    o->input = (uint8_t *)malloc(req->input_len);
+    if (o->input == NULL) {
+        free(msg);
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    memcpy(o->input, req->input, req->input_len);
+    o->input_len = req->input_len;
+    o->tier = req->tier;
+    memcpy(o->req_nonce, req->req_nonce, sizeof o->req_nonce);
+    o->kind = OUT_INFER;
+    err = outbound_launch(o, conn, txid, msg, msg_len, now_ms, cookie);
     free(msg);
-    return ANTS_OK;
+    return err;
+}
+
+ants_error_t ants_infer_offer_receipt(ants_infer_t *e,
+                                      ants_transport_conn_t *conn,
+                                      const ants_reputation_receipt_t *receipt,
+                                      uint64_t now_ms,
+                                      void *cookie)
+{
+    struct infer_state *s;
+    struct infer_outbound *o;
+    uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    uint8_t msg[ANTS_INFER_RECEIPT_MAX_OFFER_BYTES];
+    size_t body_len;
+    size_t msg_len;
+    ants_infer_offer_t offer;
+    uint32_t txid;
+    ants_error_t err = ANTS_OK;
+
+    if (e == NULL || conn == NULL || receipt == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    s = get_state(e);
+    if ((o = outbound_alloc(s, conn, &err)) == NULL) {
+        return err;
+    }
+    if ((err = ants_reputation_receipt_body_encode(receipt, body, sizeof body, &body_len)) !=
+        ANTS_OK) {
+        return err;
+    }
+    txid = next_txid(s);
+    memset(&offer, 0, sizeof offer);
+    offer.body = body;
+    offer.body_len = body_len;
+    memcpy(offer.client_sig, receipt->client_sig, sizeof offer.client_sig);
+    if ((err = ants_infer_wire_encode_offer(msg, sizeof msg, &msg_len, txid, &offer)) != ANTS_OK) {
+        return err;
+    }
+    o->kind = OUT_RECEIPT;
+    o->receipt = *receipt;
+    memset(o->receipt.server_sig, 0, sizeof o->receipt.server_sig);
+    return outbound_launch(o, conn, txid, msg, msg_len, now_ms, cookie);
 }
 
 static struct infer_outbound *outbound_by_stream(struct infer_state *s,
@@ -253,8 +366,49 @@ static struct infer_outbound *outbound_by_stream(struct infer_state *s,
     return NULL;
 }
 
+/* Turn a complete RECEIPT_ACK into a verdict. */
+static void receipt_conclude(struct infer_state *s, struct infer_outbound *o)
+{
+    ants_infer_receipt_result_t r;
+    ants_infer_ack_t a;
+    uint32_t txid = 0;
+    bool ok = false;
+    ants_error_t err = ANTS_ERROR_MALFORMED;
+
+    memset(&r, 0, sizeof r);
+    r.conn = o->conn;
+    r.cookie = o->cookie;
+    r.receipt = o->receipt;
+    if (ants_transport_conn_peer_id(o->conn, &r.peer_id) != ANTS_OK) {
+        r.verdict = ANTS_INFER_RECEIPT_NO_ANSWER;
+        emit_receipt(s, &r);
+        return;
+    }
+    if (o->buf != NULL && !o->oversized) {
+        err = ants_infer_wire_decode_ack(o->buf, o->len, &txid, &a);
+    }
+    if (err != ANTS_OK || txid != o->txid) {
+        r.verdict = ANTS_INFER_RECEIPT_REJECTED;
+    } else if (!a.present) {
+        r.verdict = ANTS_INFER_RECEIPT_REFUSED;
+    } else {
+        /* The countersignature must make the receipt whole: both signatures
+         * over the same body, the server's by the key this connection
+         * authenticated (the receipt names it as `server`). */
+        memcpy(r.receipt.server_sig, a.server_sig, sizeof a.server_sig);
+        if (memcmp(r.receipt.server, r.peer_id.bytes, sizeof r.receipt.server) == 0 &&
+            ants_reputation_receipt_verify(&r.receipt, &ok) == ANTS_OK && ok) {
+            r.verdict = ANTS_INFER_RECEIPT_ACKED;
+        } else {
+            memset(r.receipt.server_sig, 0, sizeof r.receipt.server_sig);
+            r.verdict = ANTS_INFER_RECEIPT_REJECTED;
+        }
+    }
+    emit_receipt(s, &r);
+}
+
 /* Turn a complete INFER_RESP into a verdict. */
-static void outbound_conclude(struct infer_state *s, struct infer_outbound *o)
+static void infer_conclude(struct infer_state *s, struct infer_outbound *o)
 {
     ants_infer_result_t r;
     ants_infer_answer_t a;
@@ -302,6 +456,23 @@ static void outbound_conclude(struct infer_state *s, struct infer_outbound *o)
     emit(s, &r);
 }
 
+static void outbound_conclude(struct infer_state *s, struct infer_outbound *o)
+{
+    if (o->kind == OUT_RECEIPT) {
+        receipt_conclude(s, o);
+    } else {
+        infer_conclude(s, o);
+    }
+}
+
+/* The most an answer to `o` may carry: an INFER_RESP, or a RECEIPT_ACK
+ * (≈ 75 bytes when countersigned). */
+static size_t outbound_cap(const struct infer_outbound *o)
+{
+    return o->kind == OUT_RECEIPT ? (size_t)ANTS_INFER_RECEIPT_MAX_ACK_BYTES
+                                  : (size_t)ANTS_INFER_MAX_RESP_BYTES;
+}
+
 static void
 outbound_on_event(struct infer_state *s, struct infer_outbound *o, const ants_transport_event_t *ev)
 {
@@ -311,13 +482,13 @@ outbound_on_event(struct infer_state *s, struct infer_outbound *o, const ants_tr
             return;
         }
         if (o->buf == NULL) {
-            o->buf = (uint8_t *)malloc(ANTS_INFER_MAX_RESP_BYTES);
+            o->buf = (uint8_t *)malloc(outbound_cap(o));
             if (o->buf == NULL) {
                 o->local_oom = true;
                 return;
             }
         }
-        if (ev->payload_len > ANTS_INFER_MAX_RESP_BYTES - o->len) {
+        if (ev->payload_len > outbound_cap(o) - o->len) {
             /* Oversized: rejected without decoding, at FIN. */
             free(o->buf);
             o->buf = NULL;
@@ -385,6 +556,167 @@ static struct infer_inbound *inbound_by_stream(struct infer_state *s,
     return NULL;
 }
 
+/* The most a claimed inbound stream may carry, by envelope type. */
+static size_t inbound_cap(uint32_t type)
+{
+    return type == ANTS_INFER_MSG_RECEIPT_OFFER ? ANTS_INFER_RECEIPT_MAX_OFFER_BYTES
+                                                : ANTS_INFER_MAX_REQ_BYTES;
+}
+
+/* ---- served answers ------------------------------------------------------ */
+
+static bool served_live(const struct infer_served *v, uint64_t now)
+{
+    return v->in_use && now >= v->served_at && now - v->served_at <= ANTS_INFER_RECEIPT_WINDOW_S;
+}
+
+/* Remember an answer we just sent: its receipt nonce, its requester, its
+ * length — once per nonce. */
+static void served_record(struct infer_state *s,
+                          const ants_peer_id_t *client,
+                          const uint8_t *commit,
+                          size_t commit_len)
+{
+    ants_inference_commit_t c;
+    uint8_t h[ANTS_INFERENCE_HASH_SIZE];
+    struct infer_served *slot = NULL;
+    size_t i;
+    if (ants_inference_commit_decode(commit, commit_len, &c) != ANTS_OK ||
+        ants_blake3_hash(commit, commit_len, h) != ANTS_OK) {
+        return;
+    }
+    /* One entry per nonce: a replayed request is answered with the same
+     * commit, and the answer belongs to whoever it was served to first. */
+    for (i = 0; i < ANTS_INFER_MAX_SERVED; i++) {
+        struct infer_served *v = &s->served[i];
+        if (served_live(v, s->now_unix) && memcmp(v->nonce, h, sizeof v->nonce) == 0) {
+            return;
+        }
+    }
+    /* A free or expired slot; else an answer already paid; else the oldest. */
+    for (i = 0; i < ANTS_INFER_MAX_SERVED && slot == NULL; i++) {
+        if (!served_live(&s->served[i], s->now_unix)) {
+            slot = &s->served[i];
+        }
+    }
+    for (i = 0; i < ANTS_INFER_MAX_SERVED && slot == NULL; i++) {
+        if (s->served[i].receipted) {
+            slot = &s->served[i];
+        }
+    }
+    /* Every entry is live and unpaid: forget the oldest. */
+    if (slot == NULL) {
+        slot = &s->served[0];
+        for (i = 1; i < ANTS_INFER_MAX_SERVED; i++) {
+            if (s->served[i].served_at < slot->served_at) {
+                slot = &s->served[i];
+            }
+        }
+    }
+    memset(slot, 0, sizeof *slot);
+    slot->in_use = true;
+    memcpy(slot->nonce, h, sizeof slot->nonce);
+    memcpy(slot->client, client->bytes, sizeof slot->client);
+    slot->length = c.length;
+    slot->served_at = s->now_unix;
+}
+
+static struct infer_served *
+served_find(struct infer_state *s, const uint8_t nonce[ANTS_REP_NONCE_SIZE], const uint8_t *client)
+{
+    size_t i;
+    for (i = 0; i < ANTS_INFER_MAX_SERVED; i++) {
+        struct infer_served *v = &s->served[i];
+        if (served_live(v, s->now_unix) && memcmp(v->nonce, nonce, sizeof v->nonce) == 0 &&
+            memcmp(v->client, client, sizeof v->client) == 0) {
+            return v;
+        }
+    }
+    return NULL;
+}
+
+/* The §11.15 producer rules. On success the countersignature is written to
+ * `out_sig`, the served answer is marked receipted, and the receipt filed. */
+static bool offer_countersign(struct infer_state *s,
+                              const ants_transport_conn_t *conn,
+                              const ants_infer_offer_t *offer,
+                              uint8_t out_sig[ANTS_REP_SIG_SIZE])
+{
+    ants_reputation_receipt_t r;
+    ants_peer_id_t client;
+    struct infer_served *v;
+    uint64_t skew;
+
+    if (s->cfg.receipt_sign_fn == NULL || ants_transport_conn_peer_id(conn, &client) != ANTS_OK) {
+        return false;
+    }
+    /* 1. a canonical body naming us as server and this connection's peer as
+     *    client. The strict decoder re-encodes to exactly these bytes, so a
+     *    signature over them is a signature over the body. */
+    if (ants_reputation_receipt_body_decode(offer->body, offer->body_len, &r) != ANTS_OK ||
+        memcmp(r.server, s->cfg.local_id.bytes, sizeof r.server) != 0 ||
+        memcmp(r.client, client.bytes, sizeof r.client) != 0) {
+        return false;
+    }
+    /* 2. the client's signature */
+    if (ants_ed25519_verify(r.client, offer->body, offer->body_len, offer->client_sig) != ANTS_OK) {
+        return false;
+    }
+    /* 3. an answer we served this client, in the window, not yet paid */
+    v = served_find(s, r.nonce, r.client);
+    if (v == NULL || v->receipted) {
+        return false;
+    }
+    if (s->cfg.receipt_paid_fn != NULL &&
+        s->cfg.receipt_paid_fn(s->cfg.receipt_paid_ctx, r.nonce)) {
+        v->receipted = true; /* paid before this entry existed */
+        return false;
+    }
+    /* 4. at least the reference rate (length <= 64: no overflow) */
+    if (r.ncs_value < (uint64_t)ANTS_INFER_REF_UNCS_PER_POSITION * v->length) {
+        return false;
+    }
+    /* 5. the timestamp near our clock */
+    skew = r.timestamp_unix_s > s->now_unix ? r.timestamp_unix_s - s->now_unix
+                                            : s->now_unix - r.timestamp_unix_s;
+    if (skew > ANTS_INFER_RECEIPT_CLOCK_SKEW_S) {
+        return false;
+    }
+    if (s->cfg.receipt_sign_fn(s->cfg.receipt_sign_ctx, offer->body, offer->body_len, out_sig) !=
+        ANTS_OK) {
+        return false;
+    }
+    v->receipted = true;
+    memcpy(r.client_sig, offer->client_sig, sizeof r.client_sig);
+    memcpy(r.server_sig, out_sig, sizeof r.server_sig);
+    if (s->cfg.receipt_fn != NULL) {
+        s->cfg.receipt_fn(s->cfg.receipt_ctx, &r);
+    }
+    return true;
+}
+
+/* Answer a complete RECEIPT_OFFER. */
+static void inbound_offer(struct infer_state *s, struct infer_inbound *in)
+{
+    ants_infer_offer_t offer;
+    ants_infer_ack_t ack;
+    uint8_t out[128];
+    size_t out_len;
+    uint32_t txid;
+
+    if (ants_infer_wire_decode_offer(in->buf, in->len, &txid, &offer) != ANTS_OK) {
+        (void)ants_transport_stream_reset(in->stream, 1); /* ours, malformed */
+        return;
+    }
+    memset(&ack, 0, sizeof ack);
+    ack.present = offer_countersign(s, in->conn, &offer, ack.server_sig);
+    if (ants_infer_wire_encode_ack(out, sizeof out, &out_len, txid, &ack) == ANTS_OK) {
+        (void)ants_transport_stream_send(in->stream, out, out_len, true);
+    } else {
+        (void)ants_transport_stream_reset(in->stream, 2);
+    }
+}
+
 /* Answer a complete INFER_REQ. */
 static void inbound_answer(struct infer_state *s, struct infer_inbound *in)
 {
@@ -432,6 +764,9 @@ static void inbound_answer(struct infer_state *s, struct infer_inbound *in)
         err = ants_infer_wire_encode_resp(out, ANTS_INFER_MAX_RESP_BYTES, &out_len, txid, NULL);
     }
     if (err == ANTS_OK) {
+        if (answer && a.present) {
+            served_record(s, &requester, served.commit, served.commit_len);
+        }
         (void)ants_transport_stream_send(in->stream, out, out_len, true);
     } else {
         (void)ants_transport_stream_reset(in->stream, 2);
@@ -449,11 +784,12 @@ static bool inbound_classify(struct infer_inbound *in, bool at_fin)
         return true; /* need more bytes */
     }
     if (ants_infer_wire_peek_type(in->head, in->len, &type) != ANTS_OK ||
-        type != ANTS_INFER_MSG_REQ) {
+        (type != ANTS_INFER_MSG_REQ && type != ANTS_INFER_MSG_RECEIPT_OFFER)) {
         inbound_release(in); /* a sibling's stream — leave it alone */
         return false;
     }
-    in->buf = (uint8_t *)malloc(ANTS_INFER_MAX_REQ_BYTES);
+    in->type = (uint32_t)type;
+    in->buf = (uint8_t *)malloc(inbound_cap(in->type));
     if (in->buf == NULL) {
         (void)ants_transport_stream_reset(in->stream, 2);
         inbound_release(in);
@@ -519,8 +855,9 @@ static void inbound_on_event(struct infer_state *s, const ants_transport_event_t
                 return; /* still short of a full head */
             }
         }
-        if (n > ANTS_INFER_MAX_REQ_BYTES - in->len) {
-            /* Larger than any conformant INFER_REQ: ours and malformed. */
+        if (n > inbound_cap(in->type) - in->len) {
+            /* Larger than any conformant message of its type: ours and
+             * malformed. */
             (void)ants_transport_stream_reset(in->stream, 1);
             inbound_release(in);
             return;
@@ -533,7 +870,11 @@ static void inbound_on_event(struct infer_state *s, const ants_transport_event_t
         if (!in->claimed && !inbound_classify(in, true)) {
             return;
         }
-        inbound_answer(s, in);
+        if (in->type == ANTS_INFER_MSG_RECEIPT_OFFER) {
+            inbound_offer(s, in);
+        } else {
+            inbound_answer(s, in);
+        }
         inbound_release(in);
         return;
     case ANTS_TRANSPORT_EV_STREAM_RESET:
@@ -548,7 +889,9 @@ static void inbound_on_event(struct infer_state *s, const ants_transport_event_t
 /* Event entry point                                                        */
 /* ------------------------------------------------------------------------ */
 
-void ants_infer_handle_transport_event(ants_infer_t *e, const ants_transport_event_t *ev)
+void ants_infer_handle_transport_event(ants_infer_t *e,
+                                       const ants_transport_event_t *ev,
+                                       uint64_t now_unix)
 {
     struct infer_state *s;
     struct infer_outbound *o;
@@ -557,6 +900,7 @@ void ants_infer_handle_transport_event(ants_infer_t *e, const ants_transport_eve
         return;
     }
     s = get_state(e);
+    s->now_unix = now_unix;
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_CLOSED) {
         s->closing = ev->conn;
         for (i = 0; i < ANTS_INFER_MAX_OUTBOUND; i++) {
@@ -621,4 +965,52 @@ ants_error_t ants_infer_serve_reference(ants_inference_t *ctx,
     memcpy(out->sig, iresp.commit_sig, sizeof out->sig);
     out->envelope_len = iresp.answer_len;
     return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Receipt helpers                                                          */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_infer_receipt_nonce(const ants_inference_commit_t *commit,
+                                      uint8_t out[ANTS_REP_NONCE_SIZE])
+{
+    uint8_t enc[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+    uint8_t h[ANTS_INFERENCE_HASH_SIZE];
+    size_t len;
+    ants_error_t err;
+    if (commit == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((err = ants_inference_commit_encode(commit, enc, sizeof enc, &len)) != ANTS_OK ||
+        (err = ants_blake3_hash(enc, len, h)) != ANTS_OK) {
+        return err;
+    }
+    memcpy(out, h, ANTS_REP_NONCE_SIZE);
+    return ANTS_OK;
+}
+
+ants_error_t ants_infer_receipt_prepare(const ants_inference_commit_t *commit,
+                                        const ants_peer_id_t *server,
+                                        const uint8_t client_priv[ANTS_INFERENCE_PRIVKEY_SIZE],
+                                        uint64_t now_unix,
+                                        ants_reputation_receipt_t *out)
+{
+    uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    size_t body_len;
+    ants_error_t err;
+    if (commit == NULL || server == NULL || client_priv == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof *out);
+    memcpy(out->server, server->bytes, sizeof out->server);
+    if ((err = ants_ed25519_pubkey_from_priv(client_priv, out->client)) != ANTS_OK ||
+        (err = ants_infer_receipt_nonce(commit, out->nonce)) != ANTS_OK) {
+        return err;
+    }
+    out->ncs_value = (uint64_t)ANTS_INFER_REF_UNCS_PER_POSITION * commit->length;
+    out->timestamp_unix_s = now_unix;
+    if ((err = ants_reputation_receipt_body_encode(out, body, sizeof body, &body_len)) != ANTS_OK) {
+        return err;
+    }
+    return ants_ed25519_sign(client_priv, body, body_len, out->client_sig);
 }

@@ -13,6 +13,47 @@ the spec repo's
 
 ## Unreleased
 
+### inference/exchange + cmd/antsd: answers are paid with receipts (PR8b of the node daemon) · 2026-10-12
+
+Served work now becomes reputation. RFC-0008 v0.14 §11.15 (ants#14) adds RECEIPT_OFFER (13) and RECEIPT_ACK (14). After an answered §11.14 exchange the requester offers a §11.9 receipt and the producer countersigns it. The receipt's nonce is `BLAKE3(commit)[0:16]`, so each receipt names the signed answer it pays for.
+
+**`reputation/identity`:** `ants_reputation_receipt_body_decode`, a strict canonical inverse of the body encoder. Tested against hand-written bytes, with the non-shortest-integer, short-nonce, wrong-arity and trailing-byte rejections.
+
+**`inference/exchange`:**
+- **Codec and helpers.** The RECEIPT_OFFER/ACK codec, plus `ants_infer_receipt_nonce` and `ants_infer_receipt_prepare` (the reference rate, 1000 μNCS per position).
+- **Requester side.** `ants_infer_offer_receipt`. An ACK counts only if it makes the receipt whole under the connection's peer-id.
+- **Producer side.** A table of the last 256 answers served (nonce, requester, length, time). Offers are countersigned under the five §11.15 rules: canonical body naming us and this peer; client signature; a served, in-window, not-yet-paid nonce; the rate; the timestamp skew. Inbound classification now claims type 13 too, with its own 512-byte cap.
+- **API change.** `ants_infer_handle_transport_event` takes the wall clock.
+
+**`cmd/antsd`:**
+- **Bag on disk.** The node countersigns with its identity and files each receipt in `<config>.receipts`: length-prefixed records, local state, never wire. At start it reloads the bag, keeping only receipts whose two signatures verify and that credit this node; a torn final record ends the load.
+- **Logging.** The node logs each receipt filed, and A and T at start and at shutdown. A and T are deliberately not recomputed per receipt: that re-verifies the whole bag, which takes about 0.3 s when the bag is full, on the event loop.
+- **New commands.** `antsd receipts <config>` prints the bag's count, A and T. `antsd ask` pays for every answer and prints the receipt verdict.
+
+**Pre-push adversarial review** reproduced three real bugs, all fixed here, each with a test that fails without the fix:
+- **A receipt could be paid twice (reproduced).** A commit is deterministic, so a replayed INFER_REQ, or a second requester copying it, yields the same nonce. Once the served entry expired or was evicted, the server countersigned it again and A counted the work twice.
+  - The served table now records a nonce once, for the first requester.
+  - A new `receipt_paid_fn` asks the node's whole history; the daemon keeps a set of every nonce ever filed, rebuilt from the file.
+  - The spec rule now reads "never filed", not "within the window" (ants#14).
+- **A torn record made every later receipt unreadable (reproduced).** The loader stopped at it, but later appends landed behind it. Loading now truncates the file back to the last record boundary, and a failed append is truncated back too. Appends are now `fsync`ed.
+- **A and T were recomputed per receipt on the event loop (measured at about 0.3 s with a full bag).** This is now done at start and shutdown only.
+
+Also fixed:
+- Paid answers are evicted from the served table before unpaid ones.
+- A RECEIPT_ACK is buffered at most 128 bytes, not 128 KiB. The spec adds `RECEIPT_MAX_ACK_BYTES` (P).
+
+**Known limit:** the receipt file is never compacted, and load time grows with it (about 87 µs per record). Compaction lands with the canonical bag in PR8c.
+
+**Not here:** the canonical-order bag root and selective-disclosure proofs over the persisted bag, and bonds over A. These come in PR8c.
+
+**Tests:**
+- **`test_infer`:**
+  - the codec;
+  - an acked receipt held whole by both sides;
+  - one case per producer rule, with the rate, skew and window each tested at the edge and one past it, and a request replayed after its window (refused: already paid).
+  - Removing the once-per-nonce, paid-history, skew or window rule makes its own test fail.
+- **`test_antsd_run`:** paid and filed. The restart reloads one receipt, skips one with a flipped signature byte, and cuts a 3-byte torn tail. A receipt filed after the restart is readable (two in the bag), and `antsd receipts` agrees. Removing the signature check on reload, or the cut, makes it fail.
+
 ### inference/exchange + cmd/antsd: the node serves inference (PR8a of the node daemon) · 2026-10-12
 
 The daemon now answers inference requests over the wire, per RFC-0008 v0.13 §11.14 (ants#13). Before this, `ants_inference_serve` and `ants_inference_audit` worked only in-process, with no message to carry a request to a producer.
