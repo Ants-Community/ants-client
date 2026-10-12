@@ -944,6 +944,159 @@ static void test_run_chain_two_trustees(const char *antsd_path)
     unlink(cfg_path);
 }
 
+/* A valid equivocation fault proof against `priv`'s identity at `epoch`
+ * (two different statements over the same domain/epoch/slot). */
+static size_t make_fault_proof(const uint8_t priv[32], uint64_t epoch, uint8_t proof[512])
+{
+    uint8_t pub[32], body_a[256], body_b[256], sig_a[64], sig_b[64];
+    size_t la = 0, lb = 0, plen = 0;
+    static const uint8_t pa[2] = {0x0A, 0x0B};
+    static const uint8_t pb[2] = {0x0C, 0x0D};
+    CHECK(ants_ed25519_pubkey_from_priv(priv, pub) == ANTS_OK);
+    CHECK(ants_crdt_statement_encode(9, epoch, 3, pa, sizeof pa, body_a, sizeof body_a, &la) ==
+          ANTS_OK);
+    CHECK(ants_crdt_statement_encode(9, epoch, 3, pb, sizeof pb, body_b, sizeof body_b, &lb) ==
+          ANTS_OK);
+    CHECK(ants_ed25519_sign(priv, body_a, la, sig_a) == ANTS_OK);
+    CHECK(ants_ed25519_sign(priv, body_b, lb, sig_b) == ANTS_OK);
+    CHECK(ants_crdt_equivocation_encode(
+              pub, epoch, body_a, la, sig_a, body_b, lb, sig_b, proof, 512, &plen) == ANTS_OK);
+    return plen;
+}
+
+static void test_run_chain_prunes(const char *antsd_path)
+{
+    /* The daemon is the sole trustee of a chain whose genesis was 40 days
+     * ago, so its first block lands in epoch 40. Through gossip it receives
+     * two fault proofs, at epochs 5 and 35. The block's view window is
+     * epochs [11, 40], so the epoch-35 proof is in the block and the
+     * epoch-5 one is not. Once the block is final, the daemon prunes
+     * everything below epoch 40 - 30 = 10: exactly the epoch-5 proof. */
+    memset(&g_cs, 0, sizeof g_cs);
+    memset(g_cs.priv, 0x57, sizeof g_cs.priv);
+    g_cs.genesis_time = UINT64_MAX; /* the seed runs no chain here */
+    uint8_t seed_pub[32];
+    CHECK(ants_ed25519_pubkey_from_priv(g_cs.priv, seed_pub) == ANTS_OK);
+
+    antsd_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    memset(cfg.identity_priv, 0x35, sizeof cfg.identity_priv);
+    uint8_t daemon_pub[32];
+    CHECK(ants_ed25519_pubkey_from_priv(cfg.identity_priv, daemon_pub) == ANTS_OK);
+
+    static ants_transport_t st;
+    memset(&st, 0, sizeof st);
+    ants_transport_config_t tcfg;
+    memset(&tcfg, 0, sizeof tcfg);
+    memcpy(tcfg.pub, seed_pub, 32);
+    tcfg.sign_fn = real_sign;
+    tcfg.sign_ctx = g_cs.priv;
+    tcfg.event_fn = cs_event;
+    tcfg.event_ctx = &g_cs;
+    tcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK(ants_transport_init(&st, &tcfg) == ANTS_OK);
+    char seed_addr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK(ants_transport_local_addr(&st, seed_addr, sizeof seed_addr) == ANTS_OK);
+    static ants_dht_t sd;
+    memset(&sd, 0, sizeof sd);
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &st;
+    memcpy(dcfg.local_peer_id.bytes, seed_pub, 32);
+    dcfg.event_fn = noop_dht_event;
+    CHECK(ants_dht_init(&sd, &dcfg) == ANTS_OK);
+    g_cs.dht = &sd;
+    ants_crdt_t *gset = NULL;
+    CHECK(ants_crdt_init(&gset) == ANTS_OK);
+    static ants_gossip_t sg;
+    static ants_gossip_transport_t sb;
+    memset(&sg, 0, sizeof sg);
+    memset(&sb, 0, sizeof sb);
+    CHECK(ants_gossip_transport_init(&sb, &sg, &st) == ANTS_OK);
+    CHECK(ants_gossip_init(&sg, gset, seed_pub, NULL, cs_send, &sb) == ANTS_OK);
+    g_cs.gossip = &sg;
+    g_cs.binding = &sb;
+
+    static const char listen[] = "/ip4/127.0.0.1/udp/0/quic-v1";
+    memcpy(cfg.listen_multiaddr, listen, sizeof listen);
+    memcpy(cfg.seeds[0].addr, seed_addr, strlen(seed_addr));
+    memcpy(cfg.seeds[0].peer_id, seed_pub, 32);
+    cfg.seed_count = 1;
+    cfg.genesis.present = true;
+    cfg.genesis.time = (uint64_t)time(NULL) - 40u * 86400u;
+    memset(cfg.genesis.hash, 0x48, 32);
+    memcpy(cfg.genesis.trustees[0], daemon_pub, 32);
+    cfg.genesis.trustee_count = 1;
+    static uint8_t enc[ANTSD_CONFIG_ENCODED_MAX];
+    size_t enc_len = 0;
+    CHECK(antsd_config_encode(&cfg, enc, sizeof enc, &enc_len) == ANTS_OK);
+    char cfg_path[512];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(cfg_path, sizeof cfg_path, "%s/antsd_prune_XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    int cfd = mkstemp(cfg_path);
+    CHECK(cfd >= 0);
+    if (cfd < 0) {
+        return;
+    }
+    CHECK(write(cfd, enc, enc_len) == (ssize_t)enc_len);
+    CHECK(close(cfd) == 0);
+
+    pid_t pid = -1;
+    int out_fd = spawn_run(antsd_path, cfg_path, &pid);
+    CHECK(out_fd >= 0);
+    if (out_fd < 0) {
+        unlink(cfg_path);
+        return;
+    }
+    static capture_t cap;
+    memset(&cap, 0, sizeof cap);
+
+    /* Once the daemon is in the seed's gossip view, push the two proofs. */
+    uint64_t until = now_ms() + HANDSHAKE_DEADLINE_MS;
+    while (now_ms() < until && ants_gossip_peer_count(&sg) == 0) {
+        tick_pace();
+        ants_transport_tick(&st);
+        ants_dht_tick(&sd);
+        (void)capture_pump(out_fd, &cap, 0);
+    }
+    CHECK(ants_gossip_peer_count(&sg) == 1);
+    uint8_t subject[32];
+    memset(subject, 0x66, sizeof subject);
+    uint8_t proof[512];
+    size_t fwd = 0;
+    size_t plen = make_fault_proof(subject, 5, proof);
+    CHECK(ants_gossip_submit(&sg, proof, plen, &fwd) == ANTS_OK);
+    CHECK(fwd == 1);
+    plen = make_fault_proof(subject, 35, proof);
+    CHECK(ants_gossip_submit(&sg, proof, plen, &fwd) == ANTS_OK);
+    CHECK(fwd == 1);
+
+    const char *hit = wait_for_output(out_fd,
+                                      &cap,
+                                      "antsd: l1 pruned 1 proofs below epoch 10",
+                                      now_ms() + 30000 + ANTS_CHAIN_RT_DRAND_FLOOR_S * 1000,
+                                      &st,
+                                      &sd);
+    CHECK(hit != NULL);
+    CHECK(strstr(cap.data, "antsd: chain on (trustee, 1 trustees)") != NULL);
+    CHECK(strstr(cap.data, " epoch=40 degraded") != NULL);
+
+    CHECK(kill(pid, SIGTERM) == 0);
+    int status = reap_with_deadline(pid, EXIT_DEADLINE_MS);
+    CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    while (capture_pump(out_fd, &cap, 100) > 0) {
+    }
+    if (failures > 0) {
+        fprintf(stderr, "daemon output: <<<%s>>>\n", cap.data);
+    }
+    CHECK(ants_transport_destroy(&st, 0) == ANTS_OK);
+    ants_gossip_transport_destroy(&sb);
+    CHECK(ants_dht_destroy(&sd) == ANTS_OK);
+    ants_crdt_destroy(gset);
+    close(out_fd);
+    unlink(cfg_path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -965,6 +1118,7 @@ int main(int argc, char **argv)
     foreign.blob_len = sizeof TDX_KAT_QUOTE;
     test_run_bootstraps_to_seed(argv[1], &foreign);
     test_run_chain_two_trustees(argv[1]);
+    test_run_chain_prunes(argv[1]);
 
     if (failures == 0) {
         printf("all checks passed\n");

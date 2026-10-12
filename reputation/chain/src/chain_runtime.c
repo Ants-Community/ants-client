@@ -583,3 +583,19 @@ uint64_t ants_chain_rt_attempt_height(const ants_chain_rt_t *rt)
 {
     return rt == NULL ? 0 : st_const(rt)->h;
 }
+
+bool ants_chain_rt_view_epochs(uint64_t genesis_time,
+                               uint64_t cutoff,
+                               uint64_t *out_min,
+                               uint64_t *out_max)
+{
+    if (out_min == NULL || out_max == NULL || cutoff < genesis_time) {
+        return false;
+    }
+    uint64_t e = (cutoff - genesis_time) / ANTS_CHAIN_RT_EPOCH_DURATION_S;
+    *out_max = e;
+    *out_min = e >= ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS - 1u
+                   ? e - (ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS - 1u)
+                   : 0;
+    return true;
+}

@@ -605,6 +605,16 @@ ants_error_t ants_gossip_iwant_encode(const uint8_t (*ids)[ANTS_CRDT_CONTENT_ID_
  */
 ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent);
 
+/*
+ * Advertise (IHAVE) only proofs whose envelope epoch is >= `min_epoch`
+ * (0 = all, the default). A node running the L2 chain sets it to the start
+ * of the current view window (RFC-0004 §"Block production runtime" items
+ * 9-10): older proofs are history its neighbours may have pruned, and would
+ * otherwise pull — and drop at their prune floor — every round.
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL g.
+ */
+ants_error_t ants_gossip_set_announce_min_epoch(ants_gossip_t *g, uint64_t min_epoch);
+
 /* ------------------------------------------------------------------------ */
 /* Transport binding (Component #6 PR2)                                     */
 /*                                                                          */

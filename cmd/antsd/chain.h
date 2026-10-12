@@ -31,6 +31,9 @@ typedef struct {
     bool trustee;
     antsd_genesis_t genesis;
     uint8_t pub[ANTS_ED25519_PUBKEY_SIZE];
+    bool archive;        /* never prune the G-Set */
+    uint64_t prune_keep; /* pending prune cutoff (0 = none) */
+    uint64_t pruned;     /* proofs pruned so far */
     uint64_t finals;
     uint64_t proposals;
     uint64_t attestations;
@@ -49,10 +52,13 @@ ants_error_t antsd_chain_start(antsd_chain_t *c,
                                const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                                ants_gossip_t *gossip,
                                ants_crdt_t *gset,
+                               bool archive,
                                uint64_t now);
 
 /* Drive the runtime's clock (propose, re-broadcast, skip); starts a
- * pending loop once the genesis time arrives. */
+ * pending loop once the genesis time arrives; applies a prune the last
+ * final head scheduled (outside any callback, since pruning rebuilds the
+ * G-Set). */
 void antsd_chain_tick(antsd_chain_t *c, uint64_t now);
 
 #endif /* ANTSD_CHAIN_H */

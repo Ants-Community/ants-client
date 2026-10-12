@@ -13,6 +13,8 @@
  *                         — write the v1 genesis (RFC-0004 §"Block
  *                           production runtime") into a config; trustees
  *                           are sorted, duplicates refused
+ *   antsd archive <config> on|off
+ *                         — archive node: never prune the L1 G-Set
  *   antsd run  <config>   — stand up transport + DHT (bootstrapped from
  *                           the config seeds) + gossip (view fed from
  *                           DHT discovery, anti-eclipse epoch refresh)
@@ -133,6 +135,7 @@ static int cmd_show(const char *path)
         printf("  [%zu] %s\n", i, cfg.seeds[i].addr);
         print_hex("      peer id ", cfg.seeds[i].peer_id, sizeof cfg.seeds[i].peer_id);
     }
+    printf("archive: %s\n", cfg.archive ? "on (L1 never pruned)" : "off");
     if (!cfg.genesis.present) {
         printf("genesis: (none — chain loop off)\n");
         return 0;
@@ -143,6 +146,39 @@ static int cmd_show(const char *path)
     for (size_t i = 0; i < cfg.genesis.trustee_count; i++) {
         print_hex("           ", cfg.genesis.trustees[i], sizeof cfg.genesis.trustees[i]);
     }
+    return 0;
+}
+
+static int cmd_archive(const char *path, const char *mode)
+{
+    bool on;
+    if (strcmp(mode, "on") == 0) {
+        on = true;
+    } else if (strcmp(mode, "off") == 0) {
+        on = false;
+    } else {
+        fprintf(stderr, "antsd: archive takes on|off\n");
+        return 2;
+    }
+    static uint8_t buf[ANTSD_CONFIG_ENCODED_MAX];
+    size_t len;
+    if (antsd_read_file(path, buf, sizeof buf, &len) != 0) {
+        fprintf(stderr, "antsd: could not read %s (missing or too large)\n", path);
+        return 1;
+    }
+    static antsd_config_t cfg;
+    ants_error_t rc = antsd_config_decode(buf, len, &cfg);
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: malformed config: %s\n", ants_strerror(rc));
+        return 1;
+    }
+    cfg.archive = on;
+    rc = antsd_config_encode(&cfg, buf, sizeof buf, &len);
+    if (rc != ANTS_OK || write_file(path, buf, len, 0600) != 0) {
+        fprintf(stderr, "antsd: could not write %s\n", path);
+        return 1;
+    }
+    printf("antsd: archive %s in %s\n", on ? "on" : "off", path);
     return 0;
 }
 
@@ -223,6 +259,8 @@ static int usage(const char *argv0)
             "  show     decode and print a config\n"
             "  genesis  <config> <unix-time> <hash-hex> <trustee-hex>...\n"
             "           write the v1 chain genesis into a config\n"
+            "  archive  <config> on|off\n"
+            "           archive node: never prune the L1 G-Set\n"
             "  run      drive the node event loop until SIGINT/SIGTERM\n",
             argv0);
     return 2;
@@ -230,6 +268,9 @@ static int usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "archive") == 0) {
+        return cmd_archive(argv[2], argv[3]);
+    }
     if (argc >= 3 && strcmp(argv[1], "genesis") == 0) {
         return cmd_genesis(argv[2], argc - 3, argv + 3);
     }

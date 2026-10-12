@@ -560,8 +560,14 @@ int antsd_cmd_run(const char *path)
     static antsd_chain_t chain; /* ~200 KB of runtime state — static */
     memset(&chain, 0, sizeof chain);
     if (cfg.genesis.present) {
-        rc = antsd_chain_start(
-            &chain, &cfg.genesis, cfg.identity_priv, pub, &gossip, gset, (uint64_t)time(NULL));
+        rc = antsd_chain_start(&chain,
+                               &cfg.genesis,
+                               cfg.identity_priv,
+                               pub,
+                               &gossip,
+                               gset,
+                               cfg.archive,
+                               (uint64_t)time(NULL));
         if (rc == ANTS_OK && chain.pending) {
             printf("antsd: chain waiting for genesis time %llu\n",
                    (unsigned long long)cfg.genesis.time);

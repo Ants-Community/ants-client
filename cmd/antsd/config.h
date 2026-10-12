@@ -62,6 +62,8 @@ typedef struct {
     antsd_seed_t seeds[ANTSD_MAX_SEEDS];
     size_t seed_count;
     antsd_genesis_t genesis;
+    /* Archive node: never prune the L1 G-Set (RFC-0004 §Archive nodes). */
+    bool archive;
 } antsd_config_t;
 
 /*
@@ -88,6 +90,6 @@ bool antsd_genesis_trustees_valid(const antsd_genesis_t *g);
 #define ANTSD_CONFIG_ENCODED_MAX                                                                   \
     (16 + ANTS_ED25519_PRIVKEY_SIZE + ANTSD_MULTIADDR_MAX +                                        \
      ANTSD_MAX_SEEDS * (8 + ANTSD_MULTIADDR_MAX + ANTS_ED25519_PUBKEY_SIZE) + 64 +                 \
-     ANTSD_MAX_TRUSTEES * (2 + ANTS_ED25519_PUBKEY_SIZE))
+     ANTSD_MAX_TRUSTEES * (2 + ANTS_ED25519_PUBKEY_SIZE) + 4)
 
 #endif /* ANTSD_CONFIG_H */

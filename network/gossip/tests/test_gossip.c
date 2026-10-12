@@ -1186,6 +1186,41 @@ static void test_chain_frame_caps(void)
     harness_destroy(&h);
 }
 
+static void test_announce_min_epoch(void)
+{
+    /* A holds proofs at epochs 1 and 5 and advertises only epoch >= 3: the
+     * lazy pull hands B the epoch-5 proof alone — the epoch-1 one is history
+     * B may have pruned and would only pull to drop. */
+    static struct harness h;
+    harness_init(&h, 2, 0x90);
+    node_t *a = &h.nodes[0], *b = &h.nodes[1];
+    link_dir(a, b);
+    link_dir(b, a);
+    uint8_t sp[32], su[32], proof[512];
+    make_key(0x91, sp, su);
+    bool ins = false;
+    size_t plen = make_proof(sp, su, 1, proof);
+    CHECK_EQ(ants_crdt_insert(a->set, proof, plen, &ins), ANTS_OK);
+    plen = make_proof(sp, su, 5, proof);
+    CHECK_EQ(ants_crdt_insert(a->set, proof, plen, &ins), ANTS_OK);
+    uint8_t want[ANTS_CRDT_CONTENT_ID_SIZE];
+    CHECK_EQ(ants_crdt_content_id(proof, plen, want), ANTS_OK);
+
+    CHECK_EQ(ants_gossip_set_announce_min_epoch(&a->g, 3), ANTS_OK);
+    CHECK_EQ(ants_gossip_announce(&a->g, NULL), ANTS_OK);
+    harness_pump(&h);
+    CHECK(ants_crdt_size(b->set) == 1);
+    CHECK(ants_crdt_contains(b->set, want));
+
+    /* min 0 (the default) advertises everything. */
+    CHECK_EQ(ants_gossip_set_announce_min_epoch(&a->g, 0), ANTS_OK);
+    CHECK_EQ(ants_gossip_announce(&a->g, NULL), ANTS_OK);
+    harness_pump(&h);
+    CHECK(ants_crdt_size(b->set) == 2);
+    CHECK_EQ(ants_gossip_set_announce_min_epoch(NULL, 3), ANTS_ERROR_INVALID_ARG);
+    harness_destroy(&h);
+}
+
 static void tick_pace(void)
 {
     struct timespec ts = {0, 1000000L}; /* 1 ms */
@@ -1356,6 +1391,7 @@ static void test_two_node_over_quic(void)
 
 int main(void)
 {
+    test_announce_min_epoch();
     test_chain_codec();
     test_chain_flood_and_dedup();
     test_chain_unsupported_and_invalid();

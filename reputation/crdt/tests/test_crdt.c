@@ -684,12 +684,62 @@ static void test_gset_prune(void)
     CHECK(ins == false);
     CHECK(ants_crdt_size(set) == 3);
 
-    /* Prune everything. */
+    /* The floor is the prune cutoff, and a pruned proof re-offered (gossip,
+     * merge, snapshot) is history, not news: ANTS_OK, not inserted. */
+    CHECK(ants_crdt_prune_floor(set) == 3);
+    plen = make_valid_proof(priv, pub, 1, proof); /* epoch 1 was pruned */
+    CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+    CHECK(ins == false);
+    CHECK(ants_crdt_size(set) == 3);
+    CHECK(ants_crdt_contains(set, id1) == false);
+    {
+        /* Below the floor but NEW: a subject never slashed here equivocates
+         * with statements labelled epoch 1 (the envelope epoch is the
+         * statement's, the subject's choice). Not stored — but the subject
+         * becomes slashed and the insert reports it new, so gossip forwards
+         * it. Offered again, it is history. (Review finding: the first cut
+         * of the floor dropped this slash silently.) */
+        uint8_t priv2[32], pub2[32];
+        make_key(0x72, priv2, pub2);
+        CHECK(ants_crdt_is_slashed(set, pub2) == false);
+        plen = make_valid_proof(priv2, pub2, 1, proof);
+        CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+        CHECK(ins == true);
+        CHECK(ants_crdt_size(set) == 3);
+        CHECK(ants_crdt_is_slashed(set, pub2) == true);
+        CHECK_EQ(ants_crdt_insert(set, proof, plen, &ins), ANTS_OK);
+        CHECK(ins == false);
+    }
+    /* A lower cutoff later never lowers the floor. */
+    CHECK_EQ(ants_crdt_prune(set, 2, NULL), ANTS_OK);
+    CHECK(ants_crdt_prune_floor(set) == 3);
+    {
+        /* Merging from a peer that still holds pruned history (an archive)
+         * does not bring it back either. */
+        ants_crdt_t *archive = NULL;
+        CHECK_EQ(ants_crdt_init(&archive), ANTS_OK);
+        plen = make_valid_proof(priv, pub, 2, proof);
+        CHECK_EQ(ants_crdt_insert(archive, proof, plen, &ins), ANTS_OK);
+        CHECK(ins == true);
+        CHECK_EQ(ants_crdt_merge(set, archive), ANTS_OK);
+        CHECK(ants_crdt_size(set) == 3);
+        ants_crdt_destroy(archive);
+    }
+
+    /* Prune everything. The evidence is gone, but the subject stays
+     * slashed (the retired-subject index — the safe direction). */
     pruned = 0;
     CHECK_EQ(ants_crdt_prune(set, 1000, &pruned), ANTS_OK);
     CHECK(pruned == 3);
     CHECK(ants_crdt_size(set) == 0);
-    CHECK(ants_crdt_is_slashed(set, pub) == false);
+    CHECK(ants_crdt_is_slashed(set, pub) == true);
+    CHECK(ants_crdt_prune_floor(set) == 1000);
+    {
+        /* A subject never in the set is still not slashed. */
+        uint8_t other[ANTS_CRDT_PEER_ID_SIZE];
+        memset(other, 0x5C, sizeof other);
+        CHECK(ants_crdt_is_slashed(set, other) == false);
+    }
 
     /* Prune an empty set, and the NULL out-param + NULL set paths. */
     CHECK_EQ(ants_crdt_prune(set, 5, NULL), ANTS_OK);
