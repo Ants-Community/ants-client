@@ -1048,7 +1048,115 @@ struct ants_crdt {
     struct crdt_elem *slots; /* `cap` buckets, power of two */
     size_t cap;
     size_t count; /* live elements */
+    /* Prune floor: the highest min_epoch_keep ever applied. A proof below it
+     * is pruned history — re-offering it (gossip, merge, snapshot) does not
+     * bring it back. Monotone. */
+    uint64_t floor;
+    /* Retired subjects: slashed subjects whose evidence is not stored (it
+     * was pruned, or arrived already below the floor), so
+     * ants_crdt_is_slashed stays true for them — the safe direction. An
+     * open-addressed set (power-of-two capacity, all-zero = empty slot;
+     * the all-zero key is tracked by `retired_zero`), so a prune over many
+     * distinct subjects stays linear. */
+    uint8_t (*retired)[ANTS_CRDT_PEER_ID_SIZE];
+    size_t n_retired;
+    size_t cap_retired;
+    bool retired_zero;
 };
+
+static bool subject_is_zero(const uint8_t s[ANTS_CRDT_PEER_ID_SIZE])
+{
+    for (size_t i = 0; i < ANTS_CRDT_PEER_ID_SIZE; i++) {
+        if (s[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Slot of `subject` in `tab` (cap a power of two): its slot if present,
+ * else the empty slot where it would go. */
+static size_t retired_probe(uint8_t (*tab)[ANTS_CRDT_PEER_ID_SIZE],
+                            size_t cap,
+                            const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE],
+                            bool *found)
+{
+    uint64_t h;
+    memcpy(&h, subject, sizeof h);
+    size_t i = (size_t)h & (cap - 1u);
+    for (;;) {
+        if (subject_is_zero(tab[i])) {
+            *found = false;
+            return i;
+        }
+        if (memcmp(tab[i], subject, ANTS_CRDT_PEER_ID_SIZE) == 0) {
+            *found = true;
+            return i;
+        }
+        i = (i + 1u) & (cap - 1u);
+    }
+}
+
+static bool retired_has(const struct ants_crdt *set, const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE])
+{
+    if (subject_is_zero(subject)) {
+        return set->retired_zero;
+    }
+    if (set->cap_retired == 0) {
+        return false;
+    }
+    bool found;
+    (void)retired_probe(set->retired, set->cap_retired, subject, &found);
+    return found;
+}
+
+/* Make room for `extra` more retired subjects (load factor <= 1/2).
+ * ANTS_ERROR_MALFORMED on OOM, with the set unchanged. */
+static ants_error_t retired_reserve(struct ants_crdt *set, size_t extra)
+{
+    size_t need = set->n_retired + extra;
+    if (need * 2u <= set->cap_retired) {
+        return ANTS_OK;
+    }
+    size_t cap = set->cap_retired ? set->cap_retired : 16u;
+    while (need * 2u > cap) {
+        cap *= 2u;
+    }
+    uint8_t(*nt)[ANTS_CRDT_PEER_ID_SIZE] = calloc(cap, sizeof *nt);
+    if (nt == NULL) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    for (size_t i = 0; i < set->cap_retired; i++) {
+        if (!subject_is_zero(set->retired[i])) {
+            bool found;
+            size_t j = retired_probe(nt, cap, set->retired[i], &found);
+            memcpy(nt[j], set->retired[i], ANTS_CRDT_PEER_ID_SIZE);
+        }
+    }
+    free(set->retired);
+    set->retired = nt;
+    set->cap_retired = cap;
+    return ANTS_OK;
+}
+
+/* Record `subject` as retired; capacity must already be reserved. Returns
+ * true if it was not retired before. */
+static bool retired_add(struct ants_crdt *set, const uint8_t subject[ANTS_CRDT_PEER_ID_SIZE])
+{
+    if (subject_is_zero(subject)) {
+        bool was = set->retired_zero;
+        set->retired_zero = true;
+        return !was;
+    }
+    bool found;
+    size_t i = retired_probe(set->retired, set->cap_retired, subject, &found);
+    if (found) {
+        return false;
+    }
+    memcpy(set->retired[i], subject, ANTS_CRDT_PEER_ID_SIZE);
+    set->n_retired++;
+    return true;
+}
 
 /* First 8 bytes of the (uniformly random) content-id as the bucket hash. */
 static uint64_t id_hash(const uint8_t id[ANTS_CRDT_CONTENT_ID_SIZE])
@@ -1119,6 +1227,29 @@ static ants_error_t crdt_insert_elem(struct ants_crdt *set,
     size_t i;
     uint8_t *copy;
 
+    if (epoch < set->floor) {
+        /* Below the prune floor: the proof is never STORED. But its envelope
+         * epoch says nothing about when it was issued (an equivocation's is
+         * the statement's, chosen by the subject), so it may be a slash this
+         * node has never seen: if its subject is not already slashed here,
+         * record the subject as retired and report it NEW (gossip forwards
+         * it). Only a proof against an already-slashed subject is history. */
+        if (out_inserted != NULL) {
+            *out_inserted = false;
+        }
+        if (retired_has(set, subject)) {
+            return ANTS_OK;
+        }
+        ants_error_t rc = retired_reserve(set, 1);
+        if (rc != ANTS_OK) {
+            return rc;
+        }
+        (void)retired_add(set, subject);
+        if (out_inserted != NULL) {
+            *out_inserted = true;
+        }
+        return ANTS_OK;
+    }
     /* Grow BEFORE probing so the slot we settle on is in the final table
      * and an empty slot is guaranteed to exist. */
     if ((set->count + 1u) * 10u >= set->cap * 7u) {
@@ -1169,6 +1300,11 @@ ants_error_t ants_crdt_init(ants_crdt_t **out_set)
     }
     set->cap = CRDT_INITIAL_CAP;
     set->count = 0;
+    set->floor = 0;
+    set->retired = NULL;
+    set->n_retired = 0;
+    set->cap_retired = 0;
+    set->retired_zero = false;
     *out_set = set;
     return ANTS_OK;
 }
@@ -1184,6 +1320,7 @@ void ants_crdt_destroy(ants_crdt_t *set)
         free(set->slots[i].proof); /* free(NULL) is a no-op */
     }
     free(set->slots);
+    free(set->retired);
     free(set);
 }
 
@@ -1246,8 +1383,14 @@ bool ants_crdt_is_slashed(const ants_crdt_t *set, const uint8_t subject[ANTS_CRD
             return true;
         }
     }
-    return false;
+    return retired_has(set, subject);
 }
+
+uint64_t ants_crdt_prune_floor(const ants_crdt_t *set)
+{
+    return (set == NULL) ? 0 : set->floor;
+}
+
 
 size_t ants_crdt_size(const ants_crdt_t *set)
 {
@@ -1324,12 +1467,17 @@ ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *
         }
     }
 
-    /* Rebuild into a fresh, compact table. Allocated up front so an OOM
-     * leaves the original set untouched (no proof is freed until the new
-     * table is guaranteed). */
+    /* Rebuild into a fresh, compact table, and grow the retired-subject
+     * index to fit every subject that may leave. Both allocated up front so
+     * an OOM leaves the original set untouched (no proof is freed until
+     * both are guaranteed). */
     new_cap = crdt_cap_for(survivors);
     ns = calloc(new_cap, sizeof *ns);
     if (ns == NULL) {
+        return ANTS_ERROR_MALFORMED; /* OOM: set unchanged */
+    }
+    if (retired_reserve(set, set->count - survivors) != ANTS_OK) {
+        free(ns);
         return ANTS_ERROR_MALFORMED; /* OOM: set unchanged */
     }
     for (i = 0; i < set->cap; i++) {
@@ -1342,6 +1490,7 @@ ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *
             size_t j = crdt_probe(ns, new_cap, e->content_id, &found);
             ns[j] = *e; /* move; keep the proof pointer */
         } else {
+            (void)retired_add(set, e->subject);
             free(e->proof);
             pruned++;
         }
@@ -1350,6 +1499,9 @@ ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *
     set->slots = ns;
     set->cap = new_cap;
     set->count = survivors;
+    if (min_epoch_keep > set->floor) {
+        set->floor = min_epoch_keep;
+    }
     if (out_pruned != NULL) {
         *out_pruned = pruned;
     }

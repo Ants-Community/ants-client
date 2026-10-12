@@ -6,7 +6,11 @@
  *     1: listen_multiaddr (tstr),
  *     2: seeds [ { 0: addr (tstr), 1: peer_id (bstr/32) }, ... ],
  *     3: genesis { 0: time (uint), 1: hash (bstr/32),
- *                  2: trustees [ bstr/32, ... ] }      ; optional }
+ *                  2: trustees [ bstr/32, ... ] }      ; optional
+ *     4: archive (true)                                 ; optional }
+ *
+ * Optional keys are present only when set (archive is never encoded as
+ * false: absence means off).
  *
  * Trustees are 1..ANTSD_MAX_TRUSTEES strictly ascending peer-ids (the
  * chain's canonical population order).
@@ -74,7 +78,7 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
         }                                                                                          \
     } while (0)
 
-    ENC(ants_cbor_enc_map(&enc, g->present ? 4 : 3));
+    ENC(ants_cbor_enc_map(&enc, 3u + (g->present ? 1u : 0u) + (cfg->archive ? 1u : 0u)));
     ENC(ants_cbor_enc_uint(&enc, 0));
     ENC(ants_cbor_enc_bytes(&enc, cfg->identity_priv, sizeof cfg->identity_priv));
     ENC(ants_cbor_enc_uint(&enc, 1));
@@ -104,6 +108,10 @@ antsd_config_encode(const antsd_config_t *cfg, uint8_t *buf, size_t cap, size_t 
         for (size_t i = 0; i < g->trustee_count; i++) {
             ENC(ants_cbor_enc_bytes(&enc, g->trustees[i], sizeof g->trustees[i]));
         }
+    }
+    if (cfg->archive) {
+        ENC(ants_cbor_enc_uint(&enc, 4));
+        ENC(ants_cbor_enc_bool(&enc, true));
     }
     ENC(ants_cbor_enc_finalise(&enc));
 #undef ENC
@@ -162,7 +170,7 @@ ants_error_t antsd_config_decode(const uint8_t *buf, size_t len, antsd_config_t 
 
     size_t n;
     DEC(ants_cbor_dec_map(&dec, &n));
-    if (n != 3 && n != 4) {
+    if (n < 3 || n > 5) {
         return ANTS_ERROR_MALFORMED;
     }
 
@@ -196,10 +204,25 @@ ants_error_t antsd_config_decode(const uint8_t *buf, size_t len, antsd_config_t 
         DEC(decode_fixed_bytes(&dec, out->seeds[i].peer_id, sizeof out->seeds[i].peer_id));
     }
     out->seed_count = seed_n;
-    if (n == 4) {
+    uint64_t last_key = 2;
+    for (size_t extra = 3; extra < n; extra++) {
+        uint64_t k;
+        DEC(ants_cbor_dec_uint(&dec, &k));
+        if (k <= last_key || (k != 3 && k != 4)) {
+            return ANTS_ERROR_MALFORMED; /* unknown, repeated or out of order */
+        }
+        last_key = k;
+        if (k == 4) {
+            bool on;
+            DEC(ants_cbor_dec_bool(&dec, &on));
+            if (!on) {
+                return ANTS_ERROR_MALFORMED; /* off is encoded by absence */
+            }
+            out->archive = true;
+            continue;
+        }
         antsd_genesis_t *g = &out->genesis;
         size_t gn, tn;
-        DEC(expect_key(&dec, 3));
         DEC(ants_cbor_dec_map(&dec, &gn));
         if (gn != 3) {
             return ANTS_ERROR_MALFORMED;

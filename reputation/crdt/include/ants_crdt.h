@@ -555,6 +555,30 @@ void ants_crdt_enumerate(const ants_crdt_t *set, ants_crdt_visit_fn fn, void *ct
 ants_error_t ants_crdt_prune(ants_crdt_t *set, uint64_t min_epoch_keep, size_t *out_pruned);
 
 /*
+ * After a prune (RFC-0004 v0.10 §"Block production runtime" item 9):
+ *   - the set keeps a monotone PRUNE FLOOR (the highest min_epoch_keep
+ *     applied). A valid proof below it is never STORED. If its subject is
+ *     already retired here (see below) it is history, not news: ANTS_OK with
+ *     *out_inserted = false, exactly like a duplicate — gossip neither
+ *     forwards it nor counts it against the honest archive that re-offered
+ *     it, so a replay of old proofs cannot re-flood the network after every
+ *     prune. If its subject is NOT yet slashed it is a slash this node has
+ *     never seen (an envelope epoch is not an issuance time: an
+ *     equivocation's is the statement's, chosen by the subject): the
+ *     subject is recorded retired (slashed) and the insert reports
+ *     *out_inserted = true, so gossip forwards it once — still without
+ *     storing the bytes. O(1): the check is the retired index only, so a
+ *     subject that also has stored (in-window) proofs may be forwarded once
+ *     more, which is harmless;
+ *   - every subject whose proof was pruned stays SLASHED for
+ *     ants_crdt_is_slashed (a compact retired-subject hash set, 32 bytes
+ *     per subject, so pruning stays linear in the proofs it drops): losing the evidence must not
+ * un-slash anyone locally — the safe direction until the L2 slashed-subject index exists.
+ * ants_crdt_prune_floor reports the floor (0 = never pruned).
+ */
+uint64_t ants_crdt_prune_floor(const ants_crdt_t *set);
+
+/*
  * A safe upper bound, in bytes, for the buffer ants_crdt_snapshot_encode
  * needs for the current set. Lets a caller size the buffer in one shot
  * rather than retry-on-BUFFER_TOO_SMALL. 0 if set is NULL.

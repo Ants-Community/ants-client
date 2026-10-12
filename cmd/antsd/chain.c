@@ -2,14 +2,17 @@
  * cmd/antsd/chain.c — the daemon's L2 chain loop (see chain.h).
  *
  * The runtime is pure; this file gives it a world:
- *   - a Layer-1 view: the G-Set's proofs visible at a cutoff, content-ids
- *     ascending, decoded into the pattern engine's events. The proof
- *     envelope carries an `epoch`, not a signing time, so visibility and
- *     the event time are derived from it deterministically: a proof is
- *     visible at `cutoff` iff its epoch has begun by then
- *     (genesis + epoch * EPOCH_DURATION <= cutoff), and its event time is
- *     that epoch's start. Every node holding the same set therefore
- *     composes the same block;
+ *   - a Layer-1 view (RFC-0004 §"Block production runtime" item 9): the
+ *     G-Set's proofs visible at a cutoff, content-ids ascending, decoded
+ *     into the pattern engine's events. The proof envelope carries an
+ *     `epoch`, not a signing time, so visibility and the event time come
+ *     from it deterministically: at a cutoff in epoch e a proof is visible
+ *     iff its epoch is in [e - 29, e] (the 30-epoch pattern window), and
+ *     its event time is that epoch's start. Every node holding the same
+ *     proofs in that window composes the same block — pruned or archive;
+ *   - pruning: after each final head, proofs older than one epoch beyond
+ *     the window (epoch < head epoch - 30) are pruned, unless the node is
+ *     an archive;
  *   - a signer (the node identity over the block hash);
  *   - the wire: proposals and attestations out as gossip BLOCK / ATTEST
  *     frames, frames in through the gossip chain handler.
@@ -41,6 +44,7 @@ static ants_chain_event_t g_view_events[ANTSD_CHAIN_VIEW_MAX];
 
 struct view_walk {
     uint64_t genesis_time;
+    uint64_t min_epoch;
     uint64_t max_epoch;
     size_t n;
     bool overflow;
@@ -53,7 +57,8 @@ static bool view_visit(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
 {
     struct view_walk *w = (struct view_walk *)ctx;
     ants_fault_proof_view_t v;
-    if (ants_crdt_fault_proof_decode(proof, len, &v) != ANTS_OK || v.epoch > w->max_epoch) {
+    if (ants_crdt_fault_proof_decode(proof, len, &v) != ANTS_OK || v.epoch > w->max_epoch ||
+        v.epoch < w->min_epoch) {
         return true; /* not visible at this cutoff */
     }
     if (w->n >= ANTSD_CHAIN_VIEW_MAX) {
@@ -85,8 +90,7 @@ static ants_error_t chain_view(uint64_t cutoff,
     struct view_walk w;
     memset(&w, 0, sizeof w);
     w.genesis_time = c->genesis_time;
-    if (cutoff >= c->genesis_time) {
-        w.max_epoch = (cutoff - c->genesis_time) / ANTS_CHAIN_RT_EPOCH_DURATION_S;
+    if (ants_chain_rt_view_epochs(c->genesis_time, cutoff, &w.min_epoch, &w.max_epoch)) {
         ants_crdt_enumerate(c->gset, view_visit, &w);
     }
     if (w.overflow) {
@@ -150,6 +154,25 @@ static void out_final(const ants_chain_head_t *head, void *ctx)
 {
     antsd_chain_t *c = (antsd_chain_t *)ctx;
     c->finals++;
+    /* The head's epoch, from its cutoff and our own genesis — not the
+     * block's claimed epoch field — and never ahead of our clock: a
+     * dishonest quorum finalising a block from the far future must not be
+     * able to push the prune floor (monotone) past live proofs. */
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t lo = 0, e = 0;
+    if (ants_chain_rt_view_epochs(
+            c->genesis_time, head->cutoff_time < now ? head->cutoff_time : now, &lo, &e)) {
+        /* Neighbours only need proofs inside the current window. */
+        (void)ants_gossip_set_announce_min_epoch(c->gossip, lo);
+        /* Schedule the prune; antsd_chain_tick applies it (this callback can
+         * run inside a gossip delivery, and pruning rebuilds the G-Set). */
+        if (!c->archive && e > ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS) {
+            uint64_t keep = e - ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS;
+            if (keep > ants_crdt_prune_floor(c->gset) && keep > c->prune_keep) {
+                c->prune_keep = keep;
+            }
+        }
+    }
     char hex[ANTS_CHAIN_HASH_SIZE * 2 + 1];
     antsd_hex_format(head->hash, sizeof head->hash, hex, sizeof hex);
     printf("antsd: chain final height=%llu hash=%s epoch=%llu%s\n",
@@ -250,9 +273,12 @@ ants_error_t antsd_chain_start(antsd_chain_t *c,
                                const uint8_t pub[ANTS_ED25519_PUBKEY_SIZE],
                                ants_gossip_t *gossip,
                                ants_crdt_t *gset,
+                               bool archive,
                                uint64_t now)
 {
     c->on = false;
+    c->archive = archive;
+    c->prune_keep = 0;
     c->pending = false;
     c->gossip = gossip;
     c->gset = gset;
@@ -283,6 +309,15 @@ void antsd_chain_tick(antsd_chain_t *c, uint64_t now)
             c->pending = false;
             fprintf(stderr, "antsd: chain off: genesis rejected at its own time\n");
         }
+    }
+    if (c->prune_keep != 0) {
+        size_t n = 0;
+        uint64_t keep = c->prune_keep;
+        if (ants_crdt_prune(c->gset, keep, &n) == ANTS_OK) {
+            c->prune_keep = 0;
+            c->pruned += n;
+            printf("antsd: l1 pruned %zu proofs below epoch %llu\n", n, (unsigned long long)keep);
+        } /* on OOM the set is unchanged: retried next tick */
     }
     if (c->on) {
         ants_chain_rt_tick(&c->rt, now);

@@ -234,6 +234,38 @@ static void test_genesis_roundtrip_and_rejects(void)
     CHECK(antsd_config_decode(buf, len + 1, &out) != ANTS_OK);
 }
 
+static void test_archive_flag(void)
+{
+    /* archive = true round-trips alone and alongside a genesis (map(4) and
+     * map(5)); off is absence, so an explicit false is rejected. */
+    antsd_config_t in;
+    memset(&in, 0, sizeof in);
+    in.identity_priv[0] = 2;
+    in.archive = true;
+    static uint8_t buf[ANTSD_CONFIG_ENCODED_MAX];
+    size_t len;
+    antsd_config_t out;
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_OK);
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_OK);
+    CHECK(out.archive && !out.genesis.present);
+    CHECK(buf[len - 2] == 0x04 && buf[len - 1] == 0xf5); /* 4: true, last */
+    buf[len - 1] = 0xf4;                                 /* 4: false */
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_ERROR_MALFORMED);
+
+    in.genesis.present = true;
+    in.genesis.time = 7;
+    in.genesis.trustee_count = 1;
+    memset(in.genesis.trustees[0], 0x11, 32);
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_OK);
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_OK);
+    CHECK(out.archive && out.genesis.present && out.genesis.time == 7);
+
+    in.archive = false;
+    CHECK(antsd_config_encode(&in, buf, sizeof buf, &len) == ANTS_OK);
+    CHECK(antsd_config_decode(buf, len, &out) == ANTS_OK);
+    CHECK(!out.archive);
+}
+
 int main(void)
 {
     test_roundtrip_full();
@@ -245,6 +277,7 @@ int main(void)
     test_decode_rejects_truncated();
     test_invalid_args();
     test_genesis_roundtrip_and_rejects();
+    test_archive_flag();
 
     if (failures == 0) {
         printf("all checks passed\n");

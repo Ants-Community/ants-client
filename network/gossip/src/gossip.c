@@ -107,6 +107,7 @@ struct gossip_state {
     ants_gossip_stats_t stats; /* propagation instrumentation (T_prop budget)      */
     struct gossip_reject_entry reject_tab[ANTS_GOSSIP_REJECT_TABLE_SIZE];
     uint8_t view[ANTS_GOSSIP_MAX_VIEW][ANTS_GOSSIP_PEER_ID_SIZE];
+    uint64_t announce_min_epoch;   /* IHAVE advertises only proofs at/above */
     ants_gossip_chain_fn chain_fn; /* NULL: chain frames are UNSUPPORTED_TYPE */
     void *chain_ctx;
     struct gossip_chain_seen chain_seen[ANTS_GOSSIP_CHAIN_DEDUP_SLOTS];
@@ -848,6 +849,7 @@ struct collect_ids_ctx {
     uint8_t (*ids)[ANTS_CRDT_CONTENT_ID_SIZE];
     size_t count;
     size_t cap;
+    uint64_t min_epoch; /* 0 = no filter */
 };
 static bool collect_ids_visit(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE],
                               const uint8_t *proof,
@@ -855,14 +857,29 @@ static bool collect_ids_visit(const uint8_t content_id[ANTS_CRDT_CONTENT_ID_SIZE
                               void *ctx)
 {
     struct collect_ids_ctx *c = ctx;
-    (void)proof;
-    (void)len;
     if (c->count >= c->cap) {
         return false; /* digest full → stop enumerating */
+    }
+    if (c->min_epoch != 0) {
+        /* Advertise only proofs a neighbour can still use: older ones are
+         * pruned history it would pull and drop at its floor, every round. */
+        ants_fault_proof_view_t v;
+        if (ants_crdt_fault_proof_decode(proof, len, &v) != ANTS_OK || v.epoch < c->min_epoch) {
+            return true;
+        }
     }
     memcpy(c->ids[c->count], content_id, ANTS_CRDT_CONTENT_ID_SIZE);
     c->count++;
     return c->count < c->cap;
+}
+
+ants_error_t ants_gossip_set_announce_min_epoch(ants_gossip_t *g, uint64_t min_epoch)
+{
+    if (g == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    state_of(g)->announce_min_epoch = min_epoch;
+    return ANTS_OK;
 }
 
 ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent)
@@ -888,6 +905,7 @@ ants_error_t ants_gossip_announce(ants_gossip_t *g, size_t *out_sent)
     cc.ids = ids;
     cc.count = 0;
     cc.cap = ANTS_GOSSIP_MAX_IDS;
+    cc.min_epoch = s->announce_min_epoch;
     ants_crdt_enumerate(s->gset, collect_ids_visit, &cc);
     if (cc.count == 0) {
         return ANTS_OK; /* empty G-Set → nothing to advertise */

@@ -678,10 +678,27 @@ static void test_init_args(void)
     CHECK(ants_chain_rt_init(&rt, &cfg, GENESIS_TIME) == ANTS_ERROR_INVALID_ARG);
 }
 
+static void test_view_window(void)
+{
+    /* RFC-0004 item 9: a cutoff in epoch e sees epochs [e - 29, e]. */
+    const uint64_t g = GENESIS_TIME, d = ANTS_CHAIN_RT_EPOCH_DURATION_S;
+    uint64_t lo = 99, hi = 99;
+    CHECK(!ants_chain_rt_view_epochs(g, g - 1, &lo, &hi)); /* before genesis */
+    CHECK(ants_chain_rt_view_epochs(g, g, &lo, &hi) && lo == 0 && hi == 0);
+    CHECK(ants_chain_rt_view_epochs(g, g + 29 * d, &lo, &hi) && lo == 0 && hi == 29);
+    CHECK(ants_chain_rt_view_epochs(g, g + 30 * d, &lo, &hi) && lo == 1 && hi == 30);
+    CHECK(ants_chain_rt_view_epochs(g, g + 40 * d + d - 1, &lo, &hi) && lo == 11 && hi == 40);
+    CHECK(hi - lo + 1 == ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS);
+    CHECK(!ants_chain_rt_view_epochs(g, g, NULL, &hi));
+    /* The window is the pattern rules' 30 days. */
+    CHECK(ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS * d == ANTS_CHAIN_PATTERN_WINDOW_S);
+}
+
 int main(void)
 {
     l1_init();
     test_init_args();
+    test_view_window();
     test_healthy_committee();
     test_offline_proposer_is_skipped();
     test_divergent_view_abstains();

@@ -81,6 +81,24 @@ extern "C" {
 /* RFC-0008 §7 EPOCH_DURATION. */
 #define ANTS_CHAIN_RT_EPOCH_DURATION_S 86400u
 
+/* RFC-0004 item 9 / RFC-0008 §7 L1_VIEW_WINDOW_EPOCHS: a block composed
+ * at a cutoff in epoch e sees the proofs of epochs [e - 29, e] — the
+ * pattern rules' 30-day window, so "N events in 30 days" still counts 30
+ * days. A node may prune proofs older than one epoch beyond that window
+ * (epoch < head epoch - 30): it can never need them again to compose or
+ * check a block. */
+#define ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS 30u
+
+/* The epochs whose proofs are visible to a block composed at `cutoff`
+ * (RFC-0004 item 9): [*out_min, *out_max], *out_max = the cutoff's epoch,
+ * the window ANTS_CHAIN_RT_VIEW_WINDOW_EPOCHS wide (clamped at epoch 0).
+ * Returns false (no epoch is visible) when cutoff < genesis_time. A node's
+ * Layer-1 view callback filters its proofs' envelope epochs by this. */
+bool ants_chain_rt_view_epochs(uint64_t genesis_time,
+                               uint64_t cutoff,
+                               uint64_t *out_min,
+                               uint64_t *out_max);
+
 /* How far in the future (by the member's clock) a proposal's cutoff may lie
  * and still be signed. DRAFT. */
 #define ANTS_CHAIN_RT_CLOCK_SKEW_S 10u

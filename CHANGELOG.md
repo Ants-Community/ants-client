@@ -13,6 +13,35 @@ the spec repo's
 
 ## Unreleased
 
+### reputation/crdt + cmd/antsd: L1 pruning wired to the L2 chain (PR7 of the node daemon) · 2026-10-12
+
+The G-Set no longer grows without bound. Per RFC-0004 v0.10 §"Block production runtime" items 9–10, after each final head of epoch E the daemon prunes every proof whose epoch is below E − 30, unless the node is an archive (`antsd archive <config> on`).
+
+**Layer-1 view window.** To keep pruned and archive nodes composing the same block, the view is now windowed. A block composed at a cutoff in epoch e sees only proofs of epochs [e − 29, e], which is the pattern rules' 30-day window. The daemon gets that window from the new pure `ants_chain_rt_view_epochs`.
+
+**`reputation/crdt` — two safeguards pruning needed:**
+- **Monotone prune floor.** A proof below the floor is never stored. When it is re-offered (by gossip, merge or snapshot) against a subject already retired, it is treated like a duplicate: `ANTS_OK`, not inserted. Gossip therefore neither forwards it nor counts it against the honest archive that re-offered it. Without the floor, every prune would be followed by a re-flood of the pruned history.
+- **Retired-subject index.** `ants_crdt_is_slashed` stays true for a subject whose proofs were pruned. Losing the evidence must not un-slash anyone locally; the L2 slashed-subject index does not exist yet.
+- An existing test pinned the old behaviour (a subject was no longer slashed after a full prune). The assertion was inverted on purpose.
+
+**Pre-push adversarial review.** It found no consensus divergence: pruned and archive nodes compose identical blocks. It did find four issues, all fixed here.
+- **High: the floor silently dropped new slashes.** An equivocation's envelope epoch is the statement's, chosen by the subject, so a never-seen slash could fall below the floor. It was not stored, not forwarded, and the subject was never slashed. Now a below-floor proof against a subject not yet retired slashes the subject and is reported NEW (forwarded once, still not stored). Only a proof against an already-retired subject is treated as history. Regression test added; removing the fix makes it fail.
+- **Medium: pruning was quadratic in the retired index.** The reviewer's scratch measured 2.6 s for 20k distinct subjects and 10.4 s for 40k, on the daemon's single event-loop thread. The index is now an open-addressed hash set, and the same scratch runs in 0.01 s and 0.02 s.
+- **IHAVE/IWANT re-pulled pruned proofs every round.** The new `ants_gossip_set_announce_min_epoch` limits IHAVE to the current window, and the daemon sets it on each final head. Test added; removing the filter makes it fail.
+- **A dishonest quorum could push the monotone floor past live proofs** by claiming a far-future epoch. The prune epoch is now computed from the block's cutoff with the node's own genesis, capped at the node's clock, and the block's `epoch` field is no longer used.
+
+**Bonds are deferred to the serving PR.** By the founder's decision, they move after PR8: A comes from serving receipts, which do not exist yet.
+
+**Tests:**
+- **`test_crdt`:**
+  - the floor rejects a pruned proof re-offered by insert and by merge from an archive;
+  - the floor is monotone;
+  - the slashed state survives a full prune;
+  - removing the floor makes four of these checks fail.
+- **`test_chain_runtime`:** the window boundaries, and its equality with the pattern window.
+- **`test_antsd_config`:** the archive flag (explicit false is rejected, and it coexists with genesis).
+- **`test_antsd_run`:** the daemon is the sole trustee of a chain whose genesis was 40 days ago. Through QUIC gossip it receives proofs at epochs 5 and 35. After its first final block (epoch 40) it logs `l1 pruned 1 proofs below epoch 10`, which is exactly the epoch-5 proof.
+
 ### network/gossip + cmd/antsd: the L2 chain on the wire (PR6b of the node daemon) · 2026-10-12
 
 The block-production runtime from #193 now runs inside the daemon, and its proposals and attestations travel the network. This implements RFC-0008 v0.10 §11.13 and RFC-0004 v0.8 §"Block production runtime (v1)" (spec: Ants-Community/ants#10).
