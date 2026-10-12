@@ -11,6 +11,7 @@ kernels add 6–18 EM per platform as v0.2+ deliverables.
 |---|---|---|---|
 | [`kernels/`](./kernels) — `ants-canonical-kernels` (#12) | 6–12 EM (CPU) | RFC-0009 v0.5 | pending claim |
 | [`orchestration/`](./orchestration) — Inference orchestration (#13) | 4 EM | RFC-0003 v0.2, RFC-0009 v0.5 | pending claim |
+| [`exchange/`](./exchange) — the inference exchange (INFER_REQ/RESP) | — | RFC-0008 §11.14 | v0.x (daemon PR8a) |
 
 The kernel library (#12) is **the largest engineering risk in the
 entire corpus** per IMPLEMENTATION.md. The strategy: leverage

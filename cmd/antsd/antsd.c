@@ -21,10 +21,15 @@
  *                           + the attestation gate + the L2 chain loop
  *                           (when the config carries a genesis) and
  *                           drive the tick loop until SIGINT/SIGTERM
- *                           (see run.c)
+ *                           (see run.c); the node serves inference
+ *                           (RFC-0008 §11.14) with the v1 reference model
+ *   antsd ask <multiaddr> <peer-id-hex> <prompt> [tier]
+ *                         — one inference request to a node, the answer
+ *                           checked and the verdict printed (see ask.c)
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "ask.h"
 #include "config.h"
 #include "run.h"
 #include "util.h"
@@ -261,13 +266,27 @@ static int usage(const char *argv0)
             "           write the v1 chain genesis into a config\n"
             "  archive  <config> on|off\n"
             "           archive node: never prune the L1 G-Set\n"
-            "  run      drive the node event loop until SIGINT/SIGTERM\n",
+            "  run      drive the node event loop until SIGINT/SIGTERM\n"
+            "  ask      <multiaddr> <peer-id-hex> <prompt> [tier]\n"
+            "           ask a node for an inference answer (tier 1..3, default 2)\n",
             argv0);
     return 2;
 }
 
 int main(int argc, char **argv)
 {
+    if ((argc == 5 || argc == 6) && strcmp(argv[1], "ask") == 0) {
+        unsigned long tier = 2;
+        if (argc == 6) {
+            char *end = NULL;
+            tier = strtoul(argv[5], &end, 10);
+            if (end == argv[5] || *end != '\0' || tier > 255) {
+                fprintf(stderr, "antsd: bad tier %s\n", argv[5]);
+                return 2;
+            }
+        }
+        return antsd_cmd_ask(argv[2], argv[3], argv[4], (unsigned)tier);
+    }
     if (argc == 4 && strcmp(argv[1], "archive") == 0) {
         return cmd_archive(argv[2], argv[3]);
     }

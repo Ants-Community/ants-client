@@ -15,7 +15,11 @@
  * §11.13). The attestation gate runs RFC-0005's v1 verify-and-tag posture:
  * every connection is asked for its attestation, unattested peers are
  * admitted, attested ones tagged, and peers presenting evidence that
- * fails verification are disconnected. The DHT is seeded from the config's
+ * fails verification are disconnected. The node serves inference
+ * (RFC-0008 §11.14) with the pinned v1 reference model: every INFER_REQ in
+ * tiers 1-3 is answered with a commit signed by the node identity, its
+ * round the height of the final L2 head (0 with the chain off).
+ * The DHT is seeded from the config's
  * bootstrap list; the gossip view is fed from DHT discovery and
  * refreshed on the anti-eclipse epoch cadence (probe + rotated
  * bucket-diverse sample, the composed recipe from ants_dht.h /
@@ -37,6 +41,8 @@
 #include "ants_crypto.h"
 #include "ants_dht.h"
 #include "ants_gossip.h"
+#include "ants_infer.h"
+#include "ants_inference.h"
 #include "ants_tee.h"
 #include "ants_transport.h"
 
@@ -96,6 +102,8 @@ typedef char antsd_seed_capacity_check[(ANTSD_MAX_SEEDS == ANTS_DHT_MAX_BOOTSTRA
  * engine's per-connection tables, or a few silent peers could starve the
  * gate (see ANTS_ATTEST_MAX_CONNS). */
 typedef char antsd_attest_capacity_check[(ANTSD_MAX_CONNECTIONS <= ANTS_ATTEST_MAX_CONNS) ? 1 : -1];
+/* The same rule for the inference producer's inbound table. */
+typedef char antsd_infer_capacity_check[(ANTSD_MAX_CONNECTIONS <= ANTS_INFER_MAX_CONNS) ? 1 : -1];
 
 /* QUIC application close code for a peer whose attestation failed
  * verification (RFC-0005 verify-and-tag: false evidence → disconnect).
@@ -121,12 +129,17 @@ typedef struct {
     ants_gossip_t *gossip;
     ants_gossip_transport_t *gossip_binding;
     ants_attest_t *attest;
+    ants_infer_t *infer;
+    ants_inference_t *inference;
+    const antsd_chain_t *chain;
     uint64_t conns_ready;
     uint64_t conns_closed;
     uint64_t dht_peers;
     uint64_t attested;
     uint64_t unattested;
     uint64_t rejected;
+    uint64_t served;
+    uint64_t declined;
     ants_peer_id_t view[ANTSD_GOSSIP_VIEW_SIZE];
     size_t view_count;
 } antsd_node_t;
@@ -200,6 +213,9 @@ static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
     if (node->attest != NULL) {
         ants_attest_handle_transport_event(node->attest, ev, (int64_t)time(NULL));
     }
+    if (node->infer != NULL) {
+        ants_infer_handle_transport_event(node->infer, ev);
+    }
     char hex[ANTS_PEER_ID_SIZE * 2 + 1];
     switch (ev->kind) {
     case ANTS_TRANSPORT_EV_CONN_READY:
@@ -246,6 +262,42 @@ static void attest_verdict(const ants_attest_result_t *r, void *ctx)
     default:
         break;
     }
+}
+
+/* INFER_REQ producer (RFC-0008 §11.14). Any tier the reference serve
+ * rejects (outside 1..3) is declined; so is anything else it cannot do.
+ * The commit's round is the final head's height: the latest round the
+ * node itself has seen finalised. */
+static bool infer_serve(void *ctx,
+                        const ants_peer_id_t *requester,
+                        const ants_infer_request_t *req,
+                        ants_infer_served_t *out)
+{
+    antsd_node_t *node = (antsd_node_t *)ctx;
+    char hex[ANTS_PEER_ID_SIZE * 2 + 1];
+    uint64_t round = 0;
+    if (node->chain != NULL && node->chain->on) {
+        ants_chain_head_t head;
+        ants_chain_rt_head(&node->chain->rt, &head);
+        round = head.height;
+    }
+    antsd_hex_format(requester->bytes, sizeof requester->bytes, hex, sizeof hex);
+    ants_error_t rc = ants_infer_serve_reference(node->inference, round, req, out);
+    if (rc != ANTS_OK) {
+        node->declined++;
+        printf("antsd: infer declined peer=%s tier=%u: %s\n",
+               hex,
+               (unsigned)req->tier,
+               ants_strerror(rc));
+        return false;
+    }
+    node->served++;
+    printf("antsd: infer served peer=%s tier=%u input=%zu round=%" PRIu64 "\n",
+           hex,
+           (unsigned)req->tier,
+           req->input_len,
+           round);
+    return true;
 }
 
 /* DHT event demux: routing-table membership is logged (it is the
@@ -552,6 +604,46 @@ int antsd_cmd_run(const char *path)
     }
     node.attest = &attest;
 
+    /* Inference serving: the pinned v1 reference model (RFC-0008 §10),
+     * signed by the node identity — requesters check the commit against
+     * the peer-id the TLS handshake authenticated. */
+    static union {
+        uint32_t align;
+        uint8_t bytes[ANTS_INFERENCE_REF_MODEL_V1_BYTES];
+    } model;
+    static ants_inference_t inference; /* ~100 KB — static, off the stack */
+    static ants_infer_t infer;
+    size_t model_len = 0;
+    ants_inference_config_t icfg;
+    memset(&icfg, 0, sizeof icfg);
+    rc = ants_inference_ref_model_v1_build(model.bytes, sizeof model.bytes, &model_len);
+    if (rc == ANTS_OK) {
+        icfg.model_weights = model.bytes;
+        icfg.model_weights_len = model_len;
+        icfg.producer_priv = cfg.identity_priv;
+        rc = ants_inference_init(&inference, &icfg);
+    }
+    if (rc == ANTS_OK) {
+        ants_infer_config_t xcfg;
+        memset(&xcfg, 0, sizeof xcfg);
+        xcfg.serve_fn = infer_serve;
+        xcfg.serve_ctx = &node;
+        rc = ants_infer_init(&infer, &xcfg);
+    }
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: inference init failed: %s\n", ants_strerror(rc));
+        ants_transport_destroy(&transport, 0);
+        ants_attest_destroy(&attest);
+        ants_inference_destroy(&inference);
+        ants_gossip_transport_destroy(&gossip_binding);
+        ants_dht_destroy(&dht);
+        ants_crdt_destroy(gset);
+        return 1;
+    }
+    node.inference = &inference;
+    node.infer = &infer;
+    printf("antsd: serving inference (reference model v1)\n");
+
     /* The L2 chain loop — only with a genesis in the config. A trustee
      * proposes and signs; any other node follows as an observer. A
      * genesis time still ahead leaves the loop pending until it arrives;
@@ -559,6 +651,7 @@ int antsd_cmd_run(const char *path)
      * with the chain off. */
     static antsd_chain_t chain; /* ~200 KB of runtime state — static */
     memset(&chain, 0, sizeof chain);
+    node.chain = &chain;
     if (cfg.genesis.present) {
         rc = antsd_chain_start(&chain,
                                &cfg.genesis,
@@ -628,7 +721,8 @@ int antsd_cmd_run(const char *path)
 
     printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ", dht peers %" PRIu64
            ", view %zu, attest %" PRIu64 "/%" PRIu64 "/%" PRIu64
-           " attested/unattested/rejected, chain finals %" PRIu64 ")\n",
+           " attested/unattested/rejected, infer %" PRIu64 "/%" PRIu64
+           " served/declined, chain finals %" PRIu64 ")\n",
            node.conns_ready,
            node.conns_closed,
            node.dht_peers,
@@ -636,6 +730,8 @@ int antsd_cmd_run(const char *path)
            node.attested,
            node.unattested,
            node.rejected,
+           node.served,
+           node.declined,
            chain.finals);
     /* Teardown order matters: the transport goes first, so its
      * CONN_CLOSED callbacks still reach the DHT and the gossip binding
@@ -646,6 +742,8 @@ int antsd_cmd_run(const char *path)
      * ants_gossip.h. */
     ants_transport_destroy(&transport, 0);
     ants_attest_destroy(&attest);
+    ants_infer_destroy(&infer);
+    ants_inference_destroy(&inference);
     ants_gossip_transport_destroy(&gossip_binding);
     ants_dht_destroy(&dht);
     ants_crdt_destroy(gset);

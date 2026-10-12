@@ -13,6 +13,44 @@ the spec repo's
 
 ## Unreleased
 
+### inference/exchange + cmd/antsd: the node serves inference (PR8a of the node daemon) · 2026-10-12
+
+The daemon now answers inference requests over the wire, per RFC-0008 v0.13 §11.14 (ants#13). Before this, `ants_inference_serve` and `ants_inference_audit` worked only in-process, with no message to carry a request to a producer.
+
+**`inference/orchestration` — two additions:**
+- **`ants_inference_ref_model_v1_build`**, a pinned deterministic generator for the v1 reference model (vocab 256, d_model 32). Every reference node now serves the same `model_hash` (`c64a0f64…eba3`, pinned in the test from the compiled artifact) and can audit any other. Each weight is an exact dyadic rational written as a little-endian FP32 bit pattern, so the blob is identical on every platform.
+- **`ants_inference_answer_check`**, the requester's checks from §11.14:
+  - the commit signature under the producer key;
+  - the commit against the request: input hash, nonce and tier;
+  - the envelope against the request and the commit (`1 ≤ m ≤ length`, vocab ≤ 256);
+  - the tier's audit policy: Tiers 2–3 `audit_threshold = 2⁶⁴−1`, Tier 1 ≥ 2⁵⁹;
+  - the reference model's context (`min(input, 63) + length ≤ 64`);
+  - the §11.8 integrity gate.
+  A failed check is a `false` verdict, not an error. Each check has a test, and each new bound has a positive control one step inside it.
+
+**New `inference/exchange` (`ants_infer`).** INFER_REQ/INFER_RESP codec plus an engine that is a sibling of the DHT server and `network/attest` on the same transport.
+- **Producer side:** a callback. `ants_infer_serve_reference` bridges it to the reference model.
+- **Requester side:** answers are checked under the connection's TLS-authenticated peer-id. Verdicts are answered, declined, rejected or no-answer, the last with a timeout driven by `ants_infer_tick`.
+- **Classification by envelope head.** Unlike `network/attest`, which holds a peer-initiated stream until FIN, this engine reads the first 10 bytes and releases any stream that is not an INFER_REQ at once. A peer's own DHT RPCs held open can therefore never use up the per-connection slots its INFER_REQ needs. Holding until FIN instead makes the regression test fail.
+
+**`cmd/antsd`:**
+- `antsd run` builds the v1 model, signs commits with the node identity, sets `round` to the final L2 head's height (0 with the chain off), and logs each served or declined request. Shutdown reports the counts.
+- New `antsd ask <multiaddr> <peer-id> <prompt> [tier]`: a one-shot requester with a throwaway identity that prints the verdict, round, model hash, root and tokens. It closes the connection explicitly, because `ants_transport_destroy` does not send CONNECTION_CLOSE.
+
+**Pre-push adversarial review** found no memory-safety issue in the engine. It did find three real ones, all fixed here:
+- **Audit-dodging answers (reproduced).** Four signed, root-consistent answers passed the first-cut check, yet `ants_inference_audit` could only error on them, never return FRAUD: `m = 0`, vocab 1024, a 63-byte input with 16 positions, and a Tier-2 commit with `audit_threshold = 0`. The m, vocab, tier-policy and context rules above close them, and the spec (ants#13) states them. Removing the context rule or the tier rule each makes its own test fail.
+- **Inbound slot exhaustion.** 16 connections each holding 2 unfinished streams could fill the 32-slot table and leave honest requesters unanswered. The table is now sized at 2 per connection for `ANTS_INFER_MAX_CONNS` (64), with a compile-time check in the daemon that it covers the transport's `max_connections`. Exhausting it now takes exhausting the connection cap first, the same rule as `network/attest`.
+- **Request on a closing connection.** A request made from the NO_ANSWER callback that CONN_CLOSED delivers could bind a stream to a connection about to be freed. It is now refused with `PEER_UNREACHABLE`. Test added; removing the guard makes it fail.
+
+**Not here yet:** receipts and their countersignature (PR8b, then bonds), the v1 beacon `B_{r+1}`, and audit dispatch. These are open in RFC-0008 §10.
+
+**Tests:**
+- **`test_orchestration`:** the v1 model (determinism, header, weight range, pinned hash, and init binding the same hash) and every answer-check reject path.
+- **`test_infer`:**
+  - the codec, with hand-written bytes and caps;
+  - over loopback QUIC: answered and then audited by a requester holding only the pinned model, declined, tampered, foreign signer, malformed, wrong-txid and oversized replies, timeout, and the sibling-stream regression.
+- **`test_antsd_run`:** the real `antsd ask` against the spawned daemon. It covers an answer under the pinned model at round 0, a decline for tier 9, no answer under a wrong peer pin, and the shutdown counts.
+
 ### reputation/crdt + cmd/antsd: L1 pruning wired to the L2 chain (PR7 of the node daemon) · 2026-10-12
 
 The G-Set no longer grows without bound. Per RFC-0004 v0.10 §"Block production runtime" items 9–10, after each final head of epoch E the daemon prunes every proof whose epoch is below E − 30, unless the node is an archive (`antsd archive <config> on`).

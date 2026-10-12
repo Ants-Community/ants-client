@@ -12,7 +12,10 @@
 #                          (RFC-0005 v1 verify-and-tag) + the L2 chain
 #                          loop when the config carries a genesis, and
 #                          drive the tick loop until SIGINT/SIGTERM
+#                          + inference serving (RFC-0008 §11.14, the v1
+#                          reference model)
 #   antsd genesis <config> <time> <hash> <trustee>... — write the v1 genesis
+#   antsd ask <multiaddr> <peer-id> <prompt> [tier] — one inference request
 
 add_library(antsd_config STATIC config.c)
 target_include_directories(antsd_config
@@ -25,12 +28,12 @@ target_include_directories(antsd_config
 target_link_libraries(antsd_config PUBLIC ants_cbor ants_crypto)
 target_compile_features(antsd_config PUBLIC c_std_99)
 
-add_executable(antsd antsd.c run.c chain.c util.c)
+add_executable(antsd antsd.c ask.c run.c chain.c util.c)
 # ants_crypto (Ed25519) arrives through antsd_config (PUBLIC) — listing it
 # again next to ants_attest's transitive copy trips macOS 'ld: ignoring
 # duplicate libraries'.
-target_link_libraries(antsd PRIVATE antsd_config ants_attest ants_chain ants_gossip ants_dht
-                                    ants_crdt ants_transport)
+target_link_libraries(antsd PRIVATE antsd_config ants_attest ants_infer ants_chain ants_gossip
+                                    ants_dht ants_crdt ants_transport)
 target_compile_features(antsd PRIVATE c_std_99)
 
 if(BUILD_TESTING)
