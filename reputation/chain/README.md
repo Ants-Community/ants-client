@@ -6,9 +6,15 @@ L2 PoUH chain. Reputation & identity layer.
 **Status:** feature-complete at v0.x. The drand beacon verification + VRF
 seed derivation, block proposal + proposer election, epoch-summary
 generation, equivocation / invalid-transition fault attribution, and the
-saturating Σ T_eff fork choice are all implemented. The remaining runtime
-glue (block production on the wire, L2→L1 prune-cutoff feedback) is
-daemon-blocked. Founder interim primary.
+saturating Σ T_eff fork choice are all implemented, and so is the
+block-production runtime (`ants_chain_runtime.h`): the v1 / RFC-0010
+Phase-1 state machine that composes them. It handles sequential heights,
+the trustee committee, proposal after the drand floor,
+recompute-and-compare signing at one signature per height, 2/3 finality,
+skip-on-timeout, and adoption of provably-final blocks. It is driven by the
+caller's clock and messages, with no I/O. Still to come: its wire (RFC-0008
+amendment pending) and daemon wiring, plus the L2→L1 prune-cutoff
+feedback. Founder interim primary.
 **Effort:** 6 EM.
 **Spec:** [RFC-0004 v0.6 §Layer 2](https://github.com/Ants-Community/ants/blob/main/spec/RFC-0004-reputation-pouh.md), §Partition recovery (incl. saturating Σ T_eff fork choice + equivocation slashing + social-Schelling fallback).
 **Dependencies:** `foundation/crypto` (BLS, Ed25519, ECVRF-ELL2), `reputation/crdt`.

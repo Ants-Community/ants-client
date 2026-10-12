@@ -21,6 +21,7 @@
 
 add_library(ants_chain STATIC
     src/chain.c
+    src/chain_runtime.c
 )
 
 target_include_directories(ants_chain
@@ -71,4 +72,12 @@ if(BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/foundation/cbor/include
         ${CMAKE_SOURCE_DIR}/reputation/identity/include)
     add_test(NAME chain_basic COMMAND test_chain)
+
+    # The block-production runtime, driven as an in-process network of
+    # simulated nodes (real Ed25519 keys, a fake clock, a message bus).
+    add_executable(test_chain_runtime tests/test_chain_runtime.c)
+    target_link_libraries(test_chain_runtime PRIVATE ants_chain)
+    target_include_directories(test_chain_runtime PRIVATE
+        ${CMAKE_SOURCE_DIR}/foundation/crypto/include)
+    add_test(NAME chain_runtime_basic COMMAND test_chain_runtime)
 endif()
