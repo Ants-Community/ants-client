@@ -13,7 +13,9 @@
  * (GET_PEERS sent), ANSWERED (response folded in), FAILED (no conn
  * or RPC error). Convergence = inflight_count == 0 AND no UNQUERIED
  * candidates remain; at that point LOOKUP_COMPLETE fires with up to
- * K closest ANSWERED peers.
+ * K closest ANSWERED peers. A lookup still unconverged when the DHT's
+ * lookup_deadline_ms elapses fires LOOKUP_TIMEOUT with the same
+ * best-effort set instead.
  *
  * Late completions (RPC fires after lookup completed or cancelled)
  * see `record->valid == false` and no-op — the dht_rpc slot is still
@@ -174,11 +176,44 @@ static void unregister_lookup(struct ants_dht_state *state, ants_dht_lookup_t *h
     }
 }
 
+/* Disarm every pending RPC slot whose completion still points into this
+ * lookup's records. The caller may legally reuse the handle once the
+ * lookup has finished (completed, timed out or cancelled — the header
+ * requires validity only until then), and lookup_start memsets it,
+ * re-validating the SAME record addresses for the next lookup. Without
+ * the disarm, a late terminal event on an old slot (a straggler
+ * response, a reset, a conn close) would fire on_rpc_complete against
+ * the new lookup's record and corrupt it — e.g. marking a candidate
+ * ANSWERED with a stale response, a hole in the probe's
+ * verified-only-fold contract. The slot itself is still reclaimed by
+ * its own stream/conn event; the complete/fail paths already tolerate
+ * a NULL completion. A converged lookup has no RPCs in flight, so this
+ * matters for the timeout and cancel paths. */
+static void disarm_pending_rpcs(struct ants_dht_state *state, struct ants_dht_lookup_state *lookup)
+{
+    uintptr_t recs_lo = (uintptr_t)&lookup->inflight_recs[0];
+    uintptr_t recs_hi = (uintptr_t)&lookup->inflight_recs[ANTS_DHT_LOOKUP_INFLIGHT_CAP];
+    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_RPCS; i++) {
+        struct ants_dht_pending_rpc *slot = &state->pending[i];
+        uintptr_t ctx = (uintptr_t)slot->completion_ctx;
+        if (slot->in_use && ctx >= recs_lo && ctx < recs_hi) {
+            slot->completion = NULL;
+            slot->completion_ctx = NULL;
+        }
+    }
+}
+
 /* ------------------------------------------------------------------------ */
-/* LOOKUP_COMPLETE event                                                    */
+/* LOOKUP_COMPLETE / LOOKUP_TIMEOUT event                                   */
 /* ------------------------------------------------------------------------ */
 
-static void fire_lookup_complete(struct ants_dht_lookup_state *lookup)
+/* Finish the lookup: fire its terminal event and release its slot.
+ * `timed_out` selects LOOKUP_TIMEOUT over LOOKUP_COMPLETE for shard
+ * lookups — the payload is the same best-effort K-closest-ANSWERED set
+ * either way. Probes ignore it: a probe past its deadline still folds
+ * only what was verified, and TABLE_REFRESHED tells the caller its probe
+ * buffer is free again. */
+static void finish_lookup(struct ants_dht_lookup_state *lookup, bool timed_out)
 {
     if (lookup->completed) {
         return;
@@ -231,7 +266,7 @@ static void fire_lookup_complete(struct ants_dht_lookup_state *lookup)
         if (state->event_fn != NULL) {
             ants_dht_event_t ev;
             memset(&ev, 0, sizeof ev);
-            ev.kind = ANTS_DHT_EV_LOOKUP_COMPLETE;
+            ev.kind = timed_out ? ANTS_DHT_EV_LOOKUP_TIMEOUT : ANTS_DHT_EV_LOOKUP_COMPLETE;
             ev.lookup = lookup_state_to_handle(lookup);
             ev.peers = result_peers;
             ev.peer_count = result_count;
@@ -244,6 +279,7 @@ static void fire_lookup_complete(struct ants_dht_lookup_state *lookup)
     for (size_t i = 0; i < ANTS_DHT_LOOKUP_INFLIGHT_CAP; i++) {
         lookup->inflight_recs[i].valid = false;
     }
+    disarm_pending_rpcs(state, lookup);
 
     unregister_lookup(state, lookup_state_to_handle(lookup));
 }
@@ -409,16 +445,23 @@ static bool issue_rpc_for_candidate(struct ants_dht_lookup_state *lookup, size_t
 /* Lookup tick                                                              */
 /* ------------------------------------------------------------------------ */
 
-static void lookup_advance(struct ants_dht_lookup_state *lookup)
+static void lookup_advance(struct ants_dht_lookup_state *lookup, uint64_t now_us)
 {
     if (lookup->completed) {
         return;
     }
 
+    /* Past the deadline no new RPCs go out; the convergence check below
+     * still runs first, so a lookup whose last response landed in time
+     * reports LOOKUP_COMPLETE rather than a spurious timeout. */
+    const struct ants_dht_state *state = dht_get_state(lookup->parent);
+    bool expired = state->lookup_deadline_ms != 0 && now_us >= lookup->started_at_us &&
+                   now_us - lookup->started_at_us >= (uint64_t)state->lookup_deadline_ms * 1000u;
+
     /* Issue new RPCs until inflight count saturates or no UNQUERIED
      * candidates remain. Walking from the head of the sorted candidate
      * array picks the closest unqueried candidate each round. */
-    while (lookup->inflight_count < ANTS_DHT_LOOKUP_INFLIGHT_CAP) {
+    while (!expired && lookup->inflight_count < ANTS_DHT_LOOKUP_INFLIGHT_CAP) {
         size_t idx = (size_t)-1;
         for (size_t i = 0; i < lookup->candidate_count; i++) {
             if (lookup->candidates[i].state == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED) {
@@ -440,15 +483,21 @@ static void lookup_advance(struct ants_dht_lookup_state *lookup)
      * candidate has been resolved (ANSWERED or FAILED). INFLIGHT_DIAL
      * candidates count as in-progress just like INFLIGHT — they're
      * waiting on CONN_READY before they can transition to INFLIGHT. */
-    if (lookup->inflight_count == 0) {
-        for (size_t i = 0; i < lookup->candidate_count; i++) {
-            uint8_t s = lookup->candidates[i].state;
-            if (s == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED ||
-                s == (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL) {
-                return;
-            }
+    bool converged = lookup->inflight_count == 0;
+    for (size_t i = 0; converged && i < lookup->candidate_count; i++) {
+        uint8_t s = lookup->candidates[i].state;
+        if (s == (uint8_t)ANTS_DHT_LOOKUP_CAND_UNQUERIED ||
+            s == (uint8_t)ANTS_DHT_LOOKUP_CAND_INFLIGHT_DIAL) {
+            converged = false;
         }
-        fire_lookup_complete(lookup);
+    }
+    if (converged) {
+        finish_lookup(lookup, false);
+    } else if (expired) {
+        /* Deadline hit with RPCs / dials still outstanding (or UNQUERIED
+         * candidates we no longer have time for): report the partial
+         * result. */
+        finish_lookup(lookup, true);
     }
 }
 
@@ -483,6 +532,7 @@ ants_error_t ants_dht_lookup_start(ants_dht_t *dht,
     lookup->is_probe = is_probe;
     lookup->parent = dht;
     lookup->target_key = target_key;
+    lookup->started_at_us = dht_now_us();
 
     /* Derive target_peer_id = BLAKE3(target_key as 8 little-endian bytes). */
     uint8_t key_le[8];
@@ -522,28 +572,9 @@ ants_error_t ants_dht_lookup_do_cancel(ants_dht_lookup_t *lookup_handle)
         lookup->inflight_recs[i].valid = false;
     }
     struct ants_dht_state *state = dht_get_state(lookup->parent);
-    /* Disarm any pending RPC slot still pointing into this handle's
-     * completion records. The caller may legally reuse the handle
-     * after cancel (the header requires validity only "until the
-     * lookup completes ... or is cancelled"), and lookup_start memsets
-     * it — re-validating the SAME record addresses for the next
-     * lookup. Without the disarm, a late terminal event on an old slot
-     * (a straggler response, a reset, a conn close) would fire
-     * on_rpc_complete against the new lookup's record and corrupt it —
-     * e.g. marking a candidate ANSWERED with a stale response, a hole
-     * in the probe's verified-only-fold contract. The slot itself is
-     * still reclaimed by its own stream/conn event; the complete/fail
-     * paths already tolerate a NULL completion. */
-    uintptr_t recs_lo = (uintptr_t)&lookup->inflight_recs[0];
-    uintptr_t recs_hi = (uintptr_t)&lookup->inflight_recs[ANTS_DHT_LOOKUP_INFLIGHT_CAP];
-    for (size_t i = 0; i < ANTS_DHT_MAX_PENDING_RPCS; i++) {
-        struct ants_dht_pending_rpc *slot = &state->pending[i];
-        uintptr_t ctx = (uintptr_t)slot->completion_ctx;
-        if (slot->in_use && ctx >= recs_lo && ctx < recs_hi) {
-            slot->completion = NULL;
-            slot->completion_ctx = NULL;
-        }
-    }
+    /* The caller may reuse the handle right after cancel — see
+     * disarm_pending_rpcs. */
+    disarm_pending_rpcs(state, lookup);
     unregister_lookup(state, lookup_handle);
     return ANTS_OK;
 }
@@ -554,6 +585,7 @@ ants_error_t ants_dht_lookup_advance_all(ants_dht_t *dht)
         return ANTS_ERROR_INVALID_ARG;
     }
     struct ants_dht_state *state = dht_get_state(dht);
+    uint64_t now_us = dht_now_us();
     for (size_t i = 0; i < ANTS_DHT_MAX_ACTIVE_LOOKUPS; i++) {
         ants_dht_lookup_t *h = state->active_lookups[i];
         if (h == NULL) {
@@ -561,7 +593,7 @@ ants_error_t ants_dht_lookup_advance_all(ants_dht_t *dht)
         }
         struct ants_dht_lookup_state *lookup = lookup_get_state(h);
         if (!lookup->completed) {
-            lookup_advance(lookup);
+            lookup_advance(lookup, now_us);
         }
     }
     return ANTS_OK;

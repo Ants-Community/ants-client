@@ -13,6 +13,33 @@ the spec repo's
 
 ## Unreleased
 
+### network/dht: enforce lookup_deadline_ms — LOOKUP_TIMEOUT fires · 2026-10-12
+
+`network/dht`: `ants_dht_config_t.lookup_deadline_ms` was stored at init and
+never read, so `ANTS_DHT_EV_LOOKUP_TIMEOUT` could not fire — a lookup whose
+RPC went unanswered (a peer that accepts the stream and stays silent) held
+its slot and the caller's buffer forever, and with all 8 lookup slots stuck
+`ants_dht_lookup` returned `BUFFER_TOO_SMALL` for good. The deadline is now
+measured from `ants_dht_lookup` / `ants_dht_probe` and enforced on
+`ants_dht_tick`: past it, no new RPCs go out; a lookup that has converged
+still reports `LOOKUP_COMPLETE`, otherwise it fires `LOOKUP_TIMEOUT` with the
+K closest candidates that ANSWERED so far. A probe past its deadline
+completes as maintenance (verified-only fold + `TABLE_REFRESHED`), never as a
+timeout. `0` keeps the old wait-forever behaviour (documented; the test
+fixtures rely on it). `ants_dht_tick`'s wake hint now includes
+`lookup_deadline_ms/4` while a lookup is active.
+
+Finishing a lookup with RPCs still in flight exposed the same hazard PR #187
+fixed for cancel: the caller may reuse the handle, `lookup_start` re-arms
+the same completion-record addresses, and a straggler response on the old
+stream would fire into the new lookup and mark a peer ANSWERED with a stale
+reply. The disarm loop is factored into `disarm_pending_rpcs` and now runs
+on every finish as well as on cancel. `test_lookup_deadline` covers it with
+a silent peer: timeout with an empty partial result, then handle reuse plus
+a late answer on the old stream (falsified: without the disarm the reused
+lookup reports a bogus `LOOKUP_COMPLETE`), then a probe that times out into
+`TABLE_REFRESHED`.
+
 ### network/dht: owned-conn registry — dial slots recycle, probe enrichment stays alive · 2026-07-02
 
 `network/dht` (PR #188): closes the deferred capacity findings from PR #187's

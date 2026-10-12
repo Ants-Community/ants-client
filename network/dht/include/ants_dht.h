@@ -269,9 +269,16 @@ typedef struct {
      * (1 minute). 0 means "no automatic refresh" — useful for tests. */
     uint32_t refresh_interval_ms;
 
-    /* Lookup deadline in milliseconds. An iterative lookup that hasn't
-     * converged within this window fires LOOKUP_TIMEOUT with its
-     * best-effort partial result. Recommended: 5000 ms. */
+    /* Lookup deadline in milliseconds, measured from ants_dht_lookup /
+     * ants_dht_probe. An iterative lookup that hasn't converged within
+     * this window fires LOOKUP_TIMEOUT with its best-effort partial
+     * result (the K closest candidates that ANSWERED so far); a probe
+     * past its deadline completes as if converged (verified-only fold +
+     * TABLE_REFRESHED). In-flight RPCs and dials are abandoned — their
+     * late responses no-op. Enforced on ants_dht_tick, so the effective
+     * resolution is the caller's tick cadence. Recommended: 5000 ms.
+     * 0 means "no deadline" — a lookup waits on its RPCs indefinitely
+     * (useful for tests). */
     uint32_t lookup_deadline_ms;
 
     /* Announcement republish interval in milliseconds. We re-emit our

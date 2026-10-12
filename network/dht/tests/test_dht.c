@@ -1199,6 +1199,8 @@ static ants_error_t test_lookup_event_fn(const ants_dht_event_t *ev, void *ctx)
         break;
     case ANTS_DHT_EV_LOOKUP_TIMEOUT:
         r->lookup_timeout++;
+        r->last_peer_count = ev->peer_count;
+        r->last_shard_key = ev->shard_key;
         break;
     case ANTS_DHT_EV_PEER_DISCOVERED:
         r->peer_discovered++;
@@ -1409,6 +1411,163 @@ static void test_lookup_cancel(void)
     CHECK(rec.lookup_timeout == 0);
 
     CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_lookup_deadline(void)
+{
+    /* lookup_deadline_ms is enforced. B accepts A's GET_PEERS but never
+     * answers (respond_with selects no response), so the RPC stays in
+     * flight and only the deadline can end the lookup:
+     *   1. LOOKUP_TIMEOUT fires (never LOOKUP_COMPLETE) with an empty
+     *      partial result — B was queried but never ANSWERED.
+     *   2. The handle is reused for a new lookup while the first one's
+     *      RPC slot is still pending; a straggler response then lands on
+     *      that old stream. The slot must have been disarmed at timeout:
+     *      otherwise the straggler fires against the new lookup's
+     *      (re-validated, same-address) completion record, marks B
+     *      ANSWERED with a stale response and converges it to a bogus
+     *      LOOKUP_COMPLETE.
+     *   3. A probe past its deadline completes as maintenance
+     *      (TABLE_REFRESHED), never as LOOKUP_TIMEOUT. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x56, sizeof a_priv);
+    memset(b_priv, 0xBC, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_rpc_server_t server;
+    memset(&server, 0, sizeof server);
+    /* No case in test_rpc_build_response: B reads the request, sends
+     * nothing back. */
+    server.respond_with = (ants_dht_msg_type_t)0;
+    test_rpc_client_t client;
+    memset(&client, 0, sizeof client);
+    test_lookup_recorder_t rec;
+    memset(&rec, 0, sizeof rec);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_rpc_server_event;
+    bcfg.event_ctx = &server;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_rpc_client_event;
+    acfg.event_ctx = &client;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_lookup_event_fn;
+    dcfg.event_ctx = &rec;
+    /* Long enough that step 2's re-issue reaches B well inside the
+     * window; short enough to keep the test fast. */
+    dcfg.lookup_deadline_ms = 300;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    client.dht = &da;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500 && client.conn_ready < 1; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+    }
+    CHECK(client.conn_ready == 1);
+
+    ants_dht_peer_t b_peer;
+    memset(&b_peer, 0, sizeof b_peer);
+    b_peer.peer_id = client.peer_id;
+    snprintf(b_peer.multiaddr, sizeof b_peer.multiaddr, "%s", baddr);
+    CHECK_EQ(ants_dht__test_insert_peer_with_conn(&da, &b_peer, &conn, 100), ANTS_OK);
+
+    /* 1. Deadline ends a lookup whose only RPC never answers. */
+    ants_dht_lookup_t lookup = {{0}};
+    ants_dht_shard_key_t target = 0x0DEAD11E0DEAD11EULL;
+    CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
+    for (int i = 0; i < 2000 && rec.lookup_timeout < 1; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+    }
+    CHECK(server.stream_fin == 1); /* B did receive the request */
+    CHECK(server.response_sent == 0);
+    CHECK(rec.lookup_timeout == 1);
+    CHECK(rec.lookup_complete == 0);
+    CHECK(rec.last_shard_key == target);
+    CHECK(rec.last_peer_count == 0);
+
+    /* Keep the first request so B can answer it late. */
+    ants_transport_stream_t *old_stream = server.inbound_stream;
+    test_rpc_server_t straggler;
+    memset(&straggler, 0, sizeof straggler);
+    memcpy(straggler.recv_buf, server.recv_buf, server.recv_len);
+    straggler.recv_len = server.recv_len;
+    straggler.respond_with = ANTS_DHT_MSG_GET_PEERS_RESP;
+
+    /* 2. Reuse the handle; wait until the new GET_PEERS reached B (so
+     * the new lookup's completion record is armed), then answer the OLD
+     * request. */
+    CHECK_EQ(ants_dht_lookup(&da, target, &lookup), ANTS_OK);
+    for (int i = 0; i < 500 && server.stream_fin < 2; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+    }
+    CHECK(server.stream_fin == 2);
+    CHECK(rec.lookup_timeout == 1); /* the re-issue beat the deadline */
+    uint8_t late[TEST_RPC_BUF_SIZE];
+    size_t late_len = 0;
+    CHECK_EQ(test_rpc_build_response(&straggler, late, sizeof late, &late_len), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_send(old_stream, late, late_len, true), ANTS_OK);
+    for (int i = 0; i < 2000 && rec.lookup_timeout < 2 && rec.lookup_complete == 0; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+    }
+    CHECK(rec.lookup_complete == 0);
+    CHECK(rec.lookup_timeout == 2);
+    CHECK(rec.last_peer_count == 0);
+
+    /* 3. A probe past its deadline is maintenance, not a timeout. */
+    size_t table_before = ants_dht_routing_table_size(&da);
+    CHECK_EQ(ants_dht_probe(&da, 0x5EED5EED5EED5EEDULL, &lookup), ANTS_OK);
+    for (int i = 0; i < 2000 && rec.table_refreshed < 1; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+        (void)ants_dht_tick(&da);
+    }
+    CHECK(rec.table_refreshed == 1);
+    CHECK(rec.last_refresh_key == 0x5EED5EED5EED5EEDULL);
+    CHECK(rec.lookup_timeout == 2);
+    CHECK(rec.lookup_complete == 0);
+    CHECK(ants_dht_routing_table_size(&da) == table_before);
+
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -3745,6 +3904,7 @@ int main(void)
     test_lookup_no_candidates();
     test_lookup_round_trip();
     test_lookup_cancel();
+    test_lookup_deadline();
 
     test_announce_unannounce_local();
     test_server_responds_to_ping();
