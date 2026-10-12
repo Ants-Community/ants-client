@@ -825,6 +825,73 @@ ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
                                   const ants_inference_eprocess_t *eprocess_params,
                                   ants_inference_verdict_t *out_verdict);
 
+/* ======================================================================== */
+/* 5. The pinned v1 reference model + requester-side answer check          */
+/*    (RFC-0008 §11.14, §10)                                                */
+/* ======================================================================== */
+
+/* The v1 reference model: vocab 256 (the full byte vocabulary), d_model 32.
+ * Every reference node builds the same blob from a pinned deterministic
+ * generator, so they all serve one model_hash and can audit each other
+ * (RFC-0008 §10). The weight VALUES are illustrative, as before. */
+#define ANTS_INFERENCE_REF_MODEL_V1_VOCAB  256u
+#define ANTS_INFERENCE_REF_MODEL_V1_DMODEL 32u
+/* Blob length: the 20-byte header plus the six FP32 tensors. */
+#define ANTS_INFERENCE_REF_MODEL_V1_BYTES                                                          \
+    (20u + 4u * (2u * ANTS_INFERENCE_REF_MODEL_V1_VOCAB * ANTS_INFERENCE_REF_MODEL_V1_DMODEL +     \
+                 4u * ANTS_INFERENCE_REF_MODEL_V1_DMODEL * ANTS_INFERENCE_REF_MODEL_V1_DMODEL))
+
+/*
+ * Build the v1 reference-model blob into `buf`. `buf` must be 4-byte
+ * aligned (ants_inference_init requires it) and hold at least
+ * ANTS_INFERENCE_REF_MODEL_V1_BYTES; the length is written to `*out_len`.
+ * Deterministic and platform-independent: the tensors are written as
+ * little-endian FP32 bit patterns, each an exact dyadic rational.
+ *
+ * Returns ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL pointers or a misaligned
+ * buffer; ANTS_ERROR_BUFFER_TOO_SMALL when cap is short.
+ */
+ants_error_t ants_inference_ref_model_v1_build(uint8_t *buf, size_t cap, size_t *out_len);
+
+/*
+ * The requester's checks on an INFER_RESP answer (RFC-0008 §11.14). The
+ * verdict is `*out_ok`; a failed check is `false`, never an error:
+ *
+ *   1. `commit_bytes` decodes canonically and `sig` verifies over it under
+ *      `producer_pub` (the caller passes the CONNECTION's authenticated
+ *      peer-id, never a key from the wire);
+ *   2. the commit matches the request: input_hash = BLAKE3(input), the same
+ *      req_nonce, the same tier;
+ *   3. the envelope decodes canonically, its input equals `input`, its
+ *      token and distribution counts equal commit.length, with
+ *      1 <= length <= ANTS_INFERENCE_REF_SEQLEN_MAX (= INFER_MAX_POSITIONS),
+ *      1 <= m <= length, the tier's audit policy (Tiers 2-3:
+ *      audit_threshold = UINT64_MAX; Tier 1: >= the reference 2^59), a byte
+ *      vocabulary (dist length / 4 <= 256), and every prefix within the
+ *      reference model's context (min(input_len, 63) + length <= 64) — so
+ *      an ANSWERED envelope is one ants_inference_audit can score;
+ *   4. the §11.8 integrity gate: the root recomputed over every
+ *      distribution equals commit.root.
+ *
+ * No beacon is needed; the audit (ants_inference_audit) runs later. On a
+ * true verdict the decoded commit is copied to `out_commit` when non-NULL.
+ *
+ * Returns ANTS_OK (consult *out_ok); ANTS_ERROR_INVALID_ARG on NULL
+ * pointers or empty buffers.
+ */
+ants_error_t ants_inference_answer_check(const uint8_t *commit_bytes,
+                                         size_t commit_len,
+                                         const uint8_t sig[ANTS_INFERENCE_SIG_SIZE],
+                                         const uint8_t producer_pub[ANTS_INFERENCE_PUBKEY_SIZE],
+                                         const uint8_t *envelope,
+                                         size_t envelope_len,
+                                         const uint8_t *input,
+                                         size_t input_len,
+                                         uint8_t tier,
+                                         const uint8_t req_nonce[ANTS_INFERENCE_HASH_SIZE],
+                                         ants_inference_commit_t *out_commit,
+                                         bool *out_ok);
+
 #ifdef __cplusplus
 }
 #endif

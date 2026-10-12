@@ -1818,6 +1818,509 @@ static void test_audit_behaviour(void)
     CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
 }
 
+/* ---- 5. the pinned v1 model + the requester's answer check ------------ */
+
+/* The v1 model_hash, pinned from the compiled artifact. Every reference
+ * node must serve exactly this model; a change here is a model change. */
+static const uint8_t REF_MODEL_V1_HASH[32] = {
+    0xc6, 0x4a, 0x0f, 0x64, 0x1f, 0x20, 0x40, 0xb5, 0x07, 0x3d, 0xcd, 0xb6, 0x11, 0xbc, 0x1d, 0xb4,
+    0x71, 0x01, 0xa2, 0x21, 0xaa, 0x7d, 0xc2, 0x1c, 0x34, 0x09, 0xa6, 0xd6, 0xfd, 0xe3, 0xeb, 0xa3};
+
+static void test_ref_model_v1(void)
+{
+    static union {
+        uint32_t a;
+        uint8_t b[ANTS_INFERENCE_REF_MODEL_V1_BYTES + 4];
+    } m1, m2;
+    size_t len1 = 0;
+    size_t len2 = 0;
+    uint8_t h[32];
+    ants_inference_t ctx;
+    ants_inference_config_t config;
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    uint8_t got_hash[32];
+    uint8_t got_pub[32];
+    size_t i;
+    bool in_range = true;
+
+    CHECK_EQ(ants_inference_ref_model_v1_build(NULL, sizeof m1.b, &len1), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_ref_model_v1_build(m1.b, sizeof m1.b, NULL), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_ref_model_v1_build(m1.b + 1, sizeof m1.b - 1, &len1),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_ref_model_v1_build(m1.b, ANTS_INFERENCE_REF_MODEL_V1_BYTES - 1, &len1),
+             ANTS_ERROR_BUFFER_TOO_SMALL);
+
+    CHECK_EQ(ants_inference_ref_model_v1_build(m1.b, sizeof m1.b, &len1), ANTS_OK);
+    CHECK_EQ(ants_inference_ref_model_v1_build(m2.b, sizeof m2.b, &len2), ANTS_OK);
+    CHECK(len1 == ANTS_INFERENCE_REF_MODEL_V1_BYTES && len1 == len2);
+    CHECK(memcmp(m1.b, m2.b, len1) == 0);
+
+    /* Header, read back independently of the library's writer. */
+    CHECK(memcmp(m1.b, "ANTSMOD1", 8) == 0);
+    CHECK(m1.b[8] == 1 && m1.b[9] == 0 && m1.b[10] == 0 && m1.b[11] == 0);
+    CHECK(m1.b[12] == 0 && m1.b[13] == 1 && m1.b[14] == 0 && m1.b[15] == 0);  /* V = 256 */
+    CHECK(m1.b[16] == 32 && m1.b[17] == 0 && m1.b[18] == 0 && m1.b[19] == 0); /* D = 32 */
+
+    /* Every weight lies in [-1/8, 1/8) and is a multiple of 2^-26. */
+    for (i = 20; i + 4 <= len1; i += 4) {
+        uint32_t bits = (uint32_t)m1.b[i] | ((uint32_t)m1.b[i + 1] << 8) |
+                        ((uint32_t)m1.b[i + 2] << 16) | ((uint32_t)m1.b[i + 3] << 24);
+        float w;
+        double scaled;
+        memcpy(&w, &bits, sizeof w);
+        scaled = (double)w * 67108864.0;
+        if (!(w >= -0.125f && w < 0.125f) || scaled != floor(scaled)) {
+            in_range = false;
+        }
+    }
+    CHECK(in_range);
+
+    CHECK_EQ(ants_blake3_hash(m1.b, len1, h), ANTS_OK);
+    CHECK(memcmp(h, REF_MODEL_V1_HASH, 32) == 0);
+
+    /* The blob loads, and init binds the same hash. */
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(i + 3);
+    }
+    memset(&config, 0, sizeof config);
+    config.model_weights = m1.b;
+    config.model_weights_len = len1;
+    config.producer_priv = priv;
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+    CHECK_EQ(ants_inference__test_get_identity(&ctx, got_hash, got_pub), ANTS_OK);
+    CHECK(memcmp(got_hash, REF_MODEL_V1_HASH, 32) == 0);
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
+}
+
+/* Serve `input` under the v1 model with `priv`; the commit encoding lands
+ * in `cbytes`. */
+static void serve_v1(ants_inference_t *ctx,
+                     const uint8_t *input,
+                     size_t input_len,
+                     uint8_t tier,
+                     const uint8_t nonce[32],
+                     ants_inference_response_t *resp,
+                     uint8_t *answer,
+                     size_t answer_cap,
+                     uint8_t cbytes[ANTS_INFERENCE_COMMIT_ENCODED_MAX],
+                     size_t *clen)
+{
+    ants_inference_request_t req;
+    memset(&req, 0, sizeof req);
+    memset(resp, 0, sizeof *resp);
+    req.input = input;
+    req.input_len = input_len;
+    req.tier = tier;
+    memcpy(req.req_nonce, nonce, 32);
+    req.round = 7;
+    resp->answer_buf = answer;
+    resp->answer_cap = answer_cap;
+    CHECK_EQ(ants_inference_serve(ctx, &req, resp), ANTS_OK);
+    CHECK_EQ(ants_inference_commit_encode(
+                 &resp->commit, cbytes, ANTS_INFERENCE_COMMIT_ENCODED_MAX, clen),
+             ANTS_OK);
+}
+
+/* Forge a correctly signed answer: an envelope of `n` positions, each a
+ * `dlen`-byte distribution (byte pattern j), for `input`; the commit is
+ * `base` with root / input_hash / length / m rewritten to match, then
+ * signed with `priv`. Lets each answer-check rule be hit in isolation. */
+static void forge_answer(const ants_inference_commit_t *base,
+                         const uint8_t priv[32],
+                         const uint8_t *input,
+                         size_t input_len,
+                         size_t n,
+                         size_t dlen,
+                         uint8_t *env,
+                         size_t env_cap,
+                         size_t *env_len,
+                         uint8_t cb[ANTS_INFERENCE_COMMIT_ENCODED_MAX],
+                         size_t *cl,
+                         uint8_t sig[64])
+{
+    static uint8_t dist[2048];
+    static uint8_t leaves[ANTS_INFERENCE_REF_SEQLEN_MAX][32];
+    uint8_t toks[ANTS_INFERENCE_REF_SEQLEN_MAX];
+    ants_inference_commit_t c = *base;
+    ants_cbor_enc_t enc;
+    size_t j;
+    CHECK(dlen <= sizeof dist && n <= ANTS_INFERENCE_REF_SEQLEN_MAX);
+    CHECK_EQ(ants_cbor_enc_init(&enc, env, env_cap), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_map(&enc, 3), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 0), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, input, input_len), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 1), ANTS_OK);
+    memset(toks, 'a', sizeof toks);
+    CHECK_EQ(ants_cbor_enc_bytes(&enc, toks, n), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_uint(&enc, 2), ANTS_OK);
+    CHECK_EQ(ants_cbor_enc_array(&enc, n), ANTS_OK);
+    for (j = 0; j < n; j++) {
+        memset(dist, (int)(j + 1), dlen);
+        CHECK_EQ(ants_cbor_enc_bytes(&enc, dist, dlen), ANTS_OK);
+        CHECK_EQ(ants_inference_leaf_hash(dist, dlen, (uint64_t)j, leaves[j]), ANTS_OK);
+    }
+    CHECK_EQ(ants_cbor_enc_finalise(&enc), ANTS_OK);
+    *env_len = ants_cbor_enc_size(&enc);
+    CHECK_EQ(ants_inference_merkle_root(leaves, n, c.root), ANTS_OK);
+    CHECK_EQ(ants_blake3_hash(input, input_len, c.input_hash), ANTS_OK);
+    c.length = (uint32_t)n;
+    c.m = (uint32_t)n;
+    CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+    CHECK_EQ(ants_inference_commit_encode(&c, cb, ANTS_INFERENCE_COMMIT_ENCODED_MAX, cl), ANTS_OK);
+}
+
+static void test_answer_check(void)
+{
+    static union {
+        uint32_t a;
+        uint8_t b[ANTS_INFERENCE_REF_MODEL_V1_BYTES];
+    } m;
+    static uint8_t answer[32768];
+    static uint8_t answer_b[32768];
+    size_t mlen;
+    ants_inference_t ctx;
+    ants_inference_config_t config;
+    uint8_t priv[ANTS_INFERENCE_PRIVKEY_SIZE];
+    uint8_t pub[32];
+    uint8_t other_pub[32];
+    uint8_t nonce[32];
+    uint8_t cbytes[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+    uint8_t cbytes_b[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+    size_t clen;
+    size_t clen_b;
+    ants_inference_response_t resp;
+    ants_inference_response_t resp_b;
+    ants_inference_commit_t out;
+    const uint8_t input[] = "what does the colony know?";
+    const uint8_t input_b[] = "a different question";
+    const size_t ilen = sizeof input - 1;
+    bool ok;
+    size_t i;
+
+    for (i = 0; i < sizeof priv; i++) {
+        priv[i] = (uint8_t)(0xA0u + i);
+        nonce[i] = (uint8_t)(i * 5u + 2u);
+    }
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(priv, pub), ANTS_OK);
+    memcpy(other_pub, pub, 32);
+    other_pub[0] ^= 1u;
+
+    CHECK_EQ(ants_inference_ref_model_v1_build(m.b, sizeof m.b, &mlen), ANTS_OK);
+    memset(&config, 0, sizeof config);
+    config.model_weights = m.b;
+    config.model_weights_len = mlen;
+    config.producer_priv = priv;
+    CHECK_EQ(ants_inference_init(&ctx, &config), ANTS_OK);
+
+    serve_v1(&ctx,
+             input,
+             ilen,
+             ANTS_INFERENCE_TIER_2,
+             nonce,
+             &resp,
+             answer,
+             sizeof answer,
+             cbytes,
+             &clen);
+
+    /* argument contract */
+    CHECK_EQ(ants_inference_answer_check(NULL,
+                                         clen,
+                                         resp.commit_sig,
+                                         pub,
+                                         answer,
+                                         resp.answer_len,
+                                         input,
+                                         ilen,
+                                         ANTS_INFERENCE_TIER_2,
+                                         nonce,
+                                         NULL,
+                                         &ok),
+             ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_inference_answer_check(cbytes,
+                                         clen,
+                                         resp.commit_sig,
+                                         pub,
+                                         answer,
+                                         resp.answer_len,
+                                         input,
+                                         ilen,
+                                         ANTS_INFERENCE_TIER_2,
+                                         nonce,
+                                         NULL,
+                                         NULL),
+             ANTS_ERROR_INVALID_ARG);
+
+    /* honest answer → answered, and the decoded commit comes back */
+    ok = false;
+    memset(&out, 0, sizeof out);
+    CHECK_EQ(ants_inference_answer_check(cbytes,
+                                         clen,
+                                         resp.commit_sig,
+                                         pub,
+                                         answer,
+                                         resp.answer_len,
+                                         input,
+                                         ilen,
+                                         ANTS_INFERENCE_TIER_2,
+                                         nonce,
+                                         &out,
+                                         &ok),
+             ANTS_OK);
+    CHECK(ok);
+    CHECK(memcmp(out.root, resp.commit.root, 32) == 0 && out.round == 7 && out.length == 16);
+
+#define EXPECT_REJECT(cb, cl, sg, pk, env, envl, in, inl, tr, nc)                                  \
+    do {                                                                                           \
+        ok = true;                                                                                 \
+        CHECK_EQ(                                                                                  \
+            ants_inference_answer_check(cb, cl, sg, pk, env, envl, in, inl, tr, nc, NULL, &ok),    \
+            ANTS_OK);                                                                              \
+        CHECK(!ok);                                                                                \
+    } while (0)
+
+    /* 1. someone else's key (a relayed answer) */
+    EXPECT_REJECT(cbytes,
+                  clen,
+                  resp.commit_sig,
+                  other_pub,
+                  answer,
+                  resp.answer_len,
+                  input,
+                  ilen,
+                  ANTS_INFERENCE_TIER_2,
+                  nonce);
+    /* 1. a flipped signature byte */
+    {
+        uint8_t sig[64];
+        memcpy(sig, resp.commit_sig, 64);
+        sig[10] ^= 0x40u;
+        EXPECT_REJECT(cbytes,
+                      clen,
+                      sig,
+                      pub,
+                      answer,
+                      resp.answer_len,
+                      input,
+                      ilen,
+                      ANTS_INFERENCE_TIER_2,
+                      nonce);
+    }
+    /* 1. non-canonical commit bytes (a trailing byte) */
+    {
+        uint8_t tb[ANTS_INFERENCE_COMMIT_ENCODED_MAX + 1];
+        memcpy(tb, cbytes, clen);
+        tb[clen] = 0x00u;
+        EXPECT_REJECT(tb,
+                      clen + 1,
+                      resp.commit_sig,
+                      pub,
+                      answer,
+                      resp.answer_len,
+                      input,
+                      ilen,
+                      ANTS_INFERENCE_TIER_2,
+                      nonce);
+    }
+    /* 2. a different nonce, tier or input than the one asked */
+    {
+        uint8_t n2[32];
+        memcpy(n2, nonce, 32);
+        n2[31] ^= 0x01u;
+        EXPECT_REJECT(cbytes,
+                      clen,
+                      resp.commit_sig,
+                      pub,
+                      answer,
+                      resp.answer_len,
+                      input,
+                      ilen,
+                      ANTS_INFERENCE_TIER_2,
+                      n2);
+    }
+    EXPECT_REJECT(cbytes,
+                  clen,
+                  resp.commit_sig,
+                  pub,
+                  answer,
+                  resp.answer_len,
+                  input,
+                  ilen,
+                  ANTS_INFERENCE_TIER_1,
+                  nonce);
+    EXPECT_REJECT(cbytes,
+                  clen,
+                  resp.commit_sig,
+                  pub,
+                  answer,
+                  resp.answer_len,
+                  input,
+                  ilen - 1,
+                  ANTS_INFERENCE_TIER_2,
+                  nonce);
+
+    /* 3. the right commit with another request's envelope: the commit and
+     *    the request agree, the envelope's input does not. */
+    serve_v1(&ctx,
+             input_b,
+             sizeof input_b - 1,
+             ANTS_INFERENCE_TIER_2,
+             nonce,
+             &resp_b,
+             answer_b,
+             sizeof answer_b,
+             cbytes_b,
+             &clen_b);
+    EXPECT_REJECT(cbytes,
+                  clen,
+                  resp.commit_sig,
+                  pub,
+                  answer_b,
+                  resp_b.answer_len,
+                  input,
+                  ilen,
+                  ANTS_INFERENCE_TIER_2,
+                  nonce);
+    /* 3. a truncated envelope */
+    EXPECT_REJECT(cbytes,
+                  clen,
+                  resp.commit_sig,
+                  pub,
+                  answer,
+                  resp.answer_len - 1,
+                  input,
+                  ilen,
+                  ANTS_INFERENCE_TIER_2,
+                  nonce);
+    /* 3. m > length, validly signed — and its positive control (m = length
+     *    re-signed passes), so the reject is the m rule and nothing else. */
+    {
+        ants_inference_commit_t c = resp.commit;
+        uint8_t sig[64];
+        uint8_t cb[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+        size_t cl;
+        c.m = c.length + 1u;
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        EXPECT_REJECT(
+            cb, cl, sig, pub, answer, resp.answer_len, input, ilen, ANTS_INFERENCE_TIER_2, nonce);
+        c.m = c.length;
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        ok = false;
+        CHECK_EQ(ants_inference_answer_check(cb,
+                                             cl,
+                                             sig,
+                                             pub,
+                                             answer,
+                                             resp.answer_len,
+                                             input,
+                                             ilen,
+                                             ANTS_INFERENCE_TIER_2,
+                                             nonce,
+                                             NULL,
+                                             &ok),
+                 ANTS_OK);
+        CHECK(ok);
+    }
+    /* 4. one flipped distribution byte: the envelope still decodes, the
+     *    root does not match. */
+    {
+        static uint8_t t[32768];
+        memcpy(t, answer, resp.answer_len);
+        t[resp.answer_len - 1] ^= 0xFFu;
+        EXPECT_REJECT(cbytes,
+                      clen,
+                      resp.commit_sig,
+                      pub,
+                      t,
+                      resp.answer_len,
+                      input,
+                      ilen,
+                      ANTS_INFERENCE_TIER_2,
+                      nonce);
+    }
+    /* 3. m = 0 and the tier's audit policy, each against a positive
+     *    control that differs only in the field under test. */
+    {
+        ants_inference_commit_t c = resp.commit;
+        uint8_t sig[64];
+        uint8_t cb[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+        size_t cl;
+        c.m = 0;
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        EXPECT_REJECT(
+            cb, cl, sig, pub, answer, resp.answer_len, input, ilen, ANTS_INFERENCE_TIER_2, nonce);
+        c = resp.commit;
+        c.audit_threshold = 0; /* a Tier-2 answer that is never audited */
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        EXPECT_REJECT(
+            cb, cl, sig, pub, answer, resp.answer_len, input, ilen, ANTS_INFERENCE_TIER_2, nonce);
+        /* Tier 1: the reference 2^59 passes, one less does not. */
+        c = resp.commit;
+        c.tier = ANTS_INFERENCE_TIER_1;
+        c.audit_threshold = 1ull << 59;
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        ok = false;
+        CHECK_EQ(ants_inference_answer_check(cb,
+                                             cl,
+                                             sig,
+                                             pub,
+                                             answer,
+                                             resp.answer_len,
+                                             input,
+                                             ilen,
+                                             ANTS_INFERENCE_TIER_1,
+                                             nonce,
+                                             NULL,
+                                             &ok),
+                 ANTS_OK);
+        CHECK(ok);
+        c.audit_threshold = (1ull << 59) - 1u;
+        CHECK_EQ(ants_inference_commit_sign(&c, priv, sig), ANTS_OK);
+        CHECK_EQ(ants_inference_commit_encode(&c, cb, sizeof cb, &cl), ANTS_OK);
+        EXPECT_REJECT(
+            cb, cl, sig, pub, answer, resp.answer_len, input, ilen, ANTS_INFERENCE_TIER_1, nonce);
+    }
+    /* 3. vocab and context bounds, on forged-but-consistent answers. */
+    {
+        static uint8_t env[65536];
+        size_t el;
+        uint8_t cb[ANTS_INFERENCE_COMMIT_ENCODED_MAX];
+        size_t cl;
+        uint8_t sig[64];
+        uint8_t in63[63];
+        memset(in63, 'q', sizeof in63);
+
+        /* vocab 256 (1024-byte dists) passes; vocab 257 does not */
+        forge_answer(&resp.commit, priv, input, ilen, 4, 1024, env, sizeof env, &el, cb, &cl, sig);
+        ok = false;
+        CHECK_EQ(
+            ants_inference_answer_check(
+                cb, cl, sig, pub, env, el, input, ilen, ANTS_INFERENCE_TIER_2, nonce, NULL, &ok),
+            ANTS_OK);
+        CHECK(ok);
+        forge_answer(&resp.commit, priv, input, ilen, 4, 1028, env, sizeof env, &el, cb, &cl, sig);
+        EXPECT_REJECT(cb, cl, sig, pub, env, el, input, ilen, ANTS_INFERENCE_TIER_2, nonce);
+
+        /* 48 input bytes + 16 positions = 64 fits; 63 + 16 does not */
+        forge_answer(&resp.commit, priv, in63, 48, 16, 1024, env, sizeof env, &el, cb, &cl, sig);
+        ok = false;
+        CHECK_EQ(ants_inference_answer_check(
+                     cb, cl, sig, pub, env, el, in63, 48, ANTS_INFERENCE_TIER_2, nonce, NULL, &ok),
+                 ANTS_OK);
+        CHECK(ok);
+        forge_answer(&resp.commit, priv, in63, 63, 16, 1024, env, sizeof env, &el, cb, &cl, sig);
+        EXPECT_REJECT(cb, cl, sig, pub, env, el, in63, 63, ANTS_INFERENCE_TIER_2, nonce);
+    }
+#undef EXPECT_REJECT
+
+    CHECK_EQ(ants_inference_destroy(&ctx), ANTS_OK);
+}
+
 int main(void)
 {
     test_tier_constants();
@@ -1852,6 +2355,9 @@ int main(void)
     test_serve_behaviour();
     test_audit_contract();
     test_audit_behaviour();
+
+    test_ref_model_v1();
+    test_answer_check();
 
     if (failures > 0) {
         fprintf(stderr, "test_orchestration: %d failure(s)\n", failures);

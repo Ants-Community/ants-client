@@ -28,6 +28,12 @@
  * only when the seed's response arrives — and log the seed's discovery
  * into its routing table.
  *
+ * Inference serving (RFC-0008 §11.14): the test runs the real `antsd ask`
+ * against the spawned daemon and requires an answer that checks out —
+ * signed by the daemon's identity, under the pinned v1 model hash, round 0
+ * with the chain off — a decline for a tier the node does not serve, and
+ * no answer from a node whose peer-id does not match the pin.
+ *
  * Plus the cheap failure path: `antsd run <missing-file>` exits 1.
  *
  * Every wait is bounded by a wall-clock deadline and every child is
@@ -1097,6 +1103,166 @@ static void test_run_chain_prunes(const char *antsd_path)
     unlink(cfg_path);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Inference serving: the real `antsd ask` against the spawned daemon       */
+/* ------------------------------------------------------------------------ */
+
+/* The pinned v1 reference-model hash (test_orchestration.c pins the same
+ * bytes from the compiled artifact). */
+#define REF_MODEL_V1_HEX "c64a0f641f2040b5073dcdb611bc1db47101a221aa7dc21c3409a6d6fde3eba3"
+
+/* Run `antsd ask <addr> <peer> <prompt> <tier>` to completion; its stdout
+ * lands in `c`. Returns the wait status (-1 if it had to be killed). */
+static int run_ask(const char *antsd_path,
+                   const char *addr,
+                   const char *peer_hex,
+                   const char *tier,
+                   capture_t *c)
+{
+    int p[2];
+    if (pipe(p) != 0) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(p[0]);
+        close(p[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        if (dup2(p[1], STDOUT_FILENO) < 0) {
+            _exit(126);
+        }
+        close(p[0]);
+        close(p[1]);
+        execl(antsd_path, "antsd", "ask", addr, peer_hex, "hello, colony", tier, (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+    memset(c, 0, sizeof *c);
+    uint64_t deadline = now_ms() + 40000u; /* > the ask's own 30-s budget */
+    while (now_ms() < deadline && capture_pump(p[0], c, 50) >= 0) {
+    }
+    close(p[0]);
+    return reap_with_deadline(pid, EXIT_DEADLINE_MS);
+}
+
+static void test_run_serves_inference(const char *antsd_path)
+{
+    antsd_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    memset(cfg.identity_priv, 0x35, sizeof cfg.identity_priv);
+    static const char listen[] = "/ip4/127.0.0.1/udp/0/quic-v1";
+    memcpy(cfg.listen_multiaddr, listen, sizeof listen);
+    uint8_t daemon_pub[ANTS_ED25519_PUBKEY_SIZE];
+    CHECK(ants_ed25519_pubkey_from_priv(cfg.identity_priv, daemon_pub) == ANTS_OK);
+    char daemon_hex[ANTS_ED25519_PUBKEY_SIZE * 2 + 1];
+    hex_format(daemon_pub, sizeof daemon_pub, daemon_hex);
+
+    uint8_t enc[ANTSD_CONFIG_ENCODED_MAX];
+    size_t enc_len = 0;
+    CHECK(antsd_config_encode(&cfg, enc, sizeof enc, &enc_len) == ANTS_OK);
+    char cfg_path[512];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(cfg_path, sizeof cfg_path, "%s/antsd_infer_XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    int cfd = mkstemp(cfg_path);
+    CHECK(cfd >= 0);
+    if (cfd < 0) {
+        return;
+    }
+    CHECK(write(cfd, enc, enc_len) == (ssize_t)enc_len);
+    CHECK(close(cfd) == 0);
+
+    pid_t pid = -1;
+    int out_fd = spawn_run(antsd_path, cfg_path, &pid);
+    CHECK(out_fd >= 0);
+    if (out_fd < 0) {
+        unlink(cfg_path);
+        return;
+    }
+    static capture_t cap;
+    memset(&cap, 0, sizeof cap);
+    char addr[ANTS_MULTIADDR_MAX_LEN];
+    int have_addr = -1;
+    uint64_t deadline = now_ms() + READY_DEADLINE_MS;
+    while (have_addr != 0 && now_ms() < deadline) {
+        have_addr = extract_listen_addr(&cap, addr, sizeof addr);
+        if (have_addr != 0 && capture_pump(out_fd, &cap, 50) < 0) {
+            have_addr = extract_listen_addr(&cap, addr, sizeof addr);
+            break;
+        }
+    }
+    CHECK(have_addr == 0);
+    CHECK(wait_for_output(out_fd,
+                          &cap,
+                          "antsd: serving inference (reference model v1)",
+                          now_ms() + READY_DEADLINE_MS,
+                          NULL,
+                          NULL) != NULL);
+    if (have_addr != 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        close(out_fd);
+        unlink(cfg_path);
+        return;
+    }
+
+    static capture_t ask;
+    char want[160];
+
+    /* 1. An answer that checks out: signed by the daemon's identity (the
+     *    ask pins it and the engine verifies under it), the pinned model,
+     *    round 0 with the chain off, the reference 16 positions. */
+    int st = run_ask(antsd_path, addr, daemon_hex, "2", &ask);
+    CHECK(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(strstr(ask.data, "antsd: ask verdict=answered") != NULL);
+    snprintf(
+        want, sizeof want, "antsd: ask round=0 tier=2 positions=16 model=%s", REF_MODEL_V1_HEX);
+    CHECK(strstr(ask.data, want) != NULL);
+    CHECK(wait_for_output(out_fd,
+                          &cap,
+                          "antsd: infer served peer=",
+                          now_ms() + HANDSHAKE_DEADLINE_MS,
+                          NULL,
+                          NULL) != NULL);
+    if (failures > 0) {
+        fprintf(stderr, "ask output: <<<%s>>>\n", ask.data);
+    }
+
+    /* 2. A tier the node does not serve: declined, exit 1. */
+    st = run_ask(antsd_path, addr, daemon_hex, "9", &ask);
+    CHECK(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 1);
+    CHECK(strstr(ask.data, "antsd: ask verdict=declined") != NULL);
+    CHECK(wait_for_output(out_fd,
+                          &cap,
+                          "antsd: infer declined peer=",
+                          now_ms() + HANDSHAKE_DEADLINE_MS,
+                          NULL,
+                          NULL) != NULL);
+
+    /* 3. The wrong peer pinned: the handshake fails, nothing is asked. */
+    {
+        char wrong[sizeof daemon_hex];
+        memcpy(wrong, daemon_hex, sizeof wrong);
+        wrong[0] = wrong[0] == '0' ? '1' : '0';
+        st = run_ask(antsd_path, addr, wrong, "2", &ask);
+        CHECK(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 1);
+        CHECK(strstr(ask.data, "antsd: ask verdict=no-answer") != NULL);
+    }
+
+    CHECK(kill(pid, SIGTERM) == 0);
+    int status = reap_with_deadline(pid, EXIT_DEADLINE_MS);
+    CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    while (capture_pump(out_fd, &cap, 100) > 0) {
+    }
+    CHECK(strstr(cap.data, "infer 1/1 served/declined") != NULL);
+    if (failures > 0) {
+        fprintf(stderr, "daemon output: <<<%s>>>\n", cap.data);
+    }
+    close(out_fd);
+    unlink(cfg_path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -1105,6 +1271,7 @@ int main(int argc, char **argv)
     }
     test_run_missing_config(argv[1]);
     test_run_serves_and_shuts_down(argv[1]);
+    test_run_serves_inference(argv[1]);
     test_run_bootstraps_to_seed(argv[1], NULL);
 
     /* A GENUINE Intel TDX quote (real chain, real signatures) presented by

@@ -10,3 +10,7 @@ add_subdirectory(kernels)
 
 # Component #13 — Inference orchestration  (4 EM)
 add_subdirectory(orchestration)
+
+# The inference exchange (RFC-0008 §11.14): INFER_REQ / INFER_RESP on the
+# bidi-RPC envelope, over network/transport.
+add_subdirectory(exchange)

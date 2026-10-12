@@ -1734,6 +1734,163 @@ ants_error_t ants_inference_audit(const ants_inference_commit_t *commit,
 }
 
 /* ======================================================================== */
+/* 5. The pinned v1 reference model + requester-side answer check          */
+/* ======================================================================== */
+
+/* Pinned generator seed ("ANTS" as a big-endian u32). Changing it, or the
+ * mixer below, changes the v1 model_hash. */
+#define ANTS_INFERENCE_REF_MODEL_V1_SEED 0x414E5453u
+
+/* Weight i: a murmur3 fmix32 of (i, seed), keeping 24 bits, centred and
+ * scaled by 2^-26 into [-0.125, 0.125). Every value is an integer times a
+ * power of two below 2^24, so the FP32 conversion is exact everywhere. */
+static uint32_t ref_model_v1_weight_bits(uint32_t i)
+{
+    uint32_t x = i * 0x9E3779B1u + ANTS_INFERENCE_REF_MODEL_V1_SEED;
+    int32_t centred;
+    float w;
+    uint32_t bits;
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35u;
+    x ^= x >> 16;
+    centred = (int32_t)(x & 0xFFFFFFu) - 0x800000;
+    w = (float)centred * (1.0f / 67108864.0f); /* 2^-26 */
+    memcpy(&bits, &w, sizeof bits);
+    return bits;
+}
+
+ants_error_t ants_inference_ref_model_v1_build(uint8_t *buf, size_t cap, size_t *out_len)
+{
+    const uint32_t V = ANTS_INFERENCE_REF_MODEL_V1_VOCAB;
+    const uint32_t D = ANTS_INFERENCE_REF_MODEL_V1_DMODEL;
+    const uint32_t n_floats = 2u * V * D + 4u * D * D;
+    uint32_t i;
+
+    if (buf == NULL || out_len == NULL || ((uintptr_t)buf % 4u) != 0u) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if (cap < (size_t)ANTS_INFERENCE_REF_MODEL_V1_BYTES) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    memcpy(buf, ANTS_INFERENCE_MODEL_MAGIC, sizeof ANTS_INFERENCE_MODEL_MAGIC);
+    write_le32(buf + 8, ANTS_INFERENCE_MODEL_VERSION);
+    write_le32(buf + 12, V);
+    write_le32(buf + 16, D);
+    for (i = 0; i < n_floats; i++) {
+        write_le32(buf + ANTS_INFERENCE_MODEL_HEADER_LEN + 4u * (size_t)i,
+                   ref_model_v1_weight_bits(i));
+    }
+    *out_len = (size_t)ANTS_INFERENCE_REF_MODEL_V1_BYTES;
+    return ANTS_OK;
+}
+
+ants_error_t ants_inference_answer_check(const uint8_t *commit_bytes,
+                                         size_t commit_len,
+                                         const uint8_t sig[ANTS_INFERENCE_SIG_SIZE],
+                                         const uint8_t producer_pub[ANTS_INFERENCE_PUBKEY_SIZE],
+                                         const uint8_t *envelope,
+                                         size_t envelope_len,
+                                         const uint8_t *input,
+                                         size_t input_len,
+                                         uint8_t tier,
+                                         const uint8_t req_nonce[ANTS_INFERENCE_HASH_SIZE],
+                                         ants_inference_commit_t *out_commit,
+                                         bool *out_ok)
+{
+    ants_inference_commit_t commit;
+    struct answer_env env;
+    uint8_t leaves[ANTS_INFERENCE_REF_SEQLEN_MAX][ANTS_INFERENCE_MERKLE_LEAF_SIZE];
+    uint8_t root[ANTS_INFERENCE_MERKLE_ROOT_SIZE];
+    uint8_t input_hash[ANTS_INFERENCE_HASH_SIZE];
+    bool sig_ok = false;
+    size_t j;
+
+    if (commit_bytes == NULL || commit_len == 0 || sig == NULL || producer_pub == NULL ||
+        envelope == NULL || envelope_len == 0 || input == NULL || input_len == 0 ||
+        req_nonce == NULL || out_ok == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    *out_ok = false;
+
+    /* 1. canonical commit + signature under the connection's peer-id. The
+     *    strict decoder accepts only canonical bytes, so verifying over the
+     *    re-encoding is verifying over the bytes received. */
+    if (ants_inference_commit_decode(commit_bytes, commit_len, &commit) != ANTS_OK) {
+        return ANTS_OK;
+    }
+    if (ants_inference_commit_verify_sig(&commit, producer_pub, sig, &sig_ok) != ANTS_OK ||
+        !sig_ok) {
+        return ANTS_OK;
+    }
+
+    /* 2. the commit answers THIS request. */
+    if (ants_blake3_hash(input, input_len, input_hash) != ANTS_OK ||
+        memcmp(input_hash, commit.input_hash, sizeof input_hash) != 0 ||
+        memcmp(req_nonce, commit.req_nonce, ANTS_INFERENCE_HASH_SIZE) != 0 || commit.tier != tier) {
+        return ANTS_OK;
+    }
+
+    /* 3. envelope shape against the request and the commit. */
+    if (answer_envelope_decode(envelope, envelope_len, &env) != ANTS_OK) {
+        return ANTS_OK;
+    }
+    if (env.input_len != input_len || memcmp(env.input, input, input_len) != 0) {
+        return ANTS_OK;
+    }
+    if (commit.length == 0u || commit.length > ANTS_INFERENCE_REF_SEQLEN_MAX ||
+        env.n != commit.length || commit.m == 0u || commit.m > commit.length) {
+        return ANTS_OK;
+    }
+    /* The audit policy the tier promises (RFC-0008 §11.14): Tiers 2-3 are
+     * always auditable; Tier 1 samples at no less than the reference rate.
+     * Without this a producer could sign audit_threshold = 0 and never be
+     * selected. */
+    if ((tier == ANTS_INFERENCE_TIER_1 &&
+         commit.audit_threshold < ANTS_INFERENCE_TIER1_AUDIT_THRESHOLD) ||
+        (tier != ANTS_INFERENCE_TIER_1 && commit.audit_threshold != UINT64_MAX)) {
+        return ANTS_OK;
+    }
+    /* A byte vocabulary (§11.8: vocab = dist length / 4 <= 256; the decoder
+     * already holds every dist to one length). */
+    if (env.dist_len[0] / 4u > ANTS_INFERENCE_REF_VOCAB_MAX) {
+        return ANTS_OK;
+    }
+    /* Auditable by the reference model: every opened prefix — the input
+     * (truncated as serve truncates it) plus the generated tokens before
+     * the position — fits its context. An answer that fails this could not
+     * be scored, only refused, by ants_inference_audit. */
+    {
+        size_t prompt_eff = input_len;
+        if (prompt_eff > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u) {
+            prompt_eff = (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX - 1u;
+        }
+        if (prompt_eff + commit.length > (size_t)ANTS_INFERENCE_REF_SEQLEN_MAX) {
+            return ANTS_OK;
+        }
+    }
+
+    /* 4. the integrity gate: one root over every distribution. */
+    for (j = 0; j < env.n; j++) {
+        if (ants_inference_leaf_hash(env.dist[j], env.dist_len[j], (uint64_t)j, leaves[j]) !=
+            ANTS_OK) {
+            return ANTS_OK;
+        }
+    }
+    if (ants_inference_merkle_root(leaves, env.n, root) != ANTS_OK ||
+        memcmp(root, commit.root, sizeof root) != 0) {
+        return ANTS_OK;
+    }
+
+    if (out_commit != NULL) {
+        *out_commit = commit;
+    }
+    *out_ok = true;
+    return ANTS_OK;
+}
+
+/* ======================================================================== */
 /* Test-only hooks                                                          */
 /*                                                                          */
 /* Non-static so the test binary can reach them; forward-declared just below */
