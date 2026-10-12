@@ -249,6 +249,19 @@ ants_error_t ants_reputation_receipt_body_encode(const ants_reputation_receipt_t
                                                  size_t *out_len);
 
 /*
+ * Decode a receipt BODY (the inverse of ants_reputation_receipt_body_encode)
+ * into `out`'s server / client / ncs_value / timestamp / nonce; both
+ * signatures are zeroed. Strict: the map must be exactly the canonical
+ * 5-pair encoding with nothing trailing, so re-encoding reproduces `buf`
+ * byte for byte and a signature over `buf` is a signature over the body.
+ *
+ * @return ANTS_OK; ANTS_ERROR_INVALID_ARG on NULL; ANTS_ERROR_NON_CANONICAL
+ *         on a §4.2.1 violation; ANTS_ERROR_MALFORMED on anything else.
+ */
+ants_error_t
+ants_reputation_receipt_body_decode(const uint8_t *buf, size_t len, ants_reputation_receipt_t *out);
+
+/*
  * Verify a receipt: both the server signature and the client
  * countersignature must validate over the canonical body encoding
  * (RFC-0004 §"A receipt without both signatures does not count").

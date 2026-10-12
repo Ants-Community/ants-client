@@ -18,7 +18,10 @@
  * fails verification are disconnected. The node serves inference
  * (RFC-0008 §11.14) with the pinned v1 reference model: every INFER_REQ in
  * tiers 1-3 is answered with a commit signed by the node identity, its
- * round the height of the final L2 head (0 with the chain off).
+ * round the height of the final L2 head (0 with the chain off). Requesters
+ * pay with receipts (§11.15): the node countersigns them under the
+ * protocol's rules and files them in its receipt bag on disk
+ * (receipts.c), from which its A and T are computed.
  * The DHT is seeded from the config's
  * bootstrap list; the gossip view is fed from DHT discovery and
  * refreshed on the anti-eclipse epoch cadence (probe + rotated
@@ -33,6 +36,7 @@
 
 #include "chain.h"
 #include "config.h"
+#include "receipts.h"
 #include "util.h"
 
 #include "ants_attest.h"
@@ -132,6 +136,7 @@ typedef struct {
     ants_infer_t *infer;
     ants_inference_t *inference;
     const antsd_chain_t *chain;
+    antsd_receipts_t *receipts;
     uint64_t conns_ready;
     uint64_t conns_closed;
     uint64_t dht_peers;
@@ -140,6 +145,7 @@ typedef struct {
     uint64_t rejected;
     uint64_t served;
     uint64_t declined;
+    uint64_t receipts_filed;
     ants_peer_id_t view[ANTSD_GOSSIP_VIEW_SIZE];
     size_t view_count;
 } antsd_node_t;
@@ -214,7 +220,7 @@ static ants_error_t event_router(const ants_transport_event_t *ev, void *ctx)
         ants_attest_handle_transport_event(node->attest, ev, (int64_t)time(NULL));
     }
     if (node->infer != NULL) {
-        ants_infer_handle_transport_event(node->infer, ev);
+        ants_infer_handle_transport_event(node->infer, ev, (uint64_t)time(NULL));
     }
     char hex[ANTS_PEER_ID_SIZE * 2 + 1];
     switch (ev->kind) {
@@ -298,6 +304,36 @@ static bool infer_serve(void *ctx,
            req->input_len,
            round);
     return true;
+}
+
+/* Countersign a receipt body with the node identity (§11.15). */
+static ants_error_t
+receipt_sign(void *ctx, const uint8_t *msg, size_t msg_len, uint8_t out_sig[ANTS_REP_SIG_SIZE])
+{
+    return ants_ed25519_sign((const uint8_t *)ctx, msg, msg_len, out_sig);
+}
+
+/* A receipt the engine countersigned: file it. A and T are not recomputed
+ * here — that re-verifies the whole bag (≈ 0.3 s when full) and this runs
+ * on the event loop; they are reported at start and at shutdown. */
+static void receipt_filed(void *ctx, const ants_reputation_receipt_t *rc)
+{
+    antsd_node_t *node = (antsd_node_t *)ctx;
+    char hex[ANTS_PEER_ID_SIZE * 2 + 1];
+    bool saved = antsd_receipts_add(node->receipts, rc) == ANTS_OK;
+    node->receipts_filed++;
+    antsd_hex_format(rc->client, sizeof rc->client, hex, sizeof hex);
+    printf("antsd: receipt filed client=%s ncs=%" PRIu64 " (bag %zu)%s\n",
+           hex,
+           rc->ncs_value,
+           node->receipts->n,
+           saved ? "" : " — NOT SAVED to disk");
+}
+
+/* §11.15 "at most one receipt per nonce", over the node's whole history. */
+static bool receipt_paid(void *ctx, const uint8_t nonce[ANTS_REP_NONCE_SIZE])
+{
+    return antsd_receipts_paid((const antsd_receipts_t *)ctx, nonce);
 }
 
 /* DHT event demux: routing-table membership is logged (it is the
@@ -623,11 +659,23 @@ int antsd_cmd_run(const char *path)
         icfg.producer_priv = cfg.identity_priv;
         rc = ants_inference_init(&inference, &icfg);
     }
+    /* The receipt bag: ~1 MB of receipts — static, off the stack. */
+    static antsd_receipts_t receipts;
+    if (rc == ANTS_OK) {
+        rc = antsd_receipts_open(&receipts, path, pub);
+    }
     if (rc == ANTS_OK) {
         ants_infer_config_t xcfg;
         memset(&xcfg, 0, sizeof xcfg);
         xcfg.serve_fn = infer_serve;
         xcfg.serve_ctx = &node;
+        memcpy(xcfg.local_id.bytes, pub, sizeof pub);
+        xcfg.receipt_sign_fn = receipt_sign;
+        xcfg.receipt_sign_ctx = cfg.identity_priv;
+        xcfg.receipt_fn = receipt_filed;
+        xcfg.receipt_ctx = &node;
+        xcfg.receipt_paid_fn = receipt_paid;
+        xcfg.receipt_paid_ctx = &receipts;
         rc = ants_infer_init(&infer, &xcfg);
     }
     if (rc != ANTS_OK) {
@@ -635,6 +683,7 @@ int antsd_cmd_run(const char *path)
         ants_transport_destroy(&transport, 0);
         ants_attest_destroy(&attest);
         ants_inference_destroy(&inference);
+        antsd_receipts_close(&receipts);
         ants_gossip_transport_destroy(&gossip_binding);
         ants_dht_destroy(&dht);
         ants_crdt_destroy(gset);
@@ -642,7 +691,20 @@ int antsd_cmd_run(const char *path)
     }
     node.inference = &inference;
     node.infer = &infer;
+    node.receipts = &receipts;
     printf("antsd: serving inference (reference model v1)\n");
+    {
+        uint64_t a = 0;
+        uint64_t t = 0;
+        (void)antsd_receipts_reputation(&receipts, (uint64_t)time(NULL), &a, &t);
+        printf("antsd: receipts %zu loaded (%zu skipped, %zu torn bytes cut) A=%" PRIu64
+               " T=%" PRIu64 " uNCS\n",
+               receipts.n,
+               receipts.skipped,
+               receipts.truncated,
+               a,
+               t);
+    }
 
     /* The L2 chain loop — only with a genesis in the config. A trustee
      * proposes and signs; any other node follows as an observer. A
@@ -719,10 +781,19 @@ int antsd_cmd_run(const char *path)
         }
     }
 
+    {
+        uint64_t a = 0;
+        uint64_t t = 0;
+        (void)antsd_receipts_reputation(&receipts, (uint64_t)time(NULL), &a, &t);
+        printf("antsd: reputation A=%" PRIu64 " T=%" PRIu64 " uNCS over %zu receipts\n",
+               a,
+               t,
+               receipts.n);
+    }
     printf("antsd: shutting down (conns ready %" PRIu64 ", closed %" PRIu64 ", dht peers %" PRIu64
            ", view %zu, attest %" PRIu64 "/%" PRIu64 "/%" PRIu64
            " attested/unattested/rejected, infer %" PRIu64 "/%" PRIu64
-           " served/declined, chain finals %" PRIu64 ")\n",
+           " served/declined, receipts %" PRIu64 ", chain finals %" PRIu64 ")\n",
            node.conns_ready,
            node.conns_closed,
            node.dht_peers,
@@ -732,6 +803,7 @@ int antsd_cmd_run(const char *path)
            node.rejected,
            node.served,
            node.declined,
+           node.receipts_filed,
            chain.finals);
     /* Teardown order matters: the transport goes first, so its
      * CONN_CLOSED callbacks still reach the DHT and the gossip binding
@@ -744,6 +816,7 @@ int antsd_cmd_run(const char *path)
     ants_attest_destroy(&attest);
     ants_infer_destroy(&infer);
     ants_inference_destroy(&inference);
+    antsd_receipts_close(&receipts);
     ants_gossip_transport_destroy(&gossip_binding);
     ants_dht_destroy(&dht);
     ants_crdt_destroy(gset);

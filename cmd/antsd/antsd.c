@@ -23,6 +23,8 @@
  *                           drive the tick loop until SIGINT/SIGTERM
  *                           (see run.c); the node serves inference
  *                           (RFC-0008 §11.14) with the v1 reference model
+ *   antsd receipts <config>
+ *                         — the node's receipt bag: count, A and T now
  *   antsd ask <multiaddr> <peer-id-hex> <prompt> [tier]
  *                         — one inference request to a node, the answer
  *                           checked and the verdict printed (see ask.c)
@@ -31,6 +33,7 @@
 
 #include "ask.h"
 #include "config.h"
+#include "receipts.h"
 #include "run.h"
 #include "util.h"
 
@@ -42,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Default listen address written by `antsd init`: all interfaces, an
@@ -187,6 +191,47 @@ static int cmd_archive(const char *path, const char *mode)
     return 0;
 }
 
+static int cmd_receipts(const char *path)
+{
+    uint8_t buf[ANTSD_CONFIG_ENCODED_MAX];
+    size_t len;
+    if (antsd_read_file(path, buf, sizeof buf, &len) != 0) {
+        fprintf(stderr, "antsd: could not read %s (missing or too large)\n", path);
+        return 1;
+    }
+    antsd_config_t cfg;
+    ants_error_t rc = antsd_config_decode(buf, len, &cfg);
+    memset(buf, 0, sizeof buf);
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: malformed config: %s\n", ants_strerror(rc));
+        return 1;
+    }
+    uint8_t pub[ANTS_ED25519_PUBKEY_SIZE];
+    rc = ants_ed25519_pubkey_from_priv(cfg.identity_priv, pub);
+    memset(cfg.identity_priv, 0, sizeof cfg.identity_priv);
+    if (rc != ANTS_OK) {
+        fprintf(stderr, "antsd: key derivation failed: %s\n", ants_strerror(rc));
+        return 1;
+    }
+    static antsd_receipts_t bag; /* ~1 MB — static */
+    if (antsd_receipts_open(&bag, path, pub) != ANTS_OK) {
+        fprintf(stderr, "antsd: bad receipts path for %s\n", path);
+        return 1;
+    }
+    uint64_t a = 0;
+    uint64_t t = 0;
+    (void)antsd_receipts_reputation(&bag, (uint64_t)time(NULL), &a, &t);
+    printf("receipts: %zu (%zu skipped, %zu torn bytes cut) in %s\n",
+           bag.n,
+           bag.skipped,
+           bag.truncated,
+           bag.path);
+    printf("A:        %llu uNCS\n", (unsigned long long)a);
+    printf("T:        %llu uNCS\n", (unsigned long long)t);
+    antsd_receipts_close(&bag);
+    return 0;
+}
+
 static int cmp_trustee(const void *a, const void *b)
 {
     return memcmp(a, b, ANTS_ED25519_PUBKEY_SIZE);
@@ -267,6 +312,7 @@ static int usage(const char *argv0)
             "  archive  <config> on|off\n"
             "           archive node: never prune the L1 G-Set\n"
             "  run      drive the node event loop until SIGINT/SIGTERM\n"
+            "  receipts the node's receipt bag: count, A and T now\n"
             "  ask      <multiaddr> <peer-id-hex> <prompt> [tier]\n"
             "           ask a node for an inference answer (tier 1..3, default 2)\n",
             argv0);
@@ -301,6 +347,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "show") == 0) {
         return cmd_show(argv[2]);
+    }
+    if (strcmp(argv[1], "receipts") == 0) {
+        return cmd_receipts(argv[2]);
     }
     if (strcmp(argv[1], "run") == 0) {
         return antsd_cmd_run(argv[2]);

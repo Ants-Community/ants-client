@@ -23,9 +23,11 @@ target_include_directories(ants_infer
 target_link_libraries(ants_infer
     PUBLIC
         ants_inference
+        ants_reputation
         ants_transport
     PRIVATE
         ants_cbor
+        ants_crypto
 )
 
 target_compile_features(ants_infer PUBLIC c_std_99)

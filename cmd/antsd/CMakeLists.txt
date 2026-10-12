@@ -15,7 +15,9 @@
 #                          + inference serving (RFC-0008 §11.14, the v1
 #                          reference model)
 #   antsd genesis <config> <time> <hash> <trustee>... — write the v1 genesis
-#   antsd ask <multiaddr> <peer-id> <prompt> [tier] — one inference request
+#   antsd ask <multiaddr> <peer-id> <prompt> [tier] — one inference request,
+#                          paid for with a receipt (§11.15)
+#   antsd receipts <config> — the node's receipt bag (receipts.c), A and T
 
 add_library(antsd_config STATIC config.c)
 target_include_directories(antsd_config
@@ -28,7 +30,7 @@ target_include_directories(antsd_config
 target_link_libraries(antsd_config PUBLIC ants_cbor ants_crypto)
 target_compile_features(antsd_config PUBLIC c_std_99)
 
-add_executable(antsd antsd.c ask.c run.c chain.c util.c)
+add_executable(antsd antsd.c ask.c receipts.c run.c chain.c util.c)
 # ants_crypto (Ed25519) arrives through antsd_config (PUBLIC) — listing it
 # again next to ants_attest's transitive copy trips macOS 'ld: ignoring
 # duplicate libraries'.

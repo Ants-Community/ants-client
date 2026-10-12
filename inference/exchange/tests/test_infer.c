@@ -38,6 +38,10 @@
 
 static int failures = 0;
 
+/* The engine's wall clock in the tests: fixed, and moved by hand where a
+ * receipt's window or skew is under test. */
+static uint64_t g_now_unix = 1760000000u;
+
 #define CHECK(cond)                                                                                \
     do {                                                                                           \
         if (!(cond)) {                                                                             \
@@ -341,7 +345,51 @@ typedef struct {
     /* On NO_ANSWER, try another request on the same (closing) conn. */
     bool rerequest;
     ants_error_t rerequest_rc;
+    /* Requester: receipt verdicts. Producer: receipts filed. */
+    int receipt_results;
+    ants_infer_receipt_result_t last_receipt;
+    int filed;
+    ants_reputation_receipt_t last_filed;
 } side_t;
+
+static void on_receipt_result(const ants_infer_receipt_result_t *r, void *ctx)
+{
+    side_t *s = (side_t *)ctx;
+    s->receipt_results++;
+    s->last_receipt = *r;
+}
+
+/* B's memory of every nonce it filed (the daemon keeps its whole bag). */
+static uint8_t g_paid[64][ANTS_REP_NONCE_SIZE];
+static int g_paid_n;
+
+static void on_receipt_filed(void *ctx, const ants_reputation_receipt_t *r)
+{
+    side_t *s = (side_t *)ctx;
+    s->filed++;
+    s->last_filed = *r;
+    if (g_paid_n < 64) {
+        memcpy(g_paid[g_paid_n++], r->nonce, ANTS_REP_NONCE_SIZE);
+    }
+}
+
+static uint8_t g_b_priv[32];
+
+static ants_error_t
+b_sign(void *ctx, const uint8_t *msg, size_t len, uint8_t sig[ANTS_REP_SIG_SIZE])
+{
+    (void)ctx;
+    return ants_ed25519_sign(g_b_priv, msg, len, sig);
+}
+
+/* Re-sign a receipt body as the client after a field was changed. */
+static void resign_client(ants_reputation_receipt_t *r, const uint8_t priv[32])
+{
+    uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    size_t n = 0;
+    CHECK_EQ(ants_reputation_receipt_body_encode(r, body, sizeof body, &n), ANTS_OK);
+    CHECK_EQ(ants_ed25519_sign(priv, body, n, r->client_sig), ANTS_OK);
+}
 
 static void on_result(const ants_infer_result_t *r, void *ctx)
 {
@@ -388,7 +436,7 @@ static ants_error_t side_event(const ants_transport_event_t *ev, void *ctx)
         return ANTS_OK;
     }
     if (s->infer != NULL) {
-        ants_infer_handle_transport_event(s->infer, ev);
+        ants_infer_handle_transport_event(s->infer, ev, g_now_unix);
     }
     return ANTS_OK;
 }
@@ -408,7 +456,39 @@ typedef struct {
     /* A hangs up its own connection mid-request, and re-requests on it
      * from the NO_ANSWER callback */
     bool a_hangs_up;
+    /* After an ANSWERED exchange, A offers a receipt this way (R_NONE: no
+     * offer). */
+    int receipt_mode;
+    /* B runs without a receipt signer */
+    bool producer_no_signer;
 } run_opts_t;
+
+enum {
+    R_NONE = 0,
+    R_HONEST,
+    R_TWICE,
+    R_LOW,
+    R_SKEW_EDGE,
+    R_SKEW,
+    R_FOREIGN_CLIENT,
+    R_WRONG_NONCE,
+    R_BAD_SIG,
+    R_WINDOW_EDGE,
+    R_EXPIRED,
+    R_REPLAY_LATE
+};
+
+
+static bool b_paid(void *ctx, const uint8_t nonce[ANTS_REP_NONCE_SIZE])
+{
+    (void)ctx;
+    for (int i = 0; i < g_paid_n; i++) {
+        if (memcmp(g_paid[i], nonce, ANTS_REP_NONCE_SIZE) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static uint8_t g_a_pub[32];
 static uint8_t g_b_pub[32];
@@ -431,6 +511,7 @@ static void run_pair(const run_opts_t *o, side_t *a, side_t *b, producer_t *prod
 
     memset(a_priv, 0x41, sizeof a_priv);
     memset(b_priv, 0x42, sizeof b_priv);
+    memcpy(g_b_priv, b_priv, sizeof b_priv);
     memset(foreign_priv, 0x43, sizeof foreign_priv);
     CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, g_a_pub), ANTS_OK);
     CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, g_b_pub), ANTS_OK);
@@ -444,6 +525,8 @@ static void run_pair(const run_opts_t *o, side_t *a, side_t *b, producer_t *prod
     cfg.result_fn = on_result;
     cfg.result_ctx = a;
     cfg.timeout_ms = o->timeout_ms;
+    cfg.receipt_result_fn = on_receipt_result;
+    cfg.receipt_result_ctx = a;
     CHECK_EQ(ants_infer_init(&inf_a, &cfg), ANTS_OK);
     a->infer = &inf_a;
 
@@ -458,6 +541,14 @@ static void run_pair(const run_opts_t *o, side_t *a, side_t *b, producer_t *prod
         memset(&cfg, 0, sizeof cfg);
         cfg.serve_fn = producer_serve;
         cfg.serve_ctx = prod;
+        memcpy(cfg.local_id.bytes, g_b_pub, 32);
+        if (!o->producer_no_signer) {
+            cfg.receipt_sign_fn = b_sign;
+        }
+        cfg.receipt_fn = on_receipt_filed;
+        cfg.receipt_ctx = b;
+        cfg.receipt_paid_fn = b_paid;
+        g_paid_n = 0;
         CHECK_EQ(ants_infer_init(&inf_b, &cfg), ANTS_OK);
         b->infer = &inf_b;
     } else if (o->b_mode == B_RAW) {
@@ -550,6 +641,88 @@ static void run_pair(const run_opts_t *o, side_t *a, side_t *b, producer_t *prod
     CHECK(a->last.conn == &conn && a->last.cookie == (void *)&conn);
     if (a->last.verdict != ANTS_INFER_VERDICT_NO_ANSWER) {
         CHECK(memcmp(a->last.peer_id.bytes, g_b_pub, 32) == 0);
+    }
+
+    /* The receipt step (§11.15). */
+    if (o->receipt_mode != R_NONE && a->last.verdict == ANTS_INFER_VERDICT_ANSWERED) {
+        ants_reputation_receipt_t r;
+        ants_peer_id_t server;
+        int offers = o->receipt_mode == R_TWICE ? 2 : 1;
+        uint64_t t0 = g_now_unix;
+        memcpy(server.bytes, g_b_pub, 32);
+        if (o->receipt_mode == R_WINDOW_EDGE) {
+            g_now_unix += ANTS_INFER_RECEIPT_WINDOW_S;
+        } else if (o->receipt_mode == R_EXPIRED) {
+            g_now_unix += ANTS_INFER_RECEIPT_WINDOW_S + 1u;
+        }
+        CHECK_EQ(
+            ants_infer_receipt_prepare(&a->last.commit,
+                                       &server,
+                                       o->receipt_mode == R_FOREIGN_CLIENT ? foreign_priv : a_priv,
+                                       g_now_unix,
+                                       &r),
+            ANTS_OK);
+        CHECK(r.ncs_value == (uint64_t)ANTS_INFER_REF_UNCS_PER_POSITION * a->last.commit.length);
+        switch (o->receipt_mode) {
+        case R_LOW:
+            r.ncs_value -= 1u;
+            resign_client(&r, a_priv);
+            break;
+        case R_SKEW_EDGE:
+            r.timestamp_unix_s = g_now_unix + ANTS_INFER_RECEIPT_CLOCK_SKEW_S;
+            resign_client(&r, a_priv);
+            break;
+        case R_SKEW:
+            r.timestamp_unix_s = g_now_unix + ANTS_INFER_RECEIPT_CLOCK_SKEW_S + 1u;
+            resign_client(&r, a_priv);
+            break;
+        case R_WRONG_NONCE:
+            r.nonce[0] ^= 1u;
+            resign_client(&r, a_priv);
+            break;
+        case R_BAD_SIG:
+            r.client_sig[5] ^= 0x10u;
+            break;
+        default:
+            break;
+        }
+        for (int k = 0; k < offers; k++) {
+            int want = a->receipt_results + 1;
+            CHECK_EQ(ants_infer_offer_receipt(&inf_a, &conn, &r, 0, NULL), ANTS_OK);
+            for (i = 0; i < 3000 && a->receipt_results < want; i++) {
+                tick_pace();
+                ants_transport_tick(&ta);
+                ants_transport_tick(&tb);
+            }
+            CHECK(a->receipt_results == want);
+            if (k == 0 && offers == 2) {
+                CHECK(a->last_receipt.verdict == ANTS_INFER_RECEIPT_ACKED);
+            }
+        }
+        /* The same request again, after the served entry expired: the commit
+         * is deterministic, so this is the same nonce — already paid. */
+        if (o->receipt_mode == R_REPLAY_LATE) {
+            int want = a->receipt_results + 1;
+            CHECK(a->last_receipt.verdict == ANTS_INFER_RECEIPT_ACKED);
+            g_now_unix += ANTS_INFER_RECEIPT_WINDOW_S + 1u;
+            CHECK_EQ(ants_infer_request(&inf_a, &conn, &req, 0, (void *)&conn), ANTS_OK);
+            for (i = 0; i < 3000 && a->results < 2; i++) {
+                tick_pace();
+                ants_transport_tick(&ta);
+                ants_transport_tick(&tb);
+            }
+            CHECK(a->results == 2 && a->last.verdict == ANTS_INFER_VERDICT_ANSWERED);
+            CHECK_EQ(ants_infer_receipt_prepare(&a->last.commit, &server, a_priv, g_now_unix, &r),
+                     ANTS_OK);
+            CHECK_EQ(ants_infer_offer_receipt(&inf_a, &conn, &r, 0, NULL), ANTS_OK);
+            for (i = 0; i < 3000 && a->receipt_results < want; i++) {
+                tick_pace();
+                ants_transport_tick(&ta);
+                ants_transport_tick(&tb);
+            }
+            CHECK(a->receipt_results == want);
+        }
+        g_now_unix = t0;
     }
 
     for (i = 0; i < o->sibling_streams && i < 4; i++) {
@@ -734,6 +907,156 @@ static void test_engine_siblings_do_not_hold_slots(void)
     CHECK(g_a.last.verdict == ANTS_INFER_VERDICT_ANSWERED);
 }
 
+/* Run one receipt case after an honest answer; returns the verdict. */
+static ants_infer_receipt_verdict_t receipt_case(int mode, bool no_signer)
+{
+    run_opts_t o;
+    memset(&o, 0, sizeof o);
+    o.b_mode = B_ENGINE;
+    o.producer_mode = P_HONEST;
+    o.receipt_mode = mode;
+    o.producer_no_signer = no_signer;
+    run_pair(&o, &g_a, &g_b, &g_prod);
+    CHECK(g_a.last.verdict == ANTS_INFER_VERDICT_ANSWERED);
+    return g_a.last_receipt.verdict;
+}
+
+static void test_receipt_acked(void)
+{
+    bool ok = false;
+    CHECK(receipt_case(R_HONEST, false) == ANTS_INFER_RECEIPT_ACKED);
+    /* Both sides hold the same complete receipt. */
+    CHECK(g_b.filed == 1);
+    CHECK(memcmp(&g_b.last_filed, &g_a.last_receipt.receipt, sizeof g_b.last_filed) == 0);
+    CHECK_EQ(ants_reputation_receipt_verify(&g_a.last_receipt.receipt, &ok), ANTS_OK);
+    CHECK(ok);
+    CHECK(memcmp(g_a.last_receipt.receipt.server, g_b_pub, 32) == 0);
+    CHECK(memcmp(g_a.last_receipt.receipt.client, g_a_pub, 32) == 0);
+    CHECK(g_a.last_receipt.receipt.ncs_value == 16u * ANTS_INFER_REF_UNCS_PER_POSITION);
+    /* The nonce names the answer's commit. */
+    {
+        uint8_t n[ANTS_REP_NONCE_SIZE];
+        CHECK_EQ(ants_infer_receipt_nonce(&g_a.last.commit, n), ANTS_OK);
+        CHECK(memcmp(n, g_a.last_receipt.receipt.nonce, sizeof n) == 0);
+    }
+}
+
+static void test_receipt_refusals(void)
+{
+    /* Once per nonce: the second offer of the same receipt is refused (the
+     * first, ACKED, is checked inside run_pair). */
+    CHECK(receipt_case(R_TWICE, false) == ANTS_INFER_RECEIPT_REFUSED);
+    CHECK(g_b.filed == 1);
+    /* One μNCS under the reference rate. */
+    CHECK(receipt_case(R_LOW, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* Timestamp: exactly the skew passes, one second more does not. */
+    CHECK(receipt_case(R_SKEW_EDGE, false) == ANTS_INFER_RECEIPT_ACKED);
+    CHECK(receipt_case(R_SKEW, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* A client field that is not this connection's peer. */
+    CHECK(receipt_case(R_FOREIGN_CLIENT, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* A nonce that names no answer we served. */
+    CHECK(receipt_case(R_WRONG_NONCE, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* A client signature that does not verify. */
+    CHECK(receipt_case(R_BAD_SIG, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* The window: exactly RECEIPT_WINDOW after serving passes, one second
+     * later does not. */
+    CHECK(receipt_case(R_WINDOW_EDGE, false) == ANTS_INFER_RECEIPT_ACKED);
+    CHECK(receipt_case(R_EXPIRED, false) == ANTS_INFER_RECEIPT_REFUSED);
+    /* A replayed request, paid once, cannot be paid again after its served
+     * entry expired. */
+    CHECK(receipt_case(R_REPLAY_LATE, false) == ANTS_INFER_RECEIPT_REFUSED);
+    CHECK(g_b.filed == 1);
+    /* A producer that does not countersign at all. */
+    CHECK(receipt_case(R_HONEST, true) == ANTS_INFER_RECEIPT_REFUSED);
+    CHECK(g_b.filed == 0);
+}
+
+static void test_wire_receipt(void)
+{
+    /* RECEIPT_OFFER, txid 7, body "b", sig 0x44 x 64 — by hand. */
+    uint8_t want[96];
+    size_t want_len = 0;
+    uint8_t buf[600];
+    size_t len = 0;
+    uint32_t txid = 0;
+    ants_infer_offer_t off;
+    ants_infer_offer_t in;
+    ants_infer_ack_t ack;
+    static const uint8_t h[] = {
+        0xa3, 0x00, 0x0d, 0x01, 0x07, 0x02, 0xa2, 0x00, 0x41, 'b', 0x01, 0x58, 0x40};
+    memcpy(want, h, sizeof h);
+    memset(want + sizeof h, 0x44, 64);
+    want_len = sizeof h + 64;
+
+    memset(&in, 0, sizeof in);
+    in.body = (const uint8_t *)"b";
+    in.body_len = 1;
+    memset(in.client_sig, 0x44, 64);
+    CHECK_EQ(ants_infer_wire_encode_offer(buf, sizeof buf, &len, 7, &in), ANTS_OK);
+    CHECK(len == want_len && memcmp(buf, want, len) == 0);
+    CHECK_EQ(ants_infer_wire_decode_offer(want, want_len, &txid, &off), ANTS_OK);
+    CHECK(txid == 7 && off.body_len == 1 && off.body[0] == 'b' && off.client_sig[63] == 0x44);
+    /* the classifier's peek sees type 13 */
+    {
+        uint64_t type = 0;
+        CHECK_EQ(ants_infer_wire_peek_type(want, want_len, &type), ANTS_OK);
+        CHECK(type == ANTS_INFER_MSG_RECEIPT_OFFER);
+    }
+    /* trailing byte; a third key; over the offer cap */
+    {
+        uint8_t t[100];
+        memcpy(t, want, want_len);
+        t[want_len] = 0x00;
+        CHECK(ants_infer_wire_decode_offer(t, want_len + 1, &txid, &off) != ANTS_OK);
+        memcpy(t, want, want_len);
+        t[6] = 0xa3;
+        t[want_len] = 0x02;
+        t[want_len + 1] = 0x00;
+        CHECK(ants_infer_wire_decode_offer(t, want_len + 2, &txid, &off) != ANTS_OK);
+    }
+    {
+        static uint8_t big[ANTS_INFER_RECEIPT_MAX_OFFER_BYTES + 1];
+        memcpy(big, want, want_len);
+        CHECK_EQ(ants_infer_wire_decode_offer(big, sizeof big, &txid, &off),
+                 ANTS_ERROR_BUFFER_TOO_SMALL);
+    }
+    /* a body over the receipt-body cap is refused by the encoder */
+    {
+        static uint8_t body[ANTS_REP_RECEIPT_BODY_ENCODED_MAX + 1];
+        in.body = body;
+        in.body_len = sizeof body;
+        CHECK_EQ(ants_infer_wire_encode_offer(buf, sizeof buf, &len, 7, &in),
+                 ANTS_ERROR_INVALID_ARG);
+    }
+
+    /* RECEIPT_ACK: refused, and countersigned */
+    {
+        static const uint8_t refused[] = {0xa2, 0x00, 0x0e, 0x01, 0x07};
+        static const uint8_t explicit_empty[] = {0xa3, 0x00, 0x0e, 0x01, 0x07, 0x02, 0xa0};
+        uint8_t full[80];
+        static const uint8_t fh[] = {0xa3, 0x00, 0x0e, 0x01, 0x07, 0x02, 0xa1, 0x00, 0x58, 0x40};
+        ants_infer_ack_t a;
+        memcpy(full, fh, sizeof fh);
+        memset(full + sizeof fh, 0x55, 64);
+        CHECK_EQ(ants_infer_wire_encode_ack(buf, sizeof buf, &len, 7, NULL), ANTS_OK);
+        CHECK(len == sizeof refused && memcmp(buf, refused, len) == 0);
+        CHECK_EQ(ants_infer_wire_decode_ack(refused, sizeof refused, &txid, &ack), ANTS_OK);
+        CHECK(!ack.present);
+        CHECK(ants_infer_wire_decode_ack(explicit_empty, sizeof explicit_empty, &txid, &ack) !=
+              ANTS_OK);
+        memset(&a, 0, sizeof a);
+        a.present = true;
+        memset(a.server_sig, 0x55, 64);
+        CHECK_EQ(ants_infer_wire_encode_ack(buf, sizeof buf, &len, 7, &a), ANTS_OK);
+        CHECK(len == sizeof fh + 64 && memcmp(buf, full, len) == 0);
+        CHECK_EQ(ants_infer_wire_decode_ack(full, sizeof fh + 64, &txid, &ack), ANTS_OK);
+        CHECK(ack.present && ack.server_sig[0] == 0x55);
+        full[9] = 0x3f; /* bstr(63) */
+        CHECK_EQ(ants_infer_wire_decode_ack(full, sizeof fh + 63, &txid, &ack),
+                 ANTS_ERROR_MALFORMED);
+    }
+}
+
 static void test_args(void)
 {
     ants_infer_t e;
@@ -769,6 +1092,9 @@ int main(void)
     test_engine_silent_peer_times_out();
     test_engine_siblings_do_not_hold_slots();
     test_engine_no_request_on_closing_conn();
+    test_wire_receipt();
+    test_receipt_acked();
+    test_receipt_refusals();
 
     if (failures > 0) {
         fprintf(stderr, "test_infer: %d failure(s)\n", failures);

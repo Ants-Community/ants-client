@@ -1,5 +1,6 @@
 /*
- * infer_wire.c — INFER_REQ / INFER_RESP codec (RFC-0008 §11.14).
+ * infer_wire.c — INFER_REQ / INFER_RESP (RFC-0008 §11.14) and
+ * RECEIPT_OFFER / RECEIPT_ACK (§11.15) codec.
  *
  * Same envelope as the DHT RPCs (§11.2): {0: type, 1: txid, 2: body}, an
  * empty body omitting key 2. Both body maps are closed: a decoder rejects
@@ -319,5 +320,175 @@ ants_error_t ants_infer_wire_decode_resp(const uint8_t *buf,
         memset(out, 0, sizeof *out);
         return ANTS_ERROR_MALFORMED;
     }
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* RECEIPT_OFFER                                                            */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_infer_wire_encode_offer(uint8_t *buf,
+                                          size_t cap,
+                                          size_t *out_len,
+                                          uint32_t txid,
+                                          const ants_infer_offer_t *o)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t err;
+    if (buf == NULL || out_len == NULL || o == NULL || o->body == NULL || o->body_len == 0 ||
+        o->body_len > ANTS_REP_RECEIPT_BODY_ENCODED_MAX) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((err = ants_cbor_enc_init(&enc, buf, cap)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = enc_head(&enc, ANTS_INFER_MSG_RECEIPT_OFFER, txid, true)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = ants_cbor_enc_map(&enc, 2)) != ANTS_OK ||
+        (err = ants_cbor_enc_uint(&enc, 0)) != ANTS_OK ||
+        (err = ants_cbor_enc_bytes(&enc, o->body, o->body_len)) != ANTS_OK ||
+        (err = ants_cbor_enc_uint(&enc, 1)) != ANTS_OK ||
+        (err = ants_cbor_enc_bytes(&enc, o->client_sig, sizeof o->client_sig)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return err;
+    }
+    *out_len = enc.pos;
+    return ANTS_OK;
+}
+
+ants_error_t ants_infer_wire_decode_offer(const uint8_t *buf,
+                                          size_t len,
+                                          uint32_t *out_txid,
+                                          ants_infer_offer_t *out)
+{
+    ants_cbor_dec_t dec;
+    uint64_t type;
+    bool has_body;
+    size_t n;
+    const uint8_t *sig;
+    size_t sig_len;
+    ants_error_t err;
+    if (buf == NULL || out_txid == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof *out);
+    if (len > ANTS_INFER_RECEIPT_MAX_OFFER_BYTES) {
+        return ANTS_ERROR_BUFFER_TOO_SMALL;
+    }
+    if ((err = ants_cbor_dec_init(&dec, buf, len)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = dec_head(&dec, &type, out_txid, &has_body)) != ANTS_OK) {
+        return err;
+    }
+    if (type != ANTS_INFER_MSG_RECEIPT_OFFER || !has_body) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if ((err = ants_cbor_dec_map(&dec, &n)) != ANTS_OK) {
+        return err;
+    }
+    if (n != 2) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if ((err = expect_key(&dec, 0)) != ANTS_OK ||
+        (err = ants_cbor_dec_bytes(&dec, &out->body, &out->body_len)) != ANTS_OK ||
+        (err = expect_key(&dec, 1)) != ANTS_OK ||
+        (err = ants_cbor_dec_bytes(&dec, &sig, &sig_len)) != ANTS_OK ||
+        (err = ants_cbor_dec_finalise(&dec)) != ANTS_OK) {
+        memset(out, 0, sizeof *out);
+        return err;
+    }
+    if (sig_len != sizeof out->client_sig || out->body_len == 0 ||
+        out->body_len > ANTS_REP_RECEIPT_BODY_ENCODED_MAX) {
+        memset(out, 0, sizeof *out);
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(out->client_sig, sig, sig_len);
+    return ANTS_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* RECEIPT_ACK                                                              */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t ants_infer_wire_encode_ack(uint8_t *buf,
+                                        size_t cap,
+                                        size_t *out_len,
+                                        uint32_t txid,
+                                        const ants_infer_ack_t *a)
+{
+    ants_cbor_enc_t enc;
+    ants_error_t err;
+    bool present = a != NULL && a->present;
+    if (buf == NULL || out_len == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    if ((err = ants_cbor_enc_init(&enc, buf, cap)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = enc_head(&enc, ANTS_INFER_MSG_RECEIPT_ACK, txid, present)) != ANTS_OK) {
+        return err;
+    }
+    if (present) {
+        if ((err = ants_cbor_enc_map(&enc, 1)) != ANTS_OK ||
+            (err = ants_cbor_enc_uint(&enc, 0)) != ANTS_OK ||
+            (err = ants_cbor_enc_bytes(&enc, a->server_sig, sizeof a->server_sig)) != ANTS_OK) {
+            return err;
+        }
+    }
+    if ((err = ants_cbor_enc_finalise(&enc)) != ANTS_OK) {
+        return err;
+    }
+    *out_len = enc.pos;
+    return ANTS_OK;
+}
+
+ants_error_t ants_infer_wire_decode_ack(const uint8_t *buf,
+                                        size_t len,
+                                        uint32_t *out_txid,
+                                        ants_infer_ack_t *out)
+{
+    ants_cbor_dec_t dec;
+    uint64_t type;
+    bool has_body;
+    size_t n;
+    const uint8_t *sig;
+    size_t sig_len;
+    ants_error_t err;
+    if (buf == NULL || out_txid == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof *out);
+    if ((err = ants_cbor_dec_init(&dec, buf, len)) != ANTS_OK) {
+        return err;
+    }
+    if ((err = dec_head(&dec, &type, out_txid, &has_body)) != ANTS_OK) {
+        return err;
+    }
+    if (type != ANTS_INFER_MSG_RECEIPT_ACK) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if (!has_body) {
+        return ants_cbor_dec_finalise(&dec); /* refused */
+    }
+    if ((err = ants_cbor_dec_map(&dec, &n)) != ANTS_OK) {
+        return err;
+    }
+    if (n != 1) {
+        return ANTS_ERROR_NON_CANONICAL;
+    }
+    if ((err = expect_key(&dec, 0)) != ANTS_OK ||
+        (err = ants_cbor_dec_bytes(&dec, &sig, &sig_len)) != ANTS_OK ||
+        (err = ants_cbor_dec_finalise(&dec)) != ANTS_OK) {
+        return err;
+    }
+    if (sig_len != sizeof out->server_sig) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    memcpy(out->server_sig, sig, sig_len);
+    out->present = true;
     return ANTS_OK;
 }

@@ -8,7 +8,8 @@
  * authenticated, the commit against the request, the envelope against the
  * commit (the §11.8 integrity gate) — and the verdict printed. The audit
  * against B_{r+1} is not run here: v1 pins no beacon for it yet (RFC-0008
- * §10).
+ * §10). An answered request is then paid for with a receipt (§11.15) at
+ * the reference rate, and the producer's verdict on it printed.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -38,6 +39,9 @@ typedef struct {
     ants_transport_conn_t *ready;
     bool closed;
     bool done;
+    bool receipt_done;
+    ants_infer_receipt_verdict_t receipt_verdict;
+    uint64_t receipt_ncs;
     ants_infer_verdict_t verdict;
     ants_inference_commit_t commit;
     uint8_t tokens[ANTS_INFER_MAX_POSITIONS];
@@ -56,7 +60,7 @@ static ants_error_t ask_event(const ants_transport_event_t *ev, void *ctx)
 {
     ask_state_t *st = (ask_state_t *)ctx;
     if (st->infer != NULL) {
-        ants_infer_handle_transport_event(st->infer, ev);
+        ants_infer_handle_transport_event(st->infer, ev, (uint64_t)time(NULL));
     }
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         st->ready = ev->conn;
@@ -93,6 +97,28 @@ static void ask_result(const ants_infer_result_t *r, void *ctx)
     if (r->verdict == ANTS_INFER_VERDICT_ANSWERED) {
         st->commit = r->commit;
         envelope_tokens(r->envelope, r->envelope_len, st);
+    }
+}
+
+static void ask_receipt_result(const ants_infer_receipt_result_t *r, void *ctx)
+{
+    ask_state_t *st = (ask_state_t *)ctx;
+    st->receipt_done = true;
+    st->receipt_verdict = r->verdict;
+    st->receipt_ncs = r->receipt.ncs_value;
+}
+
+static const char *receipt_name(ants_infer_receipt_verdict_t v)
+{
+    switch (v) {
+    case ANTS_INFER_RECEIPT_ACKED:
+        return "acked";
+    case ANTS_INFER_RECEIPT_REFUSED:
+        return "refused";
+    case ANTS_INFER_RECEIPT_REJECTED:
+        return "rejected";
+    default:
+        return "no-answer";
     }
 }
 
@@ -161,6 +187,8 @@ int antsd_cmd_ask(const char *addr, const char *peer_hex, const char *prompt, un
     memset(&xcfg, 0, sizeof xcfg);
     xcfg.result_fn = ask_result;
     xcfg.result_ctx = &st;
+    xcfg.receipt_result_fn = ask_receipt_result;
+    xcfg.receipt_result_ctx = &st;
     xcfg.timeout_ms = ANTSD_ASK_DEADLINE_MS;
     if (ants_infer_init(&infer, &xcfg) != ANTS_OK) {
         return 1;
@@ -236,6 +264,25 @@ int antsd_cmd_ask(const char *addr, const char *peer_hex, const char *prompt, un
         text[st.n_tokens] = '\0';
         printf("antsd: ask tokens=\"%s\"\n", text);
         exit_code = 0;
+
+        /* Pay for it (§11.15): a receipt at the reference rate, signed with
+         * the throwaway identity this connection authenticated. */
+        ants_reputation_receipt_t receipt;
+        rc = ants_infer_receipt_prepare(&st.commit, &expect, priv, (uint64_t)time(NULL), &receipt);
+        if (rc == ANTS_OK && st.ready != NULL && !st.closed) {
+            rc = ants_infer_offer_receipt(&infer, st.ready, &receipt, ask_now_ms(), NULL);
+        }
+        if (rc == ANTS_OK && st.ready != NULL && !st.closed) {
+            uint64_t t0 = ask_now_ms();
+            while (!st.receipt_done && !st.closed && ask_now_ms() - t0 < ANTSD_ASK_DEADLINE_MS) {
+                ants_transport_tick(&transport);
+                ants_infer_tick(&infer, ask_now_ms());
+                ask_nap(1);
+            }
+        }
+        printf("antsd: ask receipt=%s ncs=%" PRIu64 "\n",
+               st.receipt_done ? receipt_name(st.receipt_verdict) : "no-answer",
+               st.receipt_ncs);
     }
 
     /* Close politely: ants_transport_destroy does not put a

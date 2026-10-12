@@ -1618,3 +1618,49 @@ ants_error_t ants_reputation_summary_audit_bucket(const ants_reputation_summary_
     *out_ok = (acc >= stated);
     return ANTS_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Receipt body decode                                                      */
+/* ------------------------------------------------------------------------ */
+
+ants_error_t
+ants_reputation_receipt_body_decode(const uint8_t *buf, size_t len, ants_reputation_receipt_t *out)
+{
+    ants_cbor_dec_t dec;
+    size_t n_pairs;
+    ants_error_t rc;
+
+    if (buf == NULL || out == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof *out);
+    rc = norm_decode_err(ants_cbor_dec_init(&dec, buf, len));
+    if (rc == ANTS_OK) {
+        rc = norm_decode_err(ants_cbor_dec_map(&dec, &n_pairs));
+    }
+    if (rc == ANTS_OK && n_pairs != REP_BODY_PAIRS) {
+        rc = ANTS_ERROR_MALFORMED;
+    }
+    if (rc == ANTS_OK) {
+        rc = decode_bytes_field(&dec, REP_KEY_SERVER, out->server, sizeof out->server);
+    }
+    if (rc == ANTS_OK) {
+        rc = decode_bytes_field(&dec, REP_KEY_CLIENT, out->client, sizeof out->client);
+    }
+    if (rc == ANTS_OK) {
+        rc = decode_uint_field(&dec, REP_KEY_NCS, &out->ncs_value);
+    }
+    if (rc == ANTS_OK) {
+        rc = decode_uint_field(&dec, REP_KEY_TIMESTAMP, &out->timestamp_unix_s);
+    }
+    if (rc == ANTS_OK) {
+        rc = decode_bytes_field(&dec, REP_KEY_NONCE, out->nonce, sizeof out->nonce);
+    }
+    if (rc == ANTS_OK) {
+        rc = norm_decode_err(ants_cbor_dec_finalise(&dec));
+    }
+    if (rc != ANTS_OK) {
+        memset(out, 0, sizeof *out);
+    }
+    return rc;
+}

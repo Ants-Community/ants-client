@@ -32,7 +32,11 @@
  * against the spawned daemon and requires an answer that checks out —
  * signed by the daemon's identity, under the pinned v1 model hash, round 0
  * with the chain off — a decline for a tier the node does not serve, and
- * no answer from a node whose peer-id does not match the pin.
+ * no answer from a node whose peer-id does not match the pin. The answer is
+ * paid for with a receipt (§11.15) the daemon countersigns and files; a
+ * restart reloads the bag from disk — skipping a record whose signature was
+ * corrupted and cutting a torn final record, so a receipt filed after the
+ * restart is readable — and `antsd receipts` reads the same bag.
  *
  * Plus the cheap failure path: `antsd run <missing-file>` exits 1.
  *
@@ -1219,6 +1223,14 @@ static void test_run_serves_inference(const char *antsd_path)
     snprintf(
         want, sizeof want, "antsd: ask round=0 tier=2 positions=16 model=%s", REF_MODEL_V1_HEX);
     CHECK(strstr(ask.data, want) != NULL);
+    /* paid for: 16 positions at the 1000-uNCS reference rate */
+    CHECK(strstr(ask.data, "antsd: ask receipt=acked ncs=16000") != NULL);
+    CHECK(wait_for_output(out_fd,
+                          &cap,
+                          "antsd: receipt filed client=",
+                          now_ms() + HANDSHAKE_DEADLINE_MS,
+                          NULL,
+                          NULL) != NULL);
     CHECK(wait_for_output(out_fd,
                           &cap,
                           "antsd: infer served peer=",
@@ -1255,11 +1267,111 @@ static void test_run_serves_inference(const char *antsd_path)
     CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     while (capture_pump(out_fd, &cap, 100) > 0) {
     }
-    CHECK(strstr(cap.data, "infer 1/1 served/declined") != NULL);
+    CHECK(strstr(cap.data, "infer 1/1 served/declined, receipts 1,") != NULL);
+    CHECK(strstr(cap.data, "antsd: receipts 0 loaded (0 skipped, 0 torn bytes cut) A=0 T=0 uNCS") !=
+          NULL);
+    CHECK(strstr(cap.data, "antsd: reputation A=16000 T=16000 uNCS over 1 receipts") != NULL ||
+          strstr(cap.data, "antsd: reputation A=8000 ") != NULL); /* an hour bin may tick */
     if (failures > 0) {
         fprintf(stderr, "daemon output: <<<%s>>>\n", cap.data);
     }
     close(out_fd);
+
+    /* The bag on disk: one 229-byte record (2 + 99-byte body + 2 x 64).
+     * Append a copy with a flipped server-signature byte (must be skipped)
+     * and three bytes of a torn record (must end the load quietly). */
+    char bag_path[600];
+    snprintf(bag_path, sizeof bag_path, "%s.receipts", cfg_path);
+    {
+        uint8_t rec[512];
+        FILE *f = fopen(bag_path, "rb");
+        size_t n = 0;
+        CHECK(f != NULL);
+        if (f != NULL) {
+            n = fread(rec, 1, sizeof rec, f);
+            fclose(f);
+        }
+        CHECK(n == 229);
+        if (n == 229) {
+            static const uint8_t torn[3] = {0x00, 0x63, 0xa5};
+            rec[2 + 99 + 10] ^= 0x01;
+            f = fopen(bag_path, "ab");
+            CHECK(f != NULL);
+            if (f != NULL) {
+                CHECK(fwrite(rec, 1, n, f) == n);
+                CHECK(fwrite(torn, 1, sizeof torn, f) == sizeof torn);
+                fclose(f);
+            }
+        }
+    }
+
+    /* Restart: the good receipt is reloaded, the corrupted one skipped. */
+    out_fd = spawn_run(antsd_path, cfg_path, &pid);
+    CHECK(out_fd >= 0);
+    if (out_fd >= 0) {
+        memset(&cap, 0, sizeof cap);
+        CHECK(wait_for_output(out_fd,
+                              &cap,
+                              "antsd: receipts 1 loaded (1 skipped, 3 torn bytes cut) A=",
+                              now_ms() + READY_DEADLINE_MS,
+                              NULL,
+                              NULL) != NULL);
+        CHECK(strstr(cap.data, "torn bytes cut) A=0 ") == NULL);
+        /* A receipt filed after the cut lands on a record boundary — before
+         * the fix it sat behind the torn bytes and was lost on reload. */
+        {
+            char addr2[ANTS_MULTIADDR_MAX_LEN];
+            uint64_t dl = now_ms() + READY_DEADLINE_MS;
+            while (extract_listen_addr(&cap, addr2, sizeof addr2) != 0 && now_ms() < dl) {
+                (void)capture_pump(out_fd, &cap, 50);
+            }
+            CHECK(extract_listen_addr(&cap, addr2, sizeof addr2) == 0);
+            st = run_ask(antsd_path, addr2, daemon_hex, "2", &ask);
+            CHECK(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+            CHECK(strstr(ask.data, "antsd: ask receipt=acked ncs=16000") != NULL);
+            CHECK(wait_for_output(out_fd,
+                                  &cap,
+                                  "antsd: receipt filed client=",
+                                  now_ms() + HANDSHAKE_DEADLINE_MS,
+                                  NULL,
+                                  NULL) != NULL);
+        }
+        CHECK(kill(pid, SIGTERM) == 0);
+        status = reap_with_deadline(pid, EXIT_DEADLINE_MS);
+        CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        if (failures > 0) {
+            while (capture_pump(out_fd, &cap, 100) > 0) {
+            }
+            fprintf(stderr, "restarted daemon output: <<<%s>>>\n", cap.data);
+        }
+        close(out_fd);
+    }
+
+    /* `antsd receipts` reads the same bag. */
+    {
+        int p[2];
+        CHECK(pipe(p) == 0);
+        pid_t rp = fork();
+        if (rp == 0) {
+            dup2(p[1], STDOUT_FILENO);
+            close(p[0]);
+            close(p[1]);
+            execl(antsd_path, "antsd", "receipts", cfg_path, (char *)NULL);
+            _exit(127);
+        }
+        close(p[1]);
+        static capture_t rc_out;
+        memset(&rc_out, 0, sizeof rc_out);
+        uint64_t dl = now_ms() + EXIT_DEADLINE_MS;
+        while (now_ms() < dl && capture_pump(p[0], &rc_out, 50) >= 0) {
+        }
+        close(p[0]);
+        status = reap_with_deadline(rp, EXIT_DEADLINE_MS);
+        CHECK(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        /* the torn tail was cut by the restart: none left to cut now */
+        CHECK(strstr(rc_out.data, "receipts: 2 (1 skipped, 0 torn bytes cut)") != NULL);
+    }
+    unlink(bag_path);
     unlink(cfg_path);
 }
 

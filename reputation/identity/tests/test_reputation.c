@@ -196,6 +196,95 @@ static void test_receipt_body_canonical_and_verify(void)
     CHECK_EQ(ants_reputation_receipt_verify(&r, NULL), ANTS_ERROR_INVALID_ARG);
 }
 
+/* The body decoder against bytes written out by hand (independent of the
+ * encoder), plus the strict rejections. */
+static void test_receipt_body_decode(void)
+{
+    uint8_t want[128];
+    size_t n = 0;
+    ants_reputation_receipt_t r;
+    ants_reputation_receipt_t in;
+    uint8_t re[ANTS_REP_RECEIPT_BODY_ENCODED_MAX];
+    size_t re_len = 0;
+
+    /* a5 | 01 58 20 <0x11 x32> | 02 58 20 <0x22 x32> | 03 1a 00 07 a1 20
+     * | 04 1a 65 53 f1 00 | 05 50 <0x33 x16> */
+    want[n++] = 0xa5;
+    want[n++] = 0x01;
+    want[n++] = 0x58;
+    want[n++] = 0x20;
+    memset(want + n, 0x11, 32);
+    n += 32;
+    want[n++] = 0x02;
+    want[n++] = 0x58;
+    want[n++] = 0x20;
+    memset(want + n, 0x22, 32);
+    n += 32;
+    memcpy(want + n, (const uint8_t[]){0x03, 0x1a, 0x00, 0x07, 0xa1, 0x20}, 6);
+    n += 6;
+    memcpy(want + n, (const uint8_t[]){0x04, 0x1a, 0x65, 0x53, 0xf1, 0x00}, 6);
+    n += 6;
+    want[n++] = 0x05;
+    want[n++] = 0x50;
+    memset(want + n, 0x33, 16);
+    n += 16;
+
+    CHECK_EQ(ants_reputation_receipt_body_decode(want, n, &r), ANTS_OK);
+    CHECK(r.server[0] == 0x11 && r.server[31] == 0x11);
+    CHECK(r.client[0] == 0x22 && r.client[31] == 0x22);
+    CHECK(r.ncs_value == 500000u && r.timestamp_unix_s == 1700000000u);
+    CHECK(r.nonce[0] == 0x33 && r.nonce[15] == 0x33);
+
+    /* round trip: the encoder reproduces the hand-written bytes */
+    memset(&in, 0, sizeof in);
+    memset(in.server, 0x11, 32);
+    memset(in.client, 0x22, 32);
+    in.ncs_value = 500000u;
+    in.timestamp_unix_s = 1700000000u;
+    memset(in.nonce, 0x33, 16);
+    CHECK_EQ(ants_reputation_receipt_body_encode(&in, re, sizeof re, &re_len), ANTS_OK);
+    CHECK(re_len == n && memcmp(re, want, n) == 0);
+
+    /* trailing byte */
+    {
+        uint8_t t[129];
+        memcpy(t, want, n);
+        t[n] = 0x00;
+        CHECK(ants_reputation_receipt_body_decode(t, n + 1, &r) != ANTS_OK);
+    }
+    /* a non-shortest timestamp (0x1b + 8 bytes) is non-canonical */
+    {
+        uint8_t t[140];
+        size_t k = 0;
+        /* offsets: map 0, server 1-35, client 36-70, ncs 71-76, timestamp
+         * 77-82, nonce 83-100 */
+        CHECK(n == 101);
+        memcpy(t, want, 77);
+        k = 77;
+        memcpy(t + k, (const uint8_t[]){0x04, 0x1b, 0, 0, 0, 0, 0x65, 0x53, 0xf1, 0x00}, 10);
+        k += 10;
+        memcpy(t + k, want + 83, 18);
+        k += 18;
+        CHECK_EQ(ants_reputation_receipt_body_decode(t, k, &r), ANTS_ERROR_NON_CANONICAL);
+    }
+    /* a 15-byte nonce */
+    {
+        uint8_t t[128];
+        memcpy(t, want, n);
+        t[84] = 0x4f; /* bstr(15) */
+        CHECK_EQ(ants_reputation_receipt_body_decode(t, n - 1, &r), ANTS_ERROR_MALFORMED);
+    }
+    /* four pairs */
+    {
+        uint8_t t[128];
+        memcpy(t, want, n);
+        t[0] = 0xa4;
+        CHECK(ants_reputation_receipt_body_decode(t, n, &r) != ANTS_OK);
+    }
+    CHECK_EQ(ants_reputation_receipt_body_decode(NULL, n, &r), ANTS_ERROR_INVALID_ARG);
+    CHECK_EQ(ants_reputation_receipt_body_decode(want, n, NULL), ANTS_ERROR_INVALID_ARG);
+}
+
 /* ---- compute A / T -------------------------------------------------- */
 
 static void test_compute_basic_and_skips(void)
@@ -1666,6 +1755,7 @@ int main(void)
     test_decay_factor_basics();
     test_decay_factor_is_repeated_mul();
     test_receipt_body_canonical_and_verify();
+    test_receipt_body_decode();
     test_compute_basic_and_skips();
     test_compute_kappa_clips_a_bin();
     test_compute_empty_and_args();
