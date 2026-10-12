@@ -31,25 +31,87 @@ ants_error_t ants_attestation_generate(ants_tee_vendor_t vendor,
     return ANTS_ERROR_NOT_IMPLEMENTED;
 }
 
-/* Per-vendor composition, defined at the foot of this file (each depends on the
- * vendor layout constants + cert-extraction helpers below). */
-static ants_error_t tdx_attestation_verify(const ants_attestation_t *att);
-static ants_error_t snp_attestation_verify(const ants_attestation_t *att);
+/* Per-vendor evidence verification, defined at the foot of this file (each
+ * depends on the vendor layout constants + cert-extraction helpers below). On
+ * ANTS_OK the vendor-signed report_data is copied to out_report_data. */
+static ants_error_t tdx_verify_evidence(const ants_attestation_t *att,
+                                        uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE]);
+static ants_error_t snp_verify_evidence(const ants_attestation_t *att,
+                                        uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE]);
+
+ants_error_t ants_attestation_report_data(const uint8_t peer_pubkey[32],
+                                          int64_t issued_at_unix,
+                                          uint8_t out[ANTS_TEE_REPORT_DATA_SIZE])
+{
+    if (peer_pubkey == NULL || out == NULL || issued_at_unix < 0) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    /* RFC-0008 §11.12: peer-id ‖ LE64(issued_at) ‖ 0x00 × 24. */
+    memset(out, 0, ANTS_TEE_REPORT_DATA_SIZE);
+    memcpy(out, peer_pubkey, 32);
+    uint64_t t = (uint64_t)issued_at_unix;
+    for (size_t i = 0; i < 8; i++) {
+        out[32 + i] = (uint8_t)(t >> (8 * i));
+    }
+    return ANTS_OK;
+}
+
+/* Chain + signature only — the binding is the caller's next step. Shared by
+ * ants_attestation_verify and the evidence test hook below. */
+static ants_error_t verify_evidence(const ants_attestation_t *att,
+                                    uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE])
+{
+    switch (att->vendor) {
+    case ANTS_TEE_VENDOR_INTEL_TDX:
+        return tdx_verify_evidence(att, out_report_data);
+    case ANTS_TEE_VENDOR_AMD_SEV_SNP:
+        return snp_verify_evidence(att, out_report_data);
+    default:
+        /* ARM CCA / Apple SE / Qualcomm are v1.x. */
+        return ANTS_ERROR_NOT_IMPLEMENTED;
+    }
+}
 
 ants_error_t ants_attestation_verify(const ants_attestation_t *att)
 {
     if (att == NULL) {
         return ANTS_ERROR_INVALID_ARG;
     }
-    switch (att->vendor) {
-    case ANTS_TEE_VENDOR_INTEL_TDX:
-        return tdx_attestation_verify(att);
-    case ANTS_TEE_VENDOR_AMD_SEV_SNP:
-        return snp_attestation_verify(att);
-    default:
-        /* ARM CCA / Apple SE / Qualcomm are v1.x. */
-        return ANTS_ERROR_NOT_IMPLEMENTED;
+    uint8_t got[ANTS_TEE_REPORT_DATA_SIZE];
+    ants_error_t err = verify_evidence(att, got);
+    if (err != ANTS_OK) {
+        return err;
     }
+    /* Bind the vendor-signed report_data to the peer key AND the issuance
+     * time (RFC-0008 §11.12) — the commitment is what makes issued_at the
+     * signed timestamp the freshness window measures from. A negative
+     * issued_at has no LE64 encoding: malformed. */
+    uint8_t want[ANTS_TEE_REPORT_DATA_SIZE];
+    if (ants_attestation_report_data(att->peer_pubkey, att->issued_at_unix, want) != ANTS_OK) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    if (memcmp(got, want, sizeof want) != 0) {
+        return ANTS_ERROR_MALFORMED;
+    }
+    return ANTS_OK;
+}
+
+/* Internal test hook — not in ants_tee.h. Runs the evidence half of verify
+ * (chain to the pinned root + report/quote signature) and returns the signed
+ * report_data, so genuine vendor KATs — whose report_data is third-party
+ * bytes, not an ANTS binding — still exercise the full chain and signature
+ * path end to end. Forward-declared to silence -Wmissing-prototypes. */
+ants_error_t
+ants_attestation__test_verify_evidence(const ants_attestation_t *att,
+                                       uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE]);
+ants_error_t
+ants_attestation__test_verify_evidence(const ants_attestation_t *att,
+                                       uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE])
+{
+    if (att == NULL || out_report_data == NULL) {
+        return ANTS_ERROR_INVALID_ARG;
+    }
+    return verify_evidence(att, out_report_data);
 }
 
 bool ants_attestation_is_fresh(const ants_attestation_t *att,
@@ -80,6 +142,15 @@ bool ants_attestation_is_fresh(const ants_attestation_t *att,
         within_window = now < att->issued_at_unix + freshness_window_seconds;
     }
     if (!within_window) {
+        return false;
+    }
+
+    /* Clock skew (RFC-0005 §Attestation freshness window, RFC-0008 §11.12):
+     * issued_at is signed (committed in report_data), so an issuance more
+     * than ANTS_TEE_CLOCK_SKEW_SECONDS in the verifier's future is rejected.
+     * When issued > now the difference fits in uint64_t — no signed wrap. */
+    if (att->issued_at_unix > now &&
+        (uint64_t)att->issued_at_unix - (uint64_t)now > (uint64_t)ANTS_TEE_CLOCK_SKEW_SECONDS) {
         return false;
     }
 
@@ -452,13 +523,12 @@ ants_tdx_quote_verify_signature(const uint8_t *quote,
 /* chain validator (x509_chain.h) together: extract the embedded vendor cert */
 /* chain from the blob, validate it to a PINNED vendor root (tee_roots.h),   */
 /* take the proven leaf key, verify the report/quote signature under it, and */
-/* bind the attestation to the peer's Ed25519 identity key.                  */
+/* bind the signed report_data to the peer key and issuance time.           */
 /*                                                                          */
-/* Peer binding (v1): the low 32 bytes of the 64-byte report_data carry the  */
-/* Ed25519 peer public key; the upper 32 bytes are reserved (the generate    */
-/* side zero-fills them; verify does not constrain them in v1). This is the  */
-/* byte-level binding RFC-0005 leaves to the implementation — pin it in the  */
-/* spec when ants_attestation_generate lands.                               */
+/* Peer binding: the 64-byte report_data is pinned by RFC-0008 §11.12 as     */
+/* peer-id ‖ LE64(issued_at) ‖ 0x00 × 24 (ants_attestation_report_data). The */
+/* per-vendor functions below verify the EVIDENCE (chain + signature) and    */
+/* hand back the signed report_data; ants_attestation_verify compares it.   */
 /*                                                                          */
 /* No dynamic allocation: embedded certificates decode into fixed stack      */
 /* buffers; an over-large embedded cert is rejected, not truncated.          */
@@ -467,9 +537,6 @@ ants_tdx_quote_verify_signature(const uint8_t *quote,
 /* Upper bound on one embedded DER certificate (Intel PCK leaf / Platform CA
  * are ~0.7-1.1 KB). */
 #define ANTS_TEE_MAX_CERT_DER 2048
-
-/* Ed25519 peer key carried in the low half of the 64-byte report_data. */
-#define ANTS_TEE_PEER_BINDING_LEN 32
 
 static int b64_val(uint8_t c)
 {
@@ -619,7 +686,8 @@ tdx_locate_pck_pem(const uint8_t *quote, size_t quote_len, const uint8_t **pem, 
     return ANTS_OK;
 }
 
-static ants_error_t tdx_attestation_verify(const ants_attestation_t *att)
+static ants_error_t tdx_verify_evidence(const ants_attestation_t *att,
+                                        uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE])
 {
     const uint8_t *quote = att->vendor_blob;
     size_t quote_len = att->vendor_blob_len;
@@ -676,15 +744,13 @@ static ants_error_t tdx_attestation_verify(const ants_attestation_t *att)
         return err;
     }
 
-    /* Bind to the peer identity: report_data[0:32] == the peer's Ed25519 key. */
+    /* Hand back the now-authenticated report_data for the binding check. */
     ants_tdx_quote_t q;
     err = ants_tdx_quote_parse(quote, quote_len, &q);
     if (err != ANTS_OK) {
         return err;
     }
-    if (memcmp(q.report_data, att->peer_pubkey, ANTS_TEE_PEER_BINDING_LEN) != 0) {
-        return ANTS_ERROR_MALFORMED;
-    }
+    memcpy(out_report_data, q.report_data, ANTS_TEE_REPORT_DATA_SIZE);
     return ANTS_OK;
 }
 
@@ -693,12 +759,11 @@ static ants_error_t tdx_attestation_verify(const ants_attestation_t *att)
 /*                                                                          */
 /* The SNP vendor_blob is the 0x4A0-byte ATTESTATION_REPORT followed by an  */
 /* AMD GHCB certificate table carrying the VCEK (leaf) -> ASK -> ARK chain.  */
-/* snp_attestation_verify extracts the VCEK + ASK from that table, validates */
+/* snp_verify_evidence extracts the VCEK + ASK from that table, validates   */
 /* VCEK -> ASK -> the PINNED ARK-Milan root (tee_roots.h; the table's own    */
 /* ARK is ignored — trust is the pin, never the attacker-controlled blob),   */
-/* verifies the report signature under the proven VCEK leaf key, and binds   */
-/* report_data[0:32] to the peer's Ed25519 identity key (the same v1 binding */
-/* as TDX above).                                                           */
+/* verifies the report signature under the proven VCEK leaf key, and hands  */
+/* back the signed report_data for the §11.12 binding (as TDX above).       */
 /*                                                                          */
 /* GHCB certificate table (AMD GHCB spec / google/go-sev-guest abi): a       */
 /* sequence of 24-byte entries { GUID[16] || offset:u32 || length:u32 }, the */
@@ -778,7 +843,8 @@ static ants_error_t snp_cert_table_find(const uint8_t *table,
     return ANTS_ERROR_MALFORMED;
 }
 
-static ants_error_t snp_attestation_verify(const ants_attestation_t *att)
+static ants_error_t snp_verify_evidence(const ants_attestation_t *att,
+                                        uint8_t out_report_data[ANTS_TEE_REPORT_DATA_SIZE])
 {
     const uint8_t *blob = att->vendor_blob;
     size_t blob_len = att->vendor_blob_len;
@@ -832,14 +898,12 @@ static ants_error_t snp_attestation_verify(const ants_attestation_t *att)
         return err;
     }
 
-    /* Bind to the peer identity: report_data[0:32] == the peer's Ed25519 key. */
+    /* Hand back the now-authenticated report_data for the binding check. */
     ants_snp_report_t r;
     err = ants_snp_report_parse(report, ANTS_SNP_REPORT_SIZE, &r);
     if (err != ANTS_OK) {
         return err;
     }
-    if (memcmp(r.report_data, att->peer_pubkey, ANTS_TEE_PEER_BINDING_LEN) != 0) {
-        return ANTS_ERROR_MALFORMED;
-    }
+    memcpy(out_report_data, r.report_data, ANTS_TEE_REPORT_DATA_SIZE);
     return ANTS_OK;
 }

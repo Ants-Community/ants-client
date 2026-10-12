@@ -16,9 +16,16 @@
  *     separately — no combined fixture exists — so the blob is assembled here in
  *     the canonical AMD layout, byte-faithful to what hardware emits.)
  *
- * Each attestation's report_data is third-party test data, so the peer key under
- * test is its low 32 bytes — what an ANTS generate side would have placed there.
- * The binding check is then a real equality test, and a mismatch is rejected.
+ * verify = EVIDENCE (chain to the pinned root + report/quote signature) + the
+ * RFC-0008 §11.12 BINDING (report_data == peer-id ‖ LE64(issued_at) ‖ 0×24).
+ * A genuine vendor attestation carries third-party report_data, never an ANTS
+ * binding, so no real KAT can pass the full verify — that positive needs
+ * ants_attestation_generate on real confidential-compute hardware. The halves
+ * are therefore tested separately: the evidence half over the genuine
+ * attestations through an internal hook (every tamper case below goes through
+ * it, so each failure is caused by the tamper, not by the binding), and the
+ * binding half through ants_attestation_report_data plus verify's rejection of
+ * the genuine-but-unbound evidence.
  */
 
 #include "ants_common.h"
@@ -31,6 +38,25 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);                        \
+        }                                                                                          \
+    } while (0)
+
+/* Internal test hook (tee.c): verify's evidence half; returns the signed
+ * report_data. */
+extern ants_error_t ants_attestation__test_verify_evidence(const ants_attestation_t *att,
+                                                           uint8_t out_report_data[64]);
+
+static ants_error_t evidence(const ants_attestation_t *att)
+{
+    uint8_t rd[ANTS_TEE_REPORT_DATA_SIZE];
+    return ants_attestation__test_verify_evidence(att, rd);
+}
 
 /* Upper bound on the assembled SNP blob (report 1184 + 96-byte table header +
  * VCEK 1360 + ASK 1677 + ARK 1639 ~= 5956). */
@@ -201,21 +227,18 @@ int main(void)
     uint8_t peer[32];
     memcpy(peer, q.report_data, 32);
 
-    /* Positive: the full chain validates to the pinned Intel root and the quote
-     * verifies under the extracted PCK leaf. */
+    /* Evidence positive: the full chain validates to the pinned Intel root, the
+     * quote verifies under the extracted PCK leaf, and the hook returns the
+     * signed report_data byte-for-byte. */
     {
         ants_attestation_t att;
         make_att(&att, TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_OK);
-    }
-
-    /* Wrong peer key: signature chain is fine, but the identity binding fails. */
-    {
-        uint8_t bad_peer[32];
-        memcpy(bad_peer, peer, 32);
-        bad_peer[0] ^= 0xFF;
-        ants_attestation_t att;
-        make_att(&att, TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, bad_peer, NOW_VALID);
+        uint8_t rd[ANTS_TEE_REPORT_DATA_SIZE];
+        CHECK_EQ(ants_attestation__test_verify_evidence(&att, rd), ANTS_OK);
+        CHECK(memcmp(rd, q.report_data, sizeof rd) == 0);
+        /* ...but the full verify rejects it: the genuine quote's report_data
+         * [32:64] is third-party bytes, not LE64(issued_at) ‖ 0×24. With the
+         * evidence proven good above, the binding is the rejecting step. */
         CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
     }
 
@@ -228,21 +251,21 @@ int main(void)
         buf[0x100] ^= 0xFF; /* inside the signed TD body [0, 0x278) */
         ants_attestation_t att;
         make_att(&att, buf, sizeof buf, peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Issued before the certificate chain was valid: chain validity rejects. */
     {
         ants_attestation_t att;
         make_att(&att, TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, peer, NOW_TOO_EARLY);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Truncated blob: bounds checks reject before any crypto. */
     {
         ants_attestation_t att;
         make_att(&att, TDX_KAT_QUOTE, 100, peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* ---- AMD SEV-SNP ------------------------------------------------------ */
@@ -270,21 +293,22 @@ int main(void)
     uint8_t snp_peer[32];
     memcpy(snp_peer, sr.report_data, 32);
 
-    /* Positive: VCEK -> ASK -> pinned ARK-Milan validates, the report verifies
-     * under the proven VCEK leaf, and the identity binding holds. */
+    /* Evidence positive: VCEK -> ASK -> pinned ARK-Milan validates, the report
+     * verifies under the proven VCEK leaf, and the signed report_data comes
+     * back byte-for-byte. */
     {
         ants_attestation_t att;
         make_att_snp(&att, snp_blob, snp_len, snp_peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_OK);
-    }
-
-    /* Wrong peer key: chain + report signature are fine, the binding fails. */
-    {
-        uint8_t bad[32];
-        memcpy(bad, snp_peer, 32);
-        bad[0] ^= 0xFF;
-        ants_attestation_t att;
-        make_att_snp(&att, snp_blob, snp_len, bad, NOW_VALID);
+        uint8_t rd[ANTS_TEE_REPORT_DATA_SIZE];
+        CHECK_EQ(ants_attestation__test_verify_evidence(&att, rd), ANTS_OK);
+        CHECK(memcmp(rd, sr.report_data, sizeof rd) == 0);
+        /* The full verify rejects it: report_data[32:40] is zero, i.e. it
+         * would bind issued_at = 0, but this presentation claims NOW_VALID. */
+        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        /* Claiming issued_at = 0 satisfies the binding — and then the chain
+         * check rejects it, since the VCEK was not valid in 1970. Rewriting
+         * issued_at cannot get past both. */
+        make_att_snp(&att, snp_blob, snp_len, snp_peer, 0);
         CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
     }
 
@@ -296,21 +320,21 @@ int main(void)
         buf[0x100] ^= 0xFF; /* inside the signed report prefix [0, 0x2A0) */
         ants_attestation_t att;
         make_att_snp(&att, buf, snp_len, snp_peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Issued before the VCEK was valid (2010 < 2022): chain validity rejects. */
     {
         ants_attestation_t att;
         make_att_snp(&att, snp_blob, snp_len, snp_peer, NOW_TOO_EARLY);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Truncated blob (shorter than the report): rejected before any crypto. */
     {
         ants_attestation_t att;
         make_att_snp(&att, snp_blob, 100, snp_peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Cert table with the VCEK GUID corrupted: the leaf cannot be located. */
@@ -320,7 +344,7 @@ int main(void)
         buf[sizeof SNP_KAT_REPORT] ^= 0xFF; /* first byte of the VCEK GUID */
         ants_attestation_t att;
         make_att_snp(&att, buf, snp_len, snp_peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
     }
 
     /* Cert-table entry with an out-of-bounds length: the bounds check rejects
@@ -335,7 +359,51 @@ int main(void)
         buf[lf + 3] = 0xFF;
         ants_attestation_t att;
         make_att_snp(&att, buf, snp_len, snp_peer, NOW_VALID);
-        CHECK_EQ(ants_attestation_verify(&att), ANTS_ERROR_MALFORMED);
+        CHECK_EQ(evidence(&att), ANTS_ERROR_MALFORMED);
+    }
+
+    /* ---- RFC-0008 §11.12 binding ----------------------------------------- */
+
+    /* Known answer: peer-id ‖ LE64(issued_at) ‖ 0x00 × 24. Expected bytes are
+     * written out by hand, independently of the implementation. */
+    {
+        uint8_t pk[32];
+        for (size_t i = 0; i < sizeof pk; i++) {
+            pk[i] = (uint8_t)i;
+        }
+        uint8_t rd[ANTS_TEE_REPORT_DATA_SIZE];
+        memset(rd, 0xAA, sizeof rd);
+        CHECK_EQ(ants_attestation_report_data(pk, (int64_t)0x0102030405060708LL, rd), ANTS_OK);
+        static const uint8_t want_time[8] = {0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01};
+        static const uint8_t zeros[24] = {0};
+        CHECK(memcmp(rd, pk, 32) == 0);
+        CHECK(memcmp(rd + 32, want_time, 8) == 0);
+        CHECK(memcmp(rd + 40, zeros, 24) == 0);
+
+        /* 2025-01-01T00:00:00Z = 0x67748580. */
+        CHECK_EQ(ants_attestation_report_data(pk, NOW_VALID, rd), ANTS_OK);
+        static const uint8_t want_now[8] = {0x80, 0x85, 0x74, 0x67, 0x00, 0x00, 0x00, 0x00};
+        CHECK(memcmp(rd + 32, want_now, 8) == 0);
+
+        /* issued_at = 0 is the SNP KAT's own report_data: the builder
+         * reproduces a real vendor-signed report_data exactly. */
+        CHECK_EQ(ants_attestation_report_data(snp_peer, 0, rd), ANTS_OK);
+        CHECK(memcmp(rd, sr.report_data, sizeof rd) == 0);
+
+        /* Argument guards: NULLs, and a negative time (the wire field is
+         * unsigned — it has no LE64 encoding). */
+        CHECK_EQ(ants_attestation_report_data(NULL, 0, rd), ANTS_ERROR_INVALID_ARG);
+        CHECK_EQ(ants_attestation_report_data(pk, 0, NULL), ANTS_ERROR_INVALID_ARG);
+        CHECK_EQ(ants_attestation_report_data(pk, -1, rd), ANTS_ERROR_INVALID_ARG);
+    }
+
+    /* Evidence-hook argument guards. */
+    {
+        ants_attestation_t att;
+        make_att(&att, TDX_KAT_QUOTE, sizeof TDX_KAT_QUOTE, peer, NOW_VALID);
+        uint8_t rd[ANTS_TEE_REPORT_DATA_SIZE];
+        CHECK_EQ(ants_attestation__test_verify_evidence(NULL, rd), ANTS_ERROR_INVALID_ARG);
+        CHECK_EQ(ants_attestation__test_verify_evidence(&att, NULL), ANTS_ERROR_INVALID_ARG);
     }
 
     /* Vendor whose wiring has not landed yet (ARM CCA is v1.x). */
