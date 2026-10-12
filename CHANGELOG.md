@@ -13,6 +13,25 @@ the spec repo's
 
 ## Unreleased
 
+### network/transport + network/dht: unbind caller-owned streams — closes a remote use-after-free · 2026-10-12
+
+`network/transport`: callers allocate the handle for every stream they open (`ants_transport_stream_t`), and the transport registers it with picoquic as the stream's app context. Nothing ever unregistered it, so any callback that arrived after the caller freed the handle wrote into freed memory. The bridge also treated a ctx-less callback as a brand-new peer-opened stream, even for stream ids we had opened ourselves.
+
+**Reachable remotely.** The DHT RPC client abandons a reply that overflows `ANTS_DHT_RPC_RECV_CAP` mid-stream and frees the handle there. A peer answering any RPC with more than 4 KiB, spread over several packets, then gets the transport to append the next packet into freed memory. The new `test_rpc_oversized_response_mid_stream` reproduces this under ASan as a `heap-use-after-free` in `stream_recv_buf_append` before the fix. The adversarial review of #191 flagged the hazard, and the test confirmed it.
+
+**Fix, in three parts:**
+- **Explicit unbind.** The new `ants_transport_stream_unbind` detaches a stream we opened, via `picoquic_unlink_app_stream_ctx`, which looks the stream up without materialising it. Callers that free a handle mid-stream call it first: the DHT on overflow, on malloc failure, and on a failed send after open; attest on a failed request send. If it runs inside one of the stream's own events, the bridge notices and stops touching the handle (a `FIN` delivery with trailing bytes no longer dereferences it after the `READABLE` event).
+- **Automatic unbind on terminal events.** After `STREAM_RESET`, or after `STREAM_FIN` that follows our own FIN, the transport unbinds the stream itself once the event returns. It uses only `(cnx, stream_id)`, never the handle, so callers may keep freeing inside those events as they always have. This also closes the post-FIN `RESET_STREAM` window the review described. That window cannot be triggered with an honest picoquic peer, so it is covered by construction, not by a test.
+- **Local streams dropped.** A ctx-less callback for a stream id this endpoint opened is dropped instead of being bootstrapped as a peer-opened stream.
+
+The `CONN_CLOSED` and destroy paths need no unbind: picoquic delivers nothing further for the connection's streams. That matters because the destroy paths (`ants_dht_destroy`, `ants_attest_destroy`) can run after `ants_transport_destroy` has freed inbound connection states, so an unbind there would itself dereference freed memory.
+
+**Falsified:**
+- Without the DHT unbind, ASan reports the use-after-free above.
+- Without the local-stream drop, the client sees a phantom `STREAM_OPENED` for its own stream, which the regression test asserts against.
+
+`test_transport` covers the unbind API contract.
+
 ### network/attest + cmd/antsd: the v1 attestation gate — RFC-0008 §11.12 on the wire, verify-and-tag in the daemon · 2026-10-12
 
 New `network/attest` (PR5 of the node-daemon sequence): the attestation exchange and the per-connection verdict of RFC-0005's v1 handshake gate.

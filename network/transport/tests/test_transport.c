@@ -521,6 +521,19 @@ static void test_stream_lifecycle(void)
     CHECK_EQ(ants_transport_open_bidi_stream(&conn, &s_reset), ANTS_OK);
     CHECK_EQ(ants_transport_stream_reset(&s_reset, 42), ANTS_OK);
 
+    /* Unbind: a stream we opened detaches (handle then dead — sends fail,
+     * a second unbind is a no-op); NULL is rejected; a never-opened
+     * handle is a no-op. */
+    ants_transport_stream_t s_unbind = {{0}};
+    CHECK_EQ(ants_transport_open_bidi_stream(&conn, &s_unbind), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_unbind(&s_unbind), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_send(&s_unbind, payload, sizeof payload, false),
+             ANTS_ERROR_PEER_UNREACHABLE);
+    CHECK_EQ(ants_transport_stream_unbind(&s_unbind), ANTS_OK);
+    ants_transport_stream_t s_never = {{0}};
+    CHECK_EQ(ants_transport_stream_unbind(&s_never), ANTS_OK);
+    CHECK_EQ(ants_transport_stream_unbind(NULL), ANTS_ERROR_INVALID_ARG);
+
     /* Drive the I/O loop. picoquic may fire CONN_CLOSED if it detects
      * the listener has no TLS material; we don't tightly require it
      * (timing is picoquic-internal) so just verify no crash. */

@@ -890,6 +890,7 @@ static ants_error_t test_rpc_server_event(const ants_transport_event_t *ev, void
 typedef struct {
     ants_dht_t *dht;
     int conn_ready;
+    int stream_opened; /* peer-opened streams seen by the client */
     ants_peer_id_t peer_id;
 } test_rpc_client_t;
 
@@ -902,6 +903,8 @@ static ants_error_t test_rpc_client_event(const ants_transport_event_t *ev, void
     if (ev->kind == ANTS_TRANSPORT_EV_CONN_READY) {
         c->conn_ready++;
         c->peer_id = ev->peer_id;
+    } else if (ev->kind == ANTS_TRANSPORT_EV_STREAM_OPENED) {
+        c->stream_opened++;
     }
     return ANTS_OK;
 }
@@ -1025,6 +1028,112 @@ static void test_rpc_handle_event_ignores_non_dht(void)
     CHECK_EQ(ants_dht_handle_transport_event(&d, &ev), ANTS_OK);
 
     CHECK_EQ(ants_dht_destroy(&d), ANTS_OK);
+}
+
+static void test_rpc_oversized_response_mid_stream(void)
+{
+    /* A peer answers a PING with more than ANTS_DHT_RPC_RECV_CAP bytes,
+     * spread over several QUIC deliveries, then FINs. The client gives up
+     * on the RPC the moment its buffer would overflow — mid-stream — and
+     * frees the slot's stream handle. Every later delivery for that
+     * stream must then be dropped by the transport: a regression here is
+     * a remote write into freed memory (ASan: heap-use-after-free in the
+     * transport's recv-buffer append). The completion fires exactly once,
+     * with BUFFER_TOO_SMALL. */
+    uint8_t a_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t a_pub[ANTS_ED25519_PUBKEY_SIZE];
+    uint8_t b_priv[ANTS_ED25519_PRIVKEY_SIZE];
+    uint8_t b_pub[ANTS_ED25519_PUBKEY_SIZE];
+    memset(a_priv, 0x34, sizeof a_priv);
+    memset(b_priv, 0x78, sizeof b_priv);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(a_priv, a_pub), ANTS_OK);
+    CHECK_EQ(ants_ed25519_pubkey_from_priv(b_priv, b_pub), ANTS_OK);
+
+    test_rpc_server_t server;
+    memset(&server, 0, sizeof server);
+    /* No response type: B reads the request and answers nothing itself —
+     * the test writes the oversized reply by hand below. */
+    server.respond_with = (ants_dht_msg_type_t)0;
+    test_rpc_client_t client;
+    memset(&client, 0, sizeof client);
+
+    ants_transport_t tb = {{0}};
+    ants_transport_config_t bcfg;
+    memset(&bcfg, 0, sizeof bcfg);
+    memcpy(bcfg.pub, b_pub, ANTS_ED25519_PUBKEY_SIZE);
+    bcfg.sign_fn = test_real_sign;
+    bcfg.sign_ctx = b_priv;
+    bcfg.event_fn = test_rpc_server_event;
+    bcfg.event_ctx = &server;
+    bcfg.listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1";
+    CHECK_EQ(ants_transport_init(&tb, &bcfg), ANTS_OK);
+    char baddr[ANTS_MULTIADDR_MAX_LEN] = {0};
+    CHECK_EQ(ants_transport_local_addr(&tb, baddr, sizeof baddr), ANTS_OK);
+
+    ants_transport_t ta = {{0}};
+    ants_transport_config_t acfg;
+    memset(&acfg, 0, sizeof acfg);
+    memcpy(acfg.pub, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    acfg.sign_fn = test_real_sign;
+    acfg.sign_ctx = a_priv;
+    acfg.event_fn = test_rpc_client_event;
+    acfg.event_ctx = &client;
+    CHECK_EQ(ants_transport_init(&ta, &acfg), ANTS_OK);
+
+    ants_dht_t da = {{0}};
+    ants_dht_config_t dcfg;
+    memset(&dcfg, 0, sizeof dcfg);
+    dcfg.transport = &ta;
+    memcpy(dcfg.local_peer_id.bytes, a_pub, ANTS_ED25519_PUBKEY_SIZE);
+    dcfg.event_fn = test_noop_event;
+    CHECK_EQ(ants_dht_init(&da, &dcfg), ANTS_OK);
+    client.dht = &da;
+
+    ants_transport_conn_t conn = {{0}};
+    CHECK_EQ(ants_transport_dial(&ta, baddr, NULL, &conn), ANTS_OK);
+    for (int i = 0; i < 500 && client.conn_ready < 1; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+    }
+    CHECK(client.conn_ready == 1);
+
+    test_rpc_completion_t comp;
+    memset(&comp, 0, sizeof comp);
+    CHECK_EQ(ants_dht__test_send_ping(&da, &conn, test_rpc_complete_ping, &comp), ANTS_OK);
+    for (int i = 0; i < 500 && server.stream_fin < 1; i++) {
+        tick_pace();
+        ants_transport_tick(&ta);
+        ants_transport_tick(&tb);
+    }
+    CHECK(server.stream_fin == 1);
+    CHECK(server.inbound_stream != NULL);
+
+    /* Three chunks of junk, each ticked through on its own so they reach
+     * A as separate deliveries: the first stays under the cap, the second
+     * overflows it (the RPC is abandoned there), the third + FIN arrive
+     * after the client has already let go of the stream. */
+    static uint8_t junk[3000];
+    memset(junk, 0xA5, sizeof junk);
+    for (int chunk = 0; chunk < 3 && server.inbound_stream != NULL; chunk++) {
+        CHECK_EQ(ants_transport_stream_send(server.inbound_stream, junk, sizeof junk, chunk == 2),
+                 ANTS_OK);
+        for (int i = 0; i < 100; i++) {
+            tick_pace();
+            ants_transport_tick(&tb);
+            ants_transport_tick(&ta);
+        }
+    }
+
+    CHECK(comp.fired == 1);
+    CHECK(comp.last_status == ANTS_ERROR_BUFFER_TOO_SMALL);
+    /* The late deliveries were dropped, not mistaken for a peer-opened
+     * stream: B never opens one, so A must never see STREAM_OPENED. */
+    CHECK(client.stream_opened == 0);
+
+    CHECK_EQ(ants_dht_destroy(&da), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&ta, 0), ANTS_OK);
+    CHECK_EQ(ants_transport_destroy(&tb, 0), ANTS_OK);
 }
 
 static void test_rpc_round_trip(void)
@@ -3900,6 +4009,7 @@ int main(void)
     test_rpc_send_rejects_invalid_args();
     test_rpc_handle_event_ignores_non_dht();
     test_rpc_round_trip();
+    test_rpc_oversized_response_mid_stream();
 
     test_lookup_no_candidates();
     test_lookup_round_trip();
